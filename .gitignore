@@ -1,0 +1,14 @@
+# Local research workspace and build products.
+.DS_Store
+.work/
+target/
+
+# Large experiment evidence and model weights.
+artifacts/raw/
+artifacts/traces/
+*.trace
+*.safetensors
+
+# Local Python products.
+*.pyc
+__pycache__/
