@@ -1,0 +1,5 @@
+# Stage Serving Readiness by Capability Profile
+
+TurnVector ships the first serving-ready implementation as the P0 Serving Profile: one authoritative Control Store, serialized durable Control Mutation, bounded non-recovery Audit, fail-closed schema handling, exclusive process ownership through the Daemon Instance Lock, and restart with empty inference state. Identity Anchor, Runtime Identity Lease, Runtime Metadata authority, Runtime Bundle, Restore, Clone, multi-authority repair, Compatibility Custody, and the complete Bounded Integrity Lifecycle are unavailable and cannot gate or be advertised by this profile. Corruption that P0 cannot reconcile fails closed and requires creation of a new runtime rather than partial repair or inferred recovery.
+
+The later Integrity Serving Profile may add those capabilities only with their already defined durability, evidence, qualification, and recovery contracts intact. Service Readiness is evaluated against the build-declared profile and reports that profile externally, so staged delivery narrows capability scope without weakening a claimed capability.
