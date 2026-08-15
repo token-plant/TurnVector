@@ -62,7 +62,7 @@ _Avoid_: Token callback from Backend, output before Receipt
 
 **Turn Output Reservation**:
 The concrete output-channel capacity reserved immediately before an output-producing Turn for that Turn's maximum visible token count. The broader Resource Reservation budgets aggregate capacity but does not allocate the entire Max Output Tokens socket buffer up front. Without Turn Output Reservation, the candidate is temporarily non-runnable.
-_Avoid_: Admission reservation, unbounded socket buffer, Worker blocking
+_Avoid_: Admission reservation, unbounded socket buffer, Device Executor blocking
 
 **Token Request**:
 The MVP Data Plane request expressed as input token IDs, generation parameters, Service Class, a Model Alias or immutable Model Revision reference, Max Output Tokens, fixed Sampling Seed, and optional Stop Token Sequences. Request Acceptance resolves that selector exactly once and freezes the resulting Revision. Tokenization, chat templates, and text decoding belong outside TurnVector. Input length plus Max Output Tokens must not exceed the resolved Revision's context limit; TurnVector rejects overflow rather than truncating.
@@ -81,20 +81,20 @@ The single bounded output unit that one committed Turn may produce for one reque
 _Avoid_: Per-token IPC request, full-request buffer, Audit Journal record
 
 **Sampling State**:
-The logits processing, sampling configuration, and RNG state owned and executed by the C++ Backend Worker alongside KV state. The Worker returns generated token IDs rather than transferring logits to the daemon or caller.
+The logits processing, sampling configuration, and RNG state owned and executed by the in-process C++/MLX Adapter on the Device Executor alongside KV state. The Adapter returns generated token IDs rather than transferring logits to the Runtime Core or caller.
 _Avoid_: Daemon sampling, client logits stream
 
 **Sampling Seed**:
 The immutable per-request RNG seed fixed before Admission. A caller may provide it; otherwise the daemon generates it and records it in the Audit Journal. Batch membership and Turn order cannot replace it with a process-global RNG sequence.
-_Avoid_: Per-Turn seed, Worker-global RNG
+_Avoid_: Per-Turn seed, Adapter-global RNG
 
 **Stop Token Sequences**:
-The optional bounded token-ID sequences evaluated inside the C++ Backend Worker alongside Max Output Tokens. The Worker retains the longest suffix that might still form a stop sequence and publishes only tokens proven not to belong to one; matched stop tokens are not visible by default. The terminating Turn Receipt records whether completion came from a stop sequence, output limit, cancellation, or failure.
+The optional bounded token-ID sequences evaluated by the in-process C++/MLX Adapter alongside Max Output Tokens. The Adapter retains the longest suffix that might still form a stop sequence and publishes only tokens proven not to belong to one; matched stop tokens are not visible by default. The terminating Turn Receipt records whether completion came from a stop sequence, output limit, cancellation, or failure.
 _Avoid_: Text stop string, daemon-side late cancellation
 
 **Batch-Invariant Sampling**:
 The requirement that each request's independent Sampling State produce the same tokens for the same Model Revision, input, parameters, and Sampling Seed regardless of Batch membership or member order.
-_Avoid_: Worker-global RNG, batch-dependent output
+_Avoid_: Adapter-global RNG, batch-dependent output
 
 **Model**:
 The stable Model ID that receives one configured weight and competes with other runnable Models for Engine Service. Every Model Revision registered under that ID shares the same Model Weight and Model Ledger; a revision change cannot create additional fair share.
@@ -117,15 +117,15 @@ The single weighted virtual-service account shared by every Work Kind, Model Rev
 _Avoid_: Work Kind quota, request ledger
 
 **Engine Service**:
-The C++ Backend Worker-measured Monotonic Time from accepting a valid Turn Plan until that Turn's work is synchronized. It includes backend build, submission, and wait time, but excludes daemon scheduling, IPC, queueing, and output-consumer time. Only this duration advances the Model Ledger; cross-process clock alignment is unnecessary because the Worker reports a duration, not an absolute timestamp.
+The Device Executor-measured Monotonic Time from beginning direct execution of a valid Turn Plan until that Turn's C++/MLX work is synchronized. It includes graph build, submission, and wait time, but excludes ingress queueing, pre-execution Scheduler selection, Receipt commit, and output-consumer time. Only this duration advances the Model Ledger; no process-boundary clock mapping or internal transport time exists. This is the synchronized engine-service basis permitted by the P-1A YELLOW result, not MLX command-buffer service time or GPU occupancy.
 _Avoid_: Token count, queue time, GPU occupancy
 
 **Runtime Overhead**:
-The daemon-measured time outside Engine Service needed to dispatch a Plan over IPC, receive and validate its result, commit Scheduler state, and publish staged output. It is audited and bounded for timing feasibility but never charged to a Model Ledger.
+The measured time outside Engine Service needed to form and select a Plan, validate the in-memory Adapter result, commit Runtime Core state, and publish staged output. It is audited and bounded for timing feasibility but never charged to a Model Ledger.
 _Avoid_: Engine Service, client queue time, free deadline time
 
 **Deadline Cost Bound**:
-The conservative sum of a Work Candidate's Engine Service upper bound and the applicable daemon, IPC, receipt-commit, and output-publication overhead bounds. Latest Safe Start uses this end-to-end bound rather than Engine Service alone.
+The conservative sum of a Work Candidate's Engine Service upper bound and the applicable scheduling, in-process call, Receipt-commit, and output-publication overhead bounds. Latest Safe Start uses this end-to-end bound rather than Engine Service alone.
 _Avoid_: Fairness charge, observed average latency
 
 **Turn Cost Estimate**:
@@ -141,19 +141,19 @@ The Turn-boundary process triggered by activating a new Certification Record, ch
 _Avoid_: Automatic bound expansion, new-request-only update
 
 **Bound Violation**:
-A completed Turn or control operation whose actual time or resource use exceeds its Certification Record upper bound. Its Receipt remains authoritative, but the most specific affected Capability Key is removed from shared scheduling, an auditable contract violation is emitted, and re-entry requires explicit recertification. Correlated failures may escalate quarantine to a wider Envelope, Worker build, or Backend Capability. A resource-bound violation also forces immediate Resource Governor reevaluation; a bounded root-recovery underestimate follows Repository Root Recovery Bounded Recovery Capacity Admission Boundary Bound Violation and its Affected Operation Boundary, quarantining the exact recovery Tool/Capability and allowing only already externalized operations to reach their pre-reserved safe terminals. Exceeding only the ordinary Cost Profile estimate is normal calibration evidence, not a Bound Violation.
+A completed Turn or control operation whose actual time or resource use exceeds its Certification Record upper bound. Its Receipt remains authoritative, but the most specific affected Capability Key is removed from shared scheduling, an auditable contract violation is emitted, and re-entry requires explicit recertification. Correlated failures may escalate quarantine to a wider Envelope, Adapter build, or Backend Capability. A resource-bound violation also forces immediate Resource Governor reevaluation; a bounded root-recovery underestimate follows Repository Root Recovery Bounded Recovery Capacity Admission Boundary Bound Violation and its Affected Operation Boundary, quarantining the exact recovery Tool/Capability and allowing only already externalized operations to reach their pre-reserved safe terminals. Exceeding only the ordinary Cost Profile estimate is normal calibration evidence, not a Bound Violation.
 _Avoid_: Ordinary estimate error, automatic bound expansion
 
 **Backend Capability**:
-A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. It is never universal across Apple Silicon, model revisions, Worker or MLX builds, protocol capabilities, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
+A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. It is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
 _Avoid_: Work Kind, Backend process, model support
 
 **Capability Key**:
-The most specific shared-execution identity addressed by certification and quarantine: Model Revision, Execution Phase, configured batch and shape bucket, Worker and MLX build identity, negotiated Backend Protocol capability set, and Certification Envelope. A systemic fault may explicitly quarantine a coarser parent scope, but one request failure cannot silently disable or authorize unrelated keys.
+The most specific shared-execution identity addressed by certification and quarantine: Model Revision, Execution Phase, configured batch and shape bucket, Adapter and MLX build identity, Backend Interface revision, and Certification Envelope. A systemic fault may explicitly quarantine a coarser parent scope, but one request failure cannot silently disable or authorize unrelated keys.
 _Avoid_: Model ID, request ID, universal backend flag
 
 **Certification Envelope**:
-The named hardware and software scope in which a Certification Record is valid, including Apple Silicon device class, relevant GPU configuration, unified-memory size, macOS version, Worker and MLX build identities, and required Backend Protocol capabilities. A record from the current M3 Ultra 256 GB host cannot certify 32, 64, or 128 GB systems, and configured conservative Governor defaults do not create such certification.
+The named hardware and software scope in which a Certification Record is valid, including Apple Silicon device class, relevant GPU configuration, unified-memory size, macOS version, Adapter and MLX build identities, and Backend Interface revision. A record from the current M3 Ultra 256 GB host cannot certify 32, 64, or 128 GB systems, and configured conservative Governor defaults do not create such certification.
 _Avoid_: Resource Threshold Profile, all Apple Silicon, proportional memory scaling
 
 **Certification Record**:
@@ -161,11 +161,11 @@ An immutable hash-bound evidence record that authorizes one or more exact Capabi
 _Avoid_: Cost Profile, benchmark summary alone, raw trace archive
 
 **Certification Applicability**:
-The Admission-owned derived answer that one unchanged Certification Record currently covers an exact Capability Key in the observed environment. A fixed-capacity recency cache may retain it only against every determining state, Worker, protocol, and environment identity; a miss recomputes it, while eviction is neither Control State nor an auditable decision.
+The Admission-owned derived answer that one unchanged Certification Record currently covers an exact Capability Key in the observed environment. A fixed-capacity recency cache may retain it only against every determining state, Adapter, Backend Interface, and environment identity; a miss recomputes it, while eviction is neither Control State nor an auditable decision.
 _Avoid_: Certification Record, Backend Capability, persisted authorization flag
 
 **Uncertified Work**:
-Work whose Model Revision, shape, phase, batch bucket, build, protocol capability, or Certification Envelope lacks an applicable Certification Record. Shared mode rejects it explicitly. A trusted Control Plane may request it in Exclusive Mode only when a conservative peak resource bound and certified Exclusive Safety Point are independently available; the Scheduler, Backend, and Governor never enter Exclusive Mode automatically to probe it.
+Work whose Model Revision, shape, phase, batch bucket, Adapter or MLX build, Backend Interface revision, or Certification Envelope lacks an applicable Certification Record. Shared mode rejects it explicitly. A trusted Control Plane may request it in Exclusive Mode only when a conservative peak resource bound and certified Exclusive Safety Point are independently available; the Scheduler, Backend, and Governor never enter Exclusive Mode automatically to probe it.
 _Avoid_: Best-effort shared work, automatic probe, unsupported Model
 
 **Resource Impact**:
@@ -241,8 +241,8 @@ The configured maximum accumulated Monotonic Time an individual safe runnable St
 _Avoid_: Throughput target, strict fair-share window
 
 **Monotonic Time**:
-The TurnVector Daemon-owned non-decreasing time authority for deadlines, waiting bounds, evidence freshness, and Event Loop decisions. Production uses a monotonic system clock; deterministic tests inject a controllable Fake Clock. The Worker may measure and report local durations and sample sequences but never supplies absolute scheduling time, so no cross-process clock alignment is required. Wall-clock time is audit metadata only.
-_Avoid_: Calendar time, Worker absolute timestamp, cross-process clock mapping
+The TurnVector Daemon-owned non-decreasing time authority for deadlines, waiting bounds, evidence freshness, and Event Loop decisions. Production uses one monotonic system clock available to the Runtime Event Loop and in-process Adapter; deterministic tests inject a controllable Fake Clock. The Adapter reports durations and sample sequences but never supplies an independent scheduling clock. Wall-clock time is audit metadata only.
+_Avoid_: Calendar time, Adapter-owned scheduling clock, cross-process clock mapping
 
 **Suspended Work**:
 Previously accepted work that cannot currently execute under the Resource Mode. It is not Runnable and its Progress Bound clock pauses. When safety returns, it resumes at the current Model Ledger baseline without stored service credit, and its remaining timing obligation is re-established from the resume event.
@@ -285,11 +285,11 @@ The versioned effective thresholds, sampling freshness limits, grace periods, an
 _Avoid_: Resource Mode action table, hard-coded machine class
 
 **Resource Evidence**:
-A versioned Governor input assembled from Worker-reported MLX allocator and cache values plus Worker footprint, and daemon-observed system available memory, swap, compressor, and pressure. Each source retains its provenance, sequence, and freshness so the merged evidence does not imply a shared process clock.
+A versioned Governor input assembled from Device Executor-reported MLX allocator and cache values, daemon process footprint, and system available memory, swap, compressor, and pressure. Each source retains its provenance, sequence, and freshness even though all process-local observations share one daemon lifetime. The P-1B shared-host precheck may inform conservative defaults on the observed 256 GB host only; its formal status remains PENDING and it is neither a 24-hour soak result nor a smaller-memory capacity certificate.
 _Avoid_: Resource Mode, inferred allocator state, unversioned sample
 
 **Stale Resource Evidence**:
-The condition in which required resource samples exceed the configured freshness limit. It immediately forces StopAdmission. If system evidence remains stale past its grace period, Resource Mode advances to Critical; if Worker evidence or heartbeat remains stale, the daemon terminates that Worker and applies Worker Exit semantics.
+The condition in which required resource samples exceed the configured freshness limit. It immediately forces StopAdmission. If system evidence remains stale past its grace period, Resource Mode advances to Critical; if Device Executor evidence remains stale because an operation misses its certified safe point, the Operation Watchdog requests process-wide fail-stop under Daemon Failure semantics.
 _Avoid_: Last-known-good state, telemetry warning
 
 **Safety Generation**:
@@ -342,7 +342,7 @@ _Avoid_: Warming, Queued Work, Request Materialization
 
 **Preparation Timeout**:
 The independent operational maximum for Preparing. Expiry terminally fails the accepted request and releases its pre-Admission Ingress Budget; it is not a First Token Deadline, Residency Wait Timeout, or inference SLO.
-_Avoid_: Admission deadline, Worker Watchdog, Warming timeout
+_Avoid_: Admission deadline, Operation Watchdog, Warming timeout
 
 **Request State**:
 The Scheduler-owned lifecycle beginning at Request Acceptance in Preparing, optionally moving through Warming, then successful Admission and Request Materialization into queued, in-flight, suspended, quarantined, canceled, failed, or completed outcomes. The Resource Governor supplies events and the Execution Backend sees only opaque request handles; ownership never transfers between components. Preparing and Warming are accepted but not admitted and own no request Resource Reservation.
@@ -398,7 +398,7 @@ _Avoid_: Not Found, terminal state, reconnect recovery
 
 **Daemon Instance ID**:
 A unique identifier generated when the TurnVector Daemon starts and embedded in every Request ID and audit record. A restart creates a new identity and no cross-restart deduplication promise.
-_Avoid_: Persistent cluster ID, Worker ID
+_Avoid_: Persistent cluster ID, child-process ID
 
 **Correlation Tag**:
 Optional caller metadata copied into status and audit records. It may repeat and cannot suppress, identify, or retry a request by itself.
@@ -429,7 +429,7 @@ An immutable weights and capability identity registered under one stable Model I
 _Avoid_: Mutable alias, filesystem path alone
 
 **Model Manifest**:
-The immutable Control Plane registration for a Model Revision, containing a canonical Artifact Root, artifact identities and File Hashes, context limit, tokenizer identity for external adapters, expected Backend Capability version, Model Descriptor hash, and audit provenance. A Data Plane request cannot supply an arbitrary model path. Before every load, the Worker accesses only this registered root and revalidates the artifacts; the MVP does not add a more complex OS sandbox.
+The immutable Control Plane registration for a Model Revision, containing a canonical Artifact Root, artifact identities and File Hashes, context limit, tokenizer identity for external adapters, expected Backend Capability version, Model Descriptor hash, and audit provenance. A Data Plane request cannot supply an arbitrary model path. Before every load, the C++/MLX Adapter accesses only this registered root and revalidates the artifacts; the MVP does not add a more complex OS sandbox.
 _Avoid_: Mutable alias, runtime directory scan, model request
 
 **Model Registry Limit**:
@@ -437,7 +437,7 @@ The immutable binary maximum number of registered Model Revisions in one Control
 _Avoid_: Resident Model limit, dynamic Receipt chunking, capacity estimate
 
 **Artifact Root**:
-The canonical local root registered in a Model Manifest from which the C++ Backend Worker may load that Revision's hash-bound artifacts. The Worker cannot accept an ad hoc path from a Data Plane request or Residency command. It verifies artifact hashes and stable file metadata before and after loading; any change or mismatch fails the load and makes the Revision Unavailable rather than mutating its identity.
+The canonical local root registered in a Model Manifest from which the in-process C++/MLX Adapter may load that Revision's hash-bound artifacts. The Adapter cannot accept an ad hoc path from a Data Plane request or Residency command. It verifies artifact hashes and stable file metadata before and after loading; any change or mismatch fails the load and makes the Revision Unavailable rather than mutating its identity.
 _Avoid_: Model Alias, caller path, mutable Model Revision
 
 **Model Alias**:
@@ -453,7 +453,7 @@ A registered Model Revision disabled after load failure, artifact hash mismatch,
 _Avoid_: Temporary Warming, retry backoff loop, Retiring Revision
 
 **Model Descriptor**:
-The versioned, hash-bound capability and conservative resource/time description generated when a Model Manifest is registered. It permits stateless pre-Admission description while the Model is non-resident; after loading, the Worker must revalidate artifact hashes and capability version before Admission can proceed.
+The versioned, hash-bound capability and conservative resource/time description generated when a Model Manifest is registered. It permits stateless pre-Admission description while the Model is non-resident; after loading, the C++/MLX Adapter must revalidate artifact hashes and capability version before Admission can proceed.
 _Avoid_: Request Description, resident model state, caller estimate
 
 **Resource Reservation**:
@@ -461,7 +461,7 @@ The conservative capacity-ledger commitment created atomically with successful A
 _Avoid_: Actual MLX allocation, estimate only, Model Residency
 
 **Pending Reclaim**:
-Capacity that was actually allocated for a terminal request or released Backend object and remains charged after logical release until Worker allocator evidence and process footprint convergence prove reclamation. Reservation capacity that was never physically allocated is released immediately; allocated capacity cannot be reused merely because the request reached a terminal state.
+Capacity that was actually allocated for a terminal request or released Backend object and remains charged after logical release until Adapter allocator evidence and daemon process-footprint convergence prove reclamation. Reservation capacity that was never physically allocated is released immediately; allocated capacity cannot be reused merely because the request reached a terminal state.
 _Avoid_: Free capacity, fixed reclaim delay, cache size alone
 
 **Reclaim Stall**:
@@ -493,7 +493,7 @@ A Resource Governor-directed load or unload serialized as a control operation on
 _Avoid_: Turn, model request, cache clear
 
 **Transition Cancellation**:
-A cooperative request issued when Resource Mode becomes Critical during a Residency Transition. The Execution Backend stops at its declared safe cancellation point or completes or rolls back within its certified maximum blocking time. The runtime never kills only the transition thread while retaining the Worker; violation of the certified safe-point bound invokes the Operation Watchdog and whole-Worker termination policy.
+A cooperative request issued when Resource Mode becomes Critical during a Residency Transition. The Execution Backend stops at its declared safe cancellation point or completes or rolls back within its certified maximum blocking time. The runtime never kills only the Device Executor thread while retaining the process; violation of the certified safe-point bound invokes the Operation Watchdog and process-wide fail-stop.
 _Avoid_: Immediate thread termination, ignored Critical mode
 
 **Residency Receipt**:
@@ -545,7 +545,7 @@ The retryable Structured Error returned before the Runtime Event Loop when an or
 _Avoid_: Admission rejection, terminal Request failure, Resource Mode
 
 **Core Event Reserve**:
-The independently bounded Runtime Event Loop capacity reserved for cancellation, Client Disconnect, Critical resource transitions, Worker Exit, shutdown, and repair events. Ordinary submissions cannot consume it, so overload cannot prevent safety action or resource release.
+The independently bounded Runtime Event Loop capacity reserved for cancellation, Client Disconnect, Critical resource transitions, Device Executor Failure, shutdown, and repair events. Ordinary submissions cannot consume it, so overload cannot prevent safety action or resource release at the next safe boundary.
 _Avoid_: Priority queue, unbounded emergency channel, Service Class
 
 **Scheduler**:
@@ -558,7 +558,7 @@ _Avoid_: Runtime Event Loop, daemon service, collection of communicating actors
 
 **Core Event**:
 A validated Domain Type representing one Event Sequence-ordered fact presented to the Runtime Core, including accepted API commands, daemon-stamped Monotonic Time, Backend results, Resource Evidence, disconnects, cancellation, and control outcomes. Within an active daemon run its Event Sequence must be exactly the successor of the last committed event; Bootstrap initializes the first expected value only after any Crash Tail Boundary, and later duplicates, regressions, or gaps are Core Faults. Protocol DTOs and raw system events must be validated and converted before becoming Core Events.
-_Avoid_: Backend Protocol message, callback, mutable command object
+_Avoid_: Wire message, Adapter-native structure, callback, mutable command object
 
 **Core Transition**:
 The deterministic atomic result of handling one Core Event: a validated successor Runtime Core state or state delta, ordered audit decisions and records, client-facing outcomes, and zero or more Effects. The Core first stages the entire candidate Transition and verifies every Core Invariant. Only then does it commit state and expose Effects as one logical operation. Failure preserves the exact prior state and exposes no Effect. This contract does not require cloning the entire Runtime Core when a controlled transactional delta can provide the same semantics.
@@ -573,15 +573,15 @@ A machine-checked condition that must hold across the complete Runtime Core stat
 _Avoid_: Input validation, business preference, debug assertion only
 
 **Core Fault**:
-The global non-serving condition caused by an unexplained Core Event Sequence duplicate, regression, or gap within an active daemon run, or by failure of a Core Invariant while staging a Transition. The candidate state and every Effect are discarded, the prior state is not trusted for continued service, new work stops, and the daemon's outer fault handler best-effort records diagnostics, terminates the Worker, fails live connections, and exits; a durably declared cross-crash tail is not such a gap.
-_Avoid_: Domain Rejection, Worker Exit, warning-and-continue
+The global non-serving condition caused by an unexplained Core Event Sequence duplicate, regression, or gap within an active daemon run, or by failure of a Core Invariant while staging a Transition. The candidate state and every Effect are discarded, the prior state is not trusted for continued service, new work stops, and the daemon's outer fault handler best-effort records diagnostics, requests Device Executor Shutdown, fails live connections, and exits; a durably declared cross-crash tail is not such a gap.
+_Avoid_: Domain Rejection, Device Executor Failure, warning-and-continue
 
 **Effect**:
-An explicit request from the Runtime Core for the daemon to perform external work, such as a Backend command, Control State preparation, audit append, output publication, or timer registration. Before emitting it, the Core records an in-flight operation with a unique Operation ID and relevant Generation Vector. Each Effect appears in a stable ordered list and may depend only on explicitly named earlier Effects; independent Effects may execute concurrently, but the daemon cannot violate dependencies or derive semantic order from completion timing. Effects are data, not callbacks or futures, and never imply successful execution.
+An explicit request from the Runtime Core for the daemon to perform work, such as a direct Backend operation, Control State preparation, audit append, output publication, or timer registration. Before emitting it, the Core records an in-flight operation with a unique Operation ID and relevant Generation Vector. Each Effect appears in a stable ordered list and may depend only on explicitly named earlier Effects; Backend Effects execute synchronously on the Device Executor, while independent non-Backend I/O Effects may execute concurrently without changing semantic order. Effects are data, not callbacks or futures, and never imply successful execution.
 _Avoid_: Core Event, direct I/O, implicit retry
 
 **Effect Result**:
-A daemon-validated Core Event reporting the completion, failure, cancellation, or indeterminate outcome of one Effect by Operation ID and relevant generation. A result for a bounded known-completed operation becomes an audited duplicate Domain Rejection; an unknown, late, or generation-mismatched result is rejected with its own stable reason. No rejected result reapplies state. An indeterminate mutating Backend command follows Worker Exit semantics and is never retransmitted.
+A daemon-validated Core Event reporting the completion, failure, cancellation, or indeterminate outcome of one Effect by Operation ID and relevant generation. A result for a bounded known-completed operation becomes an audited duplicate Domain Rejection; an unknown, late, or generation-mismatched result is rejected with its own stable reason. No rejected result reapplies state. A Backend operation is invoked once by direct call; if process failure prevents its result from being committed, Daemon Failure discards all live inference state and restart never retransmits it.
 _Avoid_: Effect, exception, blind retry
 
 **Core Replay Case**:
@@ -589,7 +589,7 @@ A fixed initial Core state plus an Event Sequence-ordered stream of explicit Cor
 _Avoid_: Audit recovery, nondeterministic integration test, numerical MLX replay
 
 **P0 Core Gate**:
-The implementation gate requiring deterministic replay and invariant coverage for weighted scheduling, deadlines and Progress Bounds, Resource Mode transitions, Admission, request and Residency Reservations, Pending Reclaim, cancellation and output races, Worker Exit, and Audit Degraded behavior. It is satisfied through example tests, property tests, generated state-machine sequences, fault injection, and fixed-seed replay, and makes no MLX correctness, latency, throughput, or FFI claim.
+The implementation gate requiring deterministic replay and invariant coverage for weighted scheduling, deadlines and Progress Bounds, Resource Mode transitions, Admission, request and Residency Reservations, Pending Reclaim, cancellation and output races, Device Executor Failure, and Audit Degraded behavior. It is satisfied through example tests, property tests, generated state-machine sequences, fault injection, and fixed-seed replay, and makes no MLX correctness, latency, throughput, or FFI claim.
 _Avoid_: Round-robin demo, MLX certification, end-to-end serving gate
 
 **Domain Type**:
@@ -597,16 +597,16 @@ A validated Core-owned type with explicit units and identity, including newtypes
 _Avoid_: Protocol DTO, unvalidated String, unitless integer
 
 **Protocol DTO**:
-A serialization-facing Data or Control Plane or Backend Protocol structure. Boundary code enforces size, enum, capability, range, and identity rules and converts it to or from Domain Types; generated protocol structures and serialization-library types never enter the Runtime Core.
+A serialization-facing Data or Control Plane structure. Boundary code enforces size, enum, capability, range, and identity rules and converts it to or from Domain Types; generated protocol structures and serialization-library types never enter the Runtime Core or Backend Interface.
 _Avoid_: Domain Type, Core Event, shared native structure
 
 **Daemon Port**:
-One of the small external capability interfaces owned by the daemon orchestration layer, such as Backend transport, Control State storage, Audit sink, Resource sampler, or monotonic timer. Ports exist only where the daemon must substitute a system implementation in tests; Scheduler, Governor, Admission, and ordinary Core data structures are not each wrapped in traits.
+One of the small capability interfaces owned by the daemon orchestration layer, such as the direct Backend Interface, Control State storage, Audit sink, Resource sampler, or monotonic timer. Ports exist only where the daemon must substitute an implementation in tests; Scheduler, Governor, Admission, and ordinary Core data structures are not each wrapped in traits.
 _Avoid_: Core module trait, protocol DTO, general repository abstraction
 
 **Runtime Event Loop**:
-The daemon orchestration loop that is the sole owner and caller of the Runtime Core. It validates boundary inputs, assigns Event Sequence and daemon Monotonic Time, converts them to Core Events, executes each synchronous Core Transition, and dispatches returned Effects through Daemon Ports. It remains responsive while one Backend or Control Mutation is in flight without dispatching a second state operation of the same kind. Core Event Reserve protects Critical, cancellation, disconnect, Worker Exit, shutdown, and repair events, while ordinary submissions receive Overloaded before request creation when their bounded capacity is full. Other threads and processes cannot mutate Core state directly.
-_Avoid_: C++ device thread, shared-state lock, API handler
+The daemon orchestration loop running on the dedicated Device Executor OS thread. It is the sole owner and caller of the Runtime Core and the only caller of the in-process C++/MLX Adapter. It validates queued boundary inputs, assigns Event Sequence and Monotonic Time, executes each synchronous Core Transition, invokes every Backend Effect directly on the same thread, synchronizes the Turn, and feeds its in-memory result back before another Turn begins. External I/O threads remain responsive, but they can only enqueue bounded coarse-grained events or set certified cancellation and safety signals; they cannot mutate Core or MLX state. Core Event Reserve protects Critical, cancellation, disconnect, Device Executor Failure, shutdown, and repair events for processing at the next safe boundary, while ordinary submissions receive Overloaded before request creation when capacity is full. Control-store and audit I/O may use bounded executors, but no per-Turn channel, task wakeup, serialization, or process boundary exists.
+_Avoid_: Tokio scheduling task, shared-state lock, API handler, separate backend loop
 
 **Control Mutation**:
 A single successor proposal whose precondition is the complete current Control Mutation Token. The daemon assigns its Operation ID and Pending Audit Envelope before publication; success is neither acknowledged nor marked `COMPLETED` until the exact Audit Record is durably synchronized, while a post-publication synchronization failure returns Control Outcome Indeterminate and leaves the service non-ready. At most one mutation is in flight, and concurrent or stale proposals receive a bounded busy or state-conflict Structured Error.
@@ -629,7 +629,7 @@ The fully validated, versioned set of Timing Profiles, resource thresholds, acti
 _Avoid_: Mutable global settings, per-component reload
 
 **Control Store**:
-The single authoritative local persistence boundary for the Runtime Identity Record, complete Control State Generations, and exact pending Audit reconciliation evidence associated with published Control authority. Runtime modules consume the active in-memory Control State Snapshot rather than reading storage independently; the Control Store contains no request, KV, Residency, Reservation, opaque Worker handle, online in-flight operation, or Audit Journal state.
+The single authoritative local persistence boundary for the Runtime Identity Record, complete Control State Generations, and exact pending Audit reconciliation evidence associated with published Control authority. Runtime modules consume the active in-memory Control State Snapshot rather than reading storage independently; the Control Store contains no request, KV, Residency, Reservation, opaque Adapter handle, online in-flight operation, or Audit Journal state.
 _Avoid_: Request database, Audit Journal, shared module database
 
 **Runtime Metadata Store**:
@@ -673,7 +673,7 @@ The diagnostic-only window of predecessor Control State Generations retained und
 _Avoid_: Rollback policy, unbounded history, Audit retention
 
 **Control State Snapshot**:
-The durable Control Plane state containing the effective Configuration Snapshot, Model Manifests, Model Aliases, immutable Certification Records, Revision lifecycle states including Unavailable, and Worker Circuit Breaker state. Within one History Epoch it has a monotonically increasing version; every mutation supplies the complete current Control Mutation Token, atomically installs one fully validated successor, activates it at an Event Loop boundary, and appends its audit record before acknowledgement, while requests, KV, Residency, Reservations, derived certification applicability, and in-flight operations are never persisted in it.
+The durable Control Plane state containing the effective Configuration Snapshot, Model Manifests, Model Aliases, immutable Certification Records, and Revision lifecycle states including Unavailable. Within one History Epoch it has a monotonically increasing version; every mutation supplies the complete current Control Mutation Token, atomically installs one fully validated successor, activates it at an Event Loop boundary, and appends its audit record before acknowledgement, while requests, KV, Residency, Reservations, derived certification applicability, failure backoff, and in-flight operations are never persisted in it.
 _Avoid_: Request recovery WAL, last-writer-wins configuration, Scheduling Snapshot
 
 **Control State Commit**:
@@ -694,7 +694,7 @@ _Avoid_: Maintenance Operation Receipt, temporary path, Control Mutation Token
 
 **Runtime ID**:
 The persistent random 128-bit identity generated by Control Initialization or Runtime Clone for one deliberately initialized runtime directory. Its canonical stored and protocol form is exactly 16 bytes and its CLI and log form is 32 lowercase hexadecimal digits; it survives daemon restart and appears in the Runtime Identity Record, every Control State Generation, and every Audit Segment header.
-_Avoid_: Daemon Instance ID, runtime path hash, Worker ID
+_Avoid_: Daemon Instance ID, runtime path hash, child-process ID
 
 **Runtime Locator Record**:
 The fixed two-slot container-local identity locator that uniquely identifies which Runtime ID's Lease and Anchor must be consulted before other Runtime bytes can be trusted. It grants no authority, never changes Runtime ID, and must agree with independently authoritative identity evidence.
@@ -781,7 +781,7 @@ The typed Evidence Hash of a Runtime Bundle's canonical manifest, whose identity
 _Avoid_: Bundle path, File Hash, Semantic State Hash
 
 **Store Schema Version**:
-The independently owned version of either the Control Store or Runtime Metadata Store physical schema, separate from Hash Schema Version, Control State version, and every public or Backend Protocol version. A supported older schema requires explicit migration and an unknown newer schema reports no path; Bootstrap never changes or reinterprets it automatically.
+The independently owned version of either the Control Store or Runtime Metadata Store physical schema, separate from Hash Schema Version, Control State version, and every Data or Control Plane protocol version. A supported older schema requires explicit migration and an unknown newer schema reports no path; Bootstrap never changes or reinterprets it automatically.
 _Avoid_: Protocol major, Control State version, automatic startup migration
 
 **Initialization Template**:
@@ -897,7 +897,7 @@ The stable nonzero `u32` primary outcome selected from one exact Terminal Reason
 _Avoid_: First error wins, free-form failure string, multiple primary outcomes
 
 **Compatibility Custody Attempt**:
-One trusted-CI dual-custody tool exercise dispatched only after its Compatibility Custody Open Publication reaches `OPEN_COMMITTED` for a durably appended Attempt Open Record and whose immutable result must be finalized into exactly one linked Compatibility Custody Record even when the exercise fails. It follows the exact Compatibility Custody Phase State. An Open may enter `FINALIZE` directly only when the protected runner proves no Adapter process was launched and no provider credential or network authority was exposed. If Adapter launch or external effect is possible, it enters `QUERY`; exact query may then prove `NOT_DISPATCHED` and transition to `FINALIZE`. An effective Contract Revocation or IAM regression forbids a not-yet-dispatched Open from starting a Job, while a known existing Job still reconciles without gaining retirement authority, and no later Attempt closes another Open.
+One trusted-CI dual-custody tool exercise dispatched only after its Compatibility Custody Open Publication reaches `OPEN_COMMITTED` for a durably appended Attempt Open Record and whose immutable result must be finalized into exactly one linked Compatibility Custody Record even when the exercise fails. It follows the exact Compatibility Custody Phase State. An Open may enter `FINALIZE` directly only when the protected runner proves no provider-adapter tool process was launched and no provider credential or network authority was exposed. If Adapter launch or external effect is possible, it enters `QUERY`; exact query may then prove `NOT_DISPATCHED` and transition to `FINALIZE`. An effective Contract Revocation or IAM regression forbids a not-yet-dispatched Open from starting a Job, while a known existing Job still reconciles without gaining retirement authority, and no later Attempt closes another Open.
 _Avoid_: Compatibility Custody Record, CI log, successful exercise only
 
 **Compatibility Custody Bounded Integrity Lifecycle**:
@@ -1053,11 +1053,11 @@ The effective fail-closed boundary formed from the union of every affected unive
 _Avoid_: Incident-priority fence, least-restrictive action, root-cause replacement
 
 **Compatibility Custody Logical Fresh Root Boundary**:
-The logical trust-reset boundary that establishes newly qualified semantic, Schema, Tool and dependency identities while importing predecessor incidents and terminals only as nonauthoritative ancestry. It cannot release a physical device owner, Reservation or Pending Reclaim, prove process exit, or satisfy a Physical Installation Ownership Boundary.
+The logical trust-reset boundary that establishes newly qualified semantic, Schema, Tool and dependency identities while importing predecessor incidents and terminals only as nonauthoritative ancestry. It cannot prove that a prior serving process and its in-process Device Executor are gone, release a Reservation or Pending Reclaim charge, or satisfy a Physical Installation Ownership Boundary.
 _Avoid_: Physical ownership reset, inherited old authority, fresh-root device release
 
 **Compatibility Custody Physical Installation Ownership Boundary**:
-The physical continuation boundary requiring independently agreed operating-system process, device-owner, lease-generation and resource observations before a new Installation may own the device. Logical Fresh Root creation, credential replacement, PID absence, timeout or operator assertion cannot clear prior ownership charges or establish release.
+The physical continuation boundary requiring independently agreed serving-process lifetime, Daemon Instance Lock and Runtime Identity Lease generations, absence or presence of that process's in-process Device Executor, and fresh resource observations before a new Installation may serve. It introduces no separate device process or device lease. Logical Fresh Root creation, credential replacement, PID absence, timeout, or operator assertion cannot clear prior ownership charges or establish release.
 _Avoid_: Logical-root ownership reset, PID-based Installation, operator-cleared device charge
 
 **Compatibility Custody Independent Job Failure-Domain Proof**:
@@ -1073,8 +1073,8 @@ The complete set of every Integrity Lifecycle prerequisite and dependency proof 
 _Avoid_: Partial-tree readiness, unresolved-lifecycle override, assumed subtree disjointness
 
 **Compatibility Custody Open Publication**:
-The pre-dispatch cross-authority protocol for one new Attempt. After all validation, protected CI consumes an Open-prepare Root Boundary Permit and creates the exact Reservation and Coordination intent as `OPEN_PREPARED`, binding Attempt, Correlation, complete non-predecessor Open Intent Hash, freshness evidence, Coordination Service Epoch, Clock Calibration, and expected Ledger publication, but exposes no Adapter credential. The Open Intent Hash projection contains every immutable Open field other than checked Ledger sequence, predecessor identity, resulting Open record identity, and repository path or filename; adding, omitting, or changing any other field changes the intent. CI then consumes a distinct Open-commit Permit and appends the checked Git Open; only after exact current-tree verification does a same-intent mutation advance to `OPEN_COMMITTED`, initialize Phase State `OPEN`, and permit credential issuance. Before append succeeds, at most three Git-conflict rebases may regenerate only the excluded predecessor-dependent fields. Each rebase and actual merge rechecks every bound and requires fresh Permits, and the intent expires at the earliest freshness expiry or `prepared_at + 900 seconds`; count or time exhaustion aborts it rather than waiting in a merge queue. Otherwise the reconciler writes a permanent `ABORTED_PREOPEN` Coordination tombstone binding the complete intent, full current-Ledger absence proof, Broker Issuance Audit absence proof, Reservation release outcome, and protected-CI audit digest, then starts a new Attempt and Correlation. That abort consumes no Ledger record, sequence, or reserved Terminal slot. An unattended `OPEN_PREPARED` orphan at least 24 hours old may be aborted only with those same proofs; age alone never deletes it. A Git Open already present after a crash always completes forward to `OPEN_COMMITTED`, even if pre-publication freshness later expires.
-_Avoid_: Best-effort two-step creation, TTL cleanup, Adapter before Git Open
+The pre-dispatch cross-authority protocol for one new Attempt. After all validation, protected CI consumes an Open-prepare Root Boundary Permit and creates the exact Reservation and Coordination intent as `OPEN_PREPARED`, binding Attempt, Correlation, complete non-predecessor Open Intent Hash, freshness evidence, Coordination Service Epoch, Clock Calibration, and expected Ledger publication, but exposes no provider-adapter credential. The Open Intent Hash projection contains every immutable Open field other than checked Ledger sequence, predecessor identity, resulting Open record identity, and repository path or filename; adding, omitting, or changing any other field changes the intent. CI then consumes a distinct Open-commit Permit and appends the checked Git Open; only after exact current-tree verification does a same-intent mutation advance to `OPEN_COMMITTED`, initialize Phase State `OPEN`, and permit credential issuance. Before append succeeds, at most three Git-conflict rebases may regenerate only the excluded predecessor-dependent fields. Each rebase and actual merge rechecks every bound and requires fresh Permits, and the intent expires at the earliest freshness expiry or `prepared_at + 900 seconds`; count or time exhaustion aborts it rather than waiting in a merge queue. Otherwise the reconciler writes a permanent `ABORTED_PREOPEN` Coordination tombstone binding the complete intent, full current-Ledger absence proof, Broker Issuance Audit absence proof, Reservation release outcome, and protected-CI audit digest, then starts a new Attempt and Correlation. That abort consumes no Ledger record, sequence, or reserved Terminal slot. An unattended `OPEN_PREPARED` orphan at least 24 hours old may be aborted only with those same proofs; age alone never deletes it. A Git Open already present after a crash always completes forward to `OPEN_COMMITTED`, even if pre-publication freshness later expires.
+_Avoid_: Best-effort two-step creation, TTL cleanup, provider adapter before Git Open
 
 **Compatibility Custody Provider Contract**:
 The versioned protected-CI adapter contract proving before an Open Record exists that one provider supports exact same-key idempotent dispatch, complete exact-key query within fixed binary bounds, trusted control-plane time, and query retention through the Reconciliation Horizon. It fixes each dispatch, query, cancellation, status, and result operation's HTTPS origin, method, path, request/response media types, and accepted status set under system TLS trust, forbids redirects, permits a proxy only when Policy binds its exact origin, and excludes authentication headers from every artifact. Any undeclared HTTP status or media type is transport uncertainty, never domain success or zero Jobs. Cancellation is an optional declared capability whose bounded failure never blocks terminal evidence; an incompatible, stale, revoked, or unavailable core contract prevents both Open creation and dispatch.
@@ -2234,7 +2234,7 @@ The root ownership-integrity incident when individually valid old and new author
 _Avoid_: New-lineage priority, old-lineage timeout, operator-selected ownership
 
 **Compatibility Custody Repository Root Recovery Bounded Recovery Capacity Formula Identity Change Boundary Legacy Reservation Reclaim Barrier Critical Pressure Termination Boundary Stuck Ownership Boundary Process Exit Without Ownership Release Repair Boundary Disagreement Attempt Chain Capacity Exhaustion New Authority Lineage Boundary Independent OS and Device Ownership Proof**:
-The two-fresh-Job proof binding independent operating-system process, device-owner, lease-generation and resource observations to one exact ownership boundary and proving a single released or held result without trusting either conflicting lineage. Disagreement preserves the Cross-Lineage Conflict and all charges; PID absence, epoch novelty, lease timeout, process exit alone or one Job cannot establish release.
+The two-fresh-Job proof binding independent observations of the serving-process lifetime, Daemon Instance Lock and Runtime Identity Lease generations, presence or absence of that process's in-process Device Executor, and fresh resource state to one exact ownership boundary. It proves one released or held result without trusting either conflicting lineage and never invents a separate device process or lease. Disagreement preserves the Cross-Lineage Conflict and all charges; PID absence, epoch novelty, lease timeout, process exit alone, or one Job cannot establish release.
 _Avoid_: PID-only ownership proof, new-epoch release, one-job device clearance
 
 **Compatibility Custody Repository Root Recovery Bounded Recovery Capacity Formula Identity Change Boundary Legacy Reservation Reclaim Barrier Critical Pressure Termination Boundary Stuck Ownership Boundary Process Exit Without Ownership Release Repair Boundary Disagreement Attempt Chain Capacity Exhaustion New Authority Lineage Boundary Independent OS and Device Ownership Proof Disagreement Attempt Chain**:
@@ -2250,7 +2250,7 @@ The no-state contract violation when a Backend capacity declaration has the wron
 _Avoid_: Admission formula repair, malformed-bound warning, fallback capacity declaration
 
 **Compatibility Custody Repository Root Recovery Bounded Recovery Capacity Declaration Integrity Incident Quarantine Escalation Matrix**:
-The immutable Certification Record-owned mapping from exact declaration reason, Formula Identity, Tool/Capability, Worker build, Backend build and Certification Envelope correlation identities and bounded incident counts to the precise quarantine scope: Capability, Tool generation, build or Envelope. Repository Root Recovery Bounded Recovery Capacity Declaration Integrity Incident Quarantine Escalation Matrix Identity Boundary captures one exact Matrix for each Incident; every Incident quarantines its exact Capability immediately, only a captured matrix match widens scope, and runtime heuristics, elapsed time, later matrix edits, operator intuition or unrelated failures cannot change it.
+The immutable Certification Record-owned mapping from exact declaration reason, Formula Identity, Tool/Capability, Adapter and MLX build identities, Backend Interface revision, and Certification Envelope correlation identities and bounded incident counts to the precise quarantine scope: Capability, Tool generation, build or Envelope. Repository Root Recovery Bounded Recovery Capacity Declaration Integrity Incident Quarantine Escalation Matrix Identity Boundary captures one exact Matrix for each Incident; every Incident quarantines its exact Capability immediately, only a captured matrix match widens scope, and runtime heuristics, elapsed time, later matrix edits, operator intuition or unrelated failures cannot change it.
 _Avoid_: Heuristic quarantine escalation, time-window guess, operator-selected blast radius
 
 **Compatibility Custody Repository Root Recovery Bounded Recovery Capacity Declaration Integrity Incident Quarantine Escalation Matrix Identity Boundary**:
@@ -4670,7 +4670,7 @@ The at-most-64-KiB strict canonical permanent Git root under domain `turnvector.
 _Avoid_: Mutable root certificate, latest genesis pointer, candidate-created trust root
 
 **Compatibility Custody Qualification Lineage Reset**:
-The at-most-64-KiB strict canonical permanent Git incident artifact under domain `turnvector.compatibility-custody-qualification-lineage-reset`, published as `compatibility-custody/qualification-resets/<coordination|host-fetcher|secret-broker>/<64hex-record-id>.json`. It binds kind, prior Genesis and major, complete sorted fork-tip identity set, their last verified common ancestor, incident evidence, exact Owner Registry, two distinct Owner Approval identities, protected merge-job identity, trusted `reset_authorization_time` attested no more than 300 seconds before merge, exact next major, and a new lineage ID. No fork tip is selected, adopted, deleted, or made predecessor. Current-tree membership, not Owner approval time, Git author/commit timestamp, or client clock, is the authority boundary. Once current-tree valid, the Reset immediately invalidates every Policy selection of its prior major for a new Open or dispatch whose provider network call has not begun. The protected runner revalidates the complete current tree immediately before Adapter credential delivery and again immediately before enabling provider egress; a credential delivered before Reset does not grandfather a call that has not started and is revoked or allowed to expire without use. A known Job only reconciles and cannot authorize retirement. Afterward a separate PR may publish the next-major Qualification Genesis with the assigned lineage ID; the Reset never binds the resulting Genesis identity, avoiding a hash cycle. All old branches remain evidence and permanently ineligible for new Policy selection.
+The at-most-64-KiB strict canonical permanent Git incident artifact under domain `turnvector.compatibility-custody-qualification-lineage-reset`, published as `compatibility-custody/qualification-resets/<coordination|host-fetcher|secret-broker>/<64hex-record-id>.json`. It binds kind, prior Genesis and major, complete sorted fork-tip identity set, their last verified common ancestor, incident evidence, exact Owner Registry, two distinct Owner Approval identities, protected merge-job identity, trusted `reset_authorization_time` attested no more than 300 seconds before merge, exact next major, and a new lineage ID. No fork tip is selected, adopted, deleted, or made predecessor. Current-tree membership, not Owner approval time, Git author/commit timestamp, or client clock, is the authority boundary. Once current-tree valid, the Reset immediately invalidates every Policy selection of its prior major for a new Open or dispatch whose provider network call has not begun. The protected runner revalidates the complete current tree immediately before provider-adapter credential delivery and again immediately before enabling provider egress; a credential delivered before Reset does not grandfather a call that has not started and is revoked or allowed to expire without use. A known Job only reconciles and cannot authorize retirement. Afterward a separate PR may publish the next-major Qualification Genesis with the assigned lineage ID; the Reset never binds the resulting Genesis identity, avoiding a hash cycle. All old branches remain evidence and permanently ineligible for new Policy selection.
 _Avoid_: Choosing the longest fork, deleting one successor, operator latest-tip override
 
 **Compatibility Custody Qualification Test Namespace**:
@@ -4764,7 +4764,7 @@ The permanent irrevocable Ledger record under domain `turnvector.compatibility-c
 _Avoid_: Contract expiry, deleting a Contract Record, abandoning an Open
 
 **Compatibility Custody Infrastructure Qualification Revocation**:
-The permanent irrevocable Ledger record under domain `turnvector.compatibility-custody-infrastructure-qualification-revocation` targeting exactly one Coordination Store Qualification Record, Coordination Restore Generation Authority, Host Fetcher Driver Qualification Record, or Secret Broker Profile identity, with no kind, provider, service, driver, lineage, or version wildcard. It consumes only a Ledger sequence not reserved for an unresolved Open Terminal. The same protected PR/CI authority, stable Revocation Reason, bounded evidence URI/digest, and authorization-time ordering as Provider Contract Revocation apply. A Coordination Equivocation Incident makes publication of the exact implicated Qualification Revocation mandatory and supplies its two-Certificate evidence digest; the Root Authority incident already freezes new work, so merge delay or refusal never restores authority. At or after `revocation_authorization_time`, every new Open and any dispatch whose provider network call has not begun is blocked immediately; delivery of an Adapter credential does not grandfather egress and that credential is revoked or allowed to expire unused. A known or already-started Job still reconciles but cannot qualify retirement. An ordinary noncompromised qualification target recovers through a fresh non-revoked successor in the same lineage. An equivocated Coordination service or compromised Restore Generation Authority never recovers in place: protected governance first makes this exact Revocation current-tree valid, then creates a new independently administered Authority when applicable and Coordination service/key identity, publishes the Service Replacement Receipt after old-identity isolation, qualifies it, activates a later Policy and `NORMAL` mode, and only then reconciles every unresolved Attempt and evidence subject without selecting a conflicting branch. No Unrevoke, key rotation under the compromised identity, deletion, target substitution, fork choice, manual counter copy, compound gate, or direct CLI append exists. Candidate notarization/signing revocation or immutable secret-version deletion targets the exact Secret Broker Profile with reason `candidate_notarization_revoked` or `secret_version_unavailable`. New Policy, credential delivery and calls not yet begun stop immediately; already-started calls only reconcile under their existing deadline, and no restapling, alias fallback or same-Profile repair exists.
+The permanent irrevocable Ledger record under domain `turnvector.compatibility-custody-infrastructure-qualification-revocation` targeting exactly one Coordination Store Qualification Record, Coordination Restore Generation Authority, Host Fetcher Driver Qualification Record, or Secret Broker Profile identity, with no kind, provider, service, driver, lineage, or version wildcard. It consumes only a Ledger sequence not reserved for an unresolved Open Terminal. The same protected PR/CI authority, stable Revocation Reason, bounded evidence URI/digest, and authorization-time ordering as Provider Contract Revocation apply. A Coordination Equivocation Incident makes publication of the exact implicated Qualification Revocation mandatory and supplies its two-Certificate evidence digest; the Root Authority incident already freezes new work, so merge delay or refusal never restores authority. At or after `revocation_authorization_time`, every new Open and any dispatch whose provider network call has not begun is blocked immediately; delivery of a provider-adapter credential does not grandfather egress and that credential is revoked or allowed to expire unused. A known or already-started Job still reconciles but cannot qualify retirement. An ordinary noncompromised qualification target recovers through a fresh non-revoked successor in the same lineage. An equivocated Coordination service or compromised Restore Generation Authority never recovers in place: protected governance first makes this exact Revocation current-tree valid, then creates a new independently administered Authority when applicable and Coordination service/key identity, publishes the Service Replacement Receipt after old-identity isolation, qualifies it, activates a later Policy and `NORMAL` mode, and only then reconciles every unresolved Attempt and evidence subject without selecting a conflicting branch. No Unrevoke, key rotation under the compromised identity, deletion, target substitution, fork choice, manual counter copy, compound gate, or direct CLI append exists. Candidate notarization/signing revocation or immutable secret-version deletion targets the exact Secret Broker Profile with reason `candidate_notarization_revoked` or `secret_version_unavailable`. New Policy, credential delivery and calls not yet begun stop immediately; already-started calls only reconcile under their existing deadline, and no restapling, alias fallback or same-Profile repair exists.
 Candidate notarization/signing revocation, Candidate Installation Trust Disagreement and immutable-version deletion require exact Infrastructure Qualification Revocation Evidence and target reasons `candidate_notarization_revoked`, `candidate_installation_trust_disagreement` and `secret_version_unavailable` respectively. The target-kind registry additionally admits the exact Fence Custody Repair Witness identity for Witness Integrity Incident with reason `fence_custody_repair_witness_integrity`; this never authorizes a replacement witness for an existing Fence. Infrastructure Qualification Status Disagreement immediately blocks new authority for the exact target but cannot publish this permanent Revocation until two-job evidence agrees. Deletion after a matching issuance reached `COMMITTED` never rewrites that issuance: provider-native delivery evidence selects its terminal, otherwise expiry leads to `DELIVERY_UNKNOWN_EXPIRED`, and neither the Revocation nor deletion implies `NOT_DELIVERED`.
 _Avoid_: Provider Contract Revocation, deleting a qualification file, wildcard infrastructure ban
 
@@ -4799,7 +4799,7 @@ The checked-`u64` Unix-second interval from dispatch deadline through inclusive 
 _Avoid_: Dispatch window, CI artifact retention, automatic timeout success
 
 **Compatibility Custody Execution Bundle**:
-The self-contained adapter, finalizer, and reconciler machinery identified under domain `turnvector.compatibility-custody-execution-bundle-manifest` by a canonical manifest of at most 256 ordinary files. It declares one CPU architecture, inclusive minimum and maximum compatible macOS versions, and exactly one `adapter_entrypoint`, `finalizer_entrypoint`, and `reconciler_entrypoint`; each names a `0555` file carrying the matching role, and one multi-role file may satisfy multiple fields. Each strict relative ASCII path is at most 512 bytes, each nonempty segment is at most 128 bytes and uses only `[A-Za-z0-9._+-]` without `.` or `..`; every entry binds a Bundle File Role set, exact `0444` or `0555` mode, checked length at most 1 GiB, and SHA-256, while checked aggregate bytes are at most 2 GiB and manifest bytes at most 256 KiB. Directories are implicit and links, special files, xattr dependencies, archive layout, tags, and locations are excluded. The remote logical object is this manifest plus independent digest-addressed file blobs; OCI layer order, transport packaging, and cold-store layout never enter identity. Exact policy bytes, source, manifest, build recipe, and digests remain permanent Git evidence; both indefinitely retained primary and cold copies must verify before a new Open, while an existing Open may reconcile from either correct copy and a missing peer blocks only later Opens until repaired.
+The self-contained provider-adapter, finalizer, and reconciler machinery identified under domain `turnvector.compatibility-custody-execution-bundle-manifest` by a canonical manifest of at most 256 ordinary files. It declares one CPU architecture, inclusive minimum and maximum compatible macOS versions, and exactly one `adapter_entrypoint`, `finalizer_entrypoint`, and `reconciler_entrypoint`; each names a `0555` file carrying the matching role, and one multi-role file may satisfy multiple fields. Each strict relative ASCII path is at most 512 bytes, each nonempty segment is at most 128 bytes and uses only `[A-Za-z0-9._+-]` without `.` or `..`; every entry binds a Bundle File Role set, exact `0444` or `0555` mode, checked length at most 1 GiB, and SHA-256, while checked aggregate bytes are at most 2 GiB and manifest bytes at most 256 KiB. Directories are implicit and links, special files, xattr dependencies, archive layout, tags, and locations are excluded. The remote logical object is this manifest plus independent digest-addressed file blobs; OCI layer order, transport packaging, and cold-store layout never enter identity. Exact policy bytes, source, manifest, build recipe, and digests remain permanent Git evidence; both indefinitely retained primary and cold copies must verify before a new Open, while an existing Open may reconcile from either correct copy and a missing peer blocks only later Opens until repaired.
 _Avoid_: CI cache, opportunistic rebuild, Compatibility Tool bundle
 
 **Compatibility Custody Bundle Materialization**:
@@ -4807,15 +4807,15 @@ The deterministic creation of an Execution Bundle at its digest-addressed path: 
 _Avoid_: Archive extraction in place, executable cache, lazy verification
 
 **Compatibility Custody Tool Invocation ID**:
-The fresh random 128-bit identity generated by the protected runner for one Adapter, Finalizer, or Reconciler process, encoded as 16 bytes in Protocol messages and 32 lowercase hexadecimal digits in evidence. It is unique and collision-checked within its Attempt, and the runner has a trusted obligation not to intentionally reuse it across Attempts without claiming permanent historical detectability after evidence retention. Its request binds exact Attempt and Open identities, Dispatch Correlation ID, role, invocation ordinal, absolute operation deadline, Attested Job Identity, CI Policy, Provider Contract, Execution Bundle, Tool Process Protocol, and Tool Execution Profile identities. The matching typed response must echo the exact ID and bindings; any mismatch is a Protocol Violation. PID, CI job ID, retry number alone, or a previous Invocation ID never substitutes.
+The fresh random 128-bit identity generated by the protected runner for one provider-adapter, Finalizer, or Reconciler tool process, encoded as 16 bytes in Protocol messages and 32 lowercase hexadecimal digits in evidence. It is unique and collision-checked within its Attempt, and the runner has a trusted obligation not to intentionally reuse it across Attempts without claiming permanent historical detectability after evidence retention. Its request binds exact Attempt and Open identities, Dispatch Correlation ID, role, invocation ordinal, absolute operation deadline, Attested Job Identity, CI Policy, Provider Contract, Execution Bundle, Tool Process Protocol, and Tool Execution Profile identities. The matching typed response must echo the exact ID and bindings; any mismatch is a Protocol Violation. PID, CI job ID, retry number alone, or a previous Invocation ID never substitutes.
 _Avoid_: Dispatch Correlation ID, process ID, reusable request ID
 
 **Compatibility Custody Tool Process Protocol**:
-The single-request process boundary shared by all three Bundle entrypoints under domain `turnvector.compatibility-custody-tool-process-protocol`, initially major 1/minor 0 with manifest-bound canonical descriptor Hash and independent 1-MiB request and response maxima. Open binds one exact major, minor, and descriptor Hash; the runner either implements that complete descriptor or rejects before launch, with no runtime negotiation or compatible-version inference. Typed request/response `oneof` variants are exactly Adapter, Finalizer, and Reconciler; request and response carry the exact Tool Invocation ID, Attested Job Identity, and all other Invocation bindings, and entrypoint-role or echoed-binding mismatch is a Protocol Violation. The orchestrator executes directly without a shell; stdin is `/dev/null`, stdout/stderr are diagnostics whose first byte beyond either 1-MiB cap terminates the process, descriptor 3 is read-only request, 4 write-only response, and 5 supplies one Invocation-ID-bound length-prefixed opaque provider credential of at most 64 KiB then EOF; every other inherited descriptor closes. The secret broker issues that credential for exactly the Open, provider, role, Attested Job Identity, and Invocation ID, with expiry at the operation deadline plus the five-second exit grace; it is never refreshed, transferred, or reused. Request and exactly one Terminal Response use four-byte big-endian length-prefixed Protobuf. The complete response frame must arrive by the operation deadline, then descriptor 4 EOF and process exit zero must both occur within the grace. Nonzero, signal, missing/extra response, descriptor misuse, message/log oversize, deadline, or response followed by crash is invocation failure and never erases possible provider side effects. Credentials never enter environment, files, or artifacts. The child otherwise receives only fixed C locale, UTC, private `TMPDIR`, Invocation ID, and Bundle identity.
+The single-request process boundary shared by all three Bundle entrypoints under domain `turnvector.compatibility-custody-tool-process-protocol`, initially major 1/minor 0 with manifest-bound canonical descriptor Hash and independent 1-MiB request and response maxima. Open binds one exact major, minor, and descriptor Hash; the runner either implements that complete descriptor or rejects before launch, with no runtime negotiation or compatible-version inference. Typed request/response `oneof` variants are exactly `adapter`, `finalizer`, and `reconciler`; request and response carry the exact Tool Invocation ID, Attested Job Identity, and all other Invocation bindings, and entrypoint-role or echoed-binding mismatch is a Protocol Violation. The orchestrator executes directly without a shell; stdin is `/dev/null`, stdout/stderr are diagnostics whose first byte beyond either 1-MiB cap terminates the process, descriptor 3 is read-only request, 4 write-only response, and 5 supplies one Invocation-ID-bound length-prefixed opaque provider credential of at most 64 KiB then EOF; every other inherited descriptor closes. The secret broker issues that credential for exactly the Open, provider, role, Attested Job Identity, and Invocation ID, with expiry at the operation deadline plus the five-second exit grace; it is never refreshed, transferred, or reused. Request and exactly one Terminal Response use four-byte big-endian length-prefixed Protobuf. The complete response frame must arrive by the operation deadline, then descriptor 4 EOF and process exit zero must both occur within the grace. Nonzero, signal, missing/extra response, descriptor misuse, message/log oversize, deadline, or response followed by crash is invocation failure and never erases possible provider side effects. Credentials never enter environment, files, or artifacts. The child otherwise receives only fixed C locale, UTC, private `TMPDIR`, Invocation ID, and Bundle identity.
 _Avoid_: Shell command, stdout JSON protocol, inherited CI environment
 
 **Compatibility Custody Tool Execution Profile**:
-The fail-closed build-owned canonical artifact under domain `turnvector.compatibility-custody-tool-execution-profile`, binding exact host enforcement mechanisms, process/file/network rules, quotas, Contract-authorized CIDRs, and one Load Audit Qualification Record for every Bundle entrypoint; Provider Contract and Open bind its identity. It denies subprocess creation and filesystem access outside the sealed Bundle and one invocation-private `TMPDIR` capped at 4 GiB and 16,384 objects. For direct origin mode, the runner resolves the exact host once per invocation, accepts 1-16 sorted unique final A/AAAA addresses only when every address falls within a Contract-bound CIDR, records addresses, TTLs, resolver configuration and bounded CNAME chain, limits egress to that pinned set and implicit port 443, and fixes HTTP Host and TLS SNI; TTL expiry never changes this invocation and only a later invocation resolves again. Proxy mode permits only the bound proxy, plus required system DNS/TLS services. After credential delivery and immediately before enabling the first provider egress, enforcement obtains and atomically consumes a provider-egress Root Boundary Permit bound to the Open, Invocation, Proof, Intent, service/Epoch/mode, and exact Lock generation; a delivered credential or merely issued Permit is not a started call and is revoked, fenced, or allowed to expire unused on failure. Only after successful consume and the first provider network call actually begins may that call finish under its existing deadline, after which ordinary exact-query reconciliation remains mandatory. On any process, protocol, deadline, log, filesystem, network, or quota violation, enforcement sends `SIGSTOP`, revokes egress and descriptors, then sends `SIGKILL` without `SIGTERM` and waits at most five seconds to reap the child; possible provider side effects remain unknown. Failure to prove the PID gone inside that bound permanently disqualifies the runner job, which is destroyed without further invocation; reconciliation may continue only on another independently qualified runner. After every exit the runner removes the TMPDIR. Cleanup failure withholds success and disqualifies the runner. An ephemeral runner is destroyed without reading, archiving, or uploading residue; a non-ephemeral host remains quarantined until audited deletion and complete requalification. An Adapter attempt always enters exact-query reconciliation. Provider credentials remain only on descriptor 5; if the host cannot enforce or prove the Profile, the tool does not run and conformance cannot pass.
+The fail-closed build-owned canonical artifact under domain `turnvector.compatibility-custody-tool-execution-profile`, binding exact host enforcement mechanisms, process/file/network rules, quotas, Contract-authorized CIDRs, and one Load Audit Qualification Record for every Bundle entrypoint; Provider Contract and Open bind its identity. It denies subprocess creation and filesystem access outside the sealed Bundle and one invocation-private `TMPDIR` capped at 4 GiB and 16,384 objects. For direct origin mode, the runner resolves the exact host once per invocation, accepts 1-16 sorted unique final A/AAAA addresses only when every address falls within a Contract-bound CIDR, records addresses, TTLs, resolver configuration and bounded CNAME chain, limits egress to that pinned set and implicit port 443, and fixes HTTP Host and TLS SNI; TTL expiry never changes this invocation and only a later invocation resolves again. Proxy mode permits only the bound proxy, plus required system DNS/TLS services. After credential delivery and immediately before enabling the first provider egress, enforcement obtains and atomically consumes a provider-egress Root Boundary Permit bound to the Open, Invocation, Proof, Intent, service/Epoch/mode, and exact Lock generation; a delivered credential or merely issued Permit is not a started call and is revoked, fenced, or allowed to expire unused on failure. Only after successful consume and the first provider network call actually begins may that call finish under its existing deadline, after which ordinary exact-query reconciliation remains mandatory. On any process, protocol, deadline, log, filesystem, network, or quota violation, enforcement sends `SIGSTOP`, revokes egress and descriptors, then sends `SIGKILL` without `SIGTERM` and waits at most five seconds to reap the child; possible provider side effects remain unknown. Failure to prove the PID gone inside that bound permanently disqualifies the runner job, which is destroyed without further invocation; reconciliation may continue only on another independently qualified runner. After every exit the runner removes the TMPDIR. Cleanup failure withholds success and disqualifies the runner. An ephemeral runner is destroyed without reading, archiving, or uploading residue; a non-ephemeral host remains quarantined until audited deletion and complete requalification. A provider-adapter attempt always enters exact-query reconciliation. Provider credentials remain only on descriptor 5; if the host cannot enforce or prove the Profile, the tool does not run and conformance cannot pass.
 _Avoid_: Cleared environment, ordinary CI runner, application self-discipline
 
 **Compatibility Custody OIDC Verifier Profile**:
@@ -4876,7 +4876,7 @@ The Profile governs the retirement-recovery-and-catalog-head-integrity set Compa
 _Avoid_: Environment variable secret, CI project credential, driver-managed login
 
 **Compatibility Custody Broker Issuance Audit**:
-The authentication-free canonical broker entry produced for every credential issuance attempt, binding Broker Profile and service revision, exact Attested Job Identity, credential purpose and scope, issue and expiry times, Attempt and Open plus Tool Invocation ID or publication, repair, or prune operation identity, and exactly one delivery outcome `delivered`, `failed_before_delivery`, or `uncertain`. It contains neither secret bytes nor a token, credential digest, reversible identifier, or other guessing oracle. `uncertain` is treated as possible credential exposure and never proves absence. For an Adapter, it forces the Open into exact `QUERY`; retry is permitted only when audit proves `failed_before_delivery` and the old credential is expired or explicitly revoked, and that retry uses a fresh Tool Invocation ID. Other roles reconcile their exact external operation before requesting another credential. Attempt entries are committed as `COORDINATION_EVIDENCE` and their digests enter the Attempt Artifact Manifest; publication, repair, and prune receipts bind the applicable entry digest, and `ABORTED_PREOPEN` proof requires complete absence of both `delivered` and `uncertain` Adapter issuance.
+The authentication-free canonical broker entry produced for every credential issuance attempt, binding Broker Profile and service revision, exact Attested Job Identity, credential purpose and scope, issue and expiry times, Attempt and Open plus Tool Invocation ID or publication, repair, or prune operation identity, and exactly one delivery outcome `delivered`, `failed_before_delivery`, or `uncertain`. It contains neither secret bytes nor a token, credential digest, reversible identifier, or other guessing oracle. `uncertain` is treated as possible credential exposure and never proves absence. For a provider adapter, it forces the Open into exact `QUERY`; retry is permitted only when audit proves `failed_before_delivery` and the old credential is expired or explicitly revoked, and that retry uses a fresh Tool Invocation ID. Other roles reconcile their exact external operation before requesting another credential. Attempt entries are committed as `COORDINATION_EVIDENCE` and their digests enter the Attempt Artifact Manifest; publication, repair, and prune receipts bind the applicable entry digest, and `ABORTED_PREOPEN` proof requires complete absence of both `delivered` and `uncertain` provider-adapter credential issuance.
 _Avoid_: Secret log, credential fingerprint, CI job console output
 
 **Compatibility Custody Artifact Repair Type Registry**:
@@ -5162,7 +5162,7 @@ The recovery classification for one exact current-tree valid Attempt Terminal wh
 _Avoid_: Unresolved Attempt, synthetic Terminal, tombstone overwrite
 
 **Compatibility Custody Disaster Lease**:
-The one-Attempt one-new-Epoch read-only fencing record used before a Disaster Reconciliation Receipt in `NORMAL` mode while new Opens remain globally frozen. It binds the Unresolved Attempt Set, Open, exact old and new Coordination service identities and Epochs, exact Attested Job Identity and Attestation Challenge, one fresh token, one Receipt Intent ID, the Open-bound Provider Contract and Reconciler, and an expiry equal to the checked ordinary complete-query deadline derived from its at-most-64 page calls and Policy call timeout, capped by Horizon only when acquired before Horizon. Before the initial Head, recovery must obtain the exact subject-specific Evidence Manifest Reservation and fully read-back primary and cold Route Reservations generated by the selected Envelope Registry; no Lease can begin before that Reservation is atomically consumed into the exact `OPEN` Head. Before each issue, recovery verifies that Reservation and route handles, the exact OPEN Head, complete certified Intent Receipt, selected Chunk and dual-route Head Transition Receipt sequences, exact Envelope Registry identity and latest receipt publication, and proves every deterministic fragment this complete Intent and Lease outcome can add remains within the reserved 256-record, generated-chain and final 1-MiB canonical bounds. The Lease authorizes exactly one complete page-one-through-end exact-Correlation query and dual-route evidence capture under existing body, page, parser, and call bounds; after Horizon the special late-query interpretation applies. It is never renewed. Failure or expiry abandons it, and every partial page remains evidence but is never reused or combined by a later Lease. Retry requires a fresh job, Challenge, token, and Lease over the same Set/Open. Once one Lease produces a complete query for one Receipt Intent, no later Lease repeats it. If Git outage or merge delay makes that evidence stale, the prior Intent may select one abandonment Chunk and a new Receipt Intent and Lease perform the mandatory fresh query while linking the predecessor Intent; no more than eight abandonments exist. Every Intent and Lease outcome appends its deterministic one-or-more at-most-65,536-byte Chunk fragments only after its `OPENED` Intent Receipt pair verifies and charges its exact reserved logical and route capacity. Reaching 256 records, 1 MiB, generated chain length or the eighth abandonment terminal bound precomputes the exact final Manifest and Exhaustion Record projection, atomically selects one Exhaustion Finalization Intent while entering `EXHAUSTED`, permanently freezes recovery for that Attempt, and keeps the service's new-Open gate closed. A new Unresolved Attempt Set, service identity, Manifest, Reservation, owner-approved continuation, segment, reset, aggregation, truncation, or evidence deletion cannot restart it. The Lease cannot dispatch, cancel, retrieve result content, issue an Adapter credential, mutate Attempt phase state, seal a Manifest, or publish a Terminal. At most 16 Disaster Leases for one Coordination service may be active concurrently, and failure grants no partial recovery authority.
+The one-Attempt one-new-Epoch read-only fencing record used before a Disaster Reconciliation Receipt in `NORMAL` mode while new Opens remain globally frozen. It binds the Unresolved Attempt Set, Open, exact old and new Coordination service identities and Epochs, exact Attested Job Identity and Attestation Challenge, one fresh token, one Receipt Intent ID, the Open-bound Provider Contract and Reconciler, and an expiry equal to the checked ordinary complete-query deadline derived from its at-most-64 page calls and Policy call timeout, capped by Horizon only when acquired before Horizon. Before the initial Head, recovery must obtain the exact subject-specific Evidence Manifest Reservation and fully read-back primary and cold Route Reservations generated by the selected Envelope Registry; no Lease can begin before that Reservation is atomically consumed into the exact `OPEN` Head. Before each issue, recovery verifies that Reservation and route handles, the exact OPEN Head, complete certified Intent Receipt, selected Chunk and dual-route Head Transition Receipt sequences, exact Envelope Registry identity and latest receipt publication, and proves every deterministic fragment this complete Intent and Lease outcome can add remains within the reserved 256-record, generated-chain and final 1-MiB canonical bounds. The Lease authorizes exactly one complete page-one-through-end exact-Correlation query and dual-route evidence capture under existing body, page, parser, and call bounds; after Horizon the special late-query interpretation applies. It is never renewed. Failure or expiry abandons it, and every partial page remains evidence but is never reused or combined by a later Lease. Retry requires a fresh job, Challenge, token, and Lease over the same Set/Open. Once one Lease produces a complete query for one Receipt Intent, no later Lease repeats it. If Git outage or merge delay makes that evidence stale, the prior Intent may select one abandonment Chunk and a new Receipt Intent and Lease perform the mandatory fresh query while linking the predecessor Intent; no more than eight abandonments exist. Every Intent and Lease outcome appends its deterministic one-or-more at-most-65,536-byte Chunk fragments only after its `OPENED` Intent Receipt pair verifies and charges its exact reserved logical and route capacity. Reaching 256 records, 1 MiB, generated chain length or the eighth abandonment terminal bound precomputes the exact final Manifest and Exhaustion Record projection, atomically selects one Exhaustion Finalization Intent while entering `EXHAUSTED`, permanently freezes recovery for that Attempt, and keeps the service's new-Open gate closed. A new Unresolved Attempt Set, service identity, Manifest, Reservation, owner-approved continuation, segment, reset, aggregation, truncation, or evidence deletion cannot restart it. The Lease cannot dispatch, cancel, retrieve result content, issue a provider-adapter credential, mutate Attempt phase state, seal a Manifest, or publish a Terminal. At most 16 Disaster Leases for one Coordination service may be active concurrently, and failure grants no partial recovery authority.
 _Avoid_: Attempt Phase Lease, disaster dispatch, restored fencing token
 
 **Compatibility Custody Disaster Evidence Manifest**:
@@ -5194,7 +5194,7 @@ The exact compare-and-swap intent identified by a fresh random 128-bit Mutation 
 _Avoid_: Blind CAS retry, CI job ID, client-generated revision
 
 **Compatibility Custody Phase State**:
-The Coordination Store's monotonic state machine for one Open: `OPEN -> QUERY -> RESULT -> FINALIZE -> TERMINAL`, with `QUERY -> FINALIZE` for a non-result terminal outcome and `OPEN -> FINALIZE` only when no Adapter process, provider credential, or network authority was exposed. Otherwise `OPEN -> QUERY` is mandatory, including when exact query later proves `NOT_DISPATCHED`. `QUERY -> RESULT` requires exactly one succeeded Job; `RESULT -> FINALIZE` requires a verified result or terminal result failure. `FINALIZE` performs no provider operation and only seals/reuses evidence, publishes Terminal, closes coordination, and releases unused reservation. Lease reacquisition does not change phase, no transition moves backward, and exactly one path reaches Terminal.
+The Coordination Store's monotonic state machine for one Open: `OPEN -> QUERY -> RESULT -> FINALIZE -> TERMINAL`, with `QUERY -> FINALIZE` for a non-result terminal outcome and `OPEN -> FINALIZE` only when no provider-adapter tool process, provider credential, or network authority was exposed. Otherwise `OPEN -> QUERY` is mandatory, including when exact query later proves `NOT_DISPATCHED`. `QUERY -> RESULT` requires exactly one succeeded Job; `RESULT -> FINALIZE` requires a verified result or terminal result failure. `FINALIZE` performs no provider operation and only seals/reuses evidence, publishes Terminal, closes coordination, and releases unused reservation. Lease reacquisition does not change phase, no transition moves backward, and exactly one path reaches Terminal.
 _Avoid_: Current CI job phase, retry state reset, bidirectional workflow
 
 **Compatibility Custody Attempt Phase Lease**:
@@ -5505,10 +5505,10 @@ _Avoid_: Request recovery, Control State rollback, numerical replay
 
 **Event Sequence**:
 The daemon-assigned order of every Runtime Event Loop input and accepted result. A strongly synchronized Epoch Open fixes sequence one before ordinary ranges are issued; later values are durably reserved in bounded ranges, never reused, and strictly contiguous while assigned, with a derived terminal reserve unavailable to ordinary events. Crash Tail and Clean Shutdown Boundaries explicitly close every unused suffix before a later session starts beyond the recorded high-water.
-_Avoid_: Wall-clock timestamp, Backend sequence, IPC arrival guess
+_Avoid_: Wall-clock timestamp, Backend sequence, transport arrival guess
 
 **Terminal Sequence Reserve**:
-The immutable end-of-epoch Event Sequence budget computed at build time from the worst-case simultaneous binary maxima for every live object and every required cancellation, disconnect, Critical, Worker Exit, shutdown, and repair transition, assuming one record per transition and no aggregation. Checked arithmetic and state-machine verification prove the bound; ordinary work can never consume it or extend the epoch after Sequence Exhausted.
+The immutable end-of-epoch Event Sequence budget computed at build time from the worst-case simultaneous binary maxima for every live object and every required cancellation, disconnect, Critical, Device Executor Failure, shutdown, and repair transition, assuming one record per transition and no aggregation. Checked arithmetic and state-machine verification prove the bound; ordinary work can never consume it or extend the epoch after Sequence Exhausted.
 _Avoid_: Core Event Reserve, ordinary sequence range, dynamic overflow buffer
 
 **Sequence Exhausted**:
@@ -5533,7 +5533,7 @@ _Avoid_: Process exit log, Crash Tail Boundary, lease release
 
 **Data Plane**:
 The request submission, cancellation, status, and output operations exposed as typed frames on one bidirectional, permission-restricted local Unix socket per connection, with no network listener. Connection acceptance verifies the peer's effective UID or one kernel-reported group against the daemon's fixed Installation Policy snapshot Data allowlist in addition to filesystem permissions.
-_Avoid_: Control command, backend protocol
+_Avoid_: Control command, Backend Interface
 
 **Control Plane**:
 The privileged initialization, configuration, Model Residency, Backend capability management, explicit repair, and Exclusive Mode operations exposed on a separate, more restrictive local Unix socket with no network listener. Connection acceptance verifies the peer's effective UID or one kernel-reported group against the daemon's fixed Installation Policy snapshot stricter Control allowlist; Uninitialized and repair states expose only their authorized subsets, while Identity Conflict exposes authenticated status and Sequence Exhausted exposes read-only status outside the Runtime Event Loop.
@@ -5557,20 +5557,20 @@ The installation-scoped authority granted only when an offline tool's effective 
 _Avoid_: Maintenance Capability, directory access alone, CLI flag
 
 **Local Trust Boundary**:
-The MVP security boundary that rejects credentials absent from the exact Installation Policy allowlist, malformed or oversized protocol messages, ad hoc model paths, unexpected artifact changes, and unsafe Worker failures. It assumes the host administrator, root, and explicitly authorized processes are trusted, but root still receives no unlisted protocol or maintenance bypass; defending against their malicious mutation of host bytes and operating as an Internet-facing multi-tenant service are out of scope.
+The MVP security boundary that rejects credentials absent from the exact Installation Policy allowlist, malformed or oversized public protocol messages, ad hoc model paths, unexpected artifact changes, and unsafe native Adapter outcomes. It assumes the host administrator, root, and explicitly authorized processes are trusted, but root still receives no unlisted protocol or maintenance bypass; defending against their malicious mutation of host bytes and operating as an Internet-facing multi-tenant service are out of scope.
 _Avoid_: Public API security, token authentication, full same-UID isolation
 
 **TurnVector Daemon**:
-The long-running local Rust process that owns API endpoints, Request State, Scheduler, Resource Governor, Runtime Event Loop, and audit records. It does not call MLX through an in-process FFI in the MVP.
-_Avoid_: Embedded library, MLX worker
+The one long-running local serving process that owns API endpoints, Request State, Scheduler, Resource Governor, Runtime Event Loop, audit records, and the statically linked C++/MLX Adapter. External clients use the Data or Control Plane sockets, while the Device Executor invokes the Adapter through the direct in-process Backend Interface. The MVP starts no Backend child process. Separate Compatibility Custody or offline maintenance tools may run in bounded processes, but they never own MLX, form or execute Turns, or participate in the serving hot path.
+_Avoid_: Embedded library, MLX worker process, multi-process hot path
 
 **Daemon Instance Lock**:
 The exclusive OS file lock in a runtime's stable container proving that only one process may operate on its current payload or local operation staging. The daemon holds it for its lifetime, including live non-ready repair; only authorized offline Bundle, Migration, Storage Qualification Rebind, Restore, Clone, or prune work may acquire it while the daemon is absent, and payload replacement never replaces the lock itself.
-_Avoid_: Device Ownership Lease, PID file, socket bind result
+_Avoid_: Device Executor, PID file, socket bind result
 
 **Runtime Identity Lease**:
 The host-scoped exclusive lease keyed by Runtime ID under one installation-fixed absolute identity root owned by the fixed service UID and GID, never selected by a runtime. A daemon holds it for its lifetime, including live non-ready repair; authorized offline Bundle, Migration, Storage Qualification Rebind, Restore, Clone, and prune work must hold it before reading or changing identity-scoped durable facts, normally with a matching Anchor except for exact pre-Locator staging cleanup.
-_Avoid_: Daemon Instance Lock, Device Ownership Lease, runtime path lock
+_Avoid_: Daemon Instance Lock, Device Executor, runtime path lock
 
 **Anchor Ownership**:
 The Identity Anchor state identifying whether one daemon session currently claims the Runtime ID or the last owner released it cleanly. After identity verification a new session generation writes `CLAIMED`, binding the previous generation before any recovery write; `CLEAN_RELEASED` requires a matching Clean Shutdown Boundary and Audit Head Hash, while OS lease release alone asserts nothing about history.
@@ -5593,15 +5593,15 @@ The host-persistent two-slot record keyed by Runtime ID outside every runtime co
 _Avoid_: Runtime Identity Record, central registry database, lease file alone
 
 **Identity Conflict**:
-The distinct non-ready Bootstrap state entered when two valid Locator slots select unequal identities, an initialized Runtime cannot acquire its Runtime Identity Lease, or its complete Identity Anchor token does not match. A merely occupied lease may be retried, but contradictory durable identity evidence persists; the daemon remains live for authenticated status only and starts no Worker or repair workflow.
+The distinct non-ready Bootstrap state entered when two valid Locator slots select unequal identities, an initialized Runtime cannot acquire its Runtime Identity Lease, or its complete Identity Anchor token does not match. A merely occupied lease may be retried, but contradictory durable identity evidence persists; the daemon remains live for authenticated status only and starts no Device Executor or repair workflow.
 _Avoid_: Control Repair Mode, lock retry as readiness, duplicate daemon exit
 
-**Device Ownership Lease**:
-The separate exclusive OS lock held by the C++ Backend Worker for its entire process lifetime while it may own MLX or device state. A replacement Worker cannot start serving until the previous Worker releases it through exit. If an orphan does not release it within the configured deadline, the new daemon remains not ready and follows the supervised termination policy rather than assuming time alone released the device.
-_Avoid_: Daemon Instance Lock, Exclusive Lease, fixed sleep
+**Device Executor**:
+The daemon's dedicated OS thread that exclusively owns the Runtime Event Loop, Runtime Core call sequence, C++/MLX Adapter, MLX handles, streams, models, KV, caches, and their destruction. Each scheduling cycle selects and executes one bounded Turn through direct same-thread calls and accepts its synchronized result before another Turn begins. External threads may enqueue bounded coarse-grained control events or set certified cancellation and safety signals, but cannot call MLX, mutate Core state, or insert a per-Turn round trip. Daemon Instance Lock and Runtime Identity Lease prevent another serving process for the same Runtime; there is no separate child-process device lease.
+_Avoid_: Tokio task, Backend child process, per-Turn channel, Exclusive Lease
 
 **Service Readiness**:
-The global Data Plane availability condition requiring a fully redundant valid Locator and its exact valid Initialization Manifest, matching committed Identity Anchor, exact valid storage-qualification generations, no Storage Barrier Failure, completed publication and Audit Reconciliation with no pending evidence, a writable non-exhausted Audit Journal, no Metadata Repair condition, exclusive identity and device ownership, a compatible Worker, fresh Resource Evidence, and a serving operational state. External Recovery Bundle availability does not affect it.
+The global Data Plane availability condition requiring a fully redundant valid Locator and its exact valid Initialization Manifest, matching committed Identity Anchor, exact valid storage-qualification generations, no Storage Barrier Failure, completed publication and Audit Reconciliation with no pending evidence, a writable non-exhausted Audit Journal, no Metadata Repair condition, exclusive Runtime identity ownership, an initialized Device Executor and compatible C++/MLX Adapter, fresh Resource Evidence, and a serving operational state. External Recovery Bundle availability does not affect it.
 _Avoid_: Service Liveness, socket existence, resident model count, Model availability
 
 **Service Liveness**:
@@ -5609,11 +5609,11 @@ The narrow health condition that the TurnVector Daemon process and its status pa
 _Avoid_: Service Readiness, Model availability, process PID alone
 
 **Daemon Failure**:
-Termination of the TurnVector Daemon, which fails every non-terminal request and live control conversation but does not cancel a durably staged or published Authority Publication. Bootstrap reconciles eligible durable operations forward while reporting a pending Storage Qualification Rebind for its exact offline tool; request, KV, Residency, Reservation, output, and connection state are never recovered.
+Termination of the TurnVector Daemon, which atomically loses the in-process Device Executor, C++/MLX Adapter, and every live inference object, fails every non-terminal request and live control conversation, but does not cancel a durably staged or published Authority Publication. Bootstrap reconciles eligible durable operations forward while reporting a pending Storage Qualification Rebind for its exact offline tool; request, KV, Residency, Reservation, output, and connection state are never recovered or retransmitted.
 _Avoid_: Transparent recovery, persisted Receipt
 
 **Graceful Shutdown**:
-The bounded daemon shutdown sequence that rejects new Admission and Residency Demand, orders Cooperative Cancellation for every non-terminal request, stops control operations at certified safe points, performs Orphan Shutdown of the Worker, and attempts a Clean Shutdown Boundary. It records `CLEAN_RELEASED` only after that Boundary and matching Anchor-head update succeed; if only the Anchor update fails, process exit leaves `CLAIMED` but the exact Boundary still proves a clean tail to the next Bootstrap, while Boundary failure requires crash-tail recovery.
+The bounded daemon shutdown sequence that rejects new Admission and Residency Demand, orders Cooperative Cancellation for every non-terminal request, stops control operations at certified safe points, performs Device Executor Shutdown on its owner thread, and attempts a Clean Shutdown Boundary. It records `CLEAN_RELEASED` only after that Boundary and matching Anchor-head update succeed; if only the Anchor update fails, process exit leaves `CLAIMED` but the exact Boundary still proves a clean tail to the next Bootstrap, while Boundary failure requires crash-tail recovery.
 _Avoid_: Unbounded drain, immediate process kill
 
 **Audit Journal**:
@@ -5684,20 +5684,20 @@ _Avoid_: Request-per-series telemetry, content labels, audit replacement
 The mechanism that forms compatible Work Candidates, executes a Turn, and carries out directed Residency Transitions while owning model, KV, tensor, stream, cache, and other backend-specific inference state. It also declares operation resource bounds and defines the semantics and conservative default thresholds for its backend-specific resource signals.
 _Avoid_: Scheduler, policy engine
 
-**C++ Backend Worker**:
-The MVP's default experimental native MLX child process, spawned and supervised by the Rust daemon over an inherited private socketpair. It acquires the Device Ownership Lease before owning MLX state, completes the Worker Launch Handshake, owns the MLX objects and dedicated device-execution thread, receives versioned Backend Protocol commands, and returns candidate descriptions, Plan Rejections, and Receipts. The MVP links the MLX implementation directly and loads no Backend plugin.
-_Avoid_: TurnVector Daemon, in-process FFI, proven P-1C boundary
+**C++/MLX Adapter**:
+The MVP's default experimental native MLX implementation, statically linked into the TurnVector Daemon and constructed, called, and destroyed only by the Device Executor. Its implementation and source-facing module interface are C++; a minimal private C-compatible shim with opaque owned handles and coarse operations connects Rust without exposing C++ object layout, STL types, or exceptions. One call executes a complete Candidate Formation, Turn, or Residency operation and returns an in-memory typed result only after the required synchronization boundary. This later architecture decision supersedes only the P-1C report's recommendation to defer every product topology choice: the MVP uses this coarse in-process seam, while the experiment remains RED and supplies no relative-performance certification or permanent general FFI conclusion. The MVP loads no Backend plugin.
+_Avoid_: Backend child process, per-op mlx-c, native C++ ABI across Rust, proven P-1C boundary
 
-**Worker Launch Handshake**:
-The authentication and compatibility exchange over the inherited private socketpair. The Worker must echo a one-time launch nonce and Daemon Instance ID and negotiate Backend Protocol capabilities before any MLX mutation or Service Readiness. A PID or connection to a public socket is not sufficient identity evidence.
-_Avoid_: Protocol Compatibility alone, Worker PID, reconnect handshake
+**Native Adapter Initialization**:
+The same-thread initialization performed by the Device Executor after Bootstrap has established every non-Backend readiness prerequisite. It verifies the exact Adapter and MLX build identities, installs nonterminating native error translation, creates thread-owned streams and state, and checks the Backend Interface revision before any model load or Turn. Failure leaves Service Readiness false and starts no inference work; there is no launch nonce, socket handshake, or independently reconnectable Backend process.
+_Avoid_: Socket handshake, protocol negotiation, lazy first-Turn initialization
 
-**Backend Protocol**:
-The length-framed, versioned local IPC contract between the Rust TurnVector Daemon and C++ Backend Worker. It uses explicit field numbers, major and minor versions, a capability handshake, message sequence numbers, and correlation IDs. Every local protocol has a fixed maximum frame length, validates the declared size before allocation, and feeds a bounded per-connection queue; Unix socket backpressure is not its only capacity control. It carries language-independent domain messages and opaque handles rather than native structures, C++ object layouts, Rust types, tensors, or KV state. At most one mutating command may be in flight per Worker.
-_Avoid_: C++ plugin ABI, public network API, mlx-c
+**Backend Interface**:
+The narrow in-process seam implemented by the C++/MLX Adapter and Fake Execution Backend. It exposes bounded Candidate Formation, Turn execution, Residency Transition, Resource Evidence, cancellation polling, and shutdown operations through direct calls on the Device Executor. Inputs and outputs use owned, validated in-memory representations and opaque IDs; tensors, KV layout, Rust references, C++ objects, exceptions, and serialized protocol messages never cross the seam. The interface is versioned with the build for certification and compatibility checks, but it is neither a wire protocol nor a stable public plugin ABI.
+_Avoid_: Data Plane, Control Plane, Protobuf, per-op binding, Backend Plugin ABI
 
 **Protocol Compatibility**:
-The connection rule applied independently to the Data Plane, Control Plane, and Backend Protocol. Peers select the highest common non-revoked exact descriptor whose known requirements and directional typed limits are mutually satisfied; unknown provided capabilities are omitted from the effective intersection, unknown required-peer capabilities reject negotiation, and duplicate or unsorted capability lists are Protocol Violations.
+The connection rule applied independently to the Data Plane and Control Plane. Peers select the highest common non-revoked exact descriptor whose known requirements and directional typed limits are mutually satisfied; unknown provided capabilities are omitted from the effective intersection, unknown required-peer capabilities reject negotiation, and duplicate or unsorted capability lists are Protocol Violations. It does not govern the in-process Backend Interface.
 _Avoid_: Best-effort parsing, exact minor match, native ABI compatibility
 
 **Protocol Capability ID**:
@@ -5721,47 +5721,43 @@ A framing, decoding, Hello, Command ID, envelope, or non-ignorable schema violat
 _Avoid_: Request failure, Admission rejection, Overloaded
 
 **Protocol Compatibility Gate**:
-The release gate proving every supported published minor in a protocol family's current major across old/new peer combinations and Rust/C++ encodings, plus stable rejection of every Revoked Protocol Minor. It includes golden bytes, unknown fields and enums, missing capabilities, oversized frames, and malformed input. Passing it makes no inference-correctness, performance, or Certification Record claim.
+The release gate proving every supported published minor in a public local protocol family's current major across old/new peer combinations and supported client-language encodings, plus stable rejection of every Revoked Protocol Minor. It includes golden bytes, unknown fields and enums, missing capabilities, oversized frames, and malformed input. Passing it makes no Backend Interface, inference-correctness, performance, or Certification Record claim.
 _Avoid_: Same-version smoke test, compiler success, P0 Core Gate
 
 **Structured Error**:
 The stable machine-readable failure contract containing an error code, reason code, retryable flag, relevant Command, Request, or Operation ID, an optional capability-negotiated bounded typed detail, and optional human-readable text. Clients never parse text for behavior; `ManifestRepairLimitDetail` requires its distinct `manifest_repair_limit_detail_v1` capability plus a defining selected minor and reports only request, effective, and binary maximum bytes without becoming durable state.
 _Avoid_: Error string contract, process exit status
 
-**Worker Control Channel**:
-A separate bounded IPC path that may carry heartbeats, Resource Evidence, and idempotent cancellation flags keyed by operation ID while one mutating Backend command is in flight. It cannot perform Candidate Formation, read partially updated inference state, or start another mutation.
-_Avoid_: Second command stream, Backend Protocol retry
+**Device Control Signal**:
+A bounded set of in-process atomic flags for cancellation, Critical resource action, and shutdown that external threads may set while the Device Executor is inside one certified operation. The C++/MLX Adapter polls them only at declared safe points; they carry no Plan, Candidate, mutable state, Resource Evidence, or second operation and cannot reorder Runtime Core events.
+_Avoid_: Command channel, second device loop, asynchronous Core mutation
 
 **Operation Watchdog**:
-The daemon timer for an in-flight Backend mutation. At the certified execution bound plus IPC grace it requests cooperative cancellation. If the certified next-safe-point interval expires without an unambiguous result, it requests whole-Worker process termination; after a further bounded exit grace it force-terminates the process and applies Worker Exit semantics. It never force-terminates only the device thread while retaining the process.
-_Avoid_: Estimate calibration, infinite wait, hard in-process interruption
+The daemon timer for an in-flight Backend operation. At the certified execution bound it sets the cooperative Device Control Signal. If the certified next-safe-point interval expires without a synchronized result, the runtime enters Device Executor Failure and terminates the whole daemon process after a bounded diagnostic grace; it never force-terminates only the Device Executor thread and then continues using the process.
+_Avoid_: Estimate calibration, infinite wait, hard thread interruption
 
-**Indeterminate Backend Command**:
-A mutating command whose IPC connection was lost before its result was unambiguously received. The daemon never retransmits or assumes its outcome; it terminates the Worker and fails every dependent operation under Worker Exit semantics.
+**Indeterminate Backend Operation**:
+A started in-process Backend operation whose synchronized result cannot be committed because the daemon enters process-wide fail-stop. It is never retried or reconstructed after restart; Daemon Failure discards every dependent live request, KV object, Residency state, and Reservation while durable authorities reconcile under their own protocols.
 _Avoid_: Retryable message, Plan Rejection, assumed rollback
 
-**Worker Exit**:
-Loss of a C++ Backend Worker, which immediately fails every non-terminal request and control operation depending on that Worker, invalidates every opaque handle, advances Backend Generation, and places all possibly allocated Worker capacity behind the Worker Reclaim Barrier. A supervised restart uses bounded exponential backoff, keeps Service Readiness false, and begins with empty Residency and inference state; no queued request or KV state is silently attached to it.
-_Avoid_: In-flight-only failure, transparent KV reconstruction
+**Device Executor Failure**:
+A fatal Runtime Core, Adapter, MLX, watchdog, or owner-thread condition that makes the one serving process unsafe to continue. New work stops, diagnostics are best-effort, live connections fail, and the daemon exits; the Device Executor is never restarted inside that process. The next daemon performs ordinary Bootstrap with empty inference state and fresh Resource Evidence under Daemon Failure semantics.
+_Avoid_: In-flight-only failure, child-process restart, transparent KV reconstruction
 
-**Worker Reclaim Barrier**:
-The resource-accounting barrier after Worker Exit. Logical requests and Residency become invalid immediately, but their possibly allocated capacity remains Pending Reclaim until the old process is confirmed exited, its Device Ownership Lease is released, and fresh system Resource Evidence establishes the new baseline. IPC EOF, elapsed time, or replacement-Worker launch alone cannot release the capacity.
-_Avoid_: Request failure, IPC disconnect, fixed reclaim delay
+**Process Reclaim Barrier**:
+The startup resource-safety barrier after Daemon Failure. The next daemon cannot become ready until the old process is confirmed gone through exclusive lifetime locks and fresh system Resource Evidence establishes a new baseline after OS reclamation. It inherits no request, Residency, Reservation, Pending Reclaim counter, or allocator claim from the failed process; elapsed time or socket disappearance alone cannot establish capacity.
+_Avoid_: Request failure, socket disconnect, fixed reclaim delay
 
-**Orphan Shutdown**:
-The C++ Backend Worker behavior on daemon IPC EOF. The Worker rejects further work, requests cancellation of any operation in flight, reaches its nearest certified safe point, releases MLX state, and exits instead of waiting for daemon reconnection or remaining as an orphan device owner.
-_Avoid_: Worker reconnect, immediate unsafe exit
-
-**Worker Circuit Breaker**:
-The durable supervisor state that applies bounded exponential restart backoff after Worker Exit and opens after a configured failure count. Failure count, backoff state, and Open state survive daemon restart through the Control State Snapshot. Before it opens, one Worker running continuously for the configured stability window resets the count and backoff. Once Open, no Worker is restarted and new dependent work is rejected until an explicit versioned Control Plane reset.
-_Avoid_: Infinite restart loop, permanent first-failure shutdown
+**Device Executor Shutdown**:
+The owner-thread shutdown path that rejects further Backend work, requests cancellation of any operation in flight, reaches its nearest certified safe point, destroys model, KV, cache, stream, and Adapter state on the Device Executor, and then lets the daemon exit. If the certified safe-point bound is violated, Operation Watchdog uses process-wide fail-stop instead of detaching or abandoning the thread.
+_Avoid_: Thread detach, immediate unsafe drop, child-process reconnect
 
 **Backend Plugin ABI**:
-A possible future binary extension boundary inside the C++ Backend Worker. If introduced, it uses a versioned C function table and opaque handles with C++ source wrappers; native C++ virtual interfaces, STL types, exceptions, and object layouts never cross it. The MVP does not load plugins.
-_Avoid_: Backend Protocol, native C++ ABI, MVP requirement
+A possible future binary extension seam inside the serving process. If introduced, it uses a versioned C function table and opaque handles with C++ source wrappers; native C++ virtual interfaces, STL types, exceptions, and object layouts never cross it. The MVP statically links one C++/MLX Adapter and does not load plugins.
+_Avoid_: Backend Interface, native C++ ABI, MVP requirement
 
 **Fake Execution Backend**:
-A deterministic daemon-side test implementation of the Backend Daemon Port used with scripted Effects, Effect Results, resource samples, and durations to verify Runtime Core behavior without model inference. It is not a production runtime and does not replace MLX correctness or Certification Record evidence.
+A deterministic in-process test implementation of the Backend Interface used with scripted Effects, Effect Results, resource samples, and durations to verify Runtime Core behavior without model inference. It runs under the same direct-call sequencing contract but is not a production runtime and does not replace MLX correctness or Certification Record evidence.
 _Avoid_: Fake L1, mock MLX
 
 **Resource Governor**:
