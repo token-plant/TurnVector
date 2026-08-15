@@ -5,20 +5,28 @@ TurnVector coordinates multiple resident AI models sharing Apple Silicon. Its pr
 ## Language
 
 **Turn**:
-A bounded execution interval assigned to one Model. It ends only after execution is synchronized and persistent inference state is safe to continue.
+A bounded execution interval assigned to one Model. It ends only after execution is synchronized and persistent inference state is safe to continue. A logical Prefill may require many Turns, but each Prefill Turn advances exactly one Prefill Chunk before returning control.
 _Avoid_: Request, token, Decode Step, Command Buffer
+
+**Cooperative Turn Interleaving**:
+The MVP execution-concurrency model in which a bounded number of requests for multiple Models may be live and Runnable while the Device Executor runs exactly one synchronized Turn at a time. Every accepted Turn Receipt returns control to the Runtime Core, and any continuation competes from a fresh Scheduling Snapshot and Turn Plan. It is the mechanism for request concurrency and bounded cross-Model latency isolation at certified yield points without claiming simultaneous Metal execution, command-buffer priority, or hard preemption.
+_Avoid_: Concurrent Metal Turns, one request at a time, forced interruption
 
 **Scheduling Snapshot**:
 An immutable statement of the runnable work, timing obligations, versioned cost estimates, execution capabilities, resource safety state, Monotonic Time, and Generation Vector available for one scheduling decision.
 _Avoid_: Snapshot, mutable system state, queue length
 
 **Work Candidate**:
-A backend-provided immutable description of one schedulable choice of compatible request handles for one Model, one Execution Phase, and one Service Class. Batch members cannot cross Service Classes. It carries an opaque Candidate ID and exposes timing, batching, output, and Resource Impact facts needed for selection without exposing tensors, KV layout, or backend shapes. It is infeasible if it cannot satisfy every member's current timing obligation or Progress Bound.
+A backend-provided immutable description of one schedulable choice of compatible request handles for one Model, one Execution Phase, and one Service Class. Batch members cannot cross Service Classes. It carries an opaque Candidate ID and exposes timing, batching, output, and Resource Impact facts needed for selection without exposing tensors, KV layout, or backend shapes. For Prefill, its execution and progress contract covers one next Prefill Chunk Turn, never the complete remaining prompt. It is infeasible if it cannot satisfy every member's current timing obligation or Progress Bound.
 _Avoid_: Request queue, Tensor Batch
 
 **Candidate Formation**:
 The operation in which the Scheduler supplies eligible request handles and common policy constraints, and the Execution Backend returns a deterministic bounded set of immutable Work Candidates. The MVP permits at most one candidate per Model ID, Execution Phase, Service Class, and configured batch bucket; the Backend neither enumerates arbitrary request subsets nor owns request lifecycle or scheduling priority.
 _Avoid_: Batch execution, Scheduler batching, backend queue
+
+**Prefill Chunk**:
+One contiguous resumable token-range advancement within a request's logical Prefill phase, executed as exactly one Prefill Turn. The Turn Plan supplies a target Engine Service, explicit work ceilings, and a certified hard execution bound; the Execution Backend uses its immutable Cost Profile plus current model, Batch, Shape, KV, and compile-cache state to choose the concrete token range. It evaluates and synchronizes the required output and persistent KV/cursor state before returning the processed range, continuation state, and yield reason in the Turn Receipt. A shared-mode implementation cannot loop over successive schedulable chunks or consume the remaining prompt before returning control.
+_Avoid_: Full-prompt Turn, hidden chunk loop, Scheduler-selected Tensor shape
 
 **Work Kind**:
 An Execution Backend-defined category of model work that maps to TurnVector's fixed scheduling semantics. The Scheduler does not branch on Work Kind.
@@ -41,11 +49,11 @@ A renewable Control Plane lease required for an Exclusive operation to continue 
 _Avoid_: Fixed operation timeout, automatic Exclusive entry
 
 **Turn Plan**:
-Authorization for the fixed request membership of one Model and Work Candidate to consume a bounded Turn. It states policy limits while leaving backend-specific Shape, Chunk, and Step choices to the Execution Backend.
+Authorization for the fixed request membership of one Model and Work Candidate to consume one bounded Turn. It binds the target Engine Service, certified hard execution bound, phase-specific work ceilings, and relevant generations while leaving backend-specific Shape, Prefill Chunk token count, and Decode burst choices to the Execution Backend. It never authorizes an automatic same-Model continuation after the resulting Turn Receipt.
 _Avoid_: Plan, execution graph, request
 
 **Turn Receipt**:
-The single synchronized outcome corresponding to a started Turn Plan. It records actual progress, Engine Service, resumability, and success or failure so scheduling and recovery share one causal record.
+The single synchronized outcome corresponding to a started Turn Plan. It records actual progress, including any processed Prefill token range and continuation, Engine Service, resumability, yield reason, and success or failure so scheduling and recovery share one causal record. `still_runnable` is an observation, not permission to execute again without a fresh Scheduling Snapshot and Turn Plan.
 _Avoid_: Receipt, success response, telemetry event
 
 **Plan Rejection**:
@@ -133,7 +141,7 @@ An Execution Backend-provided ordinary estimate for a Work Candidate paired with
 _Avoid_: Token count, Scheduler guess, certified Turn boundary
 
 **Cost Profile**:
-The versioned online calibration state used by the Execution Backend to produce ordinary Turn Cost Estimates within fixed Certification Record bounds. It may update atomically from Turn Receipts only between Turns, so every Scheduling Snapshot observes one immutable version. It cannot create a Backend Capability, widen a certified upper bound, or change Admission safety margins.
+The versioned online calibration state used by the Execution Backend to produce ordinary Turn Cost Estimates and translate a Turn Plan's time target into a concrete Prefill Chunk, Decode burst, or micro-batch within fixed Certification Record bounds. It may update atomically from Turn Receipts only between Turns, so every Scheduling Snapshot observes one immutable version. It cannot create a Backend Capability, widen a certified upper bound, or change Admission safety margins.
 _Avoid_: Certification Record, Model Ledger, Timing Profile
 
 **Profile Revalidation**:
@@ -141,11 +149,11 @@ The Turn-boundary process triggered by activating a new Certification Record, ch
 _Avoid_: Automatic bound expansion, new-request-only update
 
 **Bound Violation**:
-A completed Turn or control operation whose actual time or resource use exceeds its Certification Record upper bound. Its Receipt remains authoritative, but the most specific affected Capability Key is removed from shared scheduling, an auditable contract violation is emitted, and re-entry requires explicit recertification. Correlated failures may escalate quarantine to a wider Envelope, Adapter build, or Backend Capability. A resource-bound violation also forces immediate Resource Governor reevaluation; a bounded root-recovery underestimate follows Repository Root Recovery Bounded Recovery Capacity Admission Boundary Bound Violation and its Affected Operation Boundary, quarantining the exact recovery Tool/Capability and allowing only already externalized operations to reach their pre-reserved safe terminals. Exceeding only the ordinary Cost Profile estimate is normal calibration evidence, not a Bound Violation.
+A completed Turn or control operation whose actual time or resource use exceeds its Certification Record upper bound. A Prefill Turn that consumes beyond its granted chunk or fails to return synchronized continuation by that bound is the same violation; an internal full-prompt or multi-chunk loop cannot redefine the Turn. Its Receipt remains authoritative, but the most specific affected Capability Key is removed from shared scheduling, an auditable contract violation is emitted, and re-entry requires explicit recertification. Correlated failures may escalate quarantine to a wider Envelope, Adapter build, or Backend Capability. A resource-bound violation also forces immediate Resource Governor reevaluation; a bounded root-recovery underestimate follows Repository Root Recovery Bounded Recovery Capacity Admission Boundary Bound Violation and its Affected Operation Boundary, quarantining the exact recovery Tool/Capability and allowing only already externalized operations to reach their pre-reserved safe terminals. Exceeding only the ordinary Cost Profile estimate is normal calibration evidence, not a Bound Violation.
 _Avoid_: Ordinary estimate error, automatic bound expansion
 
 **Backend Capability**:
-A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. It is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
+A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. The MVP shared-execution contract authorizes Cooperative Turn Interleaving with exactly one Backend Turn in flight; it does not infer simultaneous multi-stream safety from individually valid Capability Keys. Any future concurrent-stream mode requires a separate architecture decision and correctness, attribution, latency, throughput, and peak-memory certification for the complete co-running set. A capability is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
 _Avoid_: Work Kind, Backend process, model support
 
 **Capability Key**:
@@ -589,7 +597,7 @@ A fixed initial Core state plus an Event Sequence-ordered stream of explicit Cor
 _Avoid_: Audit recovery, nondeterministic integration test, numerical MLX replay
 
 **P0 Core Gate**:
-The implementation gate requiring deterministic replay and invariant coverage for weighted scheduling, deadlines and Progress Bounds, Resource Mode transitions, Admission, request and Residency Reservations, Pending Reclaim, cancellation and output races, Device Executor Failure, and Audit Degraded behavior. It is satisfied through example tests, property tests, generated state-machine sequences, fault injection, and fixed-seed replay, and makes no MLX correctness, latency, throughput, or FFI claim.
+The implementation gate requiring deterministic replay and invariant coverage for weighted scheduling, deadlines and Progress Bounds, Cooperative Turn Interleaving including one-Receipt-per-Prefill-Chunk continuation, Resource Mode transitions, Admission, request and Residency Reservations, Pending Reclaim, cancellation and output races, Device Executor Failure, and Audit Degraded behavior. It is satisfied through example tests, property tests, generated state-machine sequences, fault injection, and fixed-seed replay, and makes no MLX correctness, latency, throughput, or FFI claim.
 _Avoid_: Round-robin demo, MLX certification, end-to-end serving gate
 
 **Domain Type**:
@@ -605,7 +613,7 @@ One of the small capability interfaces owned by the daemon orchestration layer, 
 _Avoid_: Core module trait, protocol DTO, general repository abstraction
 
 **Runtime Event Loop**:
-The daemon orchestration loop running on the dedicated Device Executor OS thread. It is the sole owner and caller of the Runtime Core and the only caller of the in-process C++/MLX Adapter. It validates queued boundary inputs, assigns Event Sequence and Monotonic Time, executes each synchronous Core Transition, invokes every Backend Effect directly on the same thread, synchronizes the Turn, and feeds its in-memory result back before another Turn begins. External I/O threads remain responsive, but they can only enqueue bounded coarse-grained events or set certified cancellation and safety signals; they cannot mutate Core or MLX state. Core Event Reserve protects Critical, cancellation, disconnect, Device Executor Failure, shutdown, and repair events for processing at the next safe boundary, while ordinary submissions receive Overloaded before request creation when capacity is full. Control-store and audit I/O may use bounded executors, but no per-Turn channel, task wakeup, serialization, or process boundary exists.
+The daemon orchestration loop running on the dedicated Device Executor OS thread. It is the sole owner and caller of the Runtime Core and the only caller of the in-process C++/MLX Adapter. It validates queued boundary inputs, assigns Event Sequence and Monotonic Time, executes each synchronous Core Transition, invokes every Backend Effect directly on the same thread, synchronizes the Turn, and feeds its in-memory result back before another Turn begins. A still-runnable Prefill or Decode result cannot continue inline: after the Receipt transition and every earlier sequenced event, the Core must form a fresh Scheduling Snapshot and Turn Plan. External I/O threads remain responsive, but they can only enqueue bounded coarse-grained events or set certified cancellation and safety signals; they cannot mutate Core or MLX state. Core Event Reserve protects Critical, cancellation, disconnect, Device Executor Failure, shutdown, and repair events for processing at the next safe boundary, while ordinary submissions receive Overloaded before request creation when capacity is full. Control-store and audit I/O may use bounded executors, but no per-Turn channel, task wakeup, serialization, or process boundary exists.
 _Avoid_: Tokio scheduling task, shared-state lock, API handler, separate backend loop
 
 **Control Mutation**:
@@ -5597,7 +5605,7 @@ The distinct non-ready Bootstrap state entered when two valid Locator slots sele
 _Avoid_: Control Repair Mode, lock retry as readiness, duplicate daemon exit
 
 **Device Executor**:
-The daemon's dedicated OS thread that exclusively owns the Runtime Event Loop, Runtime Core call sequence, C++/MLX Adapter, MLX handles, streams, models, KV, caches, and their destruction. Each scheduling cycle selects and executes one bounded Turn through direct same-thread calls and accepts its synchronized result before another Turn begins. External threads may enqueue bounded coarse-grained control events or set certified cancellation and safety signals, but cannot call MLX, mutate Core state, or insert a per-Turn round trip. Daemon Instance Lock and Runtime Identity Lease prevent another serving process for the same Runtime; there is no separate child-process device lease.
+The daemon's dedicated OS thread that exclusively owns the Runtime Event Loop, Runtime Core call sequence, C++/MLX Adapter, MLX handles, streams, models, KV, caches, and their destruction. Each scheduling cycle selects and executes one bounded Turn through direct same-thread calls and accepts its synchronized result before another Turn begins. Multiple bounded requests may remain live and Runnable, but no second Backend Turn overlaps the first; a remaining Prefill range returns only as continuation state for a later scheduling cycle. External threads may enqueue bounded coarse-grained control events or set certified cancellation and safety signals, but cannot call MLX, mutate Core state, or insert a per-Turn round trip. Daemon Instance Lock and Runtime Identity Lease prevent another serving process for the same Runtime; there is no separate child-process device lease.
 _Avoid_: Tokio task, Backend child process, per-Turn channel, Exclusive Lease
 
 **Service Readiness**:
@@ -5685,7 +5693,7 @@ The mechanism that forms compatible Work Candidates, executes a Turn, and carrie
 _Avoid_: Scheduler, policy engine
 
 **C++/MLX Adapter**:
-The MVP's default experimental native MLX implementation, statically linked into the TurnVector Daemon and constructed, called, and destroyed only by the Device Executor. Its implementation and source-facing module interface are C++; a minimal private C-compatible shim with opaque owned handles and coarse operations connects Rust without exposing C++ object layout, STL types, or exceptions. One call executes a complete Candidate Formation, Turn, or Residency operation and returns an in-memory typed result only after the required synchronization boundary. This later architecture decision supersedes only the P-1C report's recommendation to defer every product topology choice: the MVP uses this coarse in-process seam, while the experiment remains RED and supplies no relative-performance certification or permanent general FFI conclusion. The MVP loads no Backend plugin.
+The MVP's default experimental native MLX implementation, statically linked into the TurnVector Daemon and constructed, called, and destroyed only by the Device Executor. Its implementation and source-facing module interface are C++; a minimal private C-compatible shim with opaque owned handles and coarse operations connects Rust without exposing C++ object layout, STL types, or exceptions. One call executes a complete Candidate Formation, Turn, or Residency operation and returns an in-memory typed result only after the required synchronization boundary. For Prefill, one Turn call advances one selected Prefill Chunk and returns continuation state; it cannot hide a loop that consumes successive schedulable chunks. This later architecture decision supersedes only the P-1C report's recommendation to defer every product topology choice: the MVP uses this coarse in-process seam, while the experiment remains RED and supplies no relative-performance certification or permanent general FFI conclusion. The MVP loads no Backend plugin.
 _Avoid_: Backend child process, per-op mlx-c, native C++ ABI across Rust, proven P-1C boundary
 
 **Native Adapter Initialization**:

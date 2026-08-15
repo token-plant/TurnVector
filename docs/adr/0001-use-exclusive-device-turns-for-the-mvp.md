@@ -1,3 +1,0 @@
-# Use Exclusive Device Turns for the MVP
-
-TurnVector runs one serving process with one dedicated Device Executor OS thread and allows at most one Model to own a Turn at a time. The Runtime Event Loop, Runtime Core call sequence, and statically linked C++/MLX Adapter share that owner thread; the loop invokes the Adapter directly and no other thread accesses MLX state. This deliberately postpones cross-model stream and thread concurrency so execution order, backend-state ownership, Engine Service attribution, and latency bounds can be proved first; any concurrent mode must pass a separate correctness, attribution, latency, throughput, and memory gate.
