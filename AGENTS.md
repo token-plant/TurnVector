@@ -2,6 +2,12 @@
 
 TurnVector and TurnVectorBenchmark are independent repositories. TurnVectorBenchmark is the paired benchmark project used to verify TurnVector changes.
 
+# Required Internal References
+
+Before every TurnVector task, read `.internal/reference/INDEX.md` completely, then read every document it marks `Required: always` completely. Treat these local-only documents as design and evidence context, while revalidating facts that can drift against the current repository, runtime, hardware, and dependency revisions.
+
+If the index or a required document is missing, report the missing local prerequisite before making architecture, runtime, benchmark, or evidence claims. Keep `.internal/` local and outside Git.
+
 For TurnVector work:
 
 - Scope edits, Git operations, dependency updates, and generated files to the TurnVector repository root.
