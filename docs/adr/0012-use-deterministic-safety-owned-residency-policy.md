@@ -1,0 +1,3 @@
+# Use Deterministic Safety-Owned Residency Policy
+
+The Resource Governor owns a deterministic Residency Policy independent of Scheduler fairness. Normal unload may select only Models with no accepted or runnable work, Model Weight never acts as a residency priority, and transition frequency and total Residency Service are bounded. If cache and idle-Model reclamation remain insufficient in Critical, Eviction Rank explicitly orders affected Models; ties use estimated reclaimable bytes and stable Model ID. No Model is absolutely pinned. The runtime fails affected accepted work at the current Turn's synchronized safe boundary before unloading its Model; it does not suspend that work indefinitely or wait for MLX to fail unpredictably.
