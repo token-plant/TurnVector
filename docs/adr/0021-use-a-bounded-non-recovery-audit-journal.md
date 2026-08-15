@@ -1,5 +1,7 @@
 # Use a Bounded, Non-Recovery Audit Journal
 
+The bounded non-recovery Audit contract applies to every Serving Profile. Identity Anchor coupling, multi-authority Audit repair, Runtime Bundle lineage, Compatibility Custody, and Bounded Integrity Lifecycle mechanisms in this decision apply only to the Integrity Serving Profile and cannot gate Service Readiness under the P0 Serving Profile.
+
 Every audit-only lineage is permanently behind the Audit Lineage Non-Authority Boundary: agreement, repair, completeness, age or a successor never promotes that lineage into product authority. Audit evidence may seed a separately authorized future qualification, but the qualification owns new identities and authority rather than graduating the audit history.
 
 Secondary evidence failures remain bounded and non-recovery: conflicting cyclic late readbacks use their own finite audit chain; exposure Authority Loss may seed only a separately identified audit lineage; terminal-member audit artifacts permit exact one-good-copy repair or zero-good Authority Loss; and a replacement Aggregate audit lineage must qualify a new independent reader rather than inherit byte-identical old code. A one-good saturation-marker resolution may restore current `AT_LEAST_MAX`, but the prior conflict, loss and `SATURATION_CONTINUITY_UNKNOWN` interval remain permanent.

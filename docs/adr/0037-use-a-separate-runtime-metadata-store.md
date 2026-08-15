@@ -1,5 +1,7 @@
 # Use a Separate Runtime Metadata Store
 
+This decision applies to the Integrity Serving Profile. The P0 Serving Profile has no Runtime Metadata authority, Metadata repair, Bundle, Restore, or Clone capability; their absence cannot block Service Readiness under that profile and must be reported as unsupported rather than silently emulated.
+
 Ordinary exact Metadata repair may resolve a conflicting reappeared saturation marker only when two fresh Jobs prove one copy digest-valid and identity-bound and the other invalid. The valid lower bound may restore current `AT_LEAST_MAX`, but Runtime Metadata permanently retains both observations, the Conflict Incident, prior loss and intervening `SATURATION_CONTINUITY_UNKNOWN`; repair never backfills coverage or creates Control authority.
 
 When a previously lost saturation marker reappears under the same identity with conflicting valid bytes, Runtime Metadata records a nonauthoritative marker-integrity incident, retains both copies and the prior loss, and keeps current status `SATURATION_CONTINUITY_UNKNOWN`. It selects neither latest nor preferred bytes and does not escalate the conflict into a Repository Root Hash Incident; only ordinary exact Metadata repair may later qualify a current lower-bound marker without erasing the historical gap.
