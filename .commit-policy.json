@@ -1,0 +1,8 @@
+{
+  "counted_documentation_globs": [
+    "docs/generated/**",
+    "reports/generated/**",
+    "fixtures/**",
+    "tests/fixtures/**"
+  ]
+}
