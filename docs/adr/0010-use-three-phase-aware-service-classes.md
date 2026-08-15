@@ -1,0 +1,3 @@
+# Use Three Phase-Aware Service Classes
+
+The MVP exposes exactly Interactive, Standard, and Background Service Classes to trusted local callers. Interactive First Token Deadline begins at successful Admission and covers Materialization, Prefill, phase change, and first Decode output; later visible tokens use Stream Deadline, while other Interactive phases use configured start or progress deadlines. Standard and Background each retain a finite Progress Bound with a wider bound for Background, accrued only while safe and runnable. A Work Candidate and its Batch members have exactly one Service Class, preventing lower-class work from inheriting another request's urgency.

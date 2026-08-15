@@ -1,0 +1,3 @@
+# Separate Backend Resource Signals from Mode Semantics
+
+Execution Backends define the meaning of their resource signals, conservative default thresholds, and per-operation Resource Impact with conservative peak memory-delta bounds. Machine configuration may override threshold values through an atomic, versioned Resource Threshold Profile, and every run records the effective values and version. TurnVector retains one fixed action meaning for Normal, Guarded, StopAdmission, and Critical, so backend-specific evidence cannot silently redefine Scheduler safety behavior. Missing or stale required evidence immediately forces StopAdmission and escalates to Critical after a configured grace period.

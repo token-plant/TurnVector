@@ -1,0 +1,3 @@
+# Use Exclusive Device Turns for the MVP
+
+TurnVector will run one C++ Backend Worker process with one dedicated device-execution thread and allow at most one Model to own a Turn at a time. The Rust TurnVector Daemon communicates with that worker through the Backend Protocol and never accesses MLX state directly. This deliberately postpones cross-model stream and thread concurrency so execution order, backend-state ownership, Engine Service attribution, and latency bounds can be proved first; any concurrent mode must pass a separate correctness, attribution, latency, throughput, and memory gate.
