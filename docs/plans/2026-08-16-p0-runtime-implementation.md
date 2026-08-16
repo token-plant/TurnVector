@@ -17,7 +17,8 @@ The accepted P0 order is fixed:
 3. P0-3: Resource Governor, Reservations, Residency, and Pending Reclaim.
 4. P0-4: In-process C++/MLX Adapter, owner-thread enforcement, and conformance.
 5. P0-5: Data and Control Unix sockets, Protobuf, and output backpressure.
-6. P0-6: SQLite Control Store, bounded P0 Audit, and Daemon Instance Lock.
+6. P0-6: Qualified authority volume, SQLite Control Store, bounded P0 Audit, and
+   Daemon Instance Lock.
 7. P0-7: TurnVectorBenchmark qualification for native correctness, cross-model
    interference, observability, recovery, supervision, and certification.
 
@@ -153,81 +154,238 @@ than regenerating vocabulary authority from artifacts, logits, model defaults, o
 the hash. Post-load observation must equal the restored canonical bytes, identity,
 hash, and vocabulary size.
 
+P0 uses the existing immutable Storage Qualification Record format without
+importing the Integrity Profile's Identity Anchor or Rebind machinery. An offline
+qualifier holds the installation qualification lock, executes the build-owned
+real syscall profile on the exact Runtime Authority Volume, synchronizes one
+immutable record, and publishes it through the fixed two-slot Head. Installation
+Policy names one exact record identity, never `latest`. Before any Runtime writer,
+Bootstrap freezes that record and verifies its volume UUID, OS build, TurnVector
+build, Storage Capability Profile, record chain, and bytes. For an existing or
+possibly committed identity this proof authorizes SQLite rollback recovery only;
+after recovery the immutable Runtime Identity Record must bind the same exact
+record before any later Runtime write. Control Initialization additionally holds
+the qualification lock, verifies that the Policy record is currently Head-
+selected, and persists the binding. P0 offers no same-ID qualification rebind, so
+binding or environment drift requires a new runtime rather than an implicit Head
+selection, daemon write probe, or durability downgrade.
+
 A new profile-specific ADR then defines P0 Audit sequence authority without
 silently importing the Integrity Profile's Identity Anchor. The SQLite Control
 Store owns a small durable P0 Audit Sequence State outside the semantic Control
 State Snapshot: History Epoch, next range predecessor, and reserved high-water.
-It reserves a complete range in a `FULL` SQLite transaction and explicitly
-synchronizes the database parent directory before assignment. The Daemon Instance
-Lock proves process exclusivity; exact Audit chain validation against the
-reserved high-water proves the tail. Bootstrap first appends, synchronizes,
-verifies, and clears every exact Store-published Pending Audit Envelope. Only
-when no pending envelope remains may graceful shutdown write a strongly
-synchronized Clean Shutdown Boundary for its unused suffix; Bootstrap verifies
-that boundary, or an unclean restart reserves a new range and writes one Crash
-Tail Boundary for the complete unrecoverable prior suffix through its high-water.
-That suffix includes never-assigned values and values assigned only to lost,
-unsynchronized records; exact Store-published envelopes are completed first and
-therefore excluded. No lost record is guessed and no assigned value is reused.
-P0 never emits or claims Anchor `CLAIMED`/`CLEAN_RELEASED`. Unreconcilable
-Store/Audit mismatch is non-ready and requires a new runtime. The ADR updates the
-P0 branches of ADRs 0021, 0026, 0027, 0036, and 0040 plus their glossary terms;
-Integrity semantics remain unchanged.
+Control Initialization creates it; afterward only the guarded range-reservation
+primitive on the sole Store executor may advance it. It is daemon-owned pre-operation
+infrastructure that consumes no Event Sequence and creates no Core Event, Effect,
+Result, mutation Operation ID, Audit Record, or Pending Audit Envelope. A complete
+range becomes assignable only after its `FULL` SQLite commit and explicit database-
+parent synchronization. Control Mutation consumes an already-reserved value and never
+updates high-water. The installation-scoped Daemon Instance Lock has one fixed
+identity outside every Runtime and proves process exclusivity across Runtime ID
+replacement; exact
+Audit chain validation against reserved high-water proves the tail. Bootstrap
+first appends, synchronizes, verifies, and clears every exact Store-published
+Pending Audit Envelope. Only when no pending envelope remains may graceful
+shutdown write a strongly synchronized Clean Shutdown Boundary for its unused
+suffix; Bootstrap verifies that boundary, or an unclean restart reserves a new
+range and writes one Crash Tail Boundary for the complete unrecoverable prior
+suffix through its high-water. That suffix includes never-assigned values and
+values assigned only to lost, unsynchronized records; exact Store-published
+envelopes are completed first and therefore excluded. No lost record is guessed
+and no assigned value is reused. P0 never emits or claims Anchor
+`CLAIMED`/`CLEAN_RELEASED`. Unreconcilable Store/Audit mismatch is non-ready and
+requires a new runtime. The ADR updates the profile boundaries in ADRs 0019, 0021,
+0026, 0027, 0029, 0036, and 0040 plus their glossary terms; Integrity semantics
+remain unchanged.
 
 The same ADR defines P0 Control Initialization without Locator, Initialization
 Manifest, Identity Anchor, Runtime Metadata, or hidden defaults. Under the held
-Daemon Instance Lock, an authorized complete proposed Configuration Snapshot
-causes the daemon to generate the random Runtime ID and History Epoch. Initial
-Model, Alias, Certification, and model-scoped Configuration sets are explicitly
-empty and may change only by later Control Mutation. Initialization publishes
-version-one Control State, the
-first fully synchronized sequence range, and one exact pending Event Sequence
-one Epoch Open envelope in a new SQLite Store. Transaction commit and explicit
-database-parent synchronization are distinct crash boundaries; together they
-form the live Native Authority publication barrier. Before generating any new
-identity or sequence after a crash, the next process completes SQLite rollback
-recovery and classifies exact Store bytes. An absent transaction remains
-uninitialized. An exact committed candidate reuses its Runtime ID, History Epoch,
+Daemon Instance Lock, the daemon acquires the installation qualification lock;
+the offline qualifier never acquires a Runtime lock, so no reverse order exists.
+The daemon retains that lock through initialization commit and database-parent
+synchronization, then may release it. An authorized complete proposed
+Configuration Snapshot plus the exact verified Policy-selected storage record
+causes the daemon to generate the random Runtime ID and History Epoch.
+Initial Model, Alias, Certification, and model-scoped Configuration sets are
+explicitly empty and may change only by later Control Mutation. Initialization
+publishes the immutable qualification binding, version-one Control State, the
+first fully synchronized sequence range, and one exact pending Event Sequence one
+Epoch Open envelope in a new SQLite Store. Transaction commit and explicit
+database-parent synchronization are distinct crash boundaries; together they form
+the live Native Authority publication barrier. Before generating any new identity
+or sequence after a crash, the next process completes SQLite rollback recovery and
+classifies exact Store bytes. An absent transaction remains uninitialized. An
+exact committed candidate reuses its qualification, Runtime ID, History Epoch,
 range, generation, and pending envelope, repeats the parent synchronization, and
-finishes forward. Any third state fails closed. Epoch Open fixes the Audit
-Registry Identity and initial Generation Hash before readiness, and no path
-creates a second identity from a possibly committed transaction.
+finishes forward. Any third state fails closed. Epoch Open fixes the Audit Registry
+Identity and initial Generation Hash before readiness, and no path creates a
+second identity from a possibly committed transaction.
 
 For every later P0 Control Mutation, a bounded executor validates one complete
-successor while the predecessor remains active. Before publishing a pending
-envelope, the Event Loop obtains a typed Predecessor Fence from the single Audit
-Writer: every earlier assigned record has been appended, strongly synchronized,
-verified, and the returned Audit Head exactly matches the proposed predecessor.
-The Event Loop performs no direct I/O. At a synchronized Turn boundary it
-revalidates the complete token and fence, assigns the mutation's Event Sequence
-as the immediate successor, and builds the exact pending envelope. Any intervening
-Core Event or safety event invalidates the fence; that event is handled first and
-the mutation must obtain a new fence rather than publish against an old head.
+successor while the predecessor remains active. Before allocating a Control Mutation
+Operation ID, the Event Loop proves the complete build-derived Control Mutation
+Sequence Headroom remains in already durable ordinary ranges; if not, it completes
+the guarded range-reservation transaction first. Checked arithmetic with no
+aggregation covers the Effect-creation transition, the P0 Control Fence Attempt
+Limit times its per-attempt discretionary Intervening Assignment Limit, all
+mandatory Critical/cancellation/disconnect/Device-Failure/shutdown transitions
+admitted through bounded Core Event Reserve, every worst-case remaining ordinary
+safe completion in the build-generated Runtime Closure Registry, and the larger
+terminal branch of one nonpublication failure-or-cancellation Result, including
+trustworthy exact Store absence, or the Store-publication plus exact-envelope-
+completion Result pair. It cannot borrow Terminal Sequence Reserve. Sequence
+Exhausted or trustworthy exact-absent reservation outcome therefore leaves no mutation
+Effect or owner. An indeterminate reservation commit or parent barrier latches Storage
+Barrier Failure without a mutation ID or Control Outcome Indeterminate response and
+makes no unchanged-high-water claim. At a
+synchronized boundary the Event Loop revalidates the complete mutation token,
+current next value, and full headroom; drift is a no-ID state conflict. Only then
+does the daemon allocate one Operation ID, and Core atomically records the
+prepublication Effect, one-in-flight proposal owner, and headroom charge. Owner
+creation atomically closes the Core-owned Runtime Closure Gate until the terminal
+Result. The build-generated Runtime Closure Registry exhaustively owns every Core
+transition that can increase future sequence-and-Audit closure liability, including
+Request Acceptance, Core connection-state creation, Reservation or Residency Demand,
+and a new independent Operation or Effect. While closed, only a registered transition
+that advances or replaces already charged obligations without increasing its
+remaining maximum may commit; read-only status that creates no Core object remains
+available. C37 owns the registry and Core gate state; S11 consumes its generated
+checked maxima but cannot add transition kinds or change gate policy. The daemon then
+requests a typed Predecessor Fence
+from the single Audit Writer: every earlier assigned record must be appended,
+strongly synchronized, verified, and the returned Audit Head must exactly match the
+proposed predecessor. The writer returns this daemon-orchestration witness without
+creating a Core Event or Effect Result. Each attempt has one closed outcome:
+`granted`, `stale`, `audit_degraded`, or `storage_barrier_failure`. Intervening
+assignment, Core Event, safety event, head change, target mismatch, or writer-
+generation change is `stale`; it grants no publication authority and assigns no
+publication sequence. Each outstanding attempt permits only the nonzero build-owned
+discretionary Intervening Assignment Limit; after that many discretionary ordinary
+assignments, the Event Loop defers more discretionary work while bounded Fence I/O
+completes. Mandatory safety events remain processable and consume their separately
+calculated component of the same headroom, never Terminal Sequence Reserve.
+The daemon may retry only below the nonzero P0 Control Fence Attempt Limit. Individual
+stale attempts are internal and unsequenced. Before barrier entry, a known graceful
+cancellation uses the protected prepublication terminal Result to close the Effect,
+owner, and headroom and reopen the Runtime Closure Gate; a fail-stop safety outcome
+fabricates no Result. Exhaustion assigns the current next
+value to one nonpublication failure Effect Result; Core closes the Operation ID,
+proposal owner, and remaining headroom and reopens the Runtime Closure Gate before
+stable typed busy. An
+`audit_degraded` outcome is daemon-owned I/O custody: entry, failed supervision,
+and recovery assign no Event Sequence or Result. It keeps the Operation ID, owner,
+headroom, and exact Core stage pending, then resumes Fence acquisition while
+allowing only the already budgeted safety and registered nonincreasing closure transitions.
+Those closure transitions must be registered nonincreasing Runtime Closure Gate
+transitions.
+Audit Safety Reserve separately provides build-derived nonborrowable count-and-byte
+capacity for those records, so ordinary queue saturation cannot consume it.
 
-One guarded `FULL` SQLite transaction then writes the complete candidate, current
-pointer, sequence state, and pending envelope; explicit synchronization of the
-database parent directory completes P0's sole post-initialization Native Authority
-barrier. Only then may the exact generation become active in memory. Audit
-append/sync/verification and a `FULL` pending-clear transaction plus its parent-
-directory synchronization precede success acknowledgement. The Predecessor Fence
-and every publication phase have fixed bounds and fault classification. Any
-required SQLite, Audit, native-file, or parent-directory barrier failure enters P0
-Storage Barrier Failure. The daemon
-returns stable `outcome_indeterminate` when an operation exists, stops Device
-work and readiness, forbids every later Runtime write and same-session retry,
-retains its Daemon Instance Lock, and exposes only authenticated read-only status
-plus best-effort diagnostics until an OS signal terminates the process. It writes
-no failure marker or Clean Shutdown Boundary. Only a later process may acquire
-the OS-released lock and reconcile the stored bytes forward. P0 creates no
-Metadata staging or Anchor state for this protocol.
+At a synchronized Turn boundary the Event Loop performs final token/fence
+revalidation and enters the bounded Control Publication Commit Barrier by assigning
+the protected Store-result slot's next contiguous value to the pending Store
+publication Effect Result before external I/O and building its exact pending
+envelope. Until the typed Store publication result is consumed, that pre-sequenced
+result transition is the only Core Transition permitted; no other Backend call,
+Event Sequence assignment, or in-memory Control activation may occur. Barrier entry
+also publishes the Event Loop-owned Control Mutation Cancel Gate for the exact
+`{Daemon Instance ID, Operation ID, checked nonzero barrier generation}` after
+assigning the protected value and establishing the stage, but before external I/O.
+The session-local generation advances on every publication and never wraps. Control Plane authorization,
+protocol and Command ID validation, cancel permission, and bounded cancellation-ingress
+and Direct Response reservation precede the gate check on the single ordered Event Loop ingress path.
+The Event Loop rechecks the exact gate before Core conversion, and one connection
+completes each receive-order admission decision before a later command advances. While
+any gate is closed, every authorized Control Mutation cancellation completes before Core.
+An exact tuple receives typed `cancel_window_closed`; an unknown or different Daemon
+Instance ID, Operation ID, or barrier generation receives opaque `commit_in_progress`
+without disclosing identity existence. Both release their reservation after write or
+that Control Plane connection terminates and create no Core Event, Event Sequence,
+Effect Result, Audit Record, Domain Rejection, headroom charge, Store outcome, or
+unchanged-state claim. The gate remains
+closed through C19, barrier release, and exact-envelope completion and clears only
+with terminal owner release; Storage Barrier Failure never clears it. The originating
+Control Plane connection's disconnect ends only mutation-result delivery and may
+create at most one already charged deduplicated connection transition. Data Plane
+Client Disconnect retains its canonical audited cancellation of every owned request.
+None can overtake the Store Result, abort classification, select the pre-entry
+cancellation branch, or claim unchanged state. P24 owns the ordered protocol handler
+over a read-only gate projection; S18 alone publishes and clears that projection with
+the mutation barrier and owner lifecycle.
+The Event Loop performs no direct disk I/O; the sole bounded Store executor
+serializes this work with range reservation.
 
-The same three-state rule governs every P0 range and mutation crash boundary.
-After rollback recovery, absence preserves the predecessor/uninitialized state;
-an exact committed row is never regenerated or reused and instead receives the
-missing parent barrier plus exact pending-envelope completion; any other state is
-non-ready. Commit-before-parent-sync, parent-sync completion, Audit append, and
-pending-clear recovery each have separate witnesses. A live barrier error latches
-Storage Barrier Failure; a process crash leaves classification to the successor.
+One guarded `FULL` SQLite transaction writes the complete candidate, current
+pointer, and pending envelope while leaving P0 Audit Sequence State unchanged.
+Explicit database-parent synchronization completes P0's sole post-initialization
+Control Native Authority barrier. Trustworthy exact absence consumes the pre-
+sequenced Store-result slot as one nonpublication failure Result, preserves the
+predecessor, and closes the Effect, owner, and headroom without activation or a
+dependent Effect. Trustworthy exact committed success instead drives C19, activates
+the generation, advances the same owner, emits one dependent exact-envelope
+completion Effect, and preserves the last protected Result slot before the commit
+barrier releases. An indeterminate outcome produces no Result. Barrier release does not
+release the owner or ordinary work: the Runtime Closure Gate and Control Mutation
+Cancel Gate remain closed, and discretionary Turn dispatch stays deferred while only
+headroom-charged bounded safety and registry-approved nonincreasing closure transitions
+may interleave with exact-envelope completion. Audit append,
+synchronization, verification, and a `FULL` pending-clear transaction plus parent
+synchronization then return that Effect's ordinary sequenced Result. Only its
+accepted Core transition releases the owner/headroom, reopens both gates, and
+acknowledges success. Every Control Mutation cancellation continues to receive its
+bounded pre-Core Direct Response: `cancel_window_closed` for the exact tuple or opaque
+`commit_in_progress` for any other tuple. The originating Control Plane disconnect
+affects only delivery. Neither rolls back the candidate, repeats
+Store publication, or closes the owner. An
+ordinary post-publication append failure before the required sync attempt retains
+the same Effect, owner, headroom, and exact envelope-completion stage under Audit
+Degraded; supervised recovery may resume only that Effect, never allocate another
+Operation ID or repeat Store publication.
+After Operation ID allocation, failure of an actually attempted required
+Predecessor Fence file/parent synchronization, SQLite commit, database-parent,
+Audit synchronization/verification, pending-clear commit, or pending-clear parent
+barrier enters P0 Storage Barrier Failure and returns stable
+`outcome_indeterminate` without claiming either predecessor or candidate. Before ID
+allocation, candidate/token/capacity and trustworthy exact-absent range outcomes are
+typed pre-operation failures, but a range commit or parent-barrier failure still
+latches Storage Barrier Failure without a mutation ID or unchanged-high-water claim.
+Queue capacity,
+ordinary append failure, or inability to reach a required synchronization attempt
+is `audit_degraded` and retains the exact pending operation stage; individual
+`stale` attempts remain internal, while bounded exhaustion uses the ordinary
+sequenced failure Result described above. None assigns the publication sequence or
+latches Storage Barrier Failure. A required fence durability failure occurs before
+publication-sequence assignment, so the current next value and all remaining
+headroom values remain unassigned, the live Effect is discarded only by fail-stop
+Daemon Failure, and the successor process closes that tail without recovering the
+Effect. Failure never
+causes the daemon to fabricate a missing Effect Result. After
+barrier entry, Bootstrap first classifies the Store publication:
+an absent candidate leaves the assigned value to close as assigned-but-
+unsynchronized-lost, one exact committed candidate completes any exact Pending
+Audit Envelope forward and excludes its sequence from the tail, and a third state
+fails closed. Storage Barrier Failure stops Device work and readiness, forbids
+every later Runtime write and same-session retry, retains the Daemon Instance Lock,
+and exposes only authenticated read-only status plus best-effort diagnostics until
+OS signal termination. It writes no failure marker or Clean Shutdown Boundary.
+Only a later process may acquire the OS-released lock and reconcile stored bytes
+forward. P0 creates no Metadata staging or Anchor state for this protocol.
+
+After rollback recovery, Bootstrap classifies each P0 durable boundary by its own
+persisted evidence and never recovers or trusts a session-local Fence. Initialization
+is absent and Uninitialized, one exact committed identity candidate whose pending
+Epoch Open uses the Epoch Genesis Hash, or invalid. Range reservation is absent with
+the predecessor high-water, one exact committed P0 Audit Sequence State that receives
+any missing parent barrier and has no Pending Audit Envelope, or invalid. Control
+Mutation is absent with the predecessor, one exact committed candidate carrying one
+exact envelope, or invalid. The mutation envelope may be appended only when its
+persisted predecessor equals the current verified Audit head; if the exact record is
+already present, its sequence, predecessor, bytes, and identity must verify in-chain
+before clear. Pending-clear is classified separately as uncleared, exactly cleared,
+or invalid. Commit-before-parent-sync, parent-sync completion, Audit append, and
+pending-clear recovery each have separate witnesses. A live required durability
+error latches Storage Barrier Failure; a process crash leaves byte classification to
+the successor.
 
 The bounded SQLite executor applies the same commit-plus-parent-directory barrier
 to every successful P0 write transaction, including registry, Configuration,
@@ -239,11 +397,13 @@ Model, Configuration, and Certification Store helpers can encode and validate
 immutable rows only inside a caller-owned uncommitted transaction. They expose no
 commit, current-pointer, in-memory activation, or acknowledgement operation. P0
 Initialization is the only genesis path; afterward the unified mutation
-transaction above is the only path that can advance Control authority, and its
-parent barrier is the only point after which Core may activate that successor.
-External model, Configuration, and Certification commands therefore create a
-complete proposal Effect, not an active Core transition. Only the typed committed-
-publication result from that unified path can drive C19's atomic activation.
+transaction is the only path that can advance Control authority, while the
+guarded range-reservation primitive alone advances P0 Audit Sequence State. The
+mutation parent barrier is the only point after which Core may activate its
+successor. External model, Configuration, and Certification commands therefore
+create a complete proposal Effect, not an active Core transition. Only the typed
+committed-publication result consumed inside the Control Publication Commit Barrier
+can drive C19's atomic activation.
 
 A single daemon-session Storage Barrier Failure latch and write guard exist
 before any Runtime Store/Audit writer or Device startup. The first typed required-
@@ -253,10 +413,12 @@ rejected before a syscall. Repeated observations cannot replace the first fact,
 retry a write, emit Audit, release the instance lock, or enter graceful shutdown.
 All P0-6 writers consume this one guard rather than implementing local recovery.
 
-The Daemon Instance Lock has no live-process release operation. Its descriptor
+The installation-scoped Daemon Instance Lock has no live-process release operation
+and no Runtime-derived path. Its descriptor
 remains owned through Backend destruction, Clean Shutdown Boundary, and the last
 daemon instruction, and only OS process termination releases it. A successor
-therefore cannot acquire the lock while the prior process is alive; acquisition
+therefore cannot acquire that unchanged lock while the prior process is alive,
+whether the predecessor exits gracefully, fails, or is replaced under a new Runtime ID; acquisition
 is combined with a fresh post-exit Resource Evidence baseline before the Process
 Reclaim Barrier can clear.
 
@@ -592,7 +754,7 @@ independently green and at or below its target when measured.
 | D01 | `docs(adr): align the accepted P0 implementation order` | Correct ADR 0032's final implementation-order sentence | ADR/CONTEXT consistency and three approvals | docs only |
 | D02 | `docs(adr): complete the in-process backend seam` | Update ADRs 0008, 0011-0014, 0018, 0020, 0022, 0025, 0031, 0034 plus glossary for capability closure, ownership release/unload, load rollback, profile CAS, transition, Bootstrap/Signal/Operation descriptors, Support Budget, Exclusive, fail-stop | Admission, timing, release, reclaim, resource-signal, ownership, and conformance consistency | docs only |
 | D03 | `docs(adr): freeze the p0 token generation contract` | Update ADRs 0022/0027/0031 and glossary with compact nonempty-support Generation Parameters, RNG advancement, durable registered Model Descriptor authority, build-bound Generation Semantics/Certification identity, exact binary32 tensor flow, and Service Class mapping | Descriptor restart, enum/presence/range/tie/cutoff/non-finite/subnormal/no-crossing/survivor-below-K/zero-uniform/state-vector and applicability-invalidation matrix; no opaque Backend parameters | docs only |
-| D04 | `docs(adr): define p0 audit sequence authority` | Define P0 Initialization, sole later mutation authority, durable Predecessor Fence, commit/parent three-state recovery, pending-before-tail, complete lost suffix, range/high-water, and pre-writer Storage Barrier Failure latch; update P0 branches of ADRs 0021/0026/0027/0036/0040 plus glossary | No Anchor/Locator/Metadata or second pointer path; genesis, mutation, tails, registry, terminal reserve, fail-closed session complete | docs only |
+| D04 | `docs(adr): define p0 audit sequence authority` | Define exact P0 storage-qualification binding, Control Initialization, sole later Control mutation authority, range-only sequence-state authority, build-derived mutation headroom and Audit Safety Reserve, Core-owned Runtime Closure Gate, Event Loop-owned Control Mutation Cancel Gate, bounded noncreating Predecessor Fence interleaving, known-absent closure, two-stage success Results with no post-C19 discretionary work, installation-scoped process lock across every successor, Control Publication Commit Barrier, commit/parent recovery, pending-before-tail, lost suffix, and pre-writer Storage Barrier Failure; align ADRs 0019/0021/0026/0027/0029/0036/0040 plus glossary | No Anchor/Locator/Metadata, implicit latest qualification, same-ID P0 Rebind, second pointer, sequence-owner/headroom overlap or terminal borrowing, closure-liability fanout, delayed or identity-cycling cancel custody, safety-queue starvation, Event Loop publication/result gap, post-C19 discretionary assignment, clean-restart or cross-Runtime lock bypass, fabricated indeterminate Result, or unchanged-state claim after a required barrier failure | docs only |
 | D05 | `docs(adr): bind runtime overhead evidence` | Add daemon-owned evidence-bound, result-branch-disjoint overhead plus complete Owner-Thread Support Budget interference and update ADRs 0015/0024 plus glossary | Receipt, Plan Rejection, and every readiness-time support call have complete nonoverlapping spans and Deadline Cost coverage without online widening | docs only |
 | T01 | `build: audit unstaged commit scope` | Tracked/untracked path hashing and documentation-aware LOC checker | Unit fixtures for add/delete/rename/binary/untracked and self-count | <= 300 |
 | B01 | `build: initialize the Rust workspace` | Rust 1.97.1 toolchain, workspace, core crate, format/lint/test entrypoints | Format, clippy, workspace tests | <= 180 |
@@ -620,7 +782,7 @@ independently green and at or below its target when measured.
 | C16 | `feat(core): apply request materialization results` | Success owns state; zero-ownership failure splits the Request Backend Allocation Budget directly; partial ownership retains its complete Budget for release | Budget identity/conservation, daemon-component isolation, zero-allocation/allocated rollback, no-call/retry/early split/leak | <= 400 |
 | C17 | `feat(core): revalidate certified profiles` | Candidate/description invalidation and existing Reservation feasibility | SLO Risk and new-Admission block without silent re-promise | <= 380 |
 | C18 | `feat(core): quarantine certified bound violations` | Preserve Receipt, remove exact key, optional parent escalation, explicit recertification | Estimate miss does not quarantine; automatic widening forbidden | <= 400 |
-| C19 | `feat(core): activate complete control successors` | Only a committed publication result atomically installs the complete Model/Alias/Certification/Configuration Snapshot at a Turn boundary; Weight baseline alignment and new-Admission-only Timing Commitments | Proposal alone cannot mutate active authority; no partial visibility, historical debt, or rewritten promise | <= 400 |
+| C19 | `feat(core): activate complete control successors` | Exact-absent Store Result preserves the predecessor and closes Effect/owner/headroom without a dependent Effect; only a committed Store Result atomically installs the complete Snapshot at a Turn boundary, then advances the same owner and emits its dependent exact-envelope completion Effect while retaining the final headroom Result slot; Weight baseline/new-Admission Timing Commitments | Known absence closes once; proposal cannot activate; Store success cannot acknowledge/release before accepted evidence-completion Result; no missing Effect, partial visibility, historical debt, or rewritten promise | <= 400 |
 | C20 | `feat(core): order cooperative cancellation` | Preparing/Warming/pre-materialization no-call cancellation, owned queued release, in-flight Cancel Pending, staged-output discard, status transition | Event Sequence, ownership, Receipt, and Publication matrix | <= 400 |
 | C21 | `feat(core): reserve per-turn output capacity` | Concrete pre-execution Turn Output Reservation Effect and non-runnable backpressure state | No output Plan without capacity; cancellation releases reserve | <= 380 |
 | C22 | `feat(core): release backend request state` | Ownership-gated exactly-once release Effect; only accepted Result consumes ownership, partitions the exact Request Backend Allocation Budget, and moves actual allocation to Pending Reclaim | No daemon-capacity authority, no-call unowned path, partial allocation/use, terminal/cancel/eviction, no retry/unload/early reuse | <= 400 |
@@ -638,6 +800,7 @@ independently green and at or below its target when measured.
 | C34 | `test(core): replay bounded dual-model prefill` | One Prefill Chunk per fresh Plan with Decode interleaving | Byte-identical fixed-seed transitions and operation counts | <= 380 |
 | C35 | `feat(replay): add the bounded core replay driver` | Strict replay input/output over `Core::handle` | Golden, malformed, and repeatability cases | <= 400 |
 | C36 | `perf(core): measure release scheduler decisions` | Core-only Release measurements outside serialization and IPC | 100 warmups, >=1000 decisions, one sample per decision | <= 360 |
+| C37 | `feat(core): gate runtime closure liability` | Build-generated exhaustive Runtime Closure Registry plus Core-owned gate state covering every liability-increasing constructor, checked maximum, and registered nonincreasing closure edge | Every constructor/edge enumerated; Request Acceptance, Core connection creation, Reservation/Residency Demand, and new Operation/Effect reject while closed; closure conservation, read-only status, terminal reopen, Audit-Degraded retention | <= 400 |
 
 P0-1 exits only when Core has no Tokio, Protobuf, SQLite, MLX, I/O, async,
 callback, or system-clock dependency and the three Core benchmark lanes can be
@@ -766,12 +929,12 @@ explicitly without confusing zero with absence.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
-| P01 | `feat(policy): load the bounded installation policy` | Parse/identify fixed Data, Control, live-maintenance, and offline-maintenance UID/GID allowlists | Canonical identity plus malformed/oversize and independent-list tests | <= 400 |
+| P01 | `feat(policy): load the bounded installation policy` | Parse/identify fixed Data, Control, live-maintenance, and offline-maintenance UID/GID allowlists plus an opaque strongly typed File Hash naming the exact P0 Runtime Authority Volume qualification record; record decoding remains U01/S22-owned | Canonical identity, explicit record presence, malformed/oversize, and independent-list tests; no storage read or `latest` selector | <= 400 |
 | P02 | `feat(daemon): authenticate data-plane peers` | Permission-restricted Unix socket plus macOS `LOCAL_PEERCRED` check | Filesystem-only and unlisted-root rejection | <= 380 |
 | P03 | `feat(daemon): authenticate control-plane peers` | Stricter socket allowlist and connection-scoped Maintenance Capability | Disconnect/session expiry and no protocol-only grant | <= 400 |
 | P04 | `build(protocol): generate canonical protocol artifacts` | Pinned deterministic descriptor/registry/support-manifest tooling | Double generation and registry zero/reuse tests | <= 400 |
 | P05 | `build(protocol): lock data-plane v1.0` | Token IDs, selector, required Service Class, closed presence-tracked Generation Parameters, optional `fixed64` Sampling Seed, bounded stop sequences, Max Output, submit/query/subscribe/cancel/status/output | Descriptor hash; enum numbers; omitted/zero/nonzero Seed; subnormal positive versus negative-zero/nonfinite floats; greedy/categorical golden frames and limits | <= 400 |
-| P06 | `build(protocol): lock control-plane v1.0` | P0 initialize with complete global Configuration/no IDs, plus model/config/certification/Exclusive/management/status | Independent descriptor, empty scoped sets, limits, golden frames | <= 400 |
+| P06 | `build(protocol): lock control-plane v1.0` | P0 initialize with complete global Configuration/no IDs, initialization-specific indeterminate response without mutation token, plus model/config/certification/Exclusive/management/status, sequenced fence-busy terminal, pre-barrier cancellation, Event Loop pre-Core `cancel_window_closed` and opaque `commit_in_progress` Direct Responses, Control Plane mutation-delivery disconnect, pre-ID range-barrier fatal status, and Audit-Degraded pending Operation ID/stage/remaining-headroom status | Independent descriptor, empty scoped sets, exact versus nonmatching cancel-window frames, identity nondisclosure/no-Audit classification, Data Plane disconnect separation, limits, golden frames | <= 400 |
 | P07 | `feat(protocol): negotiate the data plane` | Exact descriptor, capability intersection, typed limits, frozen write durations | Old/new, malformed, revoked, and mismatch matrix | <= 400 |
 | P08 | `feat(protocol): negotiate the control plane` | Independent Hello, support manifest, model registry limit, Maintenance gate | Old/new, unknown required, and privilege cases | <= 400 |
 | P09 | `feat(daemon): enforce ingress budgets` | Global/per-connection command count/bytes, Preparing, Warming, active request, and output-backlog capacity | Overloaded precedes Request ID and fairness debt | <= 400 |
@@ -789,8 +952,9 @@ explicitly without confusing zero with absence.
 | P21 | `feat(daemon): serve exclusive lease commands` | Explicit enter/renew/stop/exit and one resource-bounded operation | Shared pause, expiry/disconnect, certified safety point | <= 400 |
 | P22 | `feat(daemon): serve management cancellation` | Locked privileged request inspection and cancellation DTOs | Ownership separation and ordered Core Event | <= 340 |
 | P23 | `test(daemon): exercise saturated concurrent clients` | Multiple clients over one Turn with every ordinary budget full | Cancellation order, Critical, shutdown, output, cross-model, hot-path counts | <= 400 |
+| P24 | `feat(daemon): reject closed mutation cancellation` | Ordered Control Plane pre-Core handler over the active `{Daemon Instance ID, Operation ID, checked barrier generation}` gate after authorization/validation and cancellation-ingress plus Direct Response reservation; exact tuple returns `cancel_window_closed`, every other tuple returns opaque `commit_in_progress` | Same-socket ordering, ABA/unknown/different identity flood during barrier and post-C19 Audit Degraded, identity nondisclosure, both responses no-Core/no-Audit/no-headroom, write/disconnect reservation release, no retained/replayed command, Data Plane disconnect separation | <= 380 |
 
-### P0-6: Durable P0 Control And Audit
+### P0-6: Qualified Durable P0 Control And Audit
 
 The Audit payload schema is a private durable-format contract, not either public
 socket protocol. It has its own append-only registry, canonical descriptor lock,
@@ -799,6 +963,9 @@ epoch's fixed Audit Registry Identity.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
+| U01 | `build(storage): lock the p0 capability formats` | Storage Capability Profile plus bounded immutable Qualification Record and two-slot Head codecs/identities shared with later Integrity work | Double generation, golden records/slots, unknown format, wrong profile/volume/build/OS, torn/equal-disagreeing slots | <= 400 |
+| U02 | `feat(storage): probe p0 authority volumes` | Offline qualifier under the installation qualification lock, and with no Runtime lock, runs the exact build-owned syscall/durability profile and writes one synchronized immutable candidate record | Real temporary-volume probes, fixed EINTR deadline, failure before selection, no daemon write probe or reverse lock acquisition | <= 400 |
+| U03 | `feat(storage): publish p0 qualification records` | Validate lineage predecessor, publish U02 candidate through the fixed Head barrier, and return its exact identity for explicit Installation Policy use | Record/Head crash points, one-slot healing, orphan non-adoption, lineage disagreement, explicit identity verification, no `latest` API | <= 400 |
 | S01 | `build(store): add the bounded sqlite executor` | One connection/executor, FULL durability profile, checked bindings, explicit database-parent sync, and typed barrier errors | Open/configuration/commit/parent failure tests over temporary non-Runtime stores | <= 360 |
 | S02 | `feat(daemon): latch storage barrier failures` | Session-wide first-failure observation, write guard, Device shutdown signal, read-only mode, and no retry/marker/Clean path before any Runtime writer is wired | First/duplicate failure, every later write denied before syscall, status-only custody | <= 400 |
 | S03 | `feat(store): create the versioned control schema` | Runtime/history identity, generations, current-state pointer, bounded tables through the shared write guard | Fresh/open/unknown schema and latched-guard cases | <= 400 |
@@ -807,27 +974,27 @@ epoch's fixed Audit Registry Identity.
 | S06 | `feat(store): encode certification record rows` | Transaction-scoped immutable record/evidence identities and finite Coverage Manifest with no activation API | Candidate round-trip, invalid reference rejection, current generation unchanged | <= 400 |
 | S07 | `feat(certification): compile the authorization index` | Offline verified Coverage Manifest to read-only exact-key index | Missing reference, drift, wildcard, and dominance-proof cases | <= 400 |
 | S08 | `feat(certification): prepare certification successors` | Validate candidate record/index replacement, explicit recertification evidence, and bounded Profile Revalidation plan without persistence or activation | Quarantine remains until unified mutation activation; changed bounds identify exact descriptions/candidates | <= 400 |
-| S09 | `feat(daemon): hold the instance lock` | Exclusive descriptor ownership from Bootstrap until OS process termination; no explicit unlock path | Competing process remains blocked through the last live instruction and latched read-only custody | <= 360 |
+| S09 | `feat(daemon): hold the instance lock` | One installation-fixed absolute descriptor identity outside every Runtime, acquired before Runtime-specific locks/writers and held from Bootstrap until OS process termination with no explicit unlock path | Same- and cross-Runtime-ID competing processes remain blocked through the last live instruction and latched read-only custody | <= 360 |
 | S10 | `build(audit): lock the p0 audit schema` | Bounded payload `.proto`, append-only nonzero record-kind registry, canonical descriptor lock, Audit Registry Identity | Double generation, golden payloads, unknown/reserved/reused kind rejection | <= 400 |
-| S11 | `feat(audit): compute the terminal sequence reserve` | Build-time checked worst-case formula and ordinary/terminal split | Binary maxima, no aggregation, overflow/Sequence Exhausted | <= 360 |
+| S11 | `feat(audit): compute sequence reserves` | Build-time checked Terminal Sequence Reserve plus P0 Control Mutation Sequence Headroom consuming C37's exhaustive registered maxima, Effect creation, attempt x noncreating discretionary-interleaving limits, monotonic per-object mandatory safety edges with duplicate-signal coalescing, and the larger failure/success Result branch | C37 registry projection is complete; binary maxima, no aggregation/borrowing, repeated raw signals assign no event, Runtime Closure Gate prevents downstream fanout, checked overflow, exact edge values, Sequence Exhausted | <= 400 |
 | S12 | `feat(audit): encode bounded chained records` | Framing, sequence, registry identity, checksum/hash link, content exclusion | Golden, oversize, corruption | <= 380 |
-| S13 | `feat(audit): run one bounded audit writer` | Ordered guarded queue and strong file/namespace barriers; pre-barrier failures are Audit Degraded and required-barrier failures feed S02 | Saturation, append, file/parent sync, classification, latch, and no Event Loop direct I/O | <= 400 |
-| S14 | `feat(audit): fence durable predecessors` | Typed sync-through operation drains all assigned records, strongly synchronizes/verifies the exact head, and returns a bounded Predecessor Fence | Assigned-unsynced drain, stale target/head mismatch, intervening append, and barrier failure | <= 360 |
-| S15 | `feat(store): reserve p0 audit sequence ranges` | SQLite P0 Audit Sequence State; guarded `FULL` commit plus database-parent sync publishes high-water before assignment | Absent/exact/third-state custody at commit and parent crash points; no reuse/Anchor bytes | <= 400 |
-| S16 | `feat(store): initialize p0 control and audit` | From proposed Configuration publish daemon IDs, empty registries, version-one State, pending sequence-one Epoch Open, and exact Audit root through guarded barriers | Crash leaves absent or one exact non-ready identity/pending custody; no second identity or forward-resume claim | <= 400 |
-| S17 | `feat(store): validate p0 control mutation intents` | Bounded complete successor validation, daemon Operation ID, complete token, and one-in-flight ownership while predecessor remains active | Stale/duplicate/busy, invalid complete successor, and bounded pre-fence failures | <= 360 |
-| S18 | `feat(store): fence p0 control mutations` | Obtain S14, revalidate token/fence at a Turn boundary, assign its immediate-successor sequence, and build exact pending envelope | Assigned-unsynced predecessor, intervening safety/Core Event invalidation, stale fence, no sequence on abort | <= 380 |
-| S19 | `feat(store): publish p0 control mutations` | Sole guarded post-genesis transaction encodes complete candidate and advances current pointer/sequence/pending; database-parent sync precedes sole in-memory activation | No S04-S08 authority path; absent/exact/third state at commit/parent crash, no early activation, stable `outcome_indeterminate` | <= 400 |
-| S20 | `feat(store): complete p0 mutation audit` | Append/sync/verify exact envelope whose predecessor was fenced, then guarded `FULL` pending-clear commit plus database-parent sync before acknowledgement | Assigned-unsynced-before-mutation crash, every Audit/clear barrier, no rollback/regeneration/early acknowledgement | <= 400 |
+| S13 | `feat(audit): run one bounded audit writer` | Ordered guarded ordinary queue plus build-derived nonborrowable Audit Safety Reserve count/bytes aligned with Core Event/Terminal Sequence maxima; strong file/namespace barriers; pre-barrier failures are Audit Degraded and required-barrier failures feed S02 | Ordinary saturation cannot consume safety capacity; count/byte maximum edge, append, file/parent sync, classification, latch, and no Event Loop direct I/O | <= 400 |
+| S14 | `feat(audit): fence durable predecessors` | Typed sync-through operation drains all assigned records and returns exactly granted, stale, audit-degraded, or storage-barrier-failure; only granted carries a session-local Predecessor Fence | Assigned-unsynced drain, stale target/head/generation/intervening work, pre-sync degradation, actual file/parent sync failure | <= 380 |
+| S15 | `feat(store): reserve p0 audit sequence ranges` | Sole post-genesis writer of SQLite P0 Audit Sequence State; daemon-owned unsequenced/no-ID/no-Effect/no-Audit primitive whose guarded `FULL` commit plus database-parent sync publishes high-water and can prove full S11 mutation headroom before assignment on the single Store executor | Exact headroom/range edge; known absence versus indeterminate latch; absent/exact/third-state custody at commit and parent crash points; no unchanged claim, pending envelope, mutation high-water update, terminal borrowing/reuse, or Anchor bytes | <= 400 |
+| S16 | `feat(store): initialize p0 control and audit` | While holding installation-scoped S09, acquire the qualification lock, require the Policy-selected U03 record to be Head-selected, and hold that lock through commit-plus-parent publication of its immutable binding with daemon IDs, empty registries, version-one State, genesis sequence state, pending sequence-one Epoch Open, and exact Audit root | Lock order has no reverse path; wrong/stale/orphan record rejects before identity; crash leaves absent or one exact non-ready identity/pending custody; required-barrier failure returns `initialization_outcome_indeterminate` without a mutation token | <= 400 |
+| S17 | `feat(store): validate p0 control mutation intents` | Bounded complete successor validation/token check while predecessor remains active, producing no Operation ID or owner | Stale/duplicate/busy/invalid successor rejects without ID; no external publication or daemon-only owner | <= 380 |
+| S18 | `feat(store): fence p0 control mutations` | Prove full S11 headroom, revalidate token/next/headroom, then atomically allocate daemon Operation ID plus Core Effect/owner/headroom charge and close C37's Runtime Closure Gate until terminal; enforce registered nonincreasing interleaving and state-edge-deduplicated safety; pre-barrier cancel/exhaustion consumes one terminal Result, Audit Degraded retains stage/charge without a Core Event, granted protects Store-result/conditional-completion slots, Commit Barrier publishes P24's exact checked-generation Cancel Gate for all Control Mutation cancellation, and C19 stops discretionary assignment | Range edge/Sequence Exhausted/drift has no owner; assignments conserve charge; C37 constructor/closure integration, raw-safety coalescing, pre-entry cancel/exhaustion closure, gate publication-before-I/O and persistence through C19/degraded/failure, exact/nonmatching cancel floods conserve headroom and Audit reserve, terminal clear, fail-stop no Result, degraded resume unsequenced, and no post-C19 ordinary work/terminal borrowing | <= 400 |
+| S19 | `feat(store): publish p0 control mutations` | Inside S18, use the sole guarded post-genesis Control transaction for candidate/pointer/pending envelope without sequence-state change; trustworthy exact absence returns the pre-sequenced nonpublication Result, exact committed success drives C19 activation/owner advance, and indeterminate returns no Result | Absent closes without activation/dependent Effect; committed success cannot release owner; no helper authority, unsequenced callback, overtaking, early activation, fabricated result, or unstable third-state classification | <= 400 |
+| S20 | `feat(store): complete p0 mutation audit` | With the Runtime Closure and Control Mutation Cancel Gates closed and discretionary dispatch deferred, execute C19's dependent exact-envelope completion Effect: append/sync/verify fenced bytes, guarded `FULL` pending-clear commit plus parent sync, then return one ordinary sequenced Result whose accepted Core transition alone acknowledges success, releases owner/headroom, and reopens both gates; append failure retains Effect/stage/charge and the originating Control Plane disconnect ends only delivery | Protected final slot under maximum safety edges, same-ID exact-Effect resume, exact and nonmatching mutation cancels remain bounded no-Core/no-Audit/no-headroom Direct Responses, Data Plane disconnect still cancels owned requests, no rollback, Store replay, or unsequenced callback; only actual durability failures indeterminate; no regeneration/early release | <= 400 |
 | S21 | `feat(audit): retain bounded p0 segments` | Segment boundaries, synchronized retention boundary, garbage eligibility | Capacity, file/parent barrier, latch, and reclaim failures | <= 380 |
-| S22 | `feat(daemon): order policy-first bootstrap` | Installation Policy before socket, lock, or Runtime authority; construct S02 before opening Runtime writers, then fail-closed schema inspection | Syscall/byte ordering and no pre-guard writer fixture | <= 380 |
-| S23 | `feat(daemon): classify interrupted p0 publications` | After rollback recovery, keep absent predecessor/uninitialized state, or repeat parent sync for one exact committed range/identity/generation/pending row; reject every third state | Initialization/range/mutation three-state fixtures; never regenerate or reuse possible commits | <= 400 |
-| S24 | `feat(daemon): reconcile pending p0 audit` | After S23, append/verify/clear every exact Store-published initialization or mutation envelope before tail handling | Fenced predecessor required; every Audit/clear crash point; malformed/multiple pending rejects | <= 400 |
+| S22 | `feat(daemon): order policy-first bootstrap` | Installation Policy before socket, lock, or Runtime authority; construct S02, acquire installation-scoped S09 before every Runtime-specific lock/writer, then freeze and validate the exact Policy-selected U03 record against the live volume/build/Profile before opening a Runtime writer | Syscall/byte ordering across fresh/replacement Runtime IDs, missing/foreign record, no implicit Head selection, and no pre-lock/pre-guard/pre-qualification Runtime writer | <= 400 |
+| S23 | `feat(daemon): classify interrupted p0 publications` | Under the frozen record proof, classify initialization, range, mutation, and pending-clear separately; repeat only missing parent sync; range has no pending envelope and no path recovers a Fence | Epoch-Genesis init, no-envelope range, persisted-predecessor mutation, separate pending-clear fixtures; binding mismatch/third state fail closed; no regeneration or reuse | <= 400 |
+| S24 | `feat(daemon): reconcile pending p0 audit` | After S23, complete initialization only against Epoch Genesis Hash; append mutation only at its persisted predecessor or verify its exact in-chain record; then clear before tail | No session-local Fence input; already-present exact record, predecessor mismatch, every Audit/clear crash point, malformed/multiple pending reject | <= 400 |
 | S25 | `feat(audit): reconcile the p0 journal tail` | Only with no pending envelope, verify Clean or append one Crash Tail closing every never-assigned and assigned-but-unsynchronized-lost value through old high-water | Both lost classes, pending refusal, truncation/mismatch/sequence exhaustion, no reconstruction/reuse/Anchor fallback | <= 400 |
 | S26 | `test(daemon): integrate storage barrier custody` | Exercise S02 against every real SQLite, Audit/file, parent-sync, Bootstrap, retention, and shutdown barrier while retaining the OS-only lock | Device/write stop, first observation stable, authenticated status only, no marker/Clean/retry, next process alone reconciles | <= 400 |
 | S27 | `feat(daemon): restart with empty inference state` | Rebuild Control State including complete registered Model Descriptors only after S23-S25; rehash before readiness; no request/KV/Residency restoration or descriptor regeneration | Initialization/mutation three-boundary and clean restart; missing/mismatched descriptor enters Control Repair Mode; post-restart Top K uses restored vocabulary | <= 360 |
-| S28 | `feat(daemon): enforce the process reclaim barrier` | Successor lock acquisition proves prior process exited; sampler establishes fresh post-exit baseline | Real parent/child lifetime test; no acquire-before-exit, Fake/time/socket substitute | <= 400 |
-| S29 | `feat(daemon): gate p0 service readiness` | Require lock, Store/registry schema, reconciled prior bytes/Audit, Device Executor, Adapter, environment, Resource Evidence, and reclaim barrier; current-session latch remains non-ready | Successor may become ready only after exact forward reconciliation and every fresh prerequisite | <= 400 |
+| S28 | `feat(daemon): enforce the process reclaim barrier` | After any predecessor initialized Backend, acquisition of the unchanged installation-scoped lock proves that process exited for graceful same-ID restart, Daemon Failure, and cross-Runtime replacement; sampler then establishes a fresh post-exit baseline | Real clean same-ID, failed same-ID, and cross-Runtime-ID parent/child lifetime tests; Shutdown Result/Clean Boundary and lock-before-exit samples reject; no acquire-before-exit, new path/generation, Fake/time/socket substitute | <= 400 |
+| S29 | `feat(daemon): gate p0 service readiness` | Require the installation-scoped lock, exact frozen/bound Storage Qualification Record equality, Store/registry schema, reconciled prior bytes/Audit, Device Executor, Adapter, environment, and the Process Reclaim Barrier after every predecessor Backend initialization; current-session latch remains non-ready | Every successor may become ready only after exact forward reconciliation and required post-exit/acquisition-of-the-same-lock Resource Evidence; true first genesis is explicit; clean same-ID, failed same-ID, and cross-Runtime cases reject new lock path, pre-lock sample, logical shutdown proof, and binding drift | <= 400 |
 | S30 | `feat(daemon): perform graceful shutdown` | Reject work, cancel/release live work, accept one validated zero-ownership Result plus confirmed shell deallocation, sync Clean Shutdown Boundary, then terminate with lock | Boundary only after Result/deallocation; failure/no-result/safe-point/barrier has no retry, boundary, or `CLEAN_RELEASED` claim | <= 400 |
 | S31 | `test(store): expose bounded fault custody` | Real relative files, phase markers, initialization/mutation/restart/shutdown inspection, no Effect replay | Assigned-unsynced predecessor then mutation crash, atomic publish/corrupt/truncate/SIGTERM, assigned-lost tail, all barrier-failure custody | <= 400 |
 
@@ -844,7 +1011,7 @@ machine-readable result without claiming MLX correctness or performance.
 |---|---|---|---|---:|
 | K01 | `test(gate): cover scheduling and admission properties` | Weighted service/config changes, finite authorization, exact environment, cross-model load/profile Generation refresh, Exclusive | No stale-result rejection or Admission; bounded stable reissue, examples/properties/fixed seeds | <= 400 |
 | K02 | `test(gate): generate lifecycle and residency sequences` | Never-started no-call, zero/partial materialization, owned release, release-before-unload, load re-description, Pending Reclaim, Critical eviction | Generated state machine, current description identity, allocation conservation, shrinkable replay | <= 400 |
-| K03 | `test(gate): inject executor and audit faults` | Profile post-mutation commit failure, P0 persistence recovery/fences, OS-only lock, Shutdown Result/safe-point/raw bypass, Executor/Audit/Storage failure | No divergent continuation, raw live destroy, retry, early Clean Shutdown Boundary, second identity/reuse/fabricated Receipt/Result/Effect replay/Anchor/marker | <= 400 |
+| K03 | `test(gate): inject executor and audit faults` | Profile post-mutation commit failure, P0 initialization-specific indeterminate response, qualification/binding, unsequenced range reservation/barrier failure, headroom edges, ordinary Audit saturation plus safety charge/byte edge, exhaustive Runtime Closure Registry constructors/closures, max Fence interleaving, repeated raw safety signals, four Fence outcomes, exhaustion/pre-entry cancel/exact-absent closure, authenticated ordered Control Mutation Cancel Gate exact/nonmatching flood and disconnect, degraded same-Effect continuation, two-stage success, dispatch deferral, clean same-ID and cross-Runtime process reclaim, typed recovery, shutdown and storage faults | Range reserve has no ID/Event/Effect/record/envelope; every liability-increasing constructor rejects and registered nonincreasing closure conserves charge; raw repeats coalesce; exact closed-window cancel returns `cancel_window_closed`, unknown/different returns opaque `commit_in_progress`, both release capacity on write/Control disconnect without Core/Audit/headroom change, Data disconnect remains audited request cancellation; every successor baseline follows same-lock acquisition; no starvation/borrowing, leaked charge/owner, fabricated Result/token, replay, recovered Fence, publication gap, lock-path bypass, unchanged claim, or early Clean | <= 400 |
 | K04 | `test(gate): assert incremental core work` | Every operation count, complete Exclusions, dirty-Model-only recompute, member-local Receipt | Exact count witnesses at binary maxima | <= 400 |
 | K05 | `test(gate): close the p0 core gate` | Aggregate examples, properties, generated sequences, faults, replay hashes | One command, complete matrix manifest, repeatable result | <= 300 |
 
@@ -868,7 +1035,7 @@ Benchmark revision is fixed and recorded.
 | Q08 | `feat(benchmark): expose governor qualification` | `residency-and-memory-governor` with real system samples | Reservation, Residency Service limits, Critical eviction, reclaim | <= 400 |
 | Q09 | `feat(benchmark): expose cross-model qualification` | `cross-model-serving` through production Data Plane | Timing, fairness, progress, throughput, output evidence | <= 400 |
 | Q10 | `feat(benchmark): expose observability qualification` | `observability-qualification` with honest P-1A quality | No command-buffer fairness overclaim | <= 360 |
-| Q11 | `feat(benchmark): expose persistence qualification` | P0 Control/Audit initialization, sole mutation path, predecessor fence, commit/parent tri-state, pending-before-complete-lost-tail, Storage Barrier Failure, restart without native snapshot recovery | Assigned-unsynced-before-mutation, genesis/mutation custody, assigned-lost closure, next-process reconciliation/readiness, empty inference restart | <= 400 |
+| Q11 | `feat(benchmark): expose persistence qualification` | P0 exact qualification binding, initialization-specific indeterminate response, Control/Audit init, unsequenced range reservation, separate sequence/current-pointer authorities, build-derived headroom/Audit Safety Reserve, exhaustive Runtime Closure Gate, four-way Fence bounds, exhaustion, exact-absent closure, pre-barrier cancellation and post-barrier exact/nonmatching Control Mutation Cancel Gate flood/disconnect, degraded continuation, two-stage success with post-C19 dispatch deferral, installation-lock clean/failure/replacement restart, typed recovery, pending-before-tail, Storage Failure, empty restart | Range absence versus indeterminate no-ID latch, headroom/safety conservation and signal coalescing, every closure-liability constructor/edge, owner/Result closure, same-Effect resume, authenticated ordered `cancel_window_closed`/opaque `commit_in_progress` no-Core/no-Audit/no-headroom responses with capacity release and Data/Control disconnect separation, unchanged lock plus fresh post-lock baseline for every successor, no Store replay/range envelope/recovered Fence/publication gap, assigned-lost closure/readiness | <= 400 |
 | Q12 | `feat(benchmark): expose same-process failure qualification` | Architecture-compatible protocol/owner/watchdog/fail-stop lane | No Backend process or private IPC | <= 380 |
 | Q13 | `feat(benchmark): expose certification qualification` | Production exact environment and Generation Semantics applicability/cache invalidation, quarantine, revalidation, recertification | Schema/algorithm identity drift through thin adapter over real probe, index, and Core | <= 400 |
 | Q14 | `chore: aggregate qualification evidence` | Run-level report, checksums, lane closure, and artifact containment | Every required lane represented exactly once | <= 360 |
