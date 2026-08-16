@@ -81,8 +81,16 @@ The concrete output-channel capacity reserved immediately before an output-produ
 _Avoid_: Admission reservation, unbounded socket buffer, Device Executor blocking
 
 **Token Request**:
-The MVP Data Plane request expressed as input token IDs, generation parameters, Service Class, a Model Alias or immutable Model Revision reference, Max Output Tokens, fixed Sampling Seed, and optional Stop Token Sequences. Request Acceptance resolves that selector exactly once and freezes the resulting Revision. Tokenization, chat templates, and text decoding belong outside TurnVector. Input length plus Max Output Tokens must not exceed the resolved Revision's context limit; TurnVector rejects overflow rather than truncating.
+The MVP Data Plane request expressed as input token IDs, one closed Generation Parameters value, required Service Class, a Model Alias or immutable Model Revision reference, Max Output Tokens, an optional presence-tracked caller Sampling Seed, and optional Stop Token Sequences. Before Request Acceptance the daemon validates revision-independent fields, resolves the selector exactly once, rejects an Unavailable target, validates Top K against the frozen Revision's registered Model Descriptor vocabulary size, validates context bounds, and fixes the effective Sampling Seed and origin. Tokenization, chat templates, text decoding, raw deadlines, and Backend-native generation objects belong outside TurnVector. Input length plus Max Output Tokens must not exceed the resolved Revision's context limit; TurnVector rejects overflow rather than truncating.
 _Avoid_: Prompt request, chat message, backend-native object
+
+**Generation Parameters**:
+The immutable four-field P0 token-selection value containing required Sampling Mode, Temperature, Top P, and Top K. Mode is the closed mapping `UNSPECIFIED=0` invalid, `GREEDY=1`, and `CATEGORICAL=2`; Temperature and Top P retain their accepted IEEE-754 binary32 bit patterns, Top K is `u32`, and no field has a default. Omission, negative zero, NaN, or infinity is invalid. Greedy requires positive-zero Temperature, Top P exactly `1.0`, and Top K `0`. Categorical requires Temperature in `(0, 2]`, Top P in `(0, 1]`, and Top K either `0` for disabled or strictly below the registered Model Descriptor's nonzero vocabulary size. P0 has no configurable logits bias, repetition, presence, or frequency penalty, Min P, XTC, or opaque Backend parameter. The versioned schema identity and complete allowed domain bind Certification Applicability.
+_Avoid_: Backend options map, model defaults, optional sampling fields
+
+**Generation Semantics Identity**:
+The immutable Evidence Hash of one canonical build-generated descriptor whose bytes enumerate the complete allowed Generation Parameters schema and domain, exact Greedy and Categorical token-selection algorithms, and Sampling RNG Schema transition. Deterministic double generation must reproduce the descriptor and hash. The same verified value is embedded in the daemon's Domain Type registry and in the Backend Bootstrap Manifest-bound complete Backend Capability descriptor; Backend Initialization requires exact equality before Service Readiness. The identity enters Environment Qualification, the fresh Environment Fingerprint, every applicable Certification Envelope, and the Admission cache key, so schema, domain, token-selection, or RNG drift fails closed rather than inheriting authorization.
+_Avoid_: Adapter self-attestation, model sampling defaults, runtime-inferred algorithm
 
 **Max Output Tokens**:
 The required per-request upper bound on generated tokens. Admission uses it to bound KV growth and output capacity; an unbounded generation request is invalid.
@@ -97,19 +105,27 @@ The single bounded output unit that one committed Turn may produce for one reque
 _Avoid_: Per-token IPC request, full-request buffer, Audit Journal record
 
 **Sampling State**:
-The logits processing, sampling configuration, and RNG state owned and executed by the in-process C++/MLX Adapter on the Device Executor alongside KV state. The Adapter returns generated token IDs rather than transferring logits to the Runtime Core or caller.
+The per-request Generation Parameters, effective Sampling Seed, and current Sampling RNG Schema state owned and executed by the in-process C++/MLX Adapter on the Device Executor alongside KV state. Categorical selection consumes exactly one request draw key and commits exactly one next state for every sampled token, including a token hidden or withheld by Stop Token Sequences; Greedy neither draws nor advances the state. The Adapter returns token IDs rather than logits or RNG state to Core or the caller.
 _Avoid_: Daemon sampling, client logits stream
 
 **Sampling Seed**:
-The immutable per-request RNG seed fixed before Admission. A caller may provide it; otherwise the daemon generates it and records it in the Audit Journal. Batch membership and Turn order cannot replace it with a process-global RNG sequence.
-_Avoid_: Per-Turn seed, Adapter-global RNG
+The immutable effective per-request `u64` fixed before Request Acceptance together with origin `caller` or `daemon`. Caller presence is explicit and every value, including zero, is valid. If absent, the daemon reads exactly eight bytes from macOS `SecRandomCopyBytes`, interprets them as little-endian `u64`, supplies the result to Core before Acceptance, exposes it and its origin in the Acceptance response, and emits both in the ordered Audit Effect. CSPRNG failure rejects before Acceptance and never falls back to time, a constant, or process-global RNG.
+_Avoid_: Per-Turn seed, Adapter-global RNG, treating absence as zero
+
+**Sampling RNG Schema**:
+The versioned per-request state transition that initializes `mlx::core::random::key(seed)` as pinned-build `uint32[2] {high32, low32}` and, for each Categorical token, calls `split(state)`, persists the first result as the next state, and supplies the second as the sole `random::categorical` draw key. Greedy performs no split. Its identity and exact multi-token vectors enter the Certification Envelope; Batch membership, member order, Turn boundaries, hidden stop tokens, and process-global state cannot alter the transition.
+_Avoid_: Shared batch RNG, reseeding each Turn, unspecified MLX random state
+
+**Categorical Token Selection**:
+The exact pinned-MLX binary32 algorithm applied after every model logit and its binary32 cast are proven finite. It computes `centered = logits - max(logits)`, `weights = exp(centered)`, `normalizer = sum(weights)`, `log_probabilities = centered - log(normalizer)`, then separately `probabilities = exp(log_probabilities)`. Top P `1.0` retains all entries; otherwise ascending `(log_probability, token_id)` order, inclusive binary32 cumulative probability, and an inclusive `cumulative <= 1 - Top P` mask discard the low tail, retaining the first strict crossing and all later entries. No crossing retains only the greatest log probability with lower token ID winning. Top K then keeps the greatest `min(Top K, surviving_count)` entries, with lower token ID winning ties, unless zero disables it. Retained `(token_id, log_probability)` pairs are compacted in ascending token-ID order, shifted by their maximum, divided by Temperature, sampled only within that nonempty compact vector, and mapped back to token ID. It never substitutes `weights / normalizer`, exposes masked entries to `random::categorical`, or applies Temperature before Top P and Top K.
+_Avoid_: Backend-default sampler, full-vocabulary masked categorical, approximate softmax
 
 **Stop Token Sequences**:
 The optional bounded token-ID sequences evaluated by the in-process C++/MLX Adapter alongside Max Output Tokens. The Adapter retains the longest suffix that might still form a stop sequence and publishes only tokens proven not to belong to one; matched stop tokens are not visible by default. The terminating Turn Receipt records whether completion came from a stop sequence, output limit, cancellation, or failure.
 _Avoid_: Text stop string, daemon-side late cancellation
 
 **Batch-Invariant Sampling**:
-The requirement that each request's independent Sampling State produce the same tokens for the same Model Revision, input, parameters, and Sampling Seed regardless of Batch membership or member order.
+The requirement that one request produce the same token and Sampling RNG state vectors for the same Model Revision, input token IDs, exact Generation Parameters bit patterns, effective Sampling Seed, Max Output Tokens, Stop Token Sequences, and generated-token/state prefix regardless of Batch membership, member order, other requests, or Turn interleaving. Stop-token visibility may withhold output but cannot undo or defer the sampled token's Categorical state advance.
 _Avoid_: Adapter-global RNG, batch-dependent output
 
 **Model**:
@@ -149,7 +165,7 @@ The bounded versioned build-fixed descriptor returned by Backend Initialization 
 _Avoid_: Runtime estimate, self-authorization, unbounded callback
 
 **Backend Bootstrap Manifest**:
-The immutable build-generated descriptor embedded in the daemon before the Device Executor invokes Backend Initialization. It binds the expected Adapter, dependency, Backend Interface, complete Backend Capability descriptor, Backend Resource Signal Contract, and complete Backend Operation Bound Set identities plus the finite initialization blocking, next-safe-point, cancellation, and Resource Impact entry certified for that exact build. The daemon verifies this static artifact against external conformance and operation evidence before the call, starts the initialization watchdog from its bound, and requires the returned complete descriptors to match it exactly. It contains no runtime environment fact, Certification Applicability, Admission, or Resource Mode decision and is not a second Backend Interface.
+The immutable build-generated descriptor embedded in the daemon before the Device Executor invokes Backend Initialization. It binds the expected Adapter, dependency, Backend Interface, complete Backend Capability descriptor including its Generation Semantics Identity, Backend Resource Signal Contract, and complete Backend Operation Bound Set identities plus the finite initialization blocking, next-safe-point, cancellation, and Resource Impact entry certified for that exact build. The daemon verifies this static artifact against external conformance and operation evidence before the call, requires its Generation Semantics Identity to equal the daemon Domain Type registry, starts the initialization watchdog from its bound, and requires the returned complete descriptors to match it exactly. It contains no runtime environment fact, Certification Applicability, Admission, or Resource Mode decision and is not a second Backend Interface.
 _Avoid_: Backend self-attestation, runtime handshake, hidden side channel
 
 **Hot-Path Work Budget**:
@@ -185,7 +201,7 @@ A completed Turn or control operation whose actual time or resource use exceeds 
 _Avoid_: Ordinary estimate error, automatic bound expansion
 
 **Backend Capability**:
-A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. Its complete descriptor has a content identity fixed in the Backend Bootstrap Manifest and checked against Backend Initialization; the Backend cannot supply its own expected value. The MVP shared-execution contract declares `max_overlapping_turns = 1` and authorizes Cooperative Turn Interleaving with exactly one Backend Turn in flight; this limit is an explicit capability, not an accidental property of the Device Executor Implementation. Individually valid Capability Keys never imply simultaneous multi-stream safety. Any future concurrent-stream mode requires a separate architecture decision and correctness, attribution, latency, throughput, and peak-memory certification for the complete co-running set. A capability is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
+A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. Its complete descriptor binds the exact Generation Semantics Identity and has a content identity fixed in the Backend Bootstrap Manifest and checked against Backend Initialization; the Backend cannot supply its own expected value. The MVP shared-execution contract declares `max_overlapping_turns = 1` and authorizes Cooperative Turn Interleaving with exactly one Backend Turn in flight; this limit is an explicit capability, not an accidental property of the Device Executor Implementation. Individually valid Capability Keys never imply simultaneous multi-stream safety. Any future concurrent-stream mode requires a separate architecture decision and correctness, attribution, latency, throughput, and peak-memory certification for the complete co-running set. A capability is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, memory sizes, or generation semantics. A quarantined Capability Key cannot form shared Work Candidates until recertified.
 _Avoid_: Work Kind, Backend process, model support
 
 **Capability Key**:
@@ -201,7 +217,7 @@ The finite immutable set containing every exact Capability Key that Admission de
 _Avoid_: Certification Authorization Index, Backend authorization, wildcard Envelope
 
 **Certification Envelope**:
-The named hardware and software scope in which a Certification Record is valid, including Apple Silicon device class, relevant GPU configuration, unified-memory size, macOS version, Adapter and MLX build identities, Backend Interface revision, Backend Bootstrap Manifest, Backend Capability descriptor, Backend Resource Signal Contract, and Backend Operation Bound Set identities. A record from the current M3 Ultra 256 GB host cannot certify 32, 64, or 128 GB systems, and configured conservative Governor defaults do not create such certification.
+The named hardware, software, and exact-generation-semantics scope in which a Certification Record is valid, including Apple Silicon device class, relevant GPU configuration, unified-memory size, macOS version, Adapter and MLX build identities, Backend Interface revision, Backend Bootstrap Manifest, Backend Capability descriptor, Backend Resource Signal Contract, Backend Operation Bound Set, and Generation Semantics Identity covering the complete allowed Generation Parameters schema/domain plus exact token-selection and Sampling RNG transition algorithms. A record from the current M3 Ultra 256 GB host cannot certify 32, 64, or 128 GB systems, configured conservative Governor defaults do not create such certification, and runtime observations cannot widen the covered generation domain.
 _Avoid_: Resource Threshold Profile, all Apple Silicon, proportional memory scaling
 
 **Certification Record**:
@@ -213,7 +229,7 @@ The immutable inputs from which Certification Records are compiled: Adapter Conf
 _Avoid_: Certification Record, wildcard support claim, benchmark folder
 
 **Adapter Conformance Record**:
-Immutable evidence that one exact Adapter build satisfies one Backend Interface revision's Backend Bootstrap Manifest, Backend Resource Signal Contract, Backend Operation Bound Set, ownership, synchronization, outcome, cancellation, resource-reporting, and error-mapping semantics. Bound evidence is still matched to its exact case and environment before readiness; the record does not by itself authorize a Model Revision, Shape, environment, or performance bound.
+Immutable evidence that one exact Adapter build satisfies one Backend Interface revision's Backend Bootstrap Manifest, Generation Semantics Identity and exact token-selection/RNG behavior, Backend Resource Signal Contract, Backend Operation Bound Set, ownership, synchronization, outcome, cancellation, resource-reporting, and error-mapping semantics. Bound evidence is still matched to its exact case and environment before readiness; the record does not by itself authorize a Model Revision, Shape, environment, or performance bound.
 _Avoid_: Adapter support flag, model certificate, ABI version alone
 
 **Model Revision Evidence**:
@@ -221,11 +237,11 @@ Immutable correctness and structural evidence bound to one exact model repositor
 _Avoid_: Model family support, repository name, weight path
 
 **Environment Qualification**:
-Immutable evidence for one exact hardware and software Envelope, including device and GPU configuration, unified-memory size, macOS, MLX and Adapter builds, Backend Bootstrap Manifest, Backend Capability descriptor, Backend Resource Signal Contract, Backend Operation Bound Set identities, and measurement-quality limits. It does not authorize untested Model Revisions or Cases.
+Immutable evidence for one exact hardware, software, and generation-semantics Envelope, including device and GPU configuration, unified-memory size, macOS, MLX and Adapter builds, Backend Bootstrap Manifest, Backend Capability descriptor, Generation Semantics Identity, Backend Resource Signal Contract, Backend Operation Bound Set identities, and measurement-quality limits. It does not authorize untested Model Revisions, generation semantics, or Cases.
 _Avoid_: Apple Silicon family, proportional memory profile, runtime probe
 
 **Environment Fingerprint**:
-The bounded fresh daemon-derived runtime identity assembled from trusted platform observations and the initialized Adapter, MLX, Backend Interface, Backend Bootstrap Manifest, exact Backend Capability descriptor, Backend Resource Signal Contract, and externally verified Backend Operation Bound Set identities. Admission compares it exactly with a Certification Envelope when deriving Certification Applicability; it is observation, not a Certification Record or authorization. Missing, stale, unavailable, or changed input invalidates dependent applicability cache entries and cannot be replaced by Backend inference.
+The bounded fresh daemon-derived runtime identity assembled from trusted platform observations, the build-verified Generation Semantics Identity, and the initialized Adapter, MLX, Backend Interface, Backend Bootstrap Manifest, exact Backend Capability descriptor, Backend Resource Signal Contract, and externally verified Backend Operation Bound Set identities. Admission compares every component exactly with a Certification Envelope when deriving Certification Applicability; it is observation, not a Certification Record or authorization. Missing, stale, unavailable, or changed input, including schema or algorithm identity drift, invalidates dependent applicability cache entries and cannot be replaced by Backend inference.
 _Avoid_: Certification Envelope, runtime self-certification, machine class guess
 
 **Case Bound Table**:
@@ -241,7 +257,7 @@ The build-generated read-only exact-key lookup compiled offline from verified Ce
 _Avoid_: Architecture registry, runtime certification search, mutable support cache
 
 **Certification Applicability**:
-The Admission-owned derived answer that one unchanged Certification Record in the Certification Authorization Index currently covers an exact Capability Key in the observed environment. A fixed-capacity recency cache may retain it only against every determining state, Adapter, Backend Interface, and environment identity; a miss recomputes exact applicability, while eviction is neither Control State nor an auditable decision.
+The Admission-owned derived answer that one unchanged Certification Record in the Certification Authorization Index currently covers an exact Capability Key in the observed environment. A fixed-capacity recency cache may retain it only against every determining state, Adapter, Backend Interface, Generation Semantics, and environment identity; a miss recomputes exact applicability, while eviction is neither Control State nor an auditable decision.
 _Avoid_: Certification Record, Backend Capability, persisted authorization flag
 
 **Uncertified Work**:
@@ -257,8 +273,8 @@ The kind of inference progression performed by work, independent of how urgently
 _Avoid_: Work Class, priority
 
 **Service Class**:
-One of Interactive, Standard, or Background, selected directly by a trusted local caller in the MVP. It determines latency and progress treatment independently of the inference operation, Model Weight, and backend-specific Work Kind.
-_Avoid_: Execution Phase, Model Weight
+The required closed caller-selected mapping `UNSPECIFIED=0` invalid, `INTERACTIVE=1`, `STANDARD=2`, and `BACKGROUND=3`. It determines latency and progress treatment independently of the inference operation, Model Weight, and Backend-specific Work Kind; callers cannot omit it, ask a model or Adapter to default it, or supply a raw deadline instead.
+_Avoid_: Execution Phase, Model Weight, raw deadline
 
 **Interactive Work**:
 Work governed by a phase-specific timing obligation. Interactive Decode uses a Stream Deadline; other Execution Phases use configured start or progress deadlines appropriate to that phase.
@@ -509,7 +525,7 @@ The live public-connection state after Command ID `u64::MAX` has been accepted a
 _Avoid_: Client Disconnect, Command ID zero, reconnect continuation
 
 **Explicit Request Retry**:
-A caller-created Token Request submitted after a retryable failure or Daemon Failure. It always receives a new Request ID and inherits no ownership, progress, output, or reservation; preserving the frozen Revision, input, parameters, and Sampling Seed can reproduce the same numerical request contract without resuming it.
+A caller-created Token Request submitted after a retryable failure or Daemon Failure. It always receives a new Request ID and inherits no ownership, progress, output, Sampling State, or Reservation; preserving the frozen Revision, input token IDs, exact Generation Parameters bit patterns, and effective Sampling Seed can reproduce the same numerical request contract without resuming it.
 _Avoid_: Transparent retry, Request ID reuse, reconnect recovery
 
 **Model Revision**:
@@ -517,7 +533,7 @@ An immutable weights and capability identity registered under one stable Model I
 _Avoid_: Mutable alias, filesystem path alone
 
 **Model Manifest**:
-The immutable Control Plane registration for a Model Revision, containing a canonical Artifact Root, artifact identities and File Hashes, context limit, tokenizer identity for external adapters, expected Backend Capability version, Model Descriptor hash, and audit provenance. A Data Plane request cannot supply an arbitrary model path. Before every load, the C++/MLX Adapter accesses only this registered root and revalidates the artifacts; the MVP does not add a more complex OS sandbox.
+The immutable Control Plane manifest for a Model Revision, containing a canonical Artifact Root, artifact identities and File Hashes, context limit, tokenizer identity for external adapters, expected Backend Capability version, Model Descriptor hash, and audit provenance. Its accepted registration pairs it with the complete canonical registered Model Descriptor bytes in the same Control State Snapshot; the hash validates those bytes but cannot reconstruct or replace them. A Data Plane request cannot supply an arbitrary model path. Before every load, the C++/MLX Adapter accesses only this registered root and revalidates the artifacts; the MVP does not add a more complex OS sandbox.
 _Avoid_: Mutable alias, runtime directory scan, model request
 
 **Model Registry Limit**:
@@ -541,7 +557,7 @@ A registered Model Revision disabled after load failure, artifact hash mismatch,
 _Avoid_: Temporary Warming, retry backoff loop, Retiring Revision
 
 **Model Descriptor**:
-The stateless, versioned, hash-bound Backend Interface result generated from a proposed or registered Model manifest without loading a model or creating per-request state. It validates the exact manifest and reports capabilities plus conservative residency resource/time bounds. Only a validated descriptor may be committed with registration; after a successful load advances Backend Generation, the Revision remains unavailable for Candidate Formation until a fresh call over the registered manifest returns the exact registered descriptor identity and hash.
+The stateless, versioned, hash-bound Backend Interface result generated from a proposed or registered Model manifest without loading a model or creating per-request state. It validates the exact manifest and reports a nonzero `u32` vocabulary size, capabilities, and conservative residency resource/time bounds. The complete canonical descriptor bytes, including vocabulary size, enter the descriptor identity and hash and are committed durably beside the Model Manifest in every Control State Generation; that restored and rehashed value is the sole authority for pre-Acceptance Top K validation. Missing bytes or any byte/hash mismatch makes the Control State Generation invalid and enters Control Repair Mode before Service Readiness; restart never regenerates the value from artifacts, runtime logits, model defaults, or the hash alone. Only a validated descriptor may be committed with registration; after a successful load advances Backend Generation, the Revision remains unavailable for Candidate Formation until a fresh call over the registered manifest returns exact equality with the registered canonical bytes, identity, hash, and vocabulary size.
 _Avoid_: Request Description, resident model state, caller estimate
 
 **Resource Reservation**:
@@ -773,7 +789,7 @@ The Evidence Hash identifying one closed durable Runtime Metadata Store image th
 _Avoid_: SQLite logical row hash, inode identity, metadata database path
 
 **Semantic State Hash**:
-The Evidence Hash of a complete Control State Snapshot's canonical meaning, including immutable Certification Records but excluding Runtime ID, History Epoch ID, Control State version, and derived Certification applicability. It proves whether a Runtime Restore or Runtime Clone preserved state meaning even though the destination Control State Generation has a different identity.
+The Evidence Hash of a complete Control State Snapshot's canonical meaning, including complete registered Model Descriptor bytes and immutable Certification Records but excluding Runtime ID, History Epoch ID, Control State version, and derived Certification applicability. It proves whether a Runtime Restore or Runtime Clone preserved state meaning even though the destination Control State Generation has a different identity.
 _Avoid_: Generation Hash, database checksum, Bundle hash
 
 **Generation Hash**:
@@ -785,7 +801,7 @@ The diagnostic-only window of predecessor Control State Generations retained und
 _Avoid_: Rollback policy, unbounded history, Audit retention
 
 **Control State Snapshot**:
-The durable Control Plane state containing the effective Configuration Snapshot, Model Manifests, Model Aliases, immutable Certification Records, and Revision lifecycle states including Unavailable. Within one History Epoch it has a monotonically increasing version; every mutation supplies the complete current Control Mutation Token, atomically installs one fully validated successor, activates it at an Event Loop boundary, and appends its audit record before acknowledgement, while requests, KV, Residency, Reservations, derived certification applicability, failure backoff, and in-flight operations are never persisted in it.
+The durable Control Plane state containing the effective Configuration Snapshot, Model Manifests paired with their complete canonical registered Model Descriptors, Model Aliases, immutable Certification Records, and Revision lifecycle states including Unavailable. Within one History Epoch it has a monotonically increasing version; every mutation supplies the complete current Control Mutation Token, atomically installs one fully validated successor, activates it at an Event Loop boundary, and appends its audit record before acknowledgement, while requests, KV, Residency, Reservations, derived certification applicability, failure backoff, and in-flight operations are never persisted in it.
 _Avoid_: Request recovery WAL, last-writer-wins configuration, Scheduling Snapshot
 
 **Control State Commit**:
