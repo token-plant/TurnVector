@@ -17,11 +17,11 @@ An immutable statement of the runnable work, timing obligations, versioned cost 
 _Avoid_: Snapshot, mutable system state, queue length
 
 **Work Candidate**:
-A Model Planner-provided immutable description of one schedulable choice of compatible request handles for one Model, one Execution Phase, and one Service Class. Batch members cannot cross Service Classes. It carries an opaque Candidate ID and exposes timing, batching, output, and Resource Impact facts needed for selection without exposing tensors, KV layout, or backend shapes. For Prefill, its execution and progress contract covers one next Prefill Chunk Turn, never the complete remaining prompt. It is infeasible if it cannot satisfy every member's current timing obligation or Progress Bound.
+A Model Planner-provided immutable description of one schedulable choice of compatible request handles for one Model, one Execution Phase, and one Service Class. Batch members cannot cross Service Classes. It carries an opaque Candidate ID, one exact Capability Key, and the timing, batching, output, and Resource Impact facts needed for selection without exposing tensors, KV layout, or backend shapes. Every member's frozen Authorized Capability Set must contain that exact Key. For Prefill, its execution and progress contract covers one next Prefill Chunk Turn, never the complete remaining prompt. It is infeasible if it cannot satisfy every member's current timing obligation or Progress Bound.
 _Avoid_: Request queue, Tensor Batch
 
 **Candidate Formation**:
-The pure operation in which the Scheduler supplies eligible request handles and hard feasibility constraints, and the Model Planner returns a deterministic bounded set of immutable Work Candidates plus a Candidate Exclusion for every eligible request absent from those candidates. The MVP permits at most one candidate per Model ID, Execution Phase, Service Class, and configured batch bucket; Candidate Formation neither enumerates arbitrary request subsets nor consumes Model Weight, Model Ledger, cross-Model service debt, relative priority, or urgency order.
+The pure operation in which the Scheduler supplies eligible request handles and hard feasibility constraints, and the Model Planner returns a deterministic bounded set of immutable Work Candidates plus a Candidate Exclusion for every eligible request absent from those candidates. Each Candidate carries the exact phase, batch, Shape, build, Interface, and Envelope Capability Key selected for that choice and is rejected unless every member's frozen Authorized Capability Set contains it. The MVP permits at most one candidate per Model ID, Execution Phase, Service Class, and configured batch bucket; Candidate Formation neither enumerates arbitrary request subsets nor consumes Model Weight, Model Ledger, cross-Model service debt, relative priority, or urgency order.
 _Avoid_: Batch execution, Scheduler batching, backend queue
 
 **Model Planner**:
@@ -57,11 +57,11 @@ A renewable Control Plane lease required for an Exclusive operation to continue 
 _Avoid_: Fixed operation timeout, automatic Exclusive entry
 
 **Turn Plan**:
-Authorization for the fixed request membership of one Model and Work Candidate to consume one bounded Turn. It binds the target Engine Service, certified hard execution bound, phase-specific work ceilings, and relevant generations while leaving backend-specific Shape, Prefill Chunk token count, and Decode burst choices to the Execution Backend. It never authorizes an automatic same-Model continuation after the resulting Turn Receipt.
+Authorization for the fixed request membership of one Model and Work Candidate to consume one bounded Turn. It binds the Candidate's exact Capability Key and Shape bucket, target Engine Service, certified hard execution bound, phase-specific work ceilings, and relevant generations while leaving the concrete backend Shape representation, Prefill Chunk token count, and Decode burst choice within those frozen bounds to the Execution Backend. It never authorizes an automatic same-Model continuation after the resulting Turn Receipt.
 _Avoid_: Plan, execution graph, request
 
 **Turn Receipt**:
-The single synchronized outcome corresponding to a started Turn Plan. It records actual progress, including any processed Prefill token range and continuation, Engine Service, resumability, yield reason, and success or failure so scheduling and recovery share one causal record. `still_runnable` is an observation, not permission to execute again without a fresh Scheduling Snapshot and Turn Plan.
+The single synchronized outcome corresponding to a started Turn Plan. It records actual progress, including any processed Prefill token range and continuation, Engine Service, resumability, yield reason, and completed, cancelled, partial, or failed member outcomes so scheduling and recovery share one causal record. `still_runnable` is an observation, not permission to execute again without a fresh Scheduling Snapshot and Turn Plan. A Backend operation that cannot return a trustworthy synchronized result causes process-wide fail-stop and produces no fabricated indeterminate Turn Receipt.
 _Avoid_: Receipt, success response, telemetry event
 
 **Plan Rejection**:
@@ -137,15 +137,27 @@ The Device Executor-measured Monotonic Time from beginning direct execution of a
 _Avoid_: Token count, queue time, GPU occupancy
 
 **Runtime Overhead**:
-The measured time outside Engine Service needed to form and select a Plan, validate the in-memory Adapter result, commit Runtime Core state, and publish staged output. It is audited and bounded for timing feasibility but never charged to a Model Ledger.
+The measured daemon-owned time outside Engine Service needed to form and select a Plan, validate in-memory Backend results, commit Runtime Core state, publish staged output, and execute bounded readiness-time owner-thread support calls. Its exact branch spans and worst-case Owner-Thread Support Budget interference are audited and bounded for timing feasibility but never charged to a Model Ledger.
 _Avoid_: Engine Service, client queue time, free deadline time
+
+**Owner-Thread Support Budget**:
+The versioned daemon-owned limit for every Backend Interface call permitted while Service Readiness is true other than `execute_turn`, `transition_residency`, and explicit `execute_exclusive`. It consumes only per-operation bounds whose Backend Operation Bound Set identity has exact applicable certification, and adds fixed call-count and aggregate-time maxima per finite scheduling window. The Event Loop measures complete describe, materialize, release, Candidate Formation, accepted-Receipt observation, and Backend sampling direct-call intervals as Runtime Overhead, reserves the worst-case aggregate interference in every active Deadline Cost Bound, and defers or rejects nonessential work that would exceed the budget; mandatory release and resource-safety calls consume separately pre-reserved capacity. A noncancellable call's safe point is its bounded return. Initialization runs before readiness, shutdown after readiness is false, Residency Service remains separate, and Exclusive execution requires shared dispatch to be paused.
+_Avoid_: Model Ledger, unbounded maintenance queue, background free work
+
+**Backend Operation Bound Set**:
+The bounded versioned build-fixed descriptor returned by Backend Initialization that maps every Backend Interface operation kind and bounded input bucket to its finite maximum continuous blocking bound, next-safe-point bound, cancellation class, and conservative Resource Impact. Before invoking `initialize`, the daemon already has that operation's externally verified entry and the expected complete Set identity from its Backend Bootstrap Manifest; the returned descriptor must match exactly before any later call. Exact Capability Key or Model Descriptor evidence may supply a tighter Turn or Residency bound but may never exceed this Set's applicable maximum. The daemon binds the verified Set identity into the Environment Fingerprint and refuses Service Readiness on mismatch; a Backend claim does not certify itself. The Set supplies per-call inputs to Engine, Residency, Exclusive, and Owner-Thread Support gating through the one Interface and has no hidden dynamic timing side channel.
+_Avoid_: Runtime estimate, self-authorization, unbounded callback
+
+**Backend Bootstrap Manifest**:
+The immutable build-generated descriptor embedded in the daemon before the Device Executor invokes Backend Initialization. It binds the expected Adapter, dependency, Backend Interface, complete Backend Capability descriptor, Backend Resource Signal Contract, and complete Backend Operation Bound Set identities plus the finite initialization blocking, next-safe-point, cancellation, and Resource Impact entry certified for that exact build. The daemon verifies this static artifact against external conformance and operation evidence before the call, starts the initialization watchdog from its bound, and requires the returned complete descriptors to match it exactly. It contains no runtime environment fact, Certification Applicability, Admission, or Resource Mode decision and is not a second Backend Interface.
+_Avoid_: Backend self-attestation, runtime handshake, hidden side channel
 
 **Hot-Path Work Budget**:
 The binary hard maxima for one serving decision or Core Transition, including active Models, eligible requests per Model, Work Candidates, Batch members, Core Events examined, bytes copied, allocations, and invariant work. Admission and ingress reject before accepted state can exceed these maxima, no path silently truncates work, and verification asserts the operation counts in addition to wall-clock latency.
 _Avoid_: Performance target, average benchmark, unbounded safety scan
 
 **Deadline Cost Bound**:
-The conservative sum of a Work Candidate's Engine Service upper bound and the applicable scheduling, in-process call, Receipt-commit, and output-publication overhead bounds. Latest Safe Start uses this end-to-end bound rather than Engine Service alone.
+The conservative sum of a Work Candidate's Engine Service upper bound and the applicable scheduling, in-process call, Owner-Thread Support Budget interference, Receipt-commit, and output-publication overhead bounds. Latest Safe Start uses this end-to-end bound rather than Engine Service alone.
 _Avoid_: Fairness charge, observed average latency
 
 **Turn Cost Estimate**:
@@ -153,8 +165,16 @@ An Execution Backend-provided ordinary estimate for a Work Candidate paired with
 _Avoid_: Token count, Scheduler guess, certified Turn boundary
 
 **Cost Profile**:
-The versioned online calibration state used by the Execution Backend to produce ordinary Turn Cost Estimates and translate a Turn Plan's time target into a concrete Prefill Chunk, Decode burst, or micro-batch within fixed Certification Record bounds. It may update atomically from Turn Receipts only between Turns, so every Scheduling Snapshot observes one immutable version. It cannot create a Backend Capability, widen a certified upper bound, or change Admission safety margins.
+The versioned online calibration state used by the Execution Backend to produce ordinary Turn Cost Estimates and translate a Turn Plan's time target into a concrete Prefill Chunk, Decode burst, or micro-batch within fixed Certification Record bounds. It may update only inside the compare-and-set `observe_turn_receipt` operation for an already accepted Turn Receipt and only between Turns, so every Scheduling Snapshot observes one immutable version. It cannot create a Backend Capability, widen a certified upper bound, or change Admission safety margins.
 _Avoid_: Certification Record, Model Ledger, Timing Profile
+
+**Cost Profile Update**:
+The typed compare-and-set result of owner-thread `observe_turn_receipt` for one already accepted Turn Receipt. The Receipt binds the expected current Cost Profile and Backend Generation. A mismatch returns a typed pre-mutation rejection; because Core prevalidates both identities before invoking the call, that unexpected rejection is a divergence fault and fail-stops before another Backend call. A match returns either `unchanged` or atomically installs one new Backend profile and returns `applied` with exact Receipt, affected Model, old-version, and new-version identities. Backend retains the calibration parameters; Core mirrors only the accepted profile identity and Backend Generation. An `applied` result must cross the Cost Profile Commit Barrier and be committed exactly once in the immediately following Core Transition, advancing Backend Generation, invalidating every older Scheduling Snapshot, Turn Plan, and not-yet-admitted Request Description, and marking only that Model dirty so only its cached Work Candidates are reformed. A malformed result or inability to commit after Backend mutation likewise triggers process-wide fail-stop; the daemon never continues with divergent Core and Backend versions. The update changes only ordinary estimates and never widens a certified upper bound or rewrites the Receipt.
+_Avoid_: Turn Receipt, Certification Record, online bound widening
+
+**Cost Profile Commit Barrier**:
+The short fail-closed Event Loop boundary beginning when `observe_turn_receipt` atomically applies a Backend profile and ending when its exact `applied` result becomes the next Core Event and Core commits the mirrored profile identity plus Backend Generation. No other Core Transition or Backend call may intervene; inbound events may queue only within their existing bounded ingress capacity. Result mismatch, invariant failure, or inability to commit terminates the process rather than exposing divergent versions.
+_Avoid_: General transaction manager, profile ownership transfer, asynchronous calibration queue
 
 **Profile Revalidation**:
 The Turn-boundary process triggered by activating a new Certification Record, changing a Backend Capability bound, or changing another certified feasibility input. It invalidates old Work Candidates and Request Descriptions and reruns feasibility for existing Resource Reservations. An ordinary Cost Profile estimate update within unchanged certified bounds does not trigger it. Newly infeasible obligations emit SLO Risk and block related new Admission; existing work is neither silently re-promised nor granted unbounded urgency.
@@ -165,15 +185,23 @@ A completed Turn or control operation whose actual time or resource use exceeds 
 _Avoid_: Ordinary estimate error, automatic bound expansion
 
 **Backend Capability**:
-A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. The MVP shared-execution contract declares `max_overlapping_turns = 1` and authorizes Cooperative Turn Interleaving with exactly one Backend Turn in flight; this limit is an explicit capability, not an accidental property of the Device Executor Implementation. Individually valid Capability Keys never imply simultaneous multi-stream safety. Any future concurrent-stream mode requires a separate architecture decision and correctness, attribution, latency, throughput, and peak-memory certification for the complete co-running set. A capability is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
+A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. Its complete descriptor has a content identity fixed in the Backend Bootstrap Manifest and checked against Backend Initialization; the Backend cannot supply its own expected value. The MVP shared-execution contract declares `max_overlapping_turns = 1` and authorizes Cooperative Turn Interleaving with exactly one Backend Turn in flight; this limit is an explicit capability, not an accidental property of the Device Executor Implementation. Individually valid Capability Keys never imply simultaneous multi-stream safety. Any future concurrent-stream mode requires a separate architecture decision and correctness, attribution, latency, throughput, and peak-memory certification for the complete co-running set. A capability is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, or memory sizes. A quarantined Capability Key cannot form shared Work Candidates until recertified.
 _Avoid_: Work Kind, Backend process, model support
 
 **Capability Key**:
 The most specific shared-execution identity addressed by certification and quarantine: Model Revision, Execution Phase, configured batch and shape bucket, Adapter and MLX build identity, Backend Interface revision, and Certification Envelope. A systemic fault may explicitly quarantine a coarser parent scope, but one request failure cannot silently disable or authorize unrelated keys.
 _Avoid_: Model ID, request ID, universal backend flag
 
+**Capability Requirement Set**:
+The bounded immutable pre-Admission Backend result enumerating every execution phase, configured batch bucket, Shape bucket, and Backend/build/Interface component that Candidate Formation may later select through the frozen Token Request's complete maximum-output lifecycle under its Model Descriptor. It contains no Certification Applicability decision and no Backend-selected environment authority. Admission combines every requirement with only exact Certification Envelope identities that match one fresh Environment Fingerprint and have an applicable indexed Certification Record, deriving a finite exact-key closure. Every requirement must yield at least one Key; omission, no match, or overflow rejects before Admission rather than permitting a later unlisted Candidate.
+_Avoid_: Capability Key, wildcard support, runtime range inference
+
+**Authorized Capability Set**:
+The finite immutable set containing every exact Capability Key that Admission derived for one request by matching its complete Capability Requirement Set against one fresh Environment Fingerprint and the exact-key Certification Authorization Index. Each requirement contributes at least one Key and every member has an applicable Certification Record. The Set is frozen into the request's Timing Commitment and Resource Reservation. Candidate Formation may use only a Key in every member's Set; a missing, stale, quarantined, or out-of-set Key makes the Candidate infeasible and cannot be repaired by Backend inference.
+_Avoid_: Certification Authorization Index, Backend authorization, wildcard Envelope
+
 **Certification Envelope**:
-The named hardware and software scope in which a Certification Record is valid, including Apple Silicon device class, relevant GPU configuration, unified-memory size, macOS version, Adapter and MLX build identities, and Backend Interface revision. A record from the current M3 Ultra 256 GB host cannot certify 32, 64, or 128 GB systems, and configured conservative Governor defaults do not create such certification.
+The named hardware and software scope in which a Certification Record is valid, including Apple Silicon device class, relevant GPU configuration, unified-memory size, macOS version, Adapter and MLX build identities, Backend Interface revision, Backend Bootstrap Manifest, Backend Capability descriptor, Backend Resource Signal Contract, and Backend Operation Bound Set identities. A record from the current M3 Ultra 256 GB host cannot certify 32, 64, or 128 GB systems, and configured conservative Governor defaults do not create such certification.
 _Avoid_: Resource Threshold Profile, all Apple Silicon, proportional memory scaling
 
 **Certification Record**:
@@ -185,7 +213,7 @@ The immutable inputs from which Certification Records are compiled: Adapter Conf
 _Avoid_: Certification Record, wildcard support claim, benchmark folder
 
 **Adapter Conformance Record**:
-Immutable evidence that one exact Adapter build satisfies one Backend Interface revision's ownership, synchronization, outcome, cancellation, resource-reporting, and error-mapping contracts. It does not by itself authorize a Model Revision, Shape, environment, or performance bound.
+Immutable evidence that one exact Adapter build satisfies one Backend Interface revision's Backend Bootstrap Manifest, Backend Resource Signal Contract, Backend Operation Bound Set, ownership, synchronization, outcome, cancellation, resource-reporting, and error-mapping semantics. Bound evidence is still matched to its exact case and environment before readiness; the record does not by itself authorize a Model Revision, Shape, environment, or performance bound.
 _Avoid_: Adapter support flag, model certificate, ABI version alone
 
 **Model Revision Evidence**:
@@ -193,8 +221,12 @@ Immutable correctness and structural evidence bound to one exact model repositor
 _Avoid_: Model family support, repository name, weight path
 
 **Environment Qualification**:
-Immutable evidence for one exact hardware and software Envelope, including device and GPU configuration, unified-memory size, macOS, MLX and Adapter builds, and measurement-quality limits. It does not authorize untested Model Revisions or Cases.
+Immutable evidence for one exact hardware and software Envelope, including device and GPU configuration, unified-memory size, macOS, MLX and Adapter builds, Backend Bootstrap Manifest, Backend Capability descriptor, Backend Resource Signal Contract, Backend Operation Bound Set identities, and measurement-quality limits. It does not authorize untested Model Revisions or Cases.
 _Avoid_: Apple Silicon family, proportional memory profile, runtime probe
+
+**Environment Fingerprint**:
+The bounded fresh daemon-derived runtime identity assembled from trusted platform observations and the initialized Adapter, MLX, Backend Interface, Backend Bootstrap Manifest, exact Backend Capability descriptor, Backend Resource Signal Contract, and externally verified Backend Operation Bound Set identities. Admission compares it exactly with a Certification Envelope when deriving Certification Applicability; it is observation, not a Certification Record or authorization. Missing, stale, unavailable, or changed input invalidates dependent applicability cache entries and cannot be replaced by Backend inference.
+_Avoid_: Certification Envelope, runtime self-certification, machine class guess
 
 **Case Bound Table**:
 A finite immutable table of certified bounds for exact phase, batch, Shape, KV, and work-kind cases under named evidence identities. An unlisted or changed case is not covered unless an included monotonicity or dominance proof applies explicitly.
@@ -245,7 +277,7 @@ Runtime configuration that maps Service Class, with optional Model and Execution
 _Avoid_: Caller deadline, dynamic priority
 
 **Timing Commitment**:
-The Timing Profile version and resolved obligations captured by a Resource Reservation at Admission. Later profile changes apply only to new Admission and cannot silently rewrite an existing request's promise.
+The Timing Profile version, resolved obligations, finite Authorized Capability Set, worst-case certified bounds, and Owner-Thread Support Budget interference captured by a Resource Reservation at Admission. Later profile, capability, environment, or support-budget changes apply only through explicit revalidation and cannot silently rewrite an existing request's promise.
 _Avoid_: Live configuration lookup, mutable deadline
 
 **Latest Safe Start**:
@@ -297,11 +329,11 @@ Previously accepted work that cannot currently execute under the Resource Mode. 
 _Avoid_: Starved Work, queued Work
 
 **Admission**:
-The pure accept-or-reject decision at the Scheduler boundary for Schedulable Work whose timing and resource requirements pass a fixed conservative budget calculation. Immediately before deciding, it revalidates the frozen Model Revision's availability, exact Certification Record, Timing Profile, current Resource Mode, and capacity without resolving its Model Alias again; when consuming a bounded recovery Resource Impact, it verifies and captures the registered Capacity Formula Identity and conservative aggregate, rejects Capacity Declaration Integrity Incident without state, and never interprets, executes or repairs that operation's formula or internal state machine.
+The pure accept-or-reject decision at the Scheduler boundary for work whose timing and resource requirements pass a fixed conservative budget calculation. A stale Request Description is routed back to Preparing or Warming before this decision exists. For a current-generation inference description, Admission matches every member of its Capability Requirement Set against one fresh Environment Fingerprint and the exact-key Certification Authorization Index, requires at least one applicable Key per requirement, and freezes the complete finite resulting Authorized Capability Set; it never assumes one future batch or Shape. Immediately before deciding, it revalidates the frozen Model Revision's availability, Timing Profile, current Resource Mode, and capacity without resolving its Model Alias again. When consuming a bounded recovery Resource Impact, it verifies and captures the registered Capacity Formula Identity and conservative aggregate, rejects Capacity Declaration Integrity Incident without state, and never interprets, executes or repairs that operation's formula or internal state machine.
 _Avoid_: Enqueue, model load, policy service
 
 **Admission Check**:
-The fixed conservative sufficient-condition calculation used by Admission. It ignores future Batch savings, evaluates every Resource Reservation and bounded recovery capacity aggregate at its worst-case Deadline Cost Bound over a finite configured set of timing windows, and retains a fixed safety margin. It uses checked arithmetic and rejects the complete candidate before any reservation on Aggregate Overflow or Capacity Declaration Integrity Incident; it performs no formula execution, schedule, recovery-chain or state-machine search or simulation and may reject work that could have fit opportunistically.
+The fixed conservative sufficient-condition calculation used by Admission. It ignores future Batch savings, verifies the complete finite Authorized Capability Set, evaluates every Resource Reservation and bounded recovery capacity aggregate at its worst-case Deadline Cost Bound including Owner-Thread Support Budget interference over a finite configured set of timing windows, and retains a fixed safety margin. It uses checked arithmetic and rejects before any reservation on omitted/overflowed capability closure, Aggregate Overflow, or Capacity Declaration Integrity Incident; it performs no formula execution, schedule, recovery-chain or state-machine search or simulation and may reject work that could have fit opportunistically.
 _Avoid_: Optimal scheduler, concurrency limit only, Batch forecast
 
 **SLO Risk**:
@@ -329,11 +361,19 @@ The Resource Governor rule that applies a more restrictive Resource Mode immedia
 _Avoid_: Sampling interval, delayed escalation
 
 **Resource Threshold Profile**:
-The versioned effective thresholds, sampling freshness limits, grace periods, and dwell intervals used by the Resource Governor. An Execution Backend defines its metric semantics and conservative defaults; an optional machine configuration may override values, while TurnVector retains the fixed Resource Mode action semantics. The effective values and version are recorded for audit.
+The versioned effective thresholds, sampling freshness limits, grace periods, and dwell intervals used by the Resource Governor. Its Backend-owned metric fields and conservative defaults are interpreted only through the active Backend Resource Signal Contract; an optional machine configuration may override values, while TurnVector retains the fixed Resource Mode action semantics. The effective values, Profile version, and Signal Contract identity are recorded for audit.
 _Avoid_: Resource Mode action table, hard-coded machine class
 
+**Backend Resource Signal Contract**:
+The bounded versioned descriptor returned by Backend Initialization that defines every Backend-owned resource field, unit, availability and quality meaning, conservative default threshold, and one stable Contract identity. The daemon binds that identity into the Environment Fingerprint, Resource Threshold Profile applicability, Backend Resource Samples, and audit evidence. It is an evidence schema and default-value source, never a Resource Mode action table or authorization decision; a missing, stale, or mismatched identity fails closed rather than being guessed or converted through a hidden side interface.
+_Avoid_: Resource Mode policy, unversioned metric convention, machine configuration
+
+**Backend Resource Sample**:
+The bounded owner-thread Backend Interface result containing only MLX allocator/cache values, exact Backend Resource Signal Contract identity, source identity, sequence, and quality. The daemon timestamps receipt with its Monotonic Time and rejects a sample that does not bind the active Contract. The sample contains no process footprint, available-memory, compressor, swap, pressure, Resource Mode, or reclaim decision and cannot by itself authorize Admission or capacity reuse.
+_Avoid_: Resource Evidence, Resource Mode, process sampler
+
 **Resource Evidence**:
-A versioned Governor input assembled from Device Executor-reported MLX allocator and cache values, daemon process footprint, and system available memory, swap, compressor, and pressure. Each source retains its provenance, sequence, and freshness even though all process-local observations share one daemon lifetime. The P-1B shared-host precheck may inform conservative defaults on the observed 256 GB host only; its formal status remains PENDING and it is neither a 24-hour soak result nor a smaller-memory capacity certificate.
+A versioned Governor input assembled by the daemon from one Backend Resource Sample, process footprint, and system available memory, swap, compressor, and pressure. Each source retains its provenance, sequence, quality, and freshness even though all process-local observations share one daemon lifetime. The P-1B shared-host precheck may inform conservative defaults on the observed 256 GB host only; its formal status remains PENDING and it is neither a 24-hour soak result nor a smaller-memory capacity certificate.
 _Avoid_: Resource Mode, inferred allocator state, unversioned sample
 
 **Stale Resource Evidence**:
@@ -349,7 +389,7 @@ A monotonic version of Scheduler-owned request and obligation state. Admission, 
 _Avoid_: Safety Generation, request ID
 
 **Backend Generation**:
-A monotonic version of Execution Backend state that affects Candidate Formation or execution validity, including compatible request membership and backend-owned inference state.
+A monotonic version of Execution Backend state that affects Candidate Formation or execution validity, including compatible request membership, backend-owned inference state, every successful model load, and every accepted Cost Profile Update. Advancing it invalidates every older Scheduling Snapshot, Turn Plan, and not-yet-admitted Request Description. Every affected request remains Preparing or Warming and must receive a fresh current-generation description before Admission rather than being rejected solely for internal generation change; a successful load also invalidates the affected Revision's pre-load Model Descriptor observation. Core otherwise marks only affected Models dirty and discards only their cached Work Candidates, preserving dirty-Model-only incremental recomputation for unaffected Models.
 _Avoid_: Safety Generation, Cost Profile version
 
 **Generation Vector**:
@@ -365,7 +405,7 @@ Whether a Model's weights and required runtime state are available to form Work 
 _Avoid_: Runnable Model, request activity
 
 **Residency Reservation**:
-The Resource Governor-owned capacity-ledger commitment created from a Model Descriptor before a load may start. It covers the Model Revision's shared weights and runtime residency cost independently of any Warming request. On unload, capacity never physically allocated releases immediately while allocated residency memory enters Pending Reclaim until observed convergence.
+The Resource Governor-owned capacity-ledger commitment created from a Model Descriptor before a load may start. It covers the Model Revision's shared weights and runtime residency cost independently of any Warming request. A successful load retains the complete Reservation while resident. A trusted terminal failed or cancelled load must prove zero retained Backend residency ownership; its accepted Residency Result authorizes Core to release the proven never-allocated remainder and move proven actual allocation into Pending Reclaim. Starting or logically completing unload does not release capacity; only its accepted synchronized Residency Result may authorize the corresponding split. No failure state, allocator sample, or cache-reclaim result substitutes for that result.
 _Avoid_: Request Resource Reservation, actual MLX allocation, Model Weight
 
 **Residency Demand**:
@@ -385,7 +425,7 @@ The atomic Data Plane transition after Protocol DTO validation, Ingress Budget r
 _Avoid_: Admission, Request Description, first output
 
 **Preparing**:
-The accepted pre-Admission Request State while a stateless Request Description is being obtained and validated. It is queryable and cancelable, consumes its Ingress Budget but has no Resource Reservation or inference timing commitment, and is bounded by Preparation Timeout. A resident Revision proceeds toward Admission; a non-resident Revision enters Warming and later revalidates its description and capability evidence after load.
+The accepted pre-Admission Request State while a stateless Request Description is being obtained and validated. It is queryable and cancelable, consumes its Ingress Budget but has no Resource Reservation or inference timing commitment, and is bounded by Preparation Timeout. A resident Revision obtains a current-generation description before Admission; if Backend Generation advances first, the request remains Preparing and obtains another description in stable bounded order. A non-resident Revision enters Warming and after load must complete exact registered Model Descriptor equality plus fresh current-generation Request Description.
 _Avoid_: Warming, Queued Work, Request Materialization
 
 **Preparation Timeout**:
@@ -501,28 +541,44 @@ A registered Model Revision disabled after load failure, artifact hash mismatch,
 _Avoid_: Temporary Warming, retry backoff loop, Retiring Revision
 
 **Model Descriptor**:
-The versioned, hash-bound capability and conservative resource/time description generated when a Model Manifest is registered. It permits stateless pre-Admission description while the Model is non-resident; after loading, the C++/MLX Adapter must revalidate artifact hashes and capability version before Admission can proceed.
+The stateless, versioned, hash-bound Backend Interface result generated from a proposed or registered Model manifest without loading a model or creating per-request state. It validates the exact manifest and reports capabilities plus conservative residency resource/time bounds. Only a validated descriptor may be committed with registration; after a successful load advances Backend Generation, the Revision remains unavailable for Candidate Formation until a fresh call over the registered manifest returns the exact registered descriptor identity and hash.
 _Avoid_: Request Description, resident model state, caller estimate
 
 **Resource Reservation**:
-The conservative capacity-ledger commitment created atomically with successful Admission for the request's maximum KV growth, aggregate output capacity, and timing obligations. It prevents later Admission from spending the same capacity but does not physically allocate maximum KV or socket buffers. Actual allocations consume the reserved budget while unused capacity remains unavailable to other admissions.
+The conservative typed capacity-ledger commitment created atomically with successful Admission. It contains the Request Backend Allocation Budget for maximum private Backend state, daemon-owned aggregate output capacity, separately typed worst-case transient headroom, and the request's Timing Commitment. It prevents later Admission from spending the same capacity but does not physically allocate maximum KV or socket buffers. Only the Backend allocation component crosses the Backend Interface or is partitioned by Materialization and Request Release Results; daemon-owned output, transient-headroom, and timing components settle only through their own Core, in-flight-operation, and publication ownership rules.
 _Avoid_: Actual MLX allocation, estimate only, Model Residency
 
+**Request Backend Allocation Budget**:
+The checked byte component of one request Resource Reservation bounding private KV, Sampling State, and other request-owned Backend memory. Materialization and Request Release Results bind this exact budget identity and may report only its complete allocated/never-allocated partition; they have no authority over Ingress, output-channel, transient-headroom, timing, Model Residency, or other daemon-owned capacity. Core retains the complete Budget while any request Backend ownership exists, then atomically applies one accepted ownership-consuming partition. Proven actual allocation enters Pending Reclaim until converged Resource Evidence, while proven never-allocated bytes become reusable.
+_Avoid_: Resource Reservation, process footprint, output capacity
+
 **Pending Reclaim**:
-Capacity that was actually allocated for a terminal request or released Backend object and remains charged after logical release until Adapter allocator evidence and daemon process-footprint convergence prove reclamation. Reservation capacity that was never physically allocated is released immediately; allocated capacity cannot be reused merely because the request reached a terminal state.
+Request Backend Allocation Budget or Residency Reservation capacity that a trusted synchronized zero-ownership Materialization Result, ownership-consuming Request Release Result, zero-ownership failed or cancelled load Residency Result, or successful unload Residency Result proves was actually allocated for a terminal request or released Backend object. It remains charged after logical release until Adapter allocator evidence and daemon process-footprint convergence prove reclamation. The same accepted result lets Core release the corresponding proven never-allocated remainder; a logical terminal, failed unload, cache-reclaim request/result, sample, estimate, or untrusted failure state alone cannot release either class early.
 _Avoid_: Free capacity, fixed reclaim delay, cache size alone
 
 **Reclaim Stall**:
-Pending Reclaim that has not converged within its configured timeout. It directs bounded cache clear and idle-Model reclamation and enters Guarded Mode; persistent risk follows the ordinary Resource Mode escalation path, while the capacity remains charged throughout.
+Pending Reclaim that has not converged within its configured timeout. It directs a bounded allocator/cache-reclaim Residency Transition followed by deterministic idle-Model reclamation and enters Guarded Mode; persistent risk follows the ordinary Resource Mode escalation path, while the capacity remains charged throughout.
 _Avoid_: Forced free, fixed-delay release, immediate Critical Eviction
 
 **Request Description**:
-The stateless Execution Backend result produced before Admission. It validates a Token Request and reports Backend Capability, time and resource bounds, output bound, and residency requirements without creating an opaque request handle or allocating KV state.
+The stateless Backend Interface result produced before Admission from a daemon-owned input containing the exact immutable Token Request, exact validated Model Descriptor, and current Backend Generation, all of which the Result binds. The Backend performs no registry lookup. It reports the complete bounded Capability Requirement Set, Backend Capability declarations, ordinary estimates, and conservative time, resource, output, and residency facts without selecting a future batch/Shape, Certification Envelope, applicable Certification Record, or exact authorized Key and without creating an opaque request handle or allocating KV or Sampling State. Only a current-generation Result may reach Admission. A stale Result creates no Admission decision or terminal rejection: the single bounded description owner reissues resident Preparing requests in stable Request ID order under the original timeout, while a request already Warming stays stale until its own successful-load gate. Every bounded remaining waiter then requires a fresh Result after Model Descriptor equality succeeds.
 _Avoid_: Work Candidate, admitted request, KV allocation
 
 **Request Materialization**:
-The post-Admission Backend mutation that creates the opaque request handle, private KV state, and Sampling State for one accepted Request Description before it becomes Queued. Failure produces an explicit terminal request failure, releases its Resource Reservation, triggers Resource Governor reevaluation, and is not retried transparently or returned to Warming.
+The post-Admission Backend mutation that creates the opaque request handle, private KV state, and Sampling State for one accepted Request Description before it becomes Queued. Its synchronized Materialization Result reports retained request ownership plus a checked complete allocated/never-allocated partition of the exact Request Backend Allocation Budget. A terminal failure with zero retained ownership makes no release call: its accepted Result authorizes Core to release that Budget's proven never-allocated remainder and move any proven actual allocation into Pending Reclaim; Core settles the Resource Reservation's other unconsumed components from its own facts. A failure with partial ownership requires Request State Release and retains the complete Backend Allocation Budget until that accepted result authorizes the split. Failure is terminal, triggers Resource Governor reevaluation, and is not retried transparently or returned to Warming.
 _Avoid_: Admission, stateless validation, Candidate Formation
+
+**Materialization Result**:
+The trusted synchronized Backend Interface result for one Request Materialization, binding its Operation, Request, Resource Reservation, and Request Backend Allocation Budget identities and reporting success or terminal failure, retained complete/partial/zero request ownership, and a checked complete partition of that Budget into proven allocated and never-allocated bytes. Every nonzero ownership outcome supplies one opaque releasable ownership identity. Success transfers complete ownership to Core tracking while retaining the Budget. Zero-ownership failure has already rolled back logical state and authorizes Core to apply its Budget partition without `release_request`; partial ownership failure keeps the complete Budget charged until Request State Release. The Result carries no output, transient-headroom, timing, or other daemon capacity authority. A missing identity, nonconservative partition, overflow, or otherwise untrustworthy result invokes process-wide fail-stop.
+_Avoid_: Request Release Result, inferred allocation, retry token
+
+**Request State Release**:
+The exactly-once owner-thread Backend operation required only when complete or partial opaque request ownership exists after terminal completion, cancellation, materialization failure, or eviction; a proven never-started/pre-materialization path or zero-ownership Materialization Result makes no Backend release call. Core directly withdraws a never-started operation's applicable unconsumed Resource Reservation, if any, while a zero-ownership Result authorizes its trustworthy Request Backend Allocation Budget split. The logical terminal releases no Backend allocation charge while ownership exists. An accepted synchronized Request Release Result consumes that ownership and authorizes Core to release only the Budget's proven never-allocated remainder while moving proven actual allocation into Pending Reclaim until observed convergence; other Reservation components remain daemon-owned. If no trustworthy cleanup result can be obtained, the process fail-stops; no caller retries, assumes success, destroys Backend state from another thread, unloads the owning Model, or reuses Backend capacity early.
+_Avoid_: Terminal Core transition, assumed memory free, cross-thread destruction
+
+**Request Release Result**:
+The trusted synchronized Backend Interface result for one Request State Release, binding the exact Operation, opaque ownership, Request, Model Revision, Resource Reservation, and Request Backend Allocation Budget identities and reporting zero retained request ownership plus a checked complete Budget partition into proven allocated and never-allocated bytes. Core accepts it at most once, consumes the matching ownership, and applies that Backend partition atomically; a duplicate cannot release capacity again. It carries no authority over output, transient-headroom, timing, or another daemon-owned Reservation component. Any retained or mismatched ownership, missing identity, nonconservative partition, overflow, or inability to return this result invokes process-wide fail-stop and keeps unload and Backend capacity reuse forbidden.
+_Avoid_: Materialization Result, logical terminal, retry acknowledgement
 
 **Private KV State**:
 KV state owned by exactly one request and one Model Revision. The MVP has no cross-request Prefix Cache or transparent prefix sharing; cache reclamation applies only to allocator caches and compiled artifacts that cannot alter request semantics.
@@ -537,23 +593,27 @@ Loss of a live Data Plane connection. It orders Cooperative Cancellation for eve
 _Avoid_: Temporary output backpressure, daemon failure
 
 **Residency Transition**:
-A Resource Governor-directed load or unload serialized as a control operation on the device loop. It cannot overlap a Turn, and the Execution Backend performs it at a synchronized state-safe boundary. It declares Resource Impact, a conservative blocking bound, and safe cancellation behavior. It may run during shared operation only when its bound fits every current timing budget; otherwise it must wait for explicit Exclusive Mode. A Model undergoing a transition cannot form Work Candidates.
-_Avoid_: Turn, model request, cache clear
+A Resource Governor-directed load, unload, or bounded allocator/cache-reclaim variant serialized as a control operation on the device loop. It cannot overlap a Turn, and the Execution Backend performs it at a synchronized state-safe boundary. It declares Resource Impact, a conservative blocking bound, and safe cancellation behavior. It may run during shared operation only when its bound fits every current timing budget; otherwise it must wait for explicit Exclusive Mode. A load or unload makes the affected Model unavailable for Candidate Formation; cache reclaim may leave Model Residency unchanged and cannot alter request semantics. Unload has a hard precondition of zero complete/partial request ownership and zero pending Request State Release for the Model.
+_Avoid_: Turn, model request, Exclusive operation
 
 **Transition Cancellation**:
 A cooperative request issued when Resource Mode becomes Critical during a Residency Transition. The Execution Backend stops at its declared safe cancellation point or completes or rolls back within its certified maximum blocking time. The runtime never kills only the Device Executor thread while retaining the process; violation of the certified safe-point bound invokes the Operation Watchdog and process-wide fail-stop.
 _Avoid_: Immediate thread termination, ignored Critical mode
 
 **Residency Receipt**:
-The auditable outcome of one started Residency Transition, recording its requested action, synchronized result, elapsed blocking time, resulting Model Residency, and failure status independently of Turn Receipts.
+The auditable outcome of one started Residency Transition, recording its load, unload, or cache-reclaim action, synchronized result, elapsed blocking time, resulting Model Residency, and failure status independently of Turn Receipts. For cache reclaim the resulting Model Residency may be unchanged, and the Receipt never proves physical reclamation without later converged Resource Evidence.
 _Avoid_: Turn Receipt, telemetry sample
 
+**Residency Result**:
+The trusted synchronized Backend Interface result underlying one Residency Receipt. It binds the exact Operation, Model Revision, and Residency Reservation identities and reports the action, resulting Model Residency, retained Backend residency ownership, and a checked complete partition into proven allocated and never-allocated reservation bytes where that action settles ownership. Successful load retains complete residency ownership and the complete Reservation. Terminal failed or cancelled load is strongly rolled back before return, reports zero retained ownership, and authorizes Core to release only its proven never-allocated remainder while moving proven actual allocation into Pending Reclaim. Successful unload likewise reports zero ownership and authorizes that split; failed unload retains ownership and the complete Reservation. Cache reclaim does not change ownership or settle a Residency Reservation. A missing identity, nonconservative partition, overflow, or otherwise untrustworthy result invokes process-wide fail-stop before another Backend call.
+_Avoid_: Resource Evidence, physical reclaim proof, inferred allocation split
+
 **Residency Service**:
-The synchronized device-loop time consumed by Residency Transitions. It is measured and bounded separately from Engine Service, is never charged to a Model Ledger, and is subject to Governor limits on transition frequency and aggregate occupancy.
+The synchronized device-loop time consumed by load, unload, and bounded allocator/cache-reclaim Residency Transitions. It is measured and bounded separately from Engine Service, is never charged to a Model Ledger, and is subject to Governor limits on transition frequency and aggregate occupancy.
 _Avoid_: Engine Service, free overhead, Model debt
 
 **Residency Policy**:
-The Resource Governor's deterministic rules for selecting and ordering Residency Transitions. Normal unloading is limited to Models with no accepted or runnable work, and Model Weight does not influence selection.
+The Resource Governor's deterministic rules for selecting and ordering Residency Transitions. Normal unloading is limited to Models with no accepted or runnable work, zero complete/partial request ownership, and zero pending Request State Release; Model Weight does not influence selection.
 _Avoid_: Scheduler fairness, backend heuristic, LRU alone
 
 **Eviction Rank**:
@@ -561,11 +621,11 @@ Explicit configuration ordering Models for Critical Eviction without changing th
 _Avoid_: Fairness weight, LRU, permanent pin
 
 **Critical Eviction**:
-A resource-safety action used only after reclaiming caches and idle Models is insufficient. At the current Turn's synchronized safe boundary, affected accepted work receives an explicit terminal failure before its Model is unloaded.
+A resource-safety action used only after reclaiming caches and idle Models is insufficient. At the current Turn's synchronized safe boundary, affected accepted work first receives an explicit terminal failure, every complete or partial Backend request ownership is then consumed by an accepted Request Release Result, and only then may the Model unload. An untrustworthy release result invokes process-wide fail-stop and forbids unload rather than destroying live request state.
 _Avoid_: Normal unload, transparent suspension, forced in-flight interruption
 
 **Residency Failure**:
-A terminal failure of a Residency Demand caused by load failure, artifact or descriptor mismatch, or incompatible Backend Capability. It produces a Structured Error for every Warming waiter, marks the Model Revision Unavailable, stops automatic retry, and releases or reclaims its Residency Reservation according to observed allocation. Only an explicit Control Plane repair or replacement registration may restore service.
+A terminal failure of a Residency Demand caused by load failure, artifact or descriptor mismatch, incompatible Backend Capability, or cooperative cancellation. Its accepted Residency Result must strongly roll back to zero retained Backend residency ownership and provide the trustworthy allocation split; the Governor releases the proven never-allocated remainder and moves proven actual allocation into Pending Reclaim. A zero-allocation result releases the complete Reservation, while an untrustworthy result fail-stops rather than inferring cleanup from failure or samples. It produces a Structured Error for every Warming waiter, marks the Model Revision Unavailable, stops automatic retry, and only explicit Control Plane repair or replacement registration may restore service.
 _Avoid_: Warming, retry backoff loop, Admission rejection
 
 **Stale Turn Plan**:
@@ -633,7 +693,7 @@ An explicit request from the Runtime Core for the daemon to perform work, such a
 _Avoid_: Core Event, direct I/O, implicit retry
 
 **Effect Result**:
-A daemon-validated Core Event reporting the completion, failure, cancellation, or indeterminate outcome of one Effect by Operation ID and relevant generation. A result for a bounded known-completed operation becomes an audited duplicate Domain Rejection; an unknown, late, or generation-mismatched result is rejected with its own stable reason. No rejected result reapplies state. A Backend operation is invoked once by direct call; if process failure prevents its result from being committed, Daemon Failure discards all live inference state and restart never retransmits it.
+A daemon-validated Core Event reporting the completion, failure, or cancellation of one Effect by Operation ID and relevant generation; only a non-Backend external Effect whose contract explicitly permits uncertainty may report an indeterminate outcome. A result for a bounded known-completed operation becomes an audited duplicate Domain Rejection; an unknown, late, or generation-mismatched result is rejected with its own stable reason. No rejected result reapplies state. A Backend operation is invoked once by direct call and returns only a trustworthy synchronized typed result. If process failure prevents obtaining or committing it, no Backend Effect Result is fabricated: Daemon Failure discards all live inference state and restart never retransmits the operation.
 _Avoid_: Effect, exception, blind retry
 
 **Core Replay Case**:
@@ -5745,23 +5805,35 @@ The fixed-enumeration and explicitly bounded labels permitted on runtime metrics
 _Avoid_: Request-per-series telemetry, content labels, audit replacement
 
 **Execution Backend**:
-The mechanism that owns one Model Planner, logical per-Model Model Runtimes, Turn execution, and directed Residency Transitions while retaining model, KV, tensor, stream, cache, and other backend-specific inference state. It also declares operation resource bounds and defines the semantics and conservative default thresholds for its backend-specific resource signals; it never owns cross-Model priority or global Resource Governor policy.
+The owner-thread mechanism behind the Backend Interface. It owns one Model Planner, logical per-Model Model Runtimes, stateless Model Descriptor and Request Description generation, post-Admission materialization and release, Candidate Formation, Turn and explicit Exclusive execution, accepted-Receipt Cost Profile observation, directed Residency Transitions, Backend-only sampling, and final Backend Shutdown while retaining model, KV, tensor, stream, cache, and other backend-specific inference state. It declares operation resource bounds and returns its Backend Resource Signal Contract at initialization, but never registers a Revision, decides Admission, selects cross-Model priority, assembles complete Resource Evidence, or chooses Resource Mode.
 _Avoid_: Scheduler, policy engine
+
+**Backend Initialization**:
+The first owner-thread Backend Interface operation. Before invoking it, the daemon verifies the Backend Bootstrap Manifest and starts the operation watchdog from its externally certified initialization bound. The call creates Backend root state and returns exact Adapter Implementation, dependency build, Backend Interface, complete Backend Capability descriptor, Backend Resource Signal Contract, and Backend Operation Bound Set identities plus both complete bounded descriptors, all of which must match the Manifest before any later operation. It makes no Certification Applicability, authorization, Admission, Resource Mode, or Service Readiness decision. A trustworthy failure strongly rolls back to zero Backend root ownership before return and is not retried in the same process; failure to return or roll back within the certified safe-point contract invokes process-wide fail-stop. A nominal success whose returned descriptor does not match trusted Bootstrap evidence is untrusted live state and likewise fail-stops without a later Backend call or raw deallocation.
+_Avoid_: Protocol negotiation, capability authorization, lazy first-Turn setup
+
+**Backend Shutdown**:
+The final exactly-once owner-thread Backend Interface operation after Service Readiness is false, no Backend operation is in flight, and every request ownership and pending Request State Release is zero. It may destroy remaining resident model, root, stream, and cache state, leaving only an empty opaque shell eligible for raw deallocation, while current-process capacity stays unavailable until process exit and a successor's fresh Process Reclaim Barrier baseline.
+_Avoid_: Device Executor cancellation, cross-thread destructor, physical reclaim proof
+
+**Shutdown Result**:
+The trusted synchronized Backend Shutdown result whose success proves zero Backend root, model, and request ownership, permits raw deallocation of only the now-empty opaque shell, and is required before the daemon may write a Clean Shutdown Boundary. It does not prove physical reclamation or release process-local capacity; failure, a missed safe point, or an untrustworthy result causes process-wide fail-stop with no retry, fabricated result, raw live-state destruction, or Clean Shutdown Boundary.
+_Avoid_: Clean Shutdown Boundary, assumed memory release, retry acknowledgement
 
 **Model Runtime**:
 The logical per-Model native state capsule inside the Execution Backend that owns one model graph, KV and cache state, and an explicit owner-affinity token. In the MVP every Model Runtime is constructed, called, and destroyed on the single Device Executor thread; it is not a per-Model worker, OS thread, stream-overlap grant, or independent scheduling authority.
 _Avoid_: Model process, per-Model Scheduler, concurrent Metal owner
 
 **C++/MLX Adapter**:
-The MVP's default experimental native MLX implementation, statically linked into the TurnVector Daemon and constructed, called, and destroyed only by the Device Executor. Its native-facing Module Interface and Implementation are C++; a minimal private C-compatible shim with opaque owned handles and coarse operations connects Rust without exposing C++ object layout, STL types, or exceptions. One call executes a complete Candidate Formation, Turn, or Residency operation and returns an in-memory typed result only after the required synchronization boundary. For Prefill, one Turn call advances one selected Prefill Chunk and returns continuation state; it cannot hide a loop that consumes successive schedulable chunks. This later architecture decision supersedes only the P-1C report's recommendation to defer every product topology choice: the MVP uses this coarse in-process Seam, while the experiment remains RED and supplies no relative-performance certification or permanent general FFI conclusion. The MVP loads no Backend plugin.
+The MVP's default experimental native MLX implementation, statically linked into the TurnVector Daemon and constructed and called only by the Device Executor. Its native-facing Module Interface and Implementation are C++; a minimal private C-compatible shim with opaque owned handles and one coarse entry point per Backend Interface operation connects Rust without exposing C++ object layout, STL types, exceptions, serialized messages, or per-op MLX calls. The shim's raw deallocator accepts only an empty-handle typestate after trustworthy failed-initialization rollback or successful Backend Shutdown; it rejects a live initialized handle and is never a second teardown authority. For Prefill, one Turn call advances one selected Prefill Chunk and returns continuation state; it cannot hide a loop that consumes successive schedulable chunks. This later architecture decision supersedes only the P-1C report's recommendation to defer every product topology choice: the MVP uses this coarse in-process Seam, while the experiment remains RED and supplies no relative-performance certification or permanent general FFI conclusion. The MVP loads no Backend plugin.
 _Avoid_: Backend child process, per-op mlx-c, native C++ ABI across Rust, proven P-1C boundary
 
 **Native Adapter Initialization**:
-The same-thread initialization performed by the Device Executor after Bootstrap has established every non-Backend readiness prerequisite. It verifies the exact Adapter and MLX build identities, installs nonterminating native error translation, creates thread-owned streams and state, and checks the Backend Interface revision before any model load or Turn. Failure leaves Service Readiness false and starts no inference work; there is no launch nonce, socket handshake, or independently reconnectable Backend process.
+The C++/MLX implementation of Backend Initialization, performed by the Device Executor after Bootstrap has established every non-Backend readiness prerequisite and the daemon has verified the embedded Backend Bootstrap Manifest. The pre-call watchdog uses that Manifest's certified initialization entry. The operation verifies and returns the exact Adapter and MLX build, Backend Interface, complete Backend Capability descriptor, Backend Resource Signal Contract, and Backend Operation Bound Set identities plus both complete bounded descriptors, installs nonterminating native error translation, and creates thread-owned streams and root state before any model load or Turn. The daemon requires exact Manifest equality, then evaluates applicability, Resource Mode, and Readiness. A trustworthy failure strongly rolls back all root ownership, returns the handle to the only pre-success empty typestate eligible for raw deallocation, leaves Service Readiness false, starts no inference work, and is not retried in that process; a missed rollback safe point or nominal success with mismatched returned evidence fail-stops without calling shutdown or the raw deallocator. There is no launch nonce, socket handshake, or independently reconnectable Backend process.
 _Avoid_: Socket handshake, protocol negotiation, lazy first-Turn initialization
 
 **Backend Interface**:
-The narrow in-process Seam implemented by the C++/MLX Adapter and Fake Execution Backend. It exposes bounded Candidate Formation, Turn execution, Residency Transition, Resource Evidence, cancellation polling, and shutdown operations through direct calls on the Device Executor. Inputs and outputs use owned, validated in-memory representations and opaque IDs; tensors, KV layout, Rust references, C++ objects, exceptions, and serialized protocol messages never cross the Seam. Both Adapters must pass the same conformance fixtures for Candidate completeness and exclusions, frozen Plan membership, owner affinity, bounded Prefill continuation, typed outcomes, and synchronization. The Interface is versioned with the build for certification and compatibility checks, but it is neither a wire protocol nor a stable public plugin ABI.
+The narrow in-process Seam implemented by the C++/MLX Adapter and Fake Execution Backend. Its complete bounded operation family covers initialization including the Backend Capability and Resource Signal descriptors, stateless Model Descriptor and Request Description generation with finite Capability Requirements, post-Admission Request Materialization and ownership-gated Request State Release, exact-key Candidate Formation, Turn execution, compare-and-set accepted-Receipt Cost Profile observation, explicit Exclusive execution, strongly rolled-back load/ownership-gated unload/cache-reclaim Residency Transition, contract-bound Backend Resource Sample, and exactly-once Backend Shutdown through direct owner-thread calls. Every readiness-time call has an applicable Engine, Residency, Exclusive, or Owner-Thread Support bound; no queued owner work is free. Cancellable calls receive only a read-only Device Control Signal view. Inputs and outputs use owned, validated in-memory representations and opaque IDs; tensors, KV layout, Rust references, C++ objects, exceptions, and serialized protocol messages never cross the Seam. Both implementations pass the same bootstrap/returned-descriptor, post-load Model Descriptor equality and Request Description refresh, requirement/authorized-key, ownership, call-order, blocking/safe-point, synchronization, result-gated release, profile-CAS, load-rollback, signal-contract, shutdown, and fail-stop conformance fixtures. The Interface is versioned with the build for certification and compatibility checks, but it is neither a wire protocol nor a stable public plugin ABI.
 _Avoid_: Data Plane, Control Plane, Protobuf, per-op binding, Backend Plugin ABI
 
 **Protocol Compatibility**:
@@ -5797,7 +5869,7 @@ The stable machine-readable failure contract containing an error code, reason co
 _Avoid_: Error string contract, process exit status
 
 **Device Control Signal**:
-A bounded set of in-process atomic flags for cancellation, Critical resource action, and shutdown that external threads may set while the Device Executor is inside one certified operation. The C++/MLX Adapter polls them only at declared safe points; they carry no Plan, Candidate, mutable state, Resource Evidence, or second operation and cannot reorder Runtime Core events.
+A bounded set of in-process atomic flags for cancellation, Critical resource action, and shutdown that external threads may set while the Device Executor is inside one certified operation. Each cancellable Backend Interface call receives only a read-only view and polls it at declared safe points; setting a flag is not a second Backend call or cancel-poll operation. The Signal carries no Plan, Candidate, mutable Core state, Resource Evidence, or semantic ordering and cannot reorder Runtime Core events.
 _Avoid_: Command channel, second device loop, asynchronous Core mutation
 
 **Operation Watchdog**:
@@ -5805,7 +5877,7 @@ The daemon timer for an in-flight Backend operation. At the certified execution 
 _Avoid_: Estimate calibration, infinite wait, hard thread interruption
 
 **Indeterminate Backend Operation**:
-A started in-process Backend operation whose synchronized result cannot be committed because the daemon enters process-wide fail-stop. It is never retried or reconstructed after restart; Daemon Failure discards every dependent live request, KV object, Residency state, and Reservation while durable authorities reconcile under their own protocols.
+A started in-process Backend operation for which the daemon cannot obtain or commit a trustworthy synchronized result before process-wide fail-stop. It is a fatal absence of an applicable Effect Result, never a `TurnResult`, Turn Receipt, Request Release Result, retryable response, or assumed rollback. It is never retried or reconstructed after restart; Daemon Failure discards every dependent live request, KV object, Residency state, and Reservation while durable authorities reconcile under their own protocols.
 _Avoid_: Retryable message, Plan Rejection, assumed rollback
 
 **Device Executor Failure**:
@@ -5817,15 +5889,15 @@ The startup resource-safety barrier after Daemon Failure. The next daemon cannot
 _Avoid_: Request failure, socket disconnect, fixed reclaim delay
 
 **Device Executor Shutdown**:
-The owner-thread shutdown path that rejects further Backend work, requests cancellation of any operation in flight, reaches its nearest certified safe point, destroys model, KV, cache, stream, and Adapter state on the Device Executor, and then lets the daemon exit. If the certified safe-point bound is violated, Operation Watchdog uses process-wide fail-stop instead of detaching or abandoning the thread.
-_Avoid_: Thread detach, immediate unsafe drop, child-process reconnect
+The owner-thread shutdown orchestration that rejects further Backend work, requests cancellation of any operation in flight, and waits for its nearest certified safe point. After Service Readiness is false, no Backend operation is in flight, and every request ownership and pending Request State Release is zero, it invokes exactly one Backend Shutdown as the final Backend Interface operation. Only a trustworthy synchronized Shutdown Result proving zero logical Backend ownership permits raw deallocation of the resulting empty shell; only confirmed shell deallocation permits the daemon to write a Clean Shutdown Boundary and exit cleanly. A missed safe point, missing or untrustworthy Result, or inability to confirm empty-shell deallocation causes process-wide fail-stop without retry, fabricated Result, direct destruction of live or indeterminate Backend state, or Clean Shutdown Boundary.
+_Avoid_: Direct live-state destruction, thread detach, fabricated clean shutdown
 
 **Backend Plugin ABI**:
 A possible future binary extension seam inside the serving process. If introduced, it uses a versioned C function table and opaque handles with C++ source wrappers; native C++ virtual interfaces, STL types, exceptions, and object layouts never cross it. The MVP statically links one C++/MLX Adapter and does not load plugins.
 _Avoid_: Backend Interface, native C++ ABI, MVP requirement
 
 **Fake Execution Backend**:
-A deterministic in-process test implementation of the Backend Interface used with scripted Effects, Effect Results, resource samples, and durations to verify Runtime Core behavior without model inference. It runs under the same direct-call sequencing contract but is not a production runtime and does not replace MLX correctness or Certification Record evidence.
+A deterministic in-process test implementation of the complete Backend Interface used with scripted identities and Backend Resource Signal Contract, Capability Requirement Sets, ownership/allocation, exact-key candidates, synchronized results, Cost Profile CAS outcomes, Exclusive and strongly rolled-back load/ownership-gated unload/cache-reclaim Residency outcomes, contract-bound Backend Resource Samples, control signals, per-call blocking/safe-point bounds, and durations to verify Runtime Core and Device Executor behavior without model inference. It obeys the same owner-thread, Authorized Capability membership, call-order, support-budget, result-gated release, signal-contract, and fail-stop conformance contract but is not a production runtime and does not replace MLX correctness or Certification Record evidence.
 _Avoid_: Fake L1, mock MLX
 
 **Resource Governor**:
