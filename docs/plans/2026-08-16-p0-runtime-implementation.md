@@ -50,13 +50,21 @@ Dependency checkouts, weights, and caches remain under ignored `.work/`.
 ### Architecture Authority Prerequisites
 
 Five documentation corrections precede implementation. ADR 0032 is updated to
-the accepted P0 order above. ADRs 0018 and 0020 plus every directly affected
-native/Fake glossary entry are updated to include stateless Model and Request
-Description, post-Admission Request Materialization, Receipt-driven Cost Profile
-updates, explicit request-state release, Exclusive execution, a Backend-only
-resource sample, and a shared read-only Device Control Signal view. Those
-changes also remove `indeterminate` as an ordinary Turn Receipt: process
-fail-stop prevents a Receipt from being fabricated.
+the accepted P0 order above. ADRs 0008, 0011-0014, 0018, 0020, 0022, 0025,
+0031, and 0034 plus
+every directly affected native/Fake glossary entry are updated to include
+stateless Model Descriptor and descriptor-complete Request Description, post-Admission
+Request Materialization, result-gated request/residency release, Receipt-driven
+dirty-Model Cost Profile updates, finite Capability Requirement/Authorized Sets,
+ownership-gated release-before-unload, strong rollback for failed loads, explicit
+Exclusive execution, load/unload/cache reclaim through Residency Transition, a
+manifest-bound complete Backend Capability descriptor, a versioned Backend
+Resource Signal Contract with contract-bound samples, an externally verified
+Backend Operation Bound Set, a bounded readiness-time Owner-Thread Support Budget,
+post-load current-generation description revalidation, exactly-once result-gated
+Backend Shutdown, and a shared read-only Device Control Signal view.
+Those changes also remove `indeterminate` as an ordinary Turn
+Receipt: process fail-stop prevents a Receipt from being fabricated.
 
 ADR 0022 and the request/sampling glossary entries then freeze one closed P0
 Generation Parameters contract. Every request explicitly supplies Sampling Mode,
@@ -298,28 +306,94 @@ sample_backend_resources()                    -> BackendResourceSample
 shutdown(control_view)                        -> ShutdownResult
 ```
 
-`describe_model` generates the hash-bound Model Descriptor before registration.
-`describe_request` is stateless and allocates no request handle, KV, or Sampling
-State. `materialize_request` is permitted only after Admission atomically creates
-the request Resource Reservation and Timing Commitment. Any materialized or
-partially materialized Backend state is released exactly once by
-`release_request` on the owner thread. A successful Release Result consumes
-ownership and reports the actually allocated bytes by reservation class; the
-never-allocated reservation remainder releases immediately, while allocated
-bytes remain charged as Pending Reclaim through fresh allocator and footprint
-convergence. An operation unable to return that synchronized deterministic
+Before `initialize`, a build-generated daemon-embedded Backend Bootstrap Manifest
+binds the expected implementation, complete Backend Capability descriptor, Signal
+Contract, and Operation Bound Set identities plus the externally certified
+initialization blocking/safe-point entry. The daemon verifies that artifact and
+starts the pre-call watchdog from its bound. `initialize` returns the complete
+bounded versioned descriptors, which must exactly match the trusted Manifest before
+any later call; no Backend self-report supplies its expected value. A nominal
+success with mismatched evidence fail-stops without another Backend call or raw
+deallocation. A trustworthy
+initialization failure strongly rolls back all root ownership before return and is
+not retried in the same process. `describe_model` generates the hash-bound Model
+Descriptor before registration. The daemon-owned `request` input to stateless
+`describe_request` contains the frozen Token Request, exact validated Model
+Descriptor, and current Backend Generation, all of which the Result binds; no
+Backend registry lookup, request handle, KV, or Sampling State exists at this
+point. The Result returns a complete finite Capability Requirement Set, never a
+future batch/Shape choice, Envelope, applicable Record, or exact authorized Key.
+Only a current-generation Result may reach Admission. C10 is the sole description-
+refresh owner: any Backend Generation advance invalidates all older not-yet-
+admitted Results in O(1) by generation identity. It reissues resident Preparing
+requests in stable Request ID order under the original timeout; Warming requests
+remain stale until their own post-load gate. A stale Result causes no Admission
+decision or terminal rejection. Its EffectResult is consumed by current-generation validation before
+another Backend-mutating Effect is selected. The daemon joins every requirement
+with fresh environment evidence; Admission verifies the complete exact-key closure
+and freezes the Authorized Capability Set plus worst-case bounds.
+`materialize_request` is permitted only after Admission atomically creates the
+typed request Resource Reservation and Timing Commitment. Only its Request Backend
+Allocation Budget crosses the Seam. The Result binds the exact Operation, Request,
+Reservation, Budget, releasable ownership when nonzero, and checked complete
+Budget partition; it carries no output, transient-headroom, or timing authority.
+A proven never-started or pre-materialization path makes no Backend release call
+and Core withdraws only its applicable unconsumed Reservation. A zero-ownership
+Materialization Result also makes no release call but authorizes Core to split its
+proven never-allocated remainder from proven
+actual allocation entering Pending Reclaim. Any complete or partial Backend
+ownership is released exactly once by `release_request` on the owner thread.
+Terminal Core state retains the complete Request Backend Allocation Budget until
+its accepted Release Result consumes ownership, releases the Budget's proven
+never-allocated remainder, and moves proven actual allocation into Pending
+Reclaim, where it remains until fresh allocator and footprint convergence proves
+reclamation. An operation unable to return the required synchronized deterministic
 result triggers process fail-stop: it is never retried, treated as success, or
-cleaned by cross-thread destruction. Terminal Core state retains the applicable
-charges through that boundary.
-Candidate Formation reports the Backend-owned Cost Profile version and ordinary
-estimates. Only an accepted Receipt may update that profile between Turns; the
-Adapter never widens certified bounds. An accepted profile update advances
-Backend Generation and invalidates every candidate formed against the prior
-generation. A Turn Plan grants target Engine Service and work ceilings, while
-the Backend chooses the concrete Prefill token range. `TurnResult` carries
-bounded opaque progress, staged token output, and per-member outcomes; tensors,
-raw logits, and KV layout never cross the Seam. Qualification-only logits/KV
-hashes use a separate test build seam and never enter Core or the serving ABI.
+cleaned by cross-thread destruction.
+
+Candidate Formation reports one exact Capability Key contained in every member's
+frozen Authorized Capability Set, the Backend-owned Cost Profile version, and
+ordinary estimates. Only an accepted Receipt may enter the compare-and-set
+`observe_turn_receipt` call between Turns. An unexpected version mismatch rejects
+before mutation but proves divergence and fail-stops; a match returns unchanged
+or atomically installs a new profile and returns exact old/new identities. Core
+mirrors only the identity; a Cost Profile Commit Barrier makes the result the
+next Core Event with no intervening Transition or Backend call. Core must
+immediately commit an applied update, advance Backend Generation, invalidate every
+older Scheduling Snapshot, Turn Plan, and not-yet-admitted Request Description,
+route those accepted requests through C10, and mark only its affected Model dirty. A
+malformed result or failed Core commit after Backend mutation fail-stops before
+another Backend call. The Adapter never widens certified bounds. A Turn Plan grants
+target Engine Service and work ceilings, while the Backend chooses the concrete
+Prefill token range.
+`TurnResult` carries bounded opaque progress, staged token output, and per-member
+outcomes; tensors, raw logits, and KV layout never cross the Seam.
+Qualification-only logits/KV hashes use a separate test build seam and never enter
+Core or the serving ABI.
+
+`transition_residency` has serialized load, unload, and bounded allocator/cache-
+reclaim variants. Every variant declares Resource Impact, blocking and safe-point
+bounds, cannot overlap a Turn, and produces a Residency Result; cache reclaim may
+leave Model Residency unchanged, changes no ownership, and does not prove
+physical reclamation. Core acceptance of a successful load Result retains
+ownership and the full Residency Reservation, advances Backend Generation, and
+invalidates that Revision's pre-load Model Descriptor observation plus every
+older not-yet-admitted Request Description. While it remains
+unavailable for Candidate Formation, the owner thread repeats `describe_model`
+against the exact registered Manifest and requires the returned identity and hash
+to equal the registered Model Descriptor. It then repeats `describe_request` for
+each bounded remaining Warming waiter against that descriptor and current
+Generation through C10; every unrelated invalidated request uses the same owner.
+Only fresh Results may reach Admission. Descriptor drift marks only the loaded
+Revision Unavailable and fails its waiters; Generation change alone does not fail
+an unrelated request. A terminal failed/cancelled load
+strongly rolls back to zero ownership before its accepted Result authorizes Core
+to release the proven never-allocated remainder and move proven actual allocation
+to Pending Reclaim. Unload requires zero request ownership and zero pending
+release; successful unload performs the same split, while failed unload retains
+ownership and charge. Backend Resource Samples bind the exact initialization
+Signal Contract identity; daemon sampling joins them with process and system facts
+before the Governor derives Resource Mode.
 
 Exclusive execution begins only from an explicit Control Plane request after a
 synchronized shared boundary. Core pauses shared dispatch, rejects new Admission
@@ -344,10 +418,43 @@ Executor separately brackets Residency Transition to produce a Residency Receipt
 with elapsed Residency Service. The Adapter may return diagnostic subspans but
 owns neither fairness nor residency clocks.
 
-Backend Initialization returns exact Adapter, MLX, Backend Interface, and
-Capability identities, never an authorization decision. A daemon-owned bounded
-platform probe supplies device, GPU, unified-memory, and macOS facts and joins
-them into one fresh Environment Fingerprint. Admission alone evaluates exact
+Every other Backend call permitted while Service Readiness is true consumes its
+externally verified finite continuous blocking and next-safe-point bound from the
+active Backend Operation Bound Set. Complete describe,
+materialize, release, Candidate Formation, Receipt-observation, and resource-
+sampling direct-call intervals consume a versioned Owner-Thread Support Budget as
+Runtime Overhead. The budget has fixed per-call, call-count, and aggregate-time
+maxima per finite scheduling window; every active Deadline Cost Bound reserves
+its worst-case interference. Mandatory release and safety sampling use separately
+pre-reserved capacity, while nonessential work defers or rejects when it cannot
+fit. Initialization runs before readiness, shutdown after readiness is false,
+Residency Service remains separately gated, and Exclusive execution pauses shared
+dispatch. No queued maintenance is treated as free background work.
+
+`shutdown` is the final exactly-once owner-thread operation after readiness is
+false, no Backend operation is in flight, and every request ownership and pending
+release is zero. It may destroy remaining resident model, stream, cache, and root
+state under the verified Shutdown entry in the Operation Bound Set and leaves only
+an empty opaque shell containing no Backend or MLX object. The private nonthrowing,
+bounded raw deallocator accepts that shell only after a
+successful `ShutdownResult`, or after trustworthy initialization failure already
+proved zero root ownership; it rejects live initialized state. Only a trustworthy
+synchronized `ShutdownResult` proving zero Backend root, model, and request
+ownership permits shell deallocation and a Clean Shutdown Boundary. It never
+proves physical reclaim, and all current-process capacity remains unavailable
+until process exit and a successor's fresh Process Reclaim Barrier baseline.
+Failure, an untrustworthy Result, or a missed safe point fail-stops without retry,
+raw live-state destruction, fabricated Result, or Clean Shutdown Boundary.
+
+Backend Initialization must match the preverified Backend Bootstrap Manifest and
+returns exact Adapter, MLX, Backend Interface, complete Backend Capability
+descriptor, Backend Resource Signal Contract, and Backend Operation Bound Set
+identities plus both complete bounded descriptors, never an authorization or
+Resource Mode decision. A daemon-owned bounded platform probe supplies device,
+GPU, unified-memory, and macOS facts and joins them with the initialized build,
+Interface, Bootstrap Manifest, exact Capability descriptor, Signal Contract, and
+externally verified Operation Bound Set identities into one fresh Environment
+Fingerprint. Admission alone evaluates exact
 Certification Applicability and may cache the answer in a fixed-capacity
 recency cache keyed by every determining Control, record, capability, build,
 interface, and environment identity. Every hit rechecks the current evidence's
@@ -356,8 +463,8 @@ invalidates the entry. Certification Records have no invented wall-clock expiry.
 The cache is neither persisted nor audited as authority.
 
 Runtime Overhead remains daemon-owned. Versioned conservative bounds cover Plan
-formation/selection and, after a synchronized Receipt, result validation, Core
-commit, and output publication. On that started-Turn branch, the complete
+formation/selection, Owner-Thread Support Budget interference and, after a
+synchronized Receipt, result validation, Core commit, and output publication. On that started-Turn branch, the complete
 synchronous `execute_turn` call belongs only to Engine Service. On a
 pre-execution Plan Rejection branch, the complete synchronous rejection call and
 bounded fresh-Snapshot/replanning work belong instead to Runtime Overhead; they
@@ -371,18 +478,20 @@ invalidates the applicable overhead version and blocks unsafe new timing
 commitments. Runtime Overhead is never supplied by the Backend or charged to a
 Model Ledger.
 
-The Runtime Overhead witness is continuing. E15 closes both result branches over
-the first working Fake Event Loop. Every later commit that adds covered work,
-especially protocol conversion, Core result handling, and Output Publication,
-extends the same span partition, evidence key, and bound regression in that
-commit; a partial timeline cannot be treated as the production bound.
+The Runtime Overhead witness is continuing. E16 closes both Turn-result branches
+over the first working Fake Event Loop; E17 adds every readiness-time support-call
+span and its aggregate interference budget. Every later commit that adds covered
+work, especially protocol conversion, Core result handling, and Output
+Publication, extends the same span partition, evidence key, and bound regression
+in that commit; a partial timeline cannot be treated as the production bound.
 
-`BackendResourceSample` contains only owner-thread MLX allocator/cache evidence.
-A daemon-owned sampler collects process footprint, available memory, swap,
-compressor, and macOS pressure events without hot-path shell commands. A bounded
-assembler retains each source's provenance, sequence, and freshness and is the
-only component that emits complete `ResourceEvidence`; the Backend never selects
-Resource Mode.
+`BackendResourceSample` contains only owner-thread MLX allocator/cache evidence
+and binds the exact Backend Resource Signal Contract identity returned at
+initialization. A daemon-owned sampler collects process footprint, available
+memory, swap, compressor, and macOS pressure events without hot-path shell
+commands. A bounded assembler rejects a mismatched contract, retains each
+source's provenance, sequence, quality, and freshness, and is the only component
+that emits complete `ResourceEvidence`; the Backend never selects Resource Mode.
 
 The deterministic Fake Execution Backend and the C++/MLX Adapter implement the
 same Interface and conformance fixtures. Every logical per-Model `ModelRuntime`
@@ -459,10 +568,10 @@ independently green and at or below its target when measured.
 |---|---|---|---|---:|
 | D00 | `docs: define P0 runtime implementation plan` | This plan, ledger, gates, and blockers | Links, policy consistency, three approvals | docs only |
 | D01 | `docs(adr): align the accepted P0 implementation order` | Correct ADR 0032's final implementation-order sentence | ADR/CONTEXT consistency and three approvals | docs only |
-| D02 | `docs(adr): complete the in-process backend seam` | Update ADRs 0018/0020 and affected glossary for initialization identity, Model/Request Description, Materialization/release, Cost Profile observation, Exclusive operation, Backend sample, signal view, and fail-stop | Request, model, ownership, and conformance consistency | docs only |
+| D02 | `docs(adr): complete the in-process backend seam` | Update ADRs 0008, 0011-0014, 0018, 0020, 0022, 0025, 0031, 0034 plus glossary for capability closure, ownership release/unload, load rollback, profile CAS, transition, Bootstrap/Signal/Operation descriptors, Support Budget, Exclusive, fail-stop | Admission, timing, release, reclaim, resource-signal, ownership, and conformance consistency | docs only |
 | D03 | `docs(adr): freeze the p0 token generation contract` | Update ADR 0022 and glossary with compact nonempty-support Generation Parameters, RNG advancement, Certification Envelope identity, exact binary32 tensor flow, and Service Class mapping | Enum/presence/range/tie/cutoff/subnormal/no-crossing/survivor-below-K/zero-uniform/state-vector matrix; no opaque Backend parameters | docs only |
 | D04 | `docs(adr): define p0 audit sequence authority` | Define P0 Initialization, sole later mutation authority, durable Predecessor Fence, commit/parent three-state recovery, pending-before-tail, complete lost suffix, range/high-water, and pre-writer Storage Barrier Failure latch; update P0 branches of ADRs 0021/0026/0027/0036/0040 plus glossary | No Anchor/Locator/Metadata or second pointer path; genesis, mutation, tails, registry, terminal reserve, fail-closed session complete | docs only |
-| D05 | `docs(adr): bind runtime overhead evidence` | Add daemon-owned evidence-bound, result-branch-disjoint overhead and update ADRs 0015/0024 plus glossary | Receipt and Plan Rejection each have a complete no-gap/no-overlap Deadline Cost Bound without online widening | docs only |
+| D05 | `docs(adr): bind runtime overhead evidence` | Add daemon-owned evidence-bound, result-branch-disjoint overhead plus complete Owner-Thread Support Budget interference and update ADRs 0015/0024 plus glossary | Receipt, Plan Rejection, and every readiness-time support call have complete nonoverlapping spans and Deadline Cost coverage without online widening | docs only |
 | T01 | `build: audit unstaged commit scope` | Tracked/untracked path hashing and documentation-aware LOC checker | Unit fixtures for add/delete/rename/binary/untracked and self-count | <= 300 |
 | B01 | `build: initialize the Rust workspace` | Rust 1.97.1 toolchain, workspace, core crate, format/lint/test entrypoints | Format, clippy, workspace tests | <= 180 |
 
@@ -472,36 +581,36 @@ independently green and at or below its target when measured.
 |---|---|---|---|---:|
 | C01 | `feat(core): add checked domain identities` | Distinct IDs, units, sequences, durations, and Monotonic Time | Overflow, zero, and cross-type rejection | <= 360 |
 | C02 | `feat(core): add generation and bounded collection types` | Generation Vector plus checked fixed-capacity collections | Capacity and generation mismatch cases | <= 340 |
-| C03 | `feat(core): define scheduling snapshots and candidates` | Snapshot, Work Candidate, and Candidate Exclusion contracts | Construction and completeness bounds | <= 380 |
+| C03 | `feat(core): define scheduling snapshots and candidates` | Snapshot, exact-key Work Candidate, authorized-member set, and Candidate Exclusion contracts | Construction, Key membership, and completeness bounds | <= 380 |
 | C04 | `feat(core): define turn plans and receipts` | Frozen Plan membership and completed/cancelled/partial/failed member outcomes | Stable order and member bounds | <= 380 |
 | C05 | `feat(core): apply atomic core transitions` | `Core::handle`, contiguous Event Sequence, ordered Effects, rejection/fault shell | Failed invariant preserves state and emits no Effect | <= 400 |
 | C06 | `feat(core): establish hot-path work budgets` | Incremental witness types, binary maxima, counted transition shell, and hard rejection | Exact base counts, overflow, no truncation or full-state scan | <= 380 |
 | C07 | `feat(core): manage immutable model revisions` | Manifest identities, Alias freeze, Available/Retiring/Unavailable lifecycle | No alias repoint, registry limits, and incremental counts | <= 400 |
 | C08 | `feat(core): describe model registrations` | Registration proposal, stateless Model Descriptor Effect, hash binding, and rejection | No Revision exists before descriptor validation | <= 380 |
 | C09 | `feat(core): accept requests into preparing` | Ownership, frozen Revision, explicit Service Class, closed Generation Parameters, immutable effective `u64` Sampling Seed plus origin, status version, and preparation timeout | Explicit zero/caller/daemon origin; Acceptance is not Admission; retries never inherit state | <= 400 |
-| C10 | `feat(core): drive warming and request description` | Stateless description Effect, Residency Demand, revalidation, and cancellation | No pre-Admission Backend handle or Reservation | <= 400 |
-| C11 | `feat(core): authorize exact certification keys` | Immutable record identities and read-only exact-key Authorization Index lookup | Missing/drifted/quarantined cases fail closed | <= 400 |
-| C12 | `feat(core): derive certification applicability` | Explicit fresh Environment Fingerprint plus Admission-owned fixed recency cache over every determining identity | Every hit rechecks freshness; miss/eviction/identity invalidation | <= 400 |
-| C13 | `feat(core): apply the fixed admission check` | Revision, exact applicability, timing, Resource Mode, and capacity sufficient conditions | Every missing condition rejects before state allocation | <= 400 |
-| C14 | `feat(core): commit timing and request reservations` | Atomic Timing Commitment and request Resource Reservation after Admission | Conservation, rollback, and no partial commitment | <= 400 |
+| C10 | `feat(core): drive and refresh request descriptions` | Sole initial/post-load/stale-generation owner with O(1) invalidation, stable resident reissue, and deferred Warming refresh | Cross-model advance/counts, exact post-load equality, no stale rejection/Admission, original timeout, registry, handle, or Reservation | <= 400 |
+| C11 | `feat(core): authorize exact certification keys` | Current-generation finite requirement-to-Key closure over immutable records and the read-only exact-key Authorization Index | Stale routes to C10 without lookup; omitted/overflowed/missing/drifted/quarantined cases fail closed | <= 400 |
+| C12 | `feat(core): derive certification applicability` | Fresh Environment Fingerprint including exact Capability, Resource Signal, and verified Operation Bound identities plus Admission-owned fixed recency cache | Every hit rechecks freshness/evidence; miss/eviction/identity invalidation | <= 400 |
+| C13 | `feat(core): apply the fixed admission check` | Current-generation description, Revision, complete Authorized Capability Set, worst-case timing/support interference, Resource Mode, and capacity sufficient conditions | Stale never enters Admission; every missing Key or failed condition rejects before state allocation | <= 400 |
+| C14 | `feat(core): commit timing and request reservations` | Atomic frozen Authorized Capability Set, Timing Commitment, typed Request Backend Allocation Budget, daemon output/transient components, and complete Resource Reservation after Admission | Complete-set/component identity, conservation, rollback, and no partial commitment | <= 400 |
 | C15 | `feat(core): materialize admitted requests` | Post-Admission materialization Effect and stable Backend request ownership identity | No materialization before Reservation | <= 360 |
-| C16 | `feat(core): apply request materialization results` | Success to Queued; terminal failure preserves any release-required partial state | No Warming return, retry, or leaked partial ownership | <= 380 |
+| C16 | `feat(core): apply request materialization results` | Success owns state; zero-ownership failure splits the Request Backend Allocation Budget directly; partial ownership retains its complete Budget for release | Budget identity/conservation, daemon-component isolation, zero-allocation/allocated rollback, no-call/retry/early split/leak | <= 400 |
 | C17 | `feat(core): revalidate certified profiles` | Candidate/description invalidation and existing Reservation feasibility | SLO Risk and new-Admission block without silent re-promise | <= 380 |
 | C18 | `feat(core): quarantine certified bound violations` | Preserve Receipt, remove exact key, optional parent escalation, explicit recertification | Estimate miss does not quarantine; automatic widening forbidden | <= 400 |
 | C19 | `feat(core): activate complete control successors` | Only a committed publication result atomically installs the complete Model/Alias/Certification/Configuration Snapshot at a Turn boundary; Weight baseline alignment and new-Admission-only Timing Commitments | Proposal alone cannot mutate active authority; no partial visibility, historical debt, or rewritten promise | <= 400 |
-| C20 | `feat(core): order cooperative cancellation` | Queued removal, in-flight Cancel Pending, staged-output discard, status transition | Event Sequence before/after Receipt and Publication matrix | <= 400 |
+| C20 | `feat(core): order cooperative cancellation` | Preparing/Warming/pre-materialization no-call cancellation, owned queued release, in-flight Cancel Pending, staged-output discard, status transition | Event Sequence, ownership, Receipt, and Publication matrix | <= 400 |
 | C21 | `feat(core): reserve per-turn output capacity` | Concrete pre-execution Turn Output Reservation Effect and non-runnable backpressure state | No output Plan without capacity; cancellation releases reserve | <= 380 |
-| C22 | `feat(core): release backend request state` | Exactly-once release Effect/Result; return unallocated remainder and move actual allocation to Pending Reclaim | Partial allocation/use, terminal/cancel/eviction, no retry or early reuse | <= 400 |
+| C22 | `feat(core): release backend request state` | Ownership-gated exactly-once release Effect; only accepted Result consumes ownership, partitions the exact Request Backend Allocation Budget, and moves actual allocation to Pending Reclaim | No daemon-capacity authority, no-call unowned path, partial allocation/use, terminal/cancel/eviction, no retry/unload/early reuse | <= 400 |
 | C23 | `feat(core): bound terminal request history` | Count/time Tombstones, connection Request High-Water Mark, and authorized Gone | Evicted, foreign, and never-issued IDs remain distinct | <= 400 |
 | C24 | `feat(core): manage exclusive mode leases` | Requested/active/exit states, renewal/expiry/disconnect, shared dispatch pause | No automatic entry; new Admission/Residency Demand reject | <= 400 |
 | C25 | `feat(core): authorize exclusive operations` | One operation with conservative peak bound and certified Exclusive Safety Point | Uncertified shared work never silently probes | <= 380 |
 | C26 | `feat(core): filter unsafe scheduling work` | Resource Mode and all generations before urgency/fairness | Unsafe or stale work never reaches selection | <= 360 |
 | C27 | `feat(core): account runnable weighted service` | Runnable-only Model Ledger and Device Executor Receipt charging | 1:3 example and idle re-entry without stored credit | <= 400 |
-| C28 | `feat(core): compose deadline cost bounds` | Certified Engine Service plus exact record-bound, disjoint Runtime Overhead version | Applicability/drift invalidation; no double count or Ledger charge | <= 380 |
+| C28 | `feat(core): compose deadline cost bounds` | Certified Engine Service plus exact record-bound, disjoint Runtime Overhead and worst-case Owner-Thread Support Budget interference | Applicability/drift invalidation; no gap, double count, or Ledger charge | <= 380 |
 | C29 | `feat(core): select deadline-aware turns` | Latest Safe Start, Urgent Set, fair fallback, and stable ties | Independent scheduler oracle scenarios | <= 400 |
-| C30 | `feat(core): enforce candidate formation laws` | Complete bounded formation, same class, frozen members, stable Exclusions | Missing Exclusion and substituted member rejection | <= 400 |
+| C30 | `feat(core): enforce candidate formation laws` | Complete bounded formation, same class, frozen members, exact Key in every member's Authorized Capability Set, stable Exclusions | Missing Exclusion, out-of-set Key, and substituted member rejection | <= 400 |
 | C31 | `feat(core): apply typed turn results` | Plan Rejection and synchronized Receipt acceptance only | Duplicate/late/unknown/stale results never reapply state | <= 400 |
-| C32 | `feat(core): commit cost profile updates` | Accept only the Receipt-caused update, advance Backend Generation, invalidate all old candidates for the dirty Model | Stale/duplicate/unaccepted updates and exact incremental counts | <= 400 |
+| C32 | `feat(core): commit cost profile updates` | Prevalidate Receipt/profile Generation; Commit Barrier mirrors identity, invalidates plans/dirty candidates, and routes stale pre-Admission descriptions to C10 | Cross-model refresh plus no interleaving; mismatch/no-change/stale/duplicate/malformed/commit-failure; fail-stop/counts | <= 400 |
 | C33 | `feat(core): publish committed staged output` | Ordered publication Effect after Receipt commit; visible Output Sequence advances once | Earlier cancel discards; later cancel cannot retract; failed enqueue disconnects | <= 400 |
 | C34 | `test(core): replay bounded dual-model prefill` | One Prefill Chunk per fresh Plan with Decode interleaving | Byte-identical fixed-seed transitions and operation counts | <= 380 |
 | C35 | `feat(replay): add the bounded core replay driver` | Strict replay input/output over `Core::handle` | Golden, malformed, and repeatability cases | <= 400 |
@@ -515,47 +624,50 @@ driven through a thin adapter without embedding their oracle.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
-| E01 | `feat(runtime): define the bounded backend interface` | Owned inputs/results for every accepted coarse operation, signal view, and affinity token | Bound and illegal-call-order rejection | <= 400 |
-| E02 | `feat(fake): initialize backend identity` | Deterministic Adapter/MLX/interface identities and bounded Capability set | Identity drift and capability-limit fixtures | <= 340 |
-| E03 | `feat(runtime): collect certification environment` | Daemon-owned device/GPU/unified-memory/macOS probe joined with Backend initialization identity | Freshness, unavailable facts, refresh, and exact fingerprint change | <= 400 |
-| E04 | `feat(fake): describe model registrations` | Deterministic hash-bound Model Descriptor generation | Manifest/capability mismatch cases | <= 340 |
-| E05 | `feat(fake): describe and materialize requests` | Stateless descriptions of exact request parameters followed by post-Reservation opaque handles/Sampling State | Parameter matrix and allocation counters prove the two-phase boundary | <= 380 |
-| E06 | `feat(fake): release request state` | Explicit release after success or partial allocation with allocated/unallocated byte result | Exactly once; split accounting; indeterminate cleanup invokes fail-stop | <= 380 |
-| E07 | `feat(fake): form costed candidates` | Versioned Cost Profile, complete candidates, typed Exclusions, ordinary estimates | Profile identity and fixed certified bounds | <= 400 |
-| E08 | `feat(fake): execute and observe turns` | Scripted progress/output/failure plus accepted-Receipt-only calibration | Frozen membership and one-chunk Prefill fixtures | <= 400 |
-| E09 | `feat(fake): model residency and resource samples` | Scripted load/unload plus Backend-only allocator/cache evidence | Sticky failure and provenance fixtures | <= 360 |
-| E10 | `feat(fake): execute exclusive operations` | Resource-bounded operation and certified periodic safety points | Lease/Critical stop and rollback fixtures | <= 380 |
-| E11 | `feat(runtime): run one owner-thread executor` | Same thread creates, calls, releases, and destroys Backend state | Owner success and cross-thread rejection for every operation | <= 400 |
-| E12 | `feat(runtime): measure synchronized engine service` | Daemon Monotonic Time brackets the direct `execute_turn` call and classifies its typed result | Plan Rejection charges zero; Receipt charges the exact complete call interval | <= 340 |
-| E13 | `feat(runtime): measure synchronized residency service` | Daemon time brackets transition and creates an independent Residency Receipt | Elapsed bound and watchdog cases | <= 360 |
-| E14 | `feat(runtime): drive effects through the event loop` | Sequenced `Core -> Effect -> EffectResult`; fresh scheduling after every Receipt or Plan Rejection | No inline continuation and stable Effect order | <= 400 |
-| E15 | `feat(runtime): bound runtime overhead` | Receipt branch pre/post spans plus Plan Rejection call/replanning spans over the working Event Loop against exact evidence-bound limits | Both branches have no gap/overlap; drift invalidates; no widening/Ledger charge | <= 400 |
-| E16 | `feat(runtime): share cooperative control signals` | External atomic setters and Backend safe-point read view | Cancel/Critical/lease/shutdown before and after safe point | <= 360 |
-| E17 | `feat(runtime): fail stop an indeterminate backend operation` | Watchdog escalation, no fabricated Result/Receipt, whole-process termination hook | Missed safe point cannot restart only the owner thread | <= 400 |
-| E18 | `test(runtime): replay executor failure boundaries` | Duplicate/stale result, shutdown, and deterministic Fake crash traces | Stable final hashes and no operation replay | <= 380 |
-| E19 | `test(runtime): enforce backend conformance fixtures` | Shared Fake contract runner for initialization, exact parameters, ownership, bounded operations, and release | Call order, parameter matrix, synchronization, partial ownership, outcomes | <= 400 |
+| E01 | `feat(runtime): define the bounded backend interface` | Owned inputs/results, per-call blocking/safe-point declarations, signal view, and affinity token for every coarse operation | Bound completeness and illegal-call-order rejection | <= 400 |
+| E02 | `feat(fake): initialize backend identity` | Preverified Bootstrap Manifest plus deterministic Adapter/MLX/interface/complete Capability identities and bounded Resource Signal/Operation Sets | Pre-call watchdog, trusted expected Capability, returned-descriptor equality, identity/field/unit/quality/default/operation-bound drift | <= 380 |
+| E03 | `feat(runtime): collect certification environment` | Daemon platform probe joined with exact Bootstrap/Capability/Resource Signal and externally verified Operation Bound identities | Freshness, unavailable facts, descriptor mismatch, refresh, exact fingerprint/cache-key change | <= 400 |
+| E04 | `feat(fake): describe model registrations` | Deterministic hash-bound initial and post-load Model Descriptor generation | Registered equality, current Generation, Manifest/capability drift makes Revision Unavailable | <= 360 |
+| E05 | `feat(fake): describe and materialize requests` | Generation-bound stateless composite/Requirement Set followed by post-Reservation Materialization Result with complete/partial/zero ownership and exact Request Backend Allocation Budget partition | Generation binding, Requirement closure, Budget isolation, rollback/no-call/counters; Core owns refresh | <= 400 |
+| E06 | `feat(fake): release request state` | Ownership-gated result release with exact Request Backend Allocation Budget partition | Never-started no-call, no output/transient/timing authority, exactly once, terminal charge, conservation, untrustworthy cleanup fail-stop | <= 380 |
+| E07 | `feat(fake): form costed candidates` | Exact authorized Key, versioned Cost Profile, complete candidates, typed Exclusions, ordinary estimates | Per-member Set membership, profile identity, and fixed certified bounds | <= 400 |
+| E08 | `feat(fake): execute scripted turns` | Scripted Plan Rejection and synchronized progress/output/member outcomes | Frozen membership and one-chunk Prefill fixtures | <= 380 |
+| E09 | `feat(fake): compare and set cost profiles` | Receipt/profile-generation CAS returning rejected, unchanged, or applied old/new identities under Commit Barrier | No interleaving, pre-mutation mismatch, mandatory mirror-commit/fail-stop fixtures | <= 380 |
+| E10 | `feat(fake): model residency and resource samples` | Scripted typed load/unload/cache-reclaim Results plus Signal Contract-bound Backend allocator/cache evidence | Success ownership/result, zero/partial/cancel rollback, unload ownership, unchanged reclaim, contract/provenance; no G09 dependency | <= 400 |
+| E11 | `feat(fake): execute exclusive operations` | Resource-bounded operation and certified periodic safety points | Lease/Critical stop and rollback fixtures | <= 380 |
+| E12 | `feat(runtime): run one owner-thread executor` | Same thread creates/calls Backend state and deallocates only a proven empty shell | Cross-thread calls and raw destruction of initialized or indeterminate state reject | <= 400 |
+| E13 | `feat(runtime): measure synchronized engine service` | Daemon Monotonic Time brackets the direct `execute_turn` call and classifies its typed result | Plan Rejection charges zero; Receipt charges the exact complete call interval | <= 340 |
+| E14 | `feat(runtime): measure synchronized residency service` | Daemon time brackets every load/unload/cache-reclaim transition and creates an independent Residency Receipt | Variant/result identity, elapsed bound, ownership/split, and watchdog cases | <= 380 |
+| E15 | `feat(runtime): drive effects through the event loop` | Sequenced `Core -> Effect -> EffectResult`; fresh scheduling after every Receipt or Plan Rejection | No inline continuation and stable Effect order | <= 400 |
+| E16 | `feat(runtime): bound turn-path runtime overhead` | Receipt branch pre/post spans plus Plan Rejection call/replanning spans over the working Event Loop against exact evidence-bound limits | Both branches have no gap/overlap; drift invalidates; no widening/Ledger charge | <= 400 |
+| E17 | `feat(runtime): budget owner-thread support calls` | Evidence-bound per-call blocking/safe-point plus call-count/aggregate Runtime Overhead budget and pre-reserved mandatory capacity | Every readiness operation classified; interference fits Deadline Cost; nonessential defers; no free queue | <= 400 |
+| E18 | `feat(runtime): share cooperative control signals` | External atomic setters and Backend safe-point read view | Cancel/Critical/lease/shutdown before and after safe point | <= 360 |
+| E19 | `feat(runtime): fail stop an indeterminate backend operation` | Watchdog escalation, no fabricated Result/Receipt, whole-process termination hook | Missed safe point or post-profile-mutation commit failure cannot restart only the owner thread | <= 400 |
+| E20 | `test(runtime): replay executor failure boundaries` | Duplicate/stale result, profile divergence, forced stop, and deterministic Fake crash traces | Stable final hashes and no operation replay or continued divergent Backend | <= 380 |
+| E21 | `feat(fake): shut down backend state` | Final exactly-once owner-thread operation returning zero-ownership Shutdown Result and empty-handle typestate | Readiness false, no in-flight/release ownership, destroy order, bound/safe point, no retry/fabrication/bypass/Clean Shutdown Boundary authority | <= 380 |
+| E22 | `test(runtime): enforce backend conformance fixtures` | Shared Fake runner for Bootstrap/initialization/Capability/Signal/Operation descriptors, post-load Model Descriptor equality and Request Description refresh, support bounds, ownership, CAS, transitions, release, and shutdown | Trusted identities, call order, no-call, release-before-unload, empty-handle-only raw deallocation, support budget, result-gated Clean Shutdown Boundary/fail-stop | <= 400 |
 
 ### P0-3: Resource Governor And Residency
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
-| G01 | `feat(resources): sequence backend resource samples` | Allocator/cache sample provenance and freshness | Missing, duplicate, and stale source cases | <= 340 |
+| G01 | `feat(resources): sequence backend resource samples` | Signal Contract-bound allocator/cache sample provenance and freshness | Missing, duplicate, stale, and contract-identity mismatch cases | <= 340 |
 | G02 | `feat(resources): sample macos process and vm state` | `phys_footprint`, available memory, swap, and compressor via native APIs | Typed unavailable/overflow and no-shell assertion | <= 400 |
 | G03 | `feat(resources): observe macos memory pressure` | Bounded dispatch pressure source and monotonic sequence | Normal/warning/critical transitions and teardown | <= 360 |
 | G04 | `feat(resources): assemble complete resource evidence` | Join Backend, process, VM, and pressure sources without erasing provenance | Independent freshness and out-of-order rejection | <= 400 |
 | G05 | `feat(governor): classify resource modes` | Normal, Guarded, StopAdmission, Critical, hysteretic recovery | Immediate restriction and dwell-bound recovery | <= 400 |
 | G06 | `feat(governor): activate resource configuration` | Atomic Threshold Profile, eviction rank, wait, and residency-limit propagation from the complete successor | Stricter profile advances Safety Generation; looser recovery obeys hysteresis | <= 400 |
-| G07 | `feat(governor): reserve request capacity` | KV, output, transient, and admitted capacity ledger | Conservation, overflow, rollback | <= 400 |
-| G08 | `feat(governor): reserve residency before load` | Separate Model Descriptor-based Residency Reservation committed before Effect | No load without reservation; cancel-before-start rollback | <= 380 |
-| G09 | `feat(runtime): coordinate residency demands` | Shared pending loads, waiters, FIFO ordering, timeout, sticky unavailable state | Coalescing and no Service Class reorder | <= 400 |
+| G07 | `feat(governor): reserve request capacity` | Typed Request Backend Allocation Budget plus separately typed daemon output and transient-headroom components in the admitted capacity ledger | Cross-component authority, conservation, overflow, rollback | <= 400 |
+| G08 | `feat(governor): reserve residency before load` | Separate Model Descriptor-based Residency Reservation committed before Effect | No load without reservation; cancel-before-start makes no Backend call and rolls back | <= 380 |
+| G09 | `feat(runtime): coordinate residency demands` | Shared loads/waiters/FIFO/timeout/rollback and successful-load Generation advance invoking C10 refresh | Resident cross-model reissue, unrelated Warming defer, current loaded waiters before Admission, drift scopes Unavailable | <= 400 |
 | G10 | `feat(governor): gate shared residency transitions` | Conservative blocking bound must fit every current timing budget or wait for explicit Exclusive Mode | No automatic Exclusive entry and no blocking shared transition | <= 400 |
 | G11 | `feat(governor): bound residency activity` | Configured transition frequency and aggregate Residency Service occupancy | Window rollover, saturation, and checked arithmetic | <= 380 |
-| G12 | `feat(runtime): protect resident model leases` | Lease acquisition/release and serialized unload boundary | Active lease prevents unload | <= 360 |
-| G13 | `feat(governor): select ordinary reclaim actions` | Cache then deterministic idle-model victims independent of Model Weight | Stable tie and protected-victim cases | <= 380 |
-| G14 | `feat(governor): perform critical eviction` | Eviction Rank, reclaimable-byte/stable-ID ties, terminally fail affected work before unload | Cache/idle exhaustion and no forced in-flight interruption | <= 400 |
-| G15 | `feat(governor): retain only allocated reclaim charges` | Immediately return never-allocated reservation remainder; actual request/residency allocation stays charged to convergence | Partial materialization/use/unload splits, stall, no premature reuse | <= 400 |
+| G12 | `feat(runtime): protect resident model leases` | Lease acquisition/release and unload precondition over zero request ownership/pending release | Active lease or any request ownership prevents unload | <= 360 |
+| G13 | `feat(governor): select ordinary reclaim actions` | Bounded cache-reclaim Residency Transition then deterministic idle-model victims independent of Model Weight | Transition gating, no immediate free-capacity claim, stable tie, and protected-victim cases | <= 380 |
+| G14 | `feat(governor): perform critical eviction` | Eviction Rank/ties, terminally fail affected work, consume every request ownership, then unload | Cache/idle exhaustion, release-before-unload, release fail-stop, no forced in-flight interruption | <= 400 |
+| G15 | `feat(governor): retain only allocated reclaim charges` | Accepted request results partition only the exact Request Backend Allocation Budget; rolled-back load or successful unload results partition Residency Reservation; actual allocation stays charged to convergence | Cross-component authority, zero/partial materialization/load rollback, use/unload/cache, stall, no premature reuse | <= 400 |
 | G16 | `feat(governor): decide the process reclaim barrier` | Require typed old-process lifetime proof plus fresh post-reclaim baseline | Fake proof contract; elapsed time/socket loss never establishes capacity | <= 360 |
-| G17 | `test(governor): replay pressure and residency lifecycle` | Load/unload/reload, shared/Exclusive gating, Critical eviction, request release, reclaim, stale evidence | Governor rules plus hot-path counts | <= 400 |
+| G17 | `test(governor): replay pressure and residency lifecycle` | Load failure/cancel/rollback, unload/reload, shared/Exclusive gating, Critical terminal-release-unload, reclaim, stale evidence | Governor rules, ownership order, allocation conservation, hot-path counts | <= 400 |
 
 G16 closes only the Core/Governor decision contract and its typed-proof tests.
 It does not claim that P0-3 can establish old-process termination. S28 supplies
@@ -576,8 +688,8 @@ manifest verifies.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
-| N01 | `build(native): add the versioned C shim` | Pinned MLX checkout manifest, CMake/Ninja build, opaque handles, build/interface identity, error translation, destroy | C/C++ compile, SHA verification, ABI assertions, `scripts/verify-native.sh` | <= 400 |
-| N02 | `feat(native): initialize on the executor owner thread` | MLX/stream creation plus exact Adapter/MLX/interface identities and capabilities | Owner, drift, and fail-closed teardown traces | <= 400 |
+| N01 | `build(native): add the versioned C shim` | Pinned MLX, embedded Manifest, CMake/Ninja, opaque typestate handles, identity/error translation, bounded nonthrowing empty-shell deallocator | Compile/SHA/ABI; live/indeterminate rejects; shell has no MLX object and only rolled-back-init/post-Shutdown deallocates | <= 400 |
+| N02 | `feat(native): initialize on the executor owner thread` | Pre-call Manifest watchdog, MLX/stream creation, exact Adapter/MLX/interface/complete Capability identities and Resource Signal/Operation Sets | Only trustworthy zero-root failure deallocates; timeout, missed rollback, or success-with-drift fail-stops live state without destroy | <= 400 |
 | N03 | `build(native): pin the graph export toolchain` | Ignored task Python, exact mlx-lm/MLX/dependency lock, model fetch/hash wrapper | Missing/drifted tool/model and offline replay manifest | <= 380 |
 | N04 | `build(native): define the exported graph abi` | Canonical exact-shape signatures, logits/new-KV outputs, artifact manifest and import contract | Double-export byte identity and Python round-trip harness | <= 400 |
 | N05 | `feat(native): implement the graph importer` | Bounded C++ Direct importer for verified Graph ABI signatures and complete manifest | No production import outside Residency Effect; deterministic tiny-fixture parity and drift rejection | <= 400 |
@@ -585,22 +697,23 @@ manifest verifies.
 | N07 | `build(native): export qwen15 moe graphs` | Complete Qwen1.5-MoE graph recipe including top-k routing for certified buckets | Exact revision, two exports, Python/C++ logits/KV parity, no tracked artifact | <= 400 |
 | N08 | `feat(native): verify registered model artifacts` | Canonical Artifact Root and typed File Hash checks before and after load | Ad hoc path, mutation, and Revision Unavailable cases | <= 400 |
 | N09 | `feat(native): own logical model runtime capsules` | Per-Model imported graph/KV/cache capsules on the single owner thread | Isolation and lifecycle tests | <= 380 |
-| N10 | `feat(native): describe model registrations` | Generate versioned conservative Model Descriptor from verified graph manifest/capability | Descriptor hash and nonresident operation | <= 400 |
+| N10 | `feat(native): describe model registrations` | Generate versioned conservative Model Descriptor from exact registered graph manifest/capability before registration and after load | Nonresident operation, post-load identity/hash equality, drift marks Revision Unavailable | <= 400 |
 | N11 | `feat(native): expose cooperative signal views` | Read-only atomic signal view and declared safe-point helper before any cancellable operation | Cross-thread setter ordering and stale-view rejection | <= 360 |
-| N12 | `feat(native): transition model residency` | Serialized import/load/unload/clear using the signal view and typed results | Real resident graph before request state; cancellation and cleanup | <= 400 |
-| N13 | `feat(native): describe token requests` | Stateless validation of exact Service Class/Generation Parameters against model vocabulary and certified bounded description | Complete mode/range/unsupported matrix; no handle/KV/Sampling allocation | <= 400 |
-| N14 | `feat(native): materialize admitted requests` | Resident-model per-request handle, KV, and exact immutable Sampling State after Reservation | Parameter identity preserved; partial failure reports release-required ownership | <= 400 |
-| N15 | `feat(native): release request state` | Owner-thread destruction with actual allocation split and staged-stop cleanup | All terminal paths; uncertain cleanup fail-stops without retry | <= 400 |
-| N16 | `feat(native): form costed native candidates` | Canonical Batch/Shape compatibility, Cost Profile version/estimate, typed Exclusions | Fake/native fixture parity | <= 400 |
-| N17 | `feat(native): update cost profiles from receipts` | Accepted authoritative observations produce one versioned update between Turns | Core accepts once; no stale update or bound widening | <= 380 |
+| N12 | `feat(native): transition model residency` | Serialized load with strong rollback, ownership-gated unload, and bounded allocator-cache reclaim using typed results | Success identity/ownership; zero/partial/cancel rollback split, release-before-unload, unchanged reclaim, fail-stop | <= 400 |
+| N13 | `feat(native): describe token requests` | Stateless validation of frozen Token Request plus Model Descriptor/current Backend Generation and finite Capability Requirement Set generation | Initial/post-load generation binding and complete phase/batch/Shape matrix; no Core refresh, Envelope, registry, or allocation | <= 400 |
+| N14 | `feat(native): materialize admitted requests` | Resident-model handle/KV/Sampling State with synchronized complete/partial/zero-ownership exact Request Backend Allocation Budget result | Identity/conservation; no daemon-capacity authority; zero-ownership rollback; partial failure requires release | <= 400 |
+| N15 | `feat(native): release request state` | Owner-thread destruction with trustworthy exact Request Backend Allocation Budget split only when opaque ownership exists | Unowned no-call; no output/transient/timing authority; terminal ownership retains Budget; uncertain cleanup fail-stops and blocks unload | <= 400 |
+| N16 | `feat(native): form costed native candidates` | Canonical Batch/Shape compatibility, exact authorized Key, Cost Profile version/estimate, typed Exclusions | Every member Set contains Key; Fake/native parity | <= 400 |
+| N17 | `feat(native): compare and set cost profiles` | Accepted Receipt-bound version returns mismatch, unchanged, or atomically applied Backend-owned profile under Commit Barrier | Core mirrors identity once; no interleaving; malformed/post-mutation failure fail-stops; no widening | <= 400 |
 | N18 | `feat(native): sample per request deterministically` | Exact binary32 tensor flow, compact nonempty Top P/Top K support, max-shifted Temperature scaling, greedy, and `key(seed) -> split(state)` categorical transitions | Shared subnormal/no-crossing/equal-logit/survivor-below-K/smallest-Temperature/zero-uniform compact-index and multi-token state vectors; hidden-stop and Dense/MoE B1/B4 invariance | <= 400 |
 | N19 | `feat(native): apply stop and output limits` | Longest ambiguous stop suffix retention, hidden matched tokens, exact Max Output terminal | Prefix overlap, cross-Turn match, cancellation, and limit cases | <= 400 |
 | N20 | `feat(native): execute synchronized decode turns` | Bounded Decode on resident imported graph with staged visible token output | Dense/MoE output parity, signals, and cleanup | <= 400 |
 | N21 | `feat(native): execute one prefill chunk` | One imported-graph range within Plan target/ceilings, synchronized continuation | Dense/MoE parity, signals, and no hidden loop | <= 400 |
 | N22 | `feat(native): execute exclusive operations` | Conservative resource-bound operation with certified periodic safety points | Lease/Critical cancellation and rollback | <= 400 |
-| N23 | `feat(native): report backend allocator evidence` | MLX active/cache samples with quality and source sequence | Telemetry availability and error mapping | <= 340 |
+| N23 | `feat(native): report backend allocator evidence` | Support-budgeted MLX active/cache samples bound to Signal Contract identity with quality and source sequence | Blocking/safe-point bound, contract mismatch, telemetry availability, error mapping | <= 360 |
 | N24 | `test(native): expose qualification-only numerical hashes` | Test-build output/logits/KV hashes outside serving Interface | Prove no qualification DTO in Core or production ABI | <= 360 |
-| N25 | `test(native): pass full backend conformance` | Fake/native initialization, ownership/release, graph, formation/calibration, Exclusive, synchronization | External fixtures are unavailable, never synthetic pass | <= 400 |
+| N25 | `feat(native): shut down backend state` | Final exactly-once owner-thread destruction, validated zero-ownership Result, then empty-shell deallocation | Preconditions/order/safe point; live raw destroy rejects; failure has no retry, deallocation, Clean Shutdown Boundary, or reclaim claim | <= 400 |
+| N26 | `test(native): pass full backend conformance` | Fake/native Bootstrap/Capability/Signal/Operation descriptors, post-load Generation refresh, authorization, support bounds, ownership, profile CAS, transitions, Exclusive, shutdown | Trusted identities/fixtures; raw bypass rejects; unavailable evidence never becomes synthetic pass or Clean Shutdown Boundary | <= 400 |
 
 Weights, exported graphs, build caches, raw tensors, traces, and numerical
 qualification artifacts remain outside Git with path/hash manifests only.
@@ -692,7 +805,7 @@ epoch's fixed Audit Registry Identity.
 | S27 | `feat(daemon): restart with empty inference state` | Rebuild Control State only after S23-S25; no request/KV/Residency restoration | Initialization and mutation three-boundary crash matrices plus clean restart | <= 360 |
 | S28 | `feat(daemon): enforce the process reclaim barrier` | Successor lock acquisition proves prior process exited; sampler establishes fresh post-exit baseline | Real parent/child lifetime test; no acquire-before-exit, Fake/time/socket substitute | <= 400 |
 | S29 | `feat(daemon): gate p0 service readiness` | Require lock, Store/registry schema, reconciled prior bytes/Audit, Device Executor, Adapter, environment, Resource Evidence, and reclaim barrier; current-session latch remains non-ready | Successor may become ready only after exact forward reconciliation and every fresh prerequisite | <= 400 |
-| S30 | `feat(daemon): perform graceful shutdown` | Reject work, cancel/release live work, owner-thread Backend shutdown, sync Clean Boundary, then terminate while still holding lock | OS-only lock release, terminal reserve, safe-point/barrier failures, no `CLEAN_RELEASED` claim | <= 400 |
+| S30 | `feat(daemon): perform graceful shutdown` | Reject work, cancel/release live work, accept one validated zero-ownership Result plus confirmed shell deallocation, sync Clean Shutdown Boundary, then terminate with lock | Boundary only after Result/deallocation; failure/no-result/safe-point/barrier has no retry, boundary, or `CLEAN_RELEASED` claim | <= 400 |
 | S31 | `test(store): expose bounded fault custody` | Real relative files, phase markers, initialization/mutation/restart/shutdown inspection, no Effect replay | Assigned-unsynced predecessor then mutation crash, atomic publish/corrupt/truncate/SIGTERM, assigned-lost tail, all barrier-failure custody | <= 400 |
 
 P0 durability never substitutes Runtime Metadata or Integrity-profile repair.
@@ -706,9 +819,9 @@ machine-readable result without claiming MLX correctness or performance.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
-| K01 | `test(gate): cover scheduling and admission properties` | Weighted service/config changes, complete Deadline Cost Bound, exact environment applicability, Admission, Exclusive lease/pause | Example/property tests and fixed seeds | <= 400 |
-| K02 | `test(gate): generate lifecycle and residency sequences` | Cancel/output, Tombstone/Gone, request release, partial Reservation/Pending Reclaim split, Residency limits, Critical eviction | Generated state machine and shrinkable replay | <= 400 |
-| K03 | `test(gate): inject executor and audit faults` | P0 initialization/mutation three-state recovery, durable predecessor fence, pending-before-complete-lost-tail, OS-only lock, Graceful Shutdown, Executor Failure, Audit Degraded, Storage Barrier Failure | Assigned-unsynced-before-mutation, Device/write stop, successor readiness, read-only custody, no second identity/reuse/fabricated Receipt/Effect replay/Anchor/failure marker | <= 400 |
+| K01 | `test(gate): cover scheduling and admission properties` | Weighted service/config changes, finite authorization, exact environment, cross-model load/profile Generation refresh, Exclusive | No stale-result rejection or Admission; bounded stable reissue, examples/properties/fixed seeds | <= 400 |
+| K02 | `test(gate): generate lifecycle and residency sequences` | Never-started no-call, zero/partial materialization, owned release, release-before-unload, load re-description, Pending Reclaim, Critical eviction | Generated state machine, current description identity, allocation conservation, shrinkable replay | <= 400 |
+| K03 | `test(gate): inject executor and audit faults` | Profile post-mutation commit failure, P0 persistence recovery/fences, OS-only lock, Shutdown Result/safe-point/raw bypass, Executor/Audit/Storage failure | No divergent continuation, raw live destroy, retry, early Clean Shutdown Boundary, second identity/reuse/fabricated Receipt/Result/Effect replay/Anchor/marker | <= 400 |
 | K04 | `test(gate): assert incremental core work` | Every operation count, complete Exclusions, dirty-Model-only recompute, member-local Receipt | Exact count witnesses at binary maxima | <= 400 |
 | K05 | `test(gate): close the p0 core gate` | Aggregate examples, properties, generated sequences, faults, replay hashes | One command, complete matrix manifest, repeatable result | <= 300 |
 
@@ -725,7 +838,7 @@ Benchmark revision is fixed and recorded.
 | Q01 | `build(benchmark): add the subject handshake` | Shared Subject hello, supported lanes, build/dependency/environment identities, Data Plane descriptor, artifact roots | Hello precedes every case; containment and identity tests | <= 380 |
 | Q02 | `feat(benchmark): expose core replay qualification` | `core-event-replay` adapter over real Core | Lane run and raw Transition evidence | <= 340 |
 | Q03 | `feat(benchmark): expose scheduler policy qualification` | `scheduler-policy` adapter | Oracle remains Benchmark-owned | <= 340 |
-| Q04 | `feat(benchmark): expose scheduler performance qualification` | `scheduler-performance` adapter, Release samples, and Runtime Overhead versions | IPC/serialization excluded; overhead drift and ledger exclusion declared | <= 360 |
+| Q04 | `feat(benchmark): expose scheduler performance qualification` | `scheduler-performance` adapter, Release samples, Runtime Overhead and Owner-Thread Support Budget versions | IPC/serialization excluded; support/overhead drift and Ledger exclusion declared | <= 360 |
 | Q05 | `feat(benchmark): expose request lifecycle qualification` | `request-serving-lifecycle` through production Data Plane including parameter rejection and cancel/output/release races | Locked production descriptor, Service Class mapping, and real process identity | <= 400 |
 | Q06 | `feat(benchmark): expose native correctness qualification` | `mlx-native-correctness`, reproducible full Dense/MoE graph manifests, B1/B4 omitted/zero/nonzero Seeds, complete greedy/categorical extreme-parameter and stop/Max Output matrix, external hashes | Shared exact-tensor/subnormal/no-crossing/survivor-below-K/smallest-Temperature/zero-uniform compact-index/key-state vectors, omitted-seed replay, Python/export/import parity, batch invariance | <= 400 |
 | Q07 | `feat(benchmark): expose bounded turn qualification` | `bounded-turn-and-ffi` over production native boundary | One-chunk Prefill, Exclusive Safety Point, signal cleanup | <= 380 |
