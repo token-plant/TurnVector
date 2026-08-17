@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/turnvector-core"]
+members = ["crates/turnvector-core", "crates/turnvector-daemon"]
 resolver = "3"
 
 [workspace.package]

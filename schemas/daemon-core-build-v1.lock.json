@@ -1,0 +1,1 @@
+{"algorithm":"sha256","descriptor":"daemon-core-build-v1.json","digest":"0cee2787904e7d1a48ca5f96a2ede58f06ab78f63a2d7902b00d3343905ea0f8","domain":"turnvector:evidence:daemon-core-build","hash_schema_version":1,"kind":"daemon_core_build","preimage":"utf8(domain)||0x00||u32be(hash_schema_version)||descriptor_bytes"}

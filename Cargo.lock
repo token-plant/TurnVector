@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "turnvector-core"
 version = "0.1.0"
+
+[[package]]
+name = "turnvector-daemon"
+version = "0.1.0"
+dependencies = [
+ "turnvector-core",
+]
