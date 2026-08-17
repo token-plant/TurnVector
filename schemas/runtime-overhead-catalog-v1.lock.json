@@ -1,0 +1,1 @@
+{"algorithm":"sha256","descriptor":"runtime-overhead-catalog-v1.json","digest":"04a4d5528b564a532b8a9d530d32efbb7330edcf58dcf204c40659592574b1f5","domain":"turnvector:evidence:runtime-overhead-catalog","hash_schema_version":1,"kind":"runtime_overhead_catalog","preimage":"utf8(domain)||0x00||u32be(hash_schema_version)||descriptor_bytes"}
