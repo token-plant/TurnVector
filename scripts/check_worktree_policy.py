@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I -B
 """Freeze and validate the exact unstaged TurnVector worktree."""
 
-import argparse, base64, fnmatch, hashlib, json, os, stat, subprocess, sys, tempfile
+import argparse, base64, fnmatch, hashlib, json, os, stat, subprocess, sys, tempfile, types
 from pathlib import Path
 
 if not sys.flags.isolated:
@@ -95,6 +95,7 @@ def raw_worktree_identity(root: Path):
         if stat.S_ISREG(before.st_mode) and stat_identity(before) != stat_identity(opened):
             raise RuntimeError(f"worktree changed during read of {os.fsdecode(raw_path)!r}")
         identity.append((raw_path, stat_identity(after), content))
+    identity.append((b"\0REMOTE", None, git(root, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}")))
     return tuple(identity)
 
 def line_delta(root, before, after, old_content, content, env):
@@ -137,16 +138,17 @@ def account_change(root, change, globs, env):
         row["old_path"] = old_path
     return row
 
-def proposed_config(root, env):
+def proposed_config(root, policy, env):
     raw = git(root, "ls-files", "-s", "-z", "--", ".commit-policy.json", env=env)
     if not raw:
         raise ValueError("policy config must be a regular file")
     mode, object_id, stage = raw.split(b"\t", 1)[0].split()
     if (mode, stage) != (b"100644", b"0"):
         raise ValueError("policy config must be a regular file")
-    return parse_config(git(root, "cat-file", "blob", object_id.decode(), env=env))
+    blob = object_id.decode(); content = git(root, "cat-file", "blob", blob, env=env)
+    parse_config(content); return blob, content
 
-def capture(root: Path, base: str):
+def capture(root: Path, base: str, config_base: str, head: str, policy):
     raw_untracked = git(root, "ls-files", "--others", "--exclude-standard", "-z")
     untracked = {item.decode("utf-8", "surrogateescape") for item in raw_untracked.split(b"\0") if item}
     with tempfile.TemporaryDirectory() as temporary:
@@ -161,10 +163,17 @@ def capture(root: Path, base: str):
                "GIT_ALTERNATE_OBJECT_DIRECTORIES": quote_alternate(common)}
         git(root, "read-tree", base, env=env)
         git(root, "add", "-A", "--", ".", env=env)
-        globs = proposed_config(root, env)
+        proposed = proposed_config(root, policy, env)
+        globs, history = policy.config_history(config_base, head, proposed)
         raw = git(root, "diff", "--cached", "--raw", "-z", "--no-abbrev",
                   *DIFF_OPTIONS, base, "--", env=env)
-        rows = [account_change(root, change, globs, env) for change in parse_changes(raw)]
+        changes = list(parse_changes(raw))
+        helper_blob = next((new for _status, path, _old_path, _old_mode, _mode, _old, new in changes if path == "scripts/check_commit_policy.py"), None)
+        errors = policy.policy_transition_errors([(status, path, old_path, old_mode, mode)
+            for status, path, old_path, old_mode, mode, _old, _new in changes], policy_installed=policy.tree_entry(head, "scripts/check_commit_policy.py") != ("100755", policy.T01_HELPER_BLOB), helper_blob=helper_blob)
+        if errors:
+            raise ValueError("; ".join(errors))
+        rows = [account_change(root, change, globs, env) for change in changes]
         for row in rows:
             if row["status"] == "A" and row["path"] in untracked:
                 row["status"] = "?"
@@ -177,7 +186,37 @@ def capture(root: Path, base: str):
             raise RuntimeError("worktree changed during staged snapshot")
     rows.sort(key=lambda row: (row["path"], row["status"]))
     canonical = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
-    return tuple(sorted(globs)), rows, hashlib.sha256(canonical).hexdigest()
+    return tuple(sorted(globs)), history, rows, hashlib.sha256(canonical).hexdigest()
+
+def accepted_helper(root: Path, head: str):
+    path = "scripts/check_commit_policy.py"
+    raw = git(root, "ls-tree", "-z", head, "--", path)
+    if not raw:
+        raise ValueError("accepted policy helper is missing")
+    metadata, actual = raw.removesuffix(b"\0").split(b"\t", 1)
+    mode, kind, blob = metadata.split()
+    source = git(root, "cat-file", "blob", blob.decode())
+    if (mode, kind, actual) != (b"100755", b"blob", path.encode()) or not source:
+        raise ValueError("accepted policy helper is empty or has the wrong mode")
+    policy = types.ModuleType("accepted_turnvector_policy")
+    exec(compile(source, f"{head}:{path}", "exec"), policy.__dict__)
+    return policy, blob.decode(), hashlib.sha256(source).hexdigest()
+
+def select_policy_base(root: Path, head: str, explicit, policy):
+    remote = git(root, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}").decode().strip()
+    base = remote if not explicit else git(root, "rev-parse", "--verify", "--end-of-options", f"{explicit}^{{commit}}").decode().strip()
+    if not explicit:
+        exists = subprocess.run(("git", "cat-file", "-e", f"{remote}:scripts/check_worktree_policy.py"),
+                                cwd=root, env=GIT_ENV, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL).returncode == 0
+        if not exists:
+            base = policy.T01_COMMIT
+            if subprocess.run(("git", "merge-base", "--is-ancestor", base, head),
+                              cwd=root, env=GIT_ENV).returncode:
+                raise ValueError("no reviewed T01 policy installation is reachable")
+    git(root, "merge-base", base, head)
+    git(root, "merge-base", remote, head)
+    return base, remote
 
 def review_directory(root: Path):
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
@@ -203,6 +242,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="HEAD")
     parser.add_argument("--limit", type=int, required=True)
+    parser.add_argument("--policy-base")
     args = parser.parse_args(argv)
     try:
         root = Path(os.fsdecode(
@@ -213,6 +253,18 @@ def main(argv=None):
         base = head if args.base == "HEAD" else git(
             root, "rev-parse", "--verify", "--end-of-options", f"{args.base}^{{commit}}",
         ).decode().strip()
+        policy, helper_blob, helper_sha256 = accepted_helper(root, head)
+        policy_base, config_base = select_policy_base(root, head, args.policy_base, policy)
+        auditor = policy.tree_entry(head, "scripts/check_worktree_policy.py")
+        if auditor is None or auditor[0] != "100755" or Path(__file__).read_bytes() != git(
+                root, "cat-file", "blob", auditor[1]):
+            raise ValueError("worktree auditor is not the accepted HEAD blob")
+        history_globs, _history = policy.config_history(config_base, head)
+        history_errors = [error for error in policy.validate(config_base, head, "build/policy-review",
+            "build: review policy", "", set(), history_globs, False)
+            if error != "pull request contains no commits"]
+        if history_errors:
+            raise ValueError("; ".join(history_errors))
         index = git(root, "ls-files", "-s", "-z")
         head_tree = git(root, "ls-tree", "-r", "-z", head)
         if tree_state(index, True) != tree_state(head_tree, False):
@@ -220,20 +272,24 @@ def main(argv=None):
         if git(root, "diff", "--cached", "--name-only", "-z"):
             raise RuntimeError("staged paths are forbidden during worktree review")
         entry = raw_worktree_identity(root)
-        first = capture(root, base)
+        first = capture(root, base, config_base, head, policy)
         if entry != raw_worktree_identity(root):
             raise RuntimeError("worktree changed during review scan")
-        second = capture(root, base)
+        second = capture(root, base, config_base, head, policy)
         if first != second or entry != raw_worktree_identity(root):
             raise RuntimeError("worktree changed during review scan")
         if head != git(root, "rev-parse", "HEAD").decode().strip() or index != git(root, "ls-files", "-s", "-z"):
             raise RuntimeError("worktree changed during review scan")
-        globs, rows, diff_digest = second
+        globs, history, rows, diff_digest = second
         counted = sum(row["counted_loc"] for row in rows)
-        payload = {"auditor_source": "t01-bootstrap", "auditor_source_sha256": SELF_SHA256,
+        payload = {"auditor_source": head, "auditor_source_blob": auditor[1],
+                   "auditor_source_sha256": SELF_SHA256,
                    "base": base, "counted_documentation_globs": globs, "counted_loc": counted,
                    "diff_sha256": diff_digest, "head": head, "limit": args.limit,
-                   "paths": rows, "schema": "turnvector-worktree-review-v1"}
+                   "paths": rows, "policy_base": policy_base, "policy_config_base": config_base,
+                   "policy_config_history": history, "policy_helper_blob": helper_blob,
+                   "policy_helper_sha256": helper_sha256,
+                   "schema": "turnvector-worktree-review-v1"}
         serialized = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
         digest = hashlib.sha256(serialized).hexdigest()
         directory, descriptor = review_directory(root)

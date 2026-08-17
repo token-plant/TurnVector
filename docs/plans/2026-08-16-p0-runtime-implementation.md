@@ -977,27 +977,37 @@ Every pull-request commit follows all of these rules:
    staged path are forbidden. T01 is the sole bootstrap: its candidate checker
    output is test evidence, while the review authority remains an explicit
    path/mode/blob table and full diff. T02 keeps that bootstrap review path
-   while binding executable policy authority. After signed T02 installation,
+   while binding executable policy authority; installed authority permanently
+   consumes the bootstrap and rejects restoration of the bootstrap helper before merge. After signed T02 installation,
    the canonical command is:
 
    ```sh
    set -eu
-   repository="$(pwd -P)"
+   head="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+     git -C . rev-parse --verify HEAD^{commit})"
+   remote="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+     git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
    auditor="$(mktemp "${TMPDIR:-/tmp}/turnvector-policy.XXXXXX")"
    trap 'unlink "$auditor"' EXIT
-   git_dir="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git -C "$repository" rev-parse --absolute-git-dir)"
-   env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git --git-dir="$git_dir" --work-tree="$repository" \
-     show HEAD:scripts/check_worktree_policy.py >"$auditor"
+   entry="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+     git -C . ls-tree "$head" -- scripts/check_worktree_policy.py)"
+   test "${entry%% *}" = 100755
+   entry="${entry#* }"; test "${entry%% *}" = blob
+   env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git -C . \
+     cat-file blob "${head}:scripts/check_worktree_policy.py" >"$auditor"
    test -s "$auditor"
    env -i PATH="$PATH" LC_ALL=C \
-     python3 -I -B "$auditor" --base HEAD --limit 420
+     python3 -I -B "$auditor" --base "$head" --limit 420
+   test "$remote" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+     git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
+   test "$head" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+     git -C . rev-parse --verify HEAD^{commit})"
    ```
 
    It starts isolated from the accepted `HEAD` Git object rather than the
    candidate worktree, selects the exact remote-base policy revision or the
-   first reviewed T01 installation when the remote base predates T01, executes
+   first reviewed T01 installation when the remote base predates T01, preserves
+   the exact remote tip as the separate configuration-lineage endpoint, executes
    that accepted auditor instead of changed candidate policy code, enumerates every
    tracked and untracked path, reports counted LOC, writes the ignored review
    manifest, and prints its SHA-256. Earlier documentation-only commits use an
@@ -1047,7 +1057,7 @@ independently green and at or below its target when measured.
 | D04 | `docs(adr): define p0 audit sequence authority` | Define exact P0 storage-qualification binding, Control Initialization, sole later Control mutation authority, range-only sequence-state authority, build-derived mutation headroom and Audit Safety Reserve, Core-owned Runtime Closure Gate, Event Loop-owned Control Mutation Cancel Gate, bounded noncreating Predecessor Fence interleaving, known-absent closure, two-stage success Results with no post-C27 discretionary work, installation-scoped process lock across every successor, Control Publication Commit Barrier, commit/parent recovery, pending-before-tail, lost suffix, and pre-writer Storage Barrier Failure; align ADRs 0019/0021/0026/0027/0029/0036/0040 plus glossary | No Anchor/Locator/Metadata, implicit latest qualification, same-ID P0 Rebind, second pointer, sequence-owner/headroom overlap or terminal borrowing, closure-liability fanout, delayed or identity-cycling cancel custody, safety-queue starvation, Event Loop publication/result gap, post-C27 discretionary assignment, clean-restart or cross-Runtime lock bypass, fabricated indeterminate Result, or unchanged-state claim after a required barrier failure | docs only |
 | D05 | `docs(adr): bind runtime overhead evidence` | Define the acyclic daemon/Catalog build identity, generated Runtime Overhead Catalog and Lifecycle Evidence Tables, repeatable daemon-selected pre-activation Lifecycle Overhead Qualification witness and readiness gate, Admission-owned applicability selection, separate Core-owned Resource Capacity and Support Charge Ledgers with independently green support-capacity, ordinary/lifecycle, request-entitlement, Plan-obligation, and retention slices, Catalog-bound Support Start Count Bounds, operation-scoped Support Operation Obligations, typed Support Funding Claims including Ordinary Reservation Claim, finite request Support Outstanding Credit Vectors, pre-trigger description/safety lifecycle reserves, reusable Future Turn Support Entitlements, standalone post-predecessor `begin_support`, explicit daemon-component terminal settlement, dedicated prepared carry, Admission-derived daemon Bound Sets, Core-owned Runtime Overhead Generation, Sequenced Event Interference Bound and all-trigger scheduling cut, dedicated intrinsic local-stale transition, disjoint Turn/support/event envelopes, request-quiescent Control publication, complete Configuration binding, and closed Backend lifecycle classification; update ADRs 0005/0008/0015/0016/0018/0020/0021/0022/0024/0025/0027/0030/0031/0034/0036/0040 plus glossary and remove implementation-row coupling | Catalog-wide retention, per-operation/pool half-open start-count enforcement, optional ordinary nonempty claims, consecutive-Turn/sequential churn, B1/B4 one-call-one-credit conservation including separate observation and conditional continuation, conditional-state credit/vector/horizon/carry occupancy, mixed initial+entitlement funding, newly eligible member join, Batch split/merge/cancel rebind, and activation-sequence capacity including lifecycle/carry/suballocation maxima; startup/successor qualification witness, first pre-ready sample through drain, atomic two-ledger Admission, initial obligations, request-lifetime vectors plus three distinct Plan-scoped operation obligations, post-load/post-observation description sets, safety trigger, first-plan/Receipt/rejection/local-stale/support-result/idle scheduling-cut prefix and crossing allowance, intrinsic local stale disposition, complete nonoverlapping envelopes including Output Publication before observation, sole ledger/generation/selector owners and separate Core/Event-Loop gate owners, typed prepublication carry abort, pre-owner carry/generation/headroom revalidation and ordinary-support restoration, stable zero request-liability before Store/Audit pause, exact evidence/build identity, single-count three-term Deadline Cost, pre-dispatch drift rejection, and no online widening | docs only |
 | T01 | `build: audit unstaged commit scope` | Freeze a side-effect-free entry path/type/mode/raw-byte identity before filters, then record the stable staging-equivalent tracked/untracked path hashes and documentation-aware LOC | Unit fixtures for add/delete/rename/binary/untracked, self-count, transformed content, and forward-sorted filter mutation | <= 420 |
-| T02 | `build: bind contribution-policy authority` | Fail-closed extraction and execution of the accepted Git-object auditor/helper rather than candidate policy code; clear Git selectors/config injection and disable replacement objects before extraction; bind full branch config history, path-specific policy-owner modes, policy-only transitions, isolated local/CI post-commit startup, config-invariant capture, secure manifest publication, and post-commit parity including clean base-sync merges | Missing/empty accepted object, candidate self-change, helper relaxation, add/remove config history, symlink/mode/delete/rename, Git selector/config injection, replace ref, hostile startup for both worktree and post-commit commands, ambient diff configuration, manifest path replacement, workflow mixing, and extra-payload merge fixtures | <= 300 |
+| T02 | `build: bind contribution-policy authority` | Fail-closed extraction and execution of the accepted Git-object auditor/helper rather than candidate policy code; clear Git selectors/config injection and disable replacement objects before extraction; bind both branch config lineages, checked-out base/fetched PR/event identities, path-specific policy-owner modes, policy-only transitions, one-time bootstrap consumption to irreversible installed-helper history with bootstrap-helper restoration rejection, isolated local/CI post-commit startup, config-invariant capture, secure manifest publication, and post-commit parity including clean base-sync merges | Missing/empty accepted object, candidate self-change, helper relaxation, add/remove and divergent-remote config history, pre-T01 divergent-base post-merge worktree continuity, in-scan remote-ref drift, stale event/ref identity, unsigned commit, installed-authority helper-restoration rejection, squash-installed bootstrap replay, symlink/mode/delete/rename, Git selector/config injection, replace ref, hostile startup for both worktree and post-commit commands, ambient diff configuration, manifest path replacement, workflow mixing, and exact post-commit clean/extra-payload/unrelated-parent merge fixtures | <= 420 |
 | B01 | `build: initialize the Rust workspace` | Rust 1.97.1 toolchain, workspace, core crate, format/lint/test entrypoints | Format, clippy, workspace tests | <= 180 |
 | B02 | `build: lock the generation semantics descriptor` | Canonical descriptor generator and Evidence Hash lock shared by daemon Domain Types, Fake, Manifest, Native, and qualification | Double-generation bytes/hash; incomplete/unknown descriptor rejection; every schema/domain/greedy/categorical/RNG semantic mutation changes identity | <= 300 |
 | B03 | `build(runtime): lock the daemon core build identity` | Canonical payload-independent Core build descriptor/generator binding an exact dependency-traced runtime source-closure manifest, tool/dependency locks, features/profiles, protocol/domain registries, native inputs, Catalog schema/capacity/lookup/worst-case work, Support Start Count Bound, Support Funding Claim including Ordinary Reservation Claim, and Support Outstanding Credit Vector schemas/binary maxima, conditional/pending-operation-obligation/active-record/ordinary-claim/entitlement-tombstone/lifecycle-reserve maxima and their Ingress Budget Warming/active plus Model Registry cardinality inputs, one dedicated nonborrowable Prepared Carry slot with dual-Budget mandatory/safety suballocation maxima, event-registry maxima, and executable/native text-section identities while excluding generated payload bytes | Double generation, undeclared build-input rejection, every determining-input drift, unrelated-repository-file invariance, payload-byte invariance, schema/capacity/start-count/funding-claim/ordinary-claim/vector/conditional/pending-obligation/carry-slot drift, section mismatch, and final-binary self-hash rejection | <= 360 |
@@ -1379,8 +1389,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test --workspace --release
 python3 -I -B -m unittest discover -s tests -v
-python3 -I -B scripts/check_worktree_policy.py --base HEAD --limit 420
 ```
+
+The worktree policy command is the complete accepted-object auditor block in
+Commit Protocol step 3; the candidate path is never executable authority.
 
 From N01 onward, native verification is exactly:
 
@@ -1406,12 +1418,42 @@ checks the lock, and runs record-kind compatibility fixtures.
 After a commit is signed, its one-commit policy check is:
 
 ```sh
-git verify-commit --raw HEAD
-python3 -I -B scripts/check_commit_policy.py \
-  --base HEAD^ \
-  --head HEAD \
+set -eu
+commit="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . rev-parse --verify HEAD^{commit})"
+parent1="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . rev-parse --verify "${commit}^1")"
+test -z "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . rev-parse --verify "${commit}^3" 2>/dev/null || true)"
+base="$parent1"; remote=
+if parent2="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . rev-parse --verify "${commit}^2" 2>/dev/null)"; then
+  remote="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+    git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
+  env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+    git -C . merge-base --is-ancestor "$parent2" "$remote"
+  base="$remote"
+fi
+env -i PATH="$PATH" HOME="$HOME" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . verify-commit --raw "$commit"
+helper="$(mktemp "${TMPDIR:-/tmp}/turnvector-policy.XXXXXX")"
+trap 'unlink "$helper"' EXIT
+entry="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . ls-tree "$commit" -- scripts/check_commit_policy.py)"
+test "${entry%% *}" = 100755
+entry="${entry#* }"; test "${entry%% *}" = blob
+env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git -C . \
+  cat-file blob "${commit}:scripts/check_commit_policy.py" >"$helper"
+test -s "$helper"
+env -i PATH="$PATH" LC_ALL=C python3 -I -B "$helper" \
+  --base "$base" \
+  --head "$commit" \
   --branch feat/p0-runtime-implementation \
   --title 'feat: implement P0 runtime'
+test -z "$remote" || test "$remote" = "$(env -i PATH="$PATH" LC_ALL=C \
+  GIT_NO_REPLACE_OBJECTS=1 git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
+test "$commit" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
+  git -C . rev-parse --verify HEAD^{commit})"
 ```
 
 After Q00 and a separately authorized compatible Benchmark contract are both
