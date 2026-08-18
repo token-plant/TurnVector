@@ -31,8 +31,14 @@ use std::fmt;
 use std::num::{NonZeroU64, NonZeroU128};
 
 mod bounded;
+mod scheduling;
 
 pub use bounded::{BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec};
+pub use scheduling::{
+    AuthorizedCapabilitySet, BatchBucket, CandidateCoordinates, CandidateExclusion,
+    CandidateExclusionReason, CandidateMember, CandidateValidationError, CapabilityKey,
+    ExecutionPhase, RuntimeOverheadBoundSetId, SchedulingSnapshot, ServiceClass, WorkCandidate,
+};
 
 /// Failure to construct or advance a checked domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +151,8 @@ nonzero_id!(/// The stable fairness identity shared by a model's revisions.
 ModelId);
 nonzero_id!(/// One effect or authority-publication operation.
 OperationId);
+nonzero_id!(/// One stable opaque schedulable choice.
+CandidateId);
 
 nonzero_sequence!(/// A client command position within one connection.
 CommandId);
