@@ -34,6 +34,7 @@ mod bounded;
 mod core;
 mod scheduling;
 mod turns;
+mod work;
 
 pub use bounded::{BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec};
 pub use core::{
@@ -51,6 +52,7 @@ pub use turns::{
     SupportOutstandingCreditVectorId, TurnBudget, TurnPlan, TurnPlanIdentity, TurnProgress,
     TurnReceipt, TurnReceiptIdentity, TurnReceiptMember, YieldReason,
 };
+pub use work::{HotPathWorkBudget, HotPathWorkWitness, WorkBudgetError, WorkDimension};
 
 /// Failure to construct or advance a checked domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

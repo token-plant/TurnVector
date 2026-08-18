@@ -50,6 +50,34 @@ impl<T, const CAPACITY: usize> BoundedVec<T, CAPACITY> {
             .iter()
             .map(|slot| slot.as_ref().expect("occupied bounded-vector prefix"))
     }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&T> {
+        self.slots.get(index)?.as_ref()
+    }
+
+    pub(crate) fn as_slice(&self) -> &[Option<T>] {
+        &self.slots[..self.len]
+    }
+
+    pub(crate) fn ordered_at(&self, index: usize, value: &T) -> bool
+    where
+        T: Ord,
+    {
+        index <= self.len
+            && self
+                .get(index.wrapping_sub(1))
+                .is_none_or(|existing| existing < value)
+            && self.get(index).is_none_or(|existing| value < existing)
+    }
+
+    pub(crate) fn insert_at(&mut self, index: usize, value: T) {
+        assert!(self.len < CAPACITY && index <= self.len);
+        for cursor in (index..self.len).rev() {
+            self.slots[cursor + 1] = self.slots[cursor].take();
+        }
+        self.slots[index] = Some(value);
+        self.len += 1;
+    }
 }
 
 impl<T, const CAPACITY: usize> Default for BoundedVec<T, CAPACITY> {

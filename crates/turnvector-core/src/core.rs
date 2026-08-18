@@ -1,9 +1,13 @@
+use crate::work::WorkMeter;
 use crate::{
-    BoundedCollectionError, BoundedSet, BoundedVec, EventSequence, GenerationVector, OperationId,
+    BoundedVec, EventSequence, GenerationVector, HotPathWorkBudget, HotPathWorkWitness,
+    OperationId, WorkBudgetError, WorkDimension,
 };
 const TRANSITION_EFFECT_CAPACITY: usize = 2;
+const MAX_OPERATION_ENTRIES: usize = 32_768;
 type Effects = BoundedVec<Effect, TRANSITION_EFFECT_CAPACITY>;
-type Operations<const N: usize> = BoundedSet<OperationId, N>;
+type Operations<const N: usize> = BoundedVec<OperationId, N>;
+type Positions = [usize; TRANSITION_EFFECT_CAPACITY];
 /// One validated operation request presented at an exact Event Sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreEvent {
@@ -49,6 +53,7 @@ impl Effect {
 pub enum DomainRejection {
     OperationIdCollision(OperationId),
     OperationCapacityExceeded,
+    HotPathWorkBudget(WorkBudgetError),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreFault {
@@ -72,6 +77,7 @@ pub struct CoreTransition {
     sequence: EventSequence,
     outcome: CoreOutcome,
     effects: Effects,
+    work: HotPathWorkWitness,
 }
 impl CoreTransition {
     #[must_use]
@@ -85,6 +91,10 @@ impl CoreTransition {
     #[must_use]
     pub const fn effects(&self) -> &Effects {
         &self.effects
+    }
+    #[must_use]
+    pub const fn work(&self) -> HotPathWorkWitness {
+        self.work
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,19 +122,34 @@ impl<const OPERATIONS: usize> CoreState<OPERATIONS> {
 pub struct Core<const OPERATIONS: usize> {
     state: CoreState<OPERATIONS>,
     fault: Option<CoreFault>,
+    work_budget: HotPathWorkBudget,
     #[cfg(test)]
     force_candidate_invariant_failure: bool,
 }
 impl<const OPERATIONS: usize> Core<OPERATIONS> {
     #[must_use]
     pub fn bootstrap(first_sequence: EventSequence, generations: GenerationVector) -> Self {
+        Self::bootstrap_with_work_budget(
+            first_sequence,
+            generations,
+            HotPathWorkBudget::binary_maximum(),
+        )
+    }
+    #[must_use]
+    pub fn bootstrap_with_work_budget(
+        first_sequence: EventSequence,
+        generations: GenerationVector,
+        work_budget: HotPathWorkBudget,
+    ) -> Self {
+        assert!(OPERATIONS <= MAX_OPERATION_ENTRIES);
         Self {
             state: CoreState {
                 expected_sequence: first_sequence,
                 generations,
-                operations: BoundedSet::new(),
+                operations: BoundedVec::new(),
             },
             fault: None,
+            work_budget,
             #[cfg(test)]
             force_candidate_invariant_failure: false,
         }
@@ -138,8 +163,16 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
         self.fault
     }
     pub fn handle(&mut self, event: CoreEvent) -> CoreTransition {
+        let mut work = WorkMeter::new(self.work_budget);
+        work.record(WorkDimension::VisitedEntities, 1)
+            .expect("validated budget covers one Core Event");
         if let Some(fault) = self.fault {
-            return transition(event.sequence, CoreOutcome::Fault(fault), BoundedVec::new());
+            return transition(
+                event.sequence,
+                CoreOutcome::Fault(fault),
+                BoundedVec::new(),
+                work.witness(),
+            );
         }
         if event.sequence != self.state.expected_sequence {
             return self.fail(
@@ -148,6 +181,7 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
                     expected: self.state.expected_sequence,
                     actual: event.sequence,
                 },
+                work.witness(),
             );
         }
         let next_sequence = match event.sequence.next() {
@@ -158,17 +192,20 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
                     CoreFault::EventSequenceOverflow {
                         current: event.sequence,
                     },
+                    work.witness(),
                 );
             }
         };
-        match self.stage(&event) {
-            Ok((operations, effects)) => {
-                self.state = CoreState {
-                    expected_sequence: next_sequence,
-                    generations: self.state.generations,
-                    operations,
-                };
-                transition(event.sequence, CoreOutcome::Accepted, effects)
+        match self.stage(&event, &mut work) {
+            Ok((positions, effects)) => {
+                self.commit(&positions, &effects);
+                self.state.expected_sequence = next_sequence;
+                transition(
+                    event.sequence,
+                    CoreOutcome::Accepted,
+                    effects,
+                    work.witness(),
+                )
             }
             Err(StageFailure::Rejected(rejection)) => {
                 self.state.expected_sequence = next_sequence;
@@ -176,68 +213,121 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
                     event.sequence,
                     CoreOutcome::Rejected(rejection),
                     BoundedVec::new(),
+                    work.witness(),
                 )
             }
-            Err(StageFailure::Invariant) => {
-                self.fail(event.sequence, CoreFault::CandidateInvariant)
-            }
+            Err(StageFailure::Invariant) => self.fail(
+                event.sequence,
+                CoreFault::CandidateInvariant,
+                work.witness(),
+            ),
         }
     }
-    fn stage(&self, event: &CoreEvent) -> Result<(Operations<OPERATIONS>, Effects), StageFailure> {
-        let mut operations = self.state.operations.clone();
+    fn stage(
+        &self,
+        event: &CoreEvent,
+        work: &mut WorkMeter,
+    ) -> Result<(Positions, Effects), StageFailure> {
+        let mut positions = [0; TRANSITION_EFFECT_CAPACITY];
         let mut effects = BoundedVec::new();
         stage_operation(
-            &mut operations,
+            &self.state.operations,
+            &mut positions,
             &mut effects,
             event.operation,
             None,
             self.state.generations,
+            work,
         )?;
         if let Some(follow_up) = event.follow_up {
             stage_operation(
-                &mut operations,
+                &self.state.operations,
+                &mut positions,
                 &mut effects,
                 follow_up,
                 Some(event.operation),
                 self.state.generations,
+                work,
             )?;
         }
-        if self.candidate_is_valid(&operations, &effects) {
-            Ok((operations, effects))
-        } else {
-            Err(StageFailure::Invariant)
-        }
-    }
-    fn candidate_is_valid(&self, ops: &Operations<OPERATIONS>, effects: &Effects) -> bool {
         #[cfg(test)]
         if self.force_candidate_invariant_failure {
-            return false;
+            positions[0] = self.state.operations.len() + 1;
         }
-        self.state.operations.len().checked_add(effects.len()) == Some(ops.len())
-            && effects.iter().all(|effect| ops.contains(&effect.operation))
+        let checks = 1 + 3 * effects.len() as u64 + u64::from(effects.len() == 2);
+        work.record(WorkDimension::InvariantChecks, checks)?;
+        let distinct = effects.len() != 2
+            || effects.get(0).unwrap().operation != effects.get(1).unwrap().operation;
+        let valid = self.state.operations.len() + effects.len() <= OPERATIONS
+            && distinct
+            && effects.iter().enumerate().all(|(index, effect)| {
+                self.state
+                    .operations
+                    .ordered_at(positions[index], &effect.operation)
+            });
+        if !valid {
+            return Err(StageFailure::Invariant);
+        }
+        let copied = copied_operation_bytes(self.state.operations.len(), &positions, &effects);
+        work.record(WorkDimension::CopiedBytes, copied)?;
+        Ok((positions, effects))
     }
-    fn fail(&mut self, sequence: EventSequence, fault: CoreFault) -> CoreTransition {
+    fn commit(&mut self, positions: &Positions, effects: &Effects) {
+        for index in 0..effects.len() {
+            self.state.operations.insert_at(
+                adjusted_position(index, positions, effects),
+                effects.get(index).unwrap().operation,
+            );
+        }
+    }
+    fn fail(
+        &mut self,
+        sequence: EventSequence,
+        fault: CoreFault,
+        work: HotPathWorkWitness,
+    ) -> CoreTransition {
         self.fault = Some(fault);
-        transition(sequence, CoreOutcome::Fault(fault), BoundedVec::new())
+        transition(sequence, CoreOutcome::Fault(fault), BoundedVec::new(), work)
     }
 }
 enum StageFailure {
     Rejected(DomainRejection),
     Invariant,
 }
+impl From<WorkBudgetError> for StageFailure {
+    fn from(error: WorkBudgetError) -> Self {
+        Self::Rejected(DomainRejection::HotPathWorkBudget(error))
+    }
+}
 fn stage_operation<const OPERATIONS: usize>(
-    operations: &mut Operations<OPERATIONS>,
+    operations: &Operations<OPERATIONS>,
+    positions: &mut Positions,
     effects: &mut Effects,
     operation: OperationId,
     depends_on: Option<OperationId>,
     generations: GenerationVector,
+    work: &mut WorkMeter,
 ) -> Result<(), StageFailure> {
-    operations.try_insert(operation).map_err(|error| {
-        StageFailure::Rejected(match error {
-            BoundedCollectionError::Duplicate => DomainRejection::OperationIdCollision(operation),
-            BoundedCollectionError::Full => DomainRejection::OperationCapacityExceeded,
-        })
-    })?;
+    work.record(WorkDimension::CandidateWork, 1)?;
+    let mut comparisons = 0;
+    let located = operations.as_slice().binary_search_by(|existing| {
+        comparisons += 1;
+        existing.as_ref().unwrap().cmp(&operation)
+    });
+    work.record(WorkDimension::VisitedEntities, comparisons)?;
+    let Err(position) = located else {
+        return reject(DomainRejection::OperationIdCollision(operation));
+    };
+    for effect in effects.iter() {
+        work.record(WorkDimension::VisitedEntities, 1)?;
+        if effect.operation == operation {
+            return reject(DomainRejection::OperationIdCollision(operation));
+        }
+    }
+    if operations.len() + effects.len() >= OPERATIONS {
+        return reject(DomainRejection::OperationCapacityExceeded);
+    }
+    positions[effects.len()] = position;
     effects
         .try_push(Effect {
             operation,
@@ -246,11 +336,31 @@ fn stage_operation<const OPERATIONS: usize>(
         })
         .map_err(|_| StageFailure::Invariant)
 }
-fn transition(sequence: EventSequence, outcome: CoreOutcome, effects: Effects) -> CoreTransition {
+fn reject(reason: DomainRejection) -> Result<(), StageFailure> {
+    Err(StageFailure::Rejected(reason))
+}
+fn adjusted_position(index: usize, positions: &Positions, effects: &Effects) -> usize {
+    let prior_is_lower =
+        index == 1 && effects.get(0).unwrap().operation < effects.get(1).unwrap().operation;
+    positions[index] + usize::from(prior_is_lower)
+}
+fn copied_operation_bytes(before: usize, positions: &Positions, effects: &Effects) -> u64 {
+    (0..effects.len())
+        .map(|index| before + index - adjusted_position(index, positions, effects))
+        .sum::<usize>() as u64
+        * std::mem::size_of::<OperationId>() as u64
+}
+fn transition(
+    sequence: EventSequence,
+    outcome: CoreOutcome,
+    effects: Effects,
+    work: HotPathWorkWitness,
+) -> CoreTransition {
     CoreTransition {
         sequence,
         outcome,
         effects,
+        work,
     }
 }
 #[cfg(test)]

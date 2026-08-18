@@ -1,13 +1,17 @@
 use turnvector_core::{
     BackendGeneration, Core, CoreEvent, CoreFault, CoreOutcome, DomainRejection, EventSequence,
-    GenerationVector, OperationId, RuntimeOverheadGeneration, SafetyGeneration,
-    SchedulerGeneration,
+    GenerationVector, HotPathWorkBudget, HotPathWorkWitness, OperationId,
+    RuntimeOverheadGeneration, SafetyGeneration, SchedulerGeneration, WorkBudgetError,
+    WorkDimension,
 };
 fn sequence(value: u64) -> EventSequence {
     EventSequence::new(value).unwrap()
 }
 fn operation(value: u128) -> OperationId {
     OperationId::new(value).unwrap()
+}
+fn work(values: [u64; 5]) -> HotPathWorkWitness {
+    HotPathWorkWitness::new(values)
 }
 fn generations() -> GenerationVector {
     GenerationVector::new(
@@ -42,6 +46,7 @@ fn domain_rejection_consumes_sequence_without_applying_requested_state() {
     let mut core = Core::<4>::bootstrap(sequence(1), generations());
     let accepted = core.handle(CoreEvent::operation(sequence(1), operation(10), None));
     assert_eq!(accepted.outcome(), &CoreOutcome::Accepted);
+    assert_eq!(accepted.work(), work([1, 0, 0, 1, 4]));
     let rejected = core.handle(CoreEvent::operation(sequence(2), operation(10), None));
     assert_eq!(
         rejected.outcome(),
@@ -68,6 +73,7 @@ fn noncontiguous_event_faults_and_preserves_committed_state() {
     let after_fault = core.handle(CoreEvent::operation(sequence(2), operation(12), None));
     assert_eq!(after_fault.outcome(), faulted.outcome());
     assert!(after_fault.effects().is_empty());
+    assert_eq!(after_fault.work(), work([1, 0, 0, 0, 0]));
     assert_eq!(core.state(), &before);
 }
 #[test]
@@ -86,4 +92,50 @@ fn successor_overflow_discards_the_candidate_transition() {
     );
     assert!(faulted.effects().is_empty());
     assert_eq!(core.state(), &before);
+}
+
+#[test]
+fn budget_exhaustion_rejects_without_partial_state_or_effects() {
+    let budget = HotPathWorkBudget::try_new(work([34, 1_048_528, 0, 0, 8])).unwrap();
+    let mut core = Core::<4>::bootstrap_with_work_budget(sequence(1), generations(), budget);
+    let transition = core.handle(CoreEvent::operation(sequence(1), operation(10), None));
+    assert_eq!(
+        transition.outcome(),
+        &CoreOutcome::Rejected(DomainRejection::HotPathWorkBudget(
+            WorkBudgetError::BudgetExceeded(WorkDimension::CandidateWork, 0, 1)
+        ))
+    );
+    assert!(transition.effects().is_empty());
+    assert_eq!(
+        (
+            core.state().operation_count(),
+            core.state().expected_sequence()
+        ),
+        (0, sequence(2))
+    );
+}
+#[test]
+fn operation_lookup_uses_counted_binary_work_without_a_full_state_scan() {
+    let mut core = Core::<16>::bootstrap(sequence(1), generations());
+    for offset in 0..8 {
+        let result = core.handle(CoreEvent::operation(
+            sequence(offset + 1),
+            operation(u128::from(offset + 1) * 10),
+            None,
+        ));
+        assert_eq!(result.outcome(), &CoreOutcome::Accepted);
+    }
+    let transition = core.handle(CoreEvent::operation(sequence(9), operation(5), None));
+    assert_eq!(transition.outcome(), &CoreOutcome::Accepted);
+    assert_eq!(transition.work(), work([5, 128, 0, 1, 4]));
+}
+#[test]
+fn work_budgets_reject_overflow_and_truncation() {
+    assert!(HotPathWorkBudget::try_new(work([35, 1_048_528, 0, 2, 8])).is_err());
+    assert!(matches!(
+        work([u64::MAX, 0, 0, 0, 0]).checked_add(work([1, 0, 0, 0, 0])),
+        Err(WorkBudgetError::CounterOverflow(
+            WorkDimension::VisitedEntities
+        ))
+    ));
 }
