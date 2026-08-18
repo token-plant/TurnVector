@@ -1,5 +1,9 @@
 use crate::work::WorkMeter;
-use crate::{WorkBudgetError, WorkDimension};
+use crate::{Duration, MonotonicTime, WorkBudgetError, WorkDimension};
+use std::{
+    collections::VecDeque,
+    mem::{size_of, size_of_val},
+};
 
 /// A checked fixed-capacity collection insertion failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,6 +400,211 @@ fn first_difference(left: &[u8; 33], right: &[u8; 33]) -> (u16, u64) {
     unreachable!("distinct fixed identities have distinct bytes")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixedStorageError {
+    Allocation,
+    Capacity,
+    Duplicate,
+    NonCanonical,
+    InvalidTime,
+    WindowExceeded,
+    Work(WorkBudgetError),
+}
+
+impl From<WorkBudgetError> for FixedStorageError {
+    fn from(error: WorkBudgetError) -> Self {
+        Self::Work(error)
+    }
+}
+
+impl From<FixedIndexError> for FixedStorageError {
+    fn from(error: FixedIndexError) -> Self {
+        match error {
+            FixedIndexError::Allocation => Self::Allocation,
+            FixedIndexError::Capacity => Self::Capacity,
+            FixedIndexError::Duplicate => Self::Duplicate,
+            FixedIndexError::NonCanonical => Self::NonCanonical,
+            FixedIndexError::Work(error) => Self::Work(error),
+        }
+    }
+}
+
+pub struct FixedRecordArena<V, C, const KEYS: usize> {
+    records: Vec<V>,
+    claims: Vec<C>,
+    claim_ends: Vec<u32>,
+    identities: FixedIdentityIndex<u32>,
+    record_capacity: usize,
+    claim_capacity: usize,
+}
+
+impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
+    pub fn try_new(
+        record_capacity: usize,
+        claim_capacity: usize,
+    ) -> Result<Self, FixedStorageError> {
+        if KEYS == 0 || record_capacity > u32::MAX as usize || claim_capacity > u32::MAX as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        Ok(Self {
+            records: reserved_index(record_capacity)?,
+            claims: reserved_index(claim_capacity)?,
+            claim_ends: reserved_index(record_capacity)?,
+            identities: FixedIdentityIndex::try_new(
+                record_capacity
+                    .checked_mul(KEYS)
+                    .ok_or(FixedStorageError::Capacity)?,
+            )?,
+            record_capacity,
+            claim_capacity,
+        })
+    }
+
+    pub fn try_push(
+        &mut self,
+        keys: [[u8; 33]; KEYS],
+        record: V,
+        claims: &[C],
+        work: &mut WorkMeter,
+    ) -> Result<usize, FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 2)?;
+        if self.records.len() == self.record_capacity
+            || self
+                .claims
+                .len()
+                .checked_add(claims.len())
+                .is_none_or(|end| end > self.claim_capacity)
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        let index = self.records.len();
+        let claim_start = self.claims.len();
+        let copied = size_of::<V>() + size_of::<u32>() + size_of_val(claims);
+        work.record(WorkDimension::CopiedBytes, copied as u64)?;
+        self.records.push(record);
+        self.claims.extend_from_slice(claims);
+        self.claim_ends.push(self.claims.len() as u32);
+        let entries = keys.map(|key| (key, index as u32));
+        if let Err(error) = self.identities.try_insert_sorted(&entries, work) {
+            self.records.pop();
+            self.claims.truncate(claim_start);
+            self.claim_ends.pop();
+            return Err(error.into());
+        }
+        Ok(index)
+    }
+
+    pub fn find(
+        &self,
+        key: [u8; 33],
+        work: &mut WorkMeter,
+    ) -> Result<Option<usize>, FixedStorageError> {
+        Ok(self.identities.find(key, work)?.map(|index| index as usize))
+    }
+
+    pub fn get(&self, index: usize) -> Option<&V> {
+        self.records.get(index)
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut V> {
+        self.records.get_mut(index)
+    }
+
+    pub fn claims(&self, index: usize) -> Option<&[C]> {
+        let end = *self.claim_ends.get(index)? as usize;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |prior| self.claim_ends[prior] as usize);
+        Some(&self.claims[start..end])
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedStartCountBound(pub Duration, pub u32);
+
+pub struct FixedWindowCounter<const CELLS: usize, const H: usize> {
+    bounds: [[FixedStartCountBound; H]; CELLS],
+    history: [VecDeque<MonotonicTime>; CELLS],
+}
+
+impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
+    pub fn try_new(bounds: [[FixedStartCountBound; H]; CELLS]) -> Result<Self, FixedStorageError> {
+        if CELLS == 0 || H == 0 || H > 8 {
+            return Err(FixedStorageError::Capacity);
+        }
+        let common = &bounds[0];
+        let valid = bounds.iter().all(|cell| {
+            cell.iter().zip(common).all(|(bound, reference)| {
+                bound.0 == reference.0 && bound.0.as_micros() > 0 && bound.1 > 0
+            }) && cell
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 <= pair[1].1)
+        });
+        if !valid {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let mut history = std::array::from_fn(|_| VecDeque::new());
+        for (queue, cell) in history.iter_mut().zip(&bounds) {
+            queue
+                .try_reserve_exact(cell[H - 1].1 as usize)
+                .map_err(|_| FixedStorageError::Allocation)?;
+        }
+        Ok(Self { bounds, history })
+    }
+
+    pub fn try_start(
+        &mut self,
+        cell: usize,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let (bounds, history) = self
+            .bounds
+            .get(cell)
+            .zip(self.history.get_mut(cell))
+            .ok_or(FixedStorageError::Capacity)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if history.back().is_some_and(|prior| at < *prior) {
+            return Err(FixedStorageError::InvalidTime);
+        }
+        for bound in bounds {
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            if history.len() >= bound.1 as usize {
+                work.record(WorkDimension::VisitedEntities, 1)?;
+                let prior = history[history.len() - bound.1 as usize];
+                let elapsed = at
+                    .checked_duration_since(prior)
+                    .map_err(|_| FixedStorageError::InvalidTime)?;
+                if elapsed < bound.0 {
+                    return Err(FixedStorageError::WindowExceeded);
+                }
+            }
+        }
+        work.record(
+            WorkDimension::CopiedBytes,
+            size_of::<MonotonicTime>() as u64,
+        )?;
+        if history.len() == bounds[H - 1].1 as usize {
+            history.pop_front();
+        }
+        history.push_back(at);
+        Ok(())
+    }
+
+    pub fn len(&self, cell: usize) -> Option<usize> {
+        self.history.get(cell).map(VecDeque::len)
+    }
+}
+
 #[cfg(test)]
 mod fixed_index_tests {
     use super::*;
@@ -530,5 +739,91 @@ mod fixed_index_tests {
             zero_meter.witness().value(WorkDimension::InvariantChecks),
             1
         );
+    }
+
+    #[test]
+    fn fixed_record_arena_owns_claims_and_rejects_atomically() {
+        let mut arena = FixedRecordArena::<u8, u8, 2>::try_new(2, 3).unwrap();
+        assert!(arena.is_empty());
+        let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        let first = [[0; 33], [1; 33]];
+        assert_eq!(arena.try_push(first, 7, &[2, 3], &mut work), Ok(0));
+        assert_eq!(arena.find([0; 33], &mut work), Ok(Some(0)));
+        assert_eq!(
+            (arena.get(0), arena.claims(0)),
+            (Some(&7), Some([2, 3].as_slice()))
+        );
+        assert_eq!(
+            arena.try_push(first, 8, &[4], &mut work),
+            Err(FixedStorageError::Duplicate)
+        );
+        assert_eq!((arena.len(), arena.claims(0)), (1, Some([2, 3].as_slice())));
+        assert_eq!(
+            arena.try_push([[2; 33], [3; 33]], 8, &[4, 5], &mut work),
+            Err(FixedStorageError::Capacity)
+        );
+        assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn fixed_window_counter_enforces_half_open_windows_and_atomic_work() {
+        let bounds = [[
+            FixedStartCountBound(Duration::from_micros(10), 1),
+            FixedStartCountBound(Duration::from_micros(20), 2),
+        ]];
+        let mut counter = FixedWindowCounter::try_new(bounds).unwrap();
+        let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        assert_eq!(
+            counter.try_start(1, MonotonicTime::from_micros(5), &mut work),
+            Err(FixedStorageError::Capacity)
+        );
+        let invariant_zero = HotPathWorkBudget::try_new(crate::HotPathWorkWitness::new([
+            1_000_000, 2_097_152, 0, 2, 0,
+        ]))
+        .unwrap();
+        assert!(matches!(
+            counter.try_start(
+                1,
+                MonotonicTime::from_micros(5),
+                &mut WorkMeter::new(invariant_zero)
+            ),
+            Err(FixedStorageError::Work(WorkBudgetError::BudgetExceeded(
+                WorkDimension::InvariantChecks,
+                0,
+                1
+            )))
+        ));
+        assert_eq!(counter.len(0), Some(0));
+        counter
+            .try_start(0, MonotonicTime::from_micros(5), &mut work)
+            .unwrap();
+        assert_eq!(
+            counter.try_start(0, MonotonicTime::from_micros(14), &mut work),
+            Err(FixedStorageError::WindowExceeded)
+        );
+        counter
+            .try_start(0, MonotonicTime::from_micros(15), &mut work)
+            .unwrap();
+        counter
+            .try_start(0, MonotonicTime::from_micros(25), &mut work)
+            .unwrap();
+        assert_eq!(counter.len(0), Some(2));
+        let copied_zero =
+            HotPathWorkBudget::try_new(crate::HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100]))
+                .unwrap();
+        let before = counter.len(0);
+        assert!(matches!(
+            counter.try_start(
+                0,
+                MonotonicTime::from_micros(35),
+                &mut WorkMeter::new(copied_zero)
+            ),
+            Err(FixedStorageError::Work(WorkBudgetError::BudgetExceeded(
+                WorkDimension::CopiedBytes,
+                0,
+                _
+            )))
+        ));
+        assert_eq!(counter.len(0), before);
     }
 }

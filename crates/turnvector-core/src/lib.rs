@@ -37,7 +37,8 @@ mod turns;
 mod work;
 
 pub use bounded::{
-    BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec, FixedIdentityIndex, FixedIndexError,
+    BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec, FixedIdentityIndex,
+    FixedIndexError, FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
 };
 pub use core::{
     Core, CoreEvent, CoreFault, CoreOutcome, CoreState, CoreTransition, DomainRejection, Effect,
