@@ -6,10 +6,10 @@ use turnvector_core::{
     RuntimeOverheadBoundSetId, RuntimeOverheadGeneration, SafetyGeneration, SchedulerGeneration,
     SchedulingSnapshot, ServiceClass, WorkCandidate,
 };
-type Candidate = WorkCandidate<2>;
+type Candidate = WorkCandidate<4>;
 type Error = CandidateValidationError;
 type CandidateResult = Result<Candidate, Error>;
-type Snapshot = SchedulingSnapshot<3, 2, 2>;
+type Snapshot = SchedulingSnapshot<4, 2, 4>;
 fn vector<T: Clone, const N: usize>(items: &[T]) -> BoundedVec<T, N> {
     let mut values = BoundedVec::new();
     for item in items {
@@ -116,4 +116,134 @@ fn snapshot_requires_current_generation_and_complete_dispositions() {
     };
     let error = snapshot(1, &requests, &[work], &[exclusion, covered]).unwrap_err();
     assert_eq!(error, Error::CoveredAndExcluded);
+}
+
+mod turn_plan_contract {
+    use super::*;
+    use turnvector_core::{
+        Duration, FutureTurnSupportEntitlementId, MemberOutcome,
+        PersistentStateIsolationEvidenceId, PhysicalStartCreditId, PlanMemberFunding,
+        PlanSupportObligation, PlanSupportObligations, PlanValidationError,
+        StalePlanDispositionBoundId, SupportOperationObligationId,
+        SupportOutstandingCreditVectorId, TokenCount, TurnBudget, TurnPlan, TurnPlanId,
+        TurnProgress, TurnReceipt, TurnReceiptMember, YieldReason,
+    };
+
+    type Plan = TurnPlan<4>;
+    type Evidence = (
+        BoundedVec<PlanMemberFunding, 4>,
+        TurnBudget,
+        PlanSupportObligations<4>,
+    );
+
+    fn obligation(
+        seed: u8,
+        funders: &BoundedVec<PlanMemberFunding, 4>,
+    ) -> PlanSupportObligation<4> {
+        PlanSupportObligation {
+            id: SupportOperationObligationId([seed; 32]),
+            physical_credit: PhysicalStartCreditId([seed + 10; 32]),
+            funders: funders.clone(),
+        }
+    }
+
+    fn fixture(count: usize) -> (Snapshot, Evidence) {
+        let key = CapabilityKey([1; 32]);
+        let all: [PlanMemberFunding; 4] = std::array::from_fn(|index| PlanMemberFunding {
+            request_id: request(index as u64 + 1),
+            entitlement: FutureTurnSupportEntitlementId([index as u8 + 1; 32]),
+            credit_vector: SupportOutstandingCreditVectorId([index as u8 + 21; 32]),
+        });
+        let members = vector(&all[..count]);
+        let candidate_members: [CandidateMember<2>; 4] =
+            std::array::from_fn(|index| member(all[index].request_id, key));
+        let work = candidate(1, key, &candidate_members[..count]).unwrap();
+        let requests: [RequestId; 4] = std::array::from_fn(|index| all[index].request_id);
+        let snapshot = snapshot(1, &requests[..count], &[work], &[]).unwrap();
+        let budget = TurnBudget {
+            target_engine_service: Duration::from_micros(50),
+            hard_execution_bound: Duration::from_micros(100),
+            stale_disposition_bound: StalePlanDispositionBoundId([3; 32]),
+            stale_successor_ceiling: Duration::from_micros(25),
+            phase_work_ceiling: TokenCount::new(64),
+        };
+        let support = PlanSupportObligations {
+            receipt_observation: obligation(1, &members),
+            conditional_continuation_formation: obligation(2, &members),
+            rejection_or_local_stale_formation: obligation(3, &members),
+        };
+        (snapshot, (members, budget, support))
+    }
+
+    fn build(snapshot: &Snapshot, evidence: Evidence) -> Result<Plan, PlanValidationError> {
+        let (members, budget, support) = evidence;
+        let plan_id = TurnPlanId::new(1).unwrap();
+        let candidate_id = CandidateId::new(1).unwrap();
+        TurnPlan::try_new(plan_id, snapshot, candidate_id, members, budget, support)
+    }
+
+    fn receipt(
+        plan: &Plan,
+        members: BoundedVec<TurnReceiptMember, 4>,
+    ) -> Result<TurnReceipt<4>, PlanValidationError> {
+        let service = Duration::from_micros(60);
+        TurnReceipt::try_new(plan, service, true, YieldReason::WorkCeiling, members)
+    }
+
+    #[test]
+    fn plan_freezes_b1_b4_funding_and_snapshot_identity() {
+        for count in [1, 4] {
+            let (snapshot, evidence) = fixture(count);
+            let expected = evidence.clone();
+            let plan = build(&snapshot, evidence).unwrap();
+            let support = plan.support();
+            assert_eq!(plan.members(), &expected.0);
+            assert_eq!(support, &expected.2);
+            assert_eq!(plan.identity().generations, snapshot.generations());
+            assert_eq!(
+                plan.identity().bound_set,
+                RuntimeOverheadBoundSetId([3; 32])
+            );
+            assert_eq!(plan.identity().budget, expected.1);
+            let mut reused = expected;
+            reused.2.conditional_continuation_formation.physical_credit =
+                reused.2.receipt_observation.physical_credit;
+            assert_eq!(
+                build(&snapshot, reused).unwrap_err(),
+                PlanValidationError::ReusedSupportIdentity
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_preserves_order_progress_and_typed_outcomes() {
+        let (snapshot, evidence) = fixture(4);
+        let plan = build(&snapshot, evidence).unwrap();
+        let outcomes = [
+            MemberOutcome::Completed,
+            MemberOutcome::Cancelled,
+            MemberOutcome::Partial,
+            MemberOutcome::Failed(Some(PersistentStateIsolationEvidenceId([9; 32]))),
+        ];
+        let mut rows: [TurnReceiptMember; 4] = std::array::from_fn(|index| TurnReceiptMember {
+            request_id: plan.members().iter().nth(index).unwrap().request_id,
+            progress: Some(TurnProgress {
+                start: TokenCount::new(0),
+                end: TokenCount::new(1),
+                has_continuation: outcomes[index] == MemberOutcome::Partial,
+            }),
+            outcome: outcomes[index],
+            still_runnable: outcomes[index] == MemberOutcome::Partial,
+        });
+        let accepted = receipt(&plan, vector(&rows)).unwrap();
+        assert_eq!(accepted.identity().plan, plan.identity());
+        assert_eq!(accepted.members(), &vector(&rows));
+        rows[3].outcome = MemberOutcome::Failed(None);
+        assert!(receipt(&plan, vector(&rows)).is_ok());
+        rows[0].progress.as_mut().unwrap().start = TokenCount::new(2);
+        assert_eq!(
+            receipt(&plan, vector(&rows)).unwrap_err(),
+            PlanValidationError::ReceiptProgressMismatch
+        );
+    }
 }

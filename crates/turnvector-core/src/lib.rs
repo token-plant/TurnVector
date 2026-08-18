@@ -32,12 +32,20 @@ use std::num::{NonZeroU64, NonZeroU128};
 
 mod bounded;
 mod scheduling;
+mod turns;
 
 pub use bounded::{BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec};
 pub use scheduling::{
     AuthorizedCapabilitySet, BatchBucket, CandidateCoordinates, CandidateExclusion,
     CandidateExclusionReason, CandidateMember, CandidateValidationError, CapabilityKey,
     ExecutionPhase, RuntimeOverheadBoundSetId, SchedulingSnapshot, ServiceClass, WorkCandidate,
+};
+pub use turns::{
+    FutureTurnSupportEntitlementId, MemberOutcome, PersistentStateIsolationEvidenceId,
+    PhysicalStartCreditId, PlanMemberFunding, PlanSupportObligation, PlanSupportObligations,
+    PlanValidationError, StalePlanDispositionBoundId, SupportOperationObligationId,
+    SupportOutstandingCreditVectorId, TurnBudget, TurnPlan, TurnPlanIdentity, TurnProgress,
+    TurnReceipt, TurnReceiptIdentity, TurnReceiptMember, YieldReason,
 };
 
 /// Failure to construct or advance a checked domain value.
@@ -153,6 +161,8 @@ nonzero_id!(/// One effect or authority-publication operation.
 OperationId);
 nonzero_id!(/// One stable opaque schedulable choice.
 CandidateId);
+nonzero_id!(/// One authorization for a bounded Turn.
+TurnPlanId);
 
 nonzero_sequence!(/// A client command position within one connection.
 CommandId);
