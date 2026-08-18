@@ -36,7 +36,9 @@ mod scheduling;
 mod turns;
 mod work;
 
-pub use bounded::{BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec};
+pub use bounded::{
+    BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec, FixedIdentityIndex, FixedIndexError,
+};
 pub use core::{
     Core, CoreEvent, CoreFault, CoreOutcome, CoreState, CoreTransition, DomainRejection, Effect,
 };
@@ -52,7 +54,7 @@ pub use turns::{
     SupportOutstandingCreditVectorId, TurnBudget, TurnPlan, TurnPlanIdentity, TurnProgress,
     TurnReceipt, TurnReceiptIdentity, TurnReceiptMember, YieldReason,
 };
-pub use work::{HotPathWorkBudget, HotPathWorkWitness, WorkBudgetError, WorkDimension};
+pub use work::{HotPathWorkBudget, HotPathWorkWitness, WorkBudgetError, WorkDimension, WorkMeter};
 
 /// Failure to construct or advance a checked domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

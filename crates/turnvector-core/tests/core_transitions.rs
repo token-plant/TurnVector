@@ -96,7 +96,7 @@ fn successor_overflow_discards_the_candidate_transition() {
 
 #[test]
 fn budget_exhaustion_rejects_without_partial_state_or_effects() {
-    let budget = HotPathWorkBudget::try_new(work([34, 1_048_528, 0, 0, 8])).unwrap();
+    let budget = HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 0, 0, 2_100])).unwrap();
     let mut core = Core::<4>::bootstrap_with_work_budget(sequence(1), generations(), budget);
     let transition = core.handle(CoreEvent::operation(sequence(1), operation(10), None));
     assert_eq!(
@@ -131,7 +131,11 @@ fn operation_lookup_uses_counted_binary_work_without_a_full_state_scan() {
 }
 #[test]
 fn work_budgets_reject_overflow_and_truncation() {
-    assert!(HotPathWorkBudget::try_new(work([35, 1_048_528, 0, 2, 8])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_000_001, 2_097_152, 0, 2, 2_100])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_153, 0, 2, 2_100])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 1, 2, 2_100])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 0, 3, 2_100])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 0, 2, 2_101])).is_err());
     assert!(matches!(
         work([u64::MAX, 0, 0, 0, 0]).checked_add(work([1, 0, 0, 0, 0])),
         Err(WorkBudgetError::CounterOverflow(

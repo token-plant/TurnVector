@@ -39,7 +39,7 @@ pub struct HotPathWorkBudget(HotPathWorkWitness);
 impl HotPathWorkBudget {
     #[must_use]
     pub const fn binary_maximum() -> Self {
-        Self(HotPathWorkWitness::new([34, 1_048_528, 0, 2, 8]))
+        Self(HotPathWorkWitness::new([1_000_000, 2_097_152, 0, 2, 2_100]))
     }
     pub fn try_new(maxima: HotPathWorkWitness) -> Result<Self, WorkBudgetError> {
         let binary = Self::binary_maximum().0;
@@ -62,7 +62,7 @@ pub enum WorkBudgetError {
     CounterOverflow(WorkDimension),
     BudgetExceeded(WorkDimension, u64, u64),
 }
-pub(crate) struct WorkMeter(HotPathWorkBudget, HotPathWorkWitness);
+pub struct WorkMeter(HotPathWorkBudget, HotPathWorkWitness);
 impl WorkMeter {
     pub const fn new(budget: HotPathWorkBudget) -> Self {
         Self(budget, HotPathWorkWitness([0; 5]))
@@ -77,6 +77,21 @@ impl WorkMeter {
             return Err(error);
         }
         self.1.0[dimension as usize] = attempted;
+        Ok(())
+    }
+    pub(crate) fn ensure(&self, required: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
+        for dimension in DIMENSIONS {
+            let current = self.1.value(dimension);
+            let attempted = current
+                .checked_add(required.value(dimension))
+                .ok_or(WorkBudgetError::CounterOverflow(dimension))?;
+            let maximum = self.0.0.value(dimension);
+            if attempted > maximum {
+                return Err(WorkBudgetError::BudgetExceeded(
+                    dimension, maximum, attempted,
+                ));
+            }
+        }
         Ok(())
     }
     pub const fn witness(&self) -> HotPathWorkWitness {
