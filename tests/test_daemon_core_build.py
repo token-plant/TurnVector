@@ -1,11 +1,38 @@
-import hashlib, json, os, shutil, subprocess, sys, tempfile, unittest
+import hashlib, json, os, shutil, struct, subprocess, sys, tempfile, unittest
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]; GENERATOR, LAUNCHER, SCHEMAS = ROOT / "scripts/generate_daemon_core_build.py", "scripts/run_daemon_core_build.py", ROOT / "schemas"; DESCRIPTOR, LOCK = "daemon-core-build-v1.json", "daemon-core-build-v1.lock.json"; BOOTSTRAP = json.loads((SCHEMAS / DESCRIPTOR).read_bytes())["build_variants"]["generator_execution"]["bootstrap_source"]
 INPUTS = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "crates/turnvector-core/Cargo.toml", "crates/turnvector-core/src/lib.rs", "crates/turnvector-daemon/Cargo.toml", "crates/turnvector-daemon/src/main.rs", "schemas/generation-semantics-v1.json", "schemas/generation-semantics-v1.lock.json", "scripts/generate_generation_semantics.py", "scripts/generate_daemon_core_build.py", LAUNCHER)
 def canonical(value): return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 def evidence(payload, domain="turnvector:evidence:daemon-core-build", version=1): return hashlib.sha256(domain.encode() + b"\0" + version.to_bytes(4, "big") + payload).hexdigest()
+def macho_fixture(catalog_sections=1, data_command_padding=0, rebase=b"", bind=b"", weak=b"", lazy=b"", export=b"", chained=False, reordered_loader=False):
+    frame, text, writable = 4194560, b"\xc3" + b"\0" * 31, b"\0" * 16; text_command_size, data_command_size, fixup_command_size = 152, 72 + 80 * catalog_sections + data_command_padding, 16 if chained else 48; other_commands, loader_command_size = 184, 112
+    text_offset = 32 + text_command_size + data_command_size + other_commands + loader_command_size + fixup_command_size; catalog_offset = text_offset + len(text); writable_offset = catalog_offset + frame * catalog_sections; fixup_offset = writable_offset + len(writable); text_address, catalog_address, writable_address, linkedit_address = 0x100000000, 0x200000000, 0x300000000, 0x400000000
+    name = lambda value: value.encode().ljust(16, b"\0")
+    section = lambda section_name, segment_name, address, size, offset, flags: struct.pack("<16s16sQQIIIIIIII", name(section_name), name(segment_name), address, size, offset, 0, 0, 0, flags, 0, 0, 0)
+    text_segment = struct.pack("<II16sQQQQiiII", 0x19, text_command_size, name("__TEXT"), text_address, text_offset + len(text), 0, text_offset + len(text), 5, 5, 1, 0) + section("__text", "__TEXT", text_address + text_offset, len(text), text_offset, 0x80000400)
+    data_segment = struct.pack("<II16sQQQQiiII", 0x19, data_command_size, name("__DATA_CONST"), catalog_address, frame * catalog_sections, catalog_offset, frame * catalog_sections, 3, 3, catalog_sections, 0x10)
+    data_segment += b"".join(section("__tvcatalog", "__DATA_CONST", catalog_address + frame * index, frame, catalog_offset + frame * index, 0) for index in range(catalog_sections)) + b"\0" * data_command_padding
+    streams, dyld_tail = (rebase, bind, weak, lazy, export), (b"\0" * 8 if chained else rebase + bind + weak + lazy + export); signature = b"\xfa\xde\x0c\xc0" + b"\0" * 12; tail, starts, cursor = dyld_tail + signature, [], fixup_offset
+    for stream in streams: starts.append(cursor if stream else 0); cursor += len(stream)
+    writable_segment = struct.pack("<II16sQQQQiiII", 0x19, 72, name("__DATA"), writable_address, len(writable), writable_offset, len(writable), 3, 3, 0, 0); linkedit_segment = struct.pack("<II16sQQQQiiII", 0x19, 72, name("__LINKEDIT"), linkedit_address, len(tail), fixup_offset, len(tail), 1, 1, 0, 0)
+    uuid = struct.pack("<II16s", 0x1B, 24, b"\x11" * 16); dylinker = struct.pack("<III", 0xE, 32, 12) + b"/usr/lib/dyld\0".ljust(20, b"\0"); dylib = struct.pack("<IIIIII", 0xC, 56, 24, 0, 0x10000, 0x10000) + b"/usr/lib/libSystem.B.dylib\0".ljust(32, b"\0"); main = struct.pack("<IIQQ", 0x80000028, 24, text_offset, 0)
+    loader_parts = [("dylinker", dylinker), ("dylib", dylib), ("main", main)]; loader_parts = [loader_parts[1], loader_parts[0], loader_parts[2]] if reordered_loader else loader_parts; loader_offsets, loader_start = {}, 32 + text_command_size + data_command_size + 144 + len(uuid); loader_cursor = loader_start
+    for loader_name, loader_payload in loader_parts: loader_offsets[loader_name] = loader_cursor; loader_cursor += len(loader_payload)
+    loader_commands = b"".join(payload for _, payload in loader_parts)
+    fixups = struct.pack("<IIII", 0x80000034, 16, fixup_offset, 8) if chained else struct.pack("<12I", 0x80000022, 48, starts[0], len(rebase), starts[1], len(bind), starts[2], len(weak), starts[3], len(lazy), starts[4], len(export)); code_signature = struct.pack("<IIII", 0x1D, 16, fixup_offset + len(dyld_tail), len(signature))
+    header = struct.pack("<IIIIIIII", 0xfeedfacf, 0x0100000C, 0, 2, 10, text_command_size + data_command_size + other_commands + loader_command_size + fixup_command_size, 0x200085, 0)
+    commands = header + text_segment + data_segment + writable_segment + linkedit_segment + uuid + loader_commands + fixups + code_signature
+    return bytearray(commands + text + b"\0" * (frame * catalog_sections) + writable + tail), {"catalog": catalog_offset, "code_signature": loader_start + loader_command_size + fixup_command_size, "data_section": 32 + text_command_size + 72, "data_segment": 32 + text_command_size, "dyld_info": loader_start + loader_command_size, "frame": frame, "linkedit_segment": 32 + text_command_size + data_command_size + 72, "signature": fixup_offset + len(dyld_tail), "uuid": 32 + text_command_size + data_command_size + 144, **loader_offsets, "text_section": 32 + 72, "text_segment": 32, "writable": writable_offset, "writable_segment": 32 + text_command_size + data_command_size}
 class DaemonCoreBuildTests(unittest.TestCase):
+    def test_catalog_section_reserves_the_fixed_frame(self):
+        descriptor = json.loads((SCHEMAS / DESCRIPTOR).read_bytes()); executable = descriptor["section_identities"]["executable_text"]; self.assertEqual(descriptor["catalog"]["frame"], {"encoding": "fixed_binary_tuple_v1", "header_bytes": 256, "section_bytes": 4194560}); self.assertEqual(descriptor["section_identities"]["catalog_payload"], {"byte_length": 4194560, "encoding": "fixed_binary_tuple_v1", "executable": False, "format": "mach_o_64", "header_bytes": 256, "padding_byte": 0, "section": "__tvcatalog", "segment": "__DATA_CONST", "writable": False})
+        self.assertEqual(executable["catalog_section"]["byte_length"], 4194560); self.assertEqual(executable["fixup_proof"]["catalog_target_count"], 0); self.assertFalse(executable["fixup_proof"]["chained_fixups"]); self.assertTrue(executable["fixup_proof"]["rebase_count"] > 0 and executable["fixup_proof"]["bind_count"] > 0)
     def run_generator(self, root, *args, env=None): return subprocess.run([sys.executable, "-I", "-S", "-B", "-c", BOOTSTRAP, str(root / LAUNCHER), "--root", str(root), *args], cwd=ROOT, env=env or os.environ.copy(), check=False, capture_output=True, text=True)
+    def inspect_macho(self, path, architecture="aarch64-apple-darwin"):
+        program = 'import json,pathlib,sys\ns=pathlib.Path(sys.argv[1]);b=s.read_bytes();l=pathlib.Path(sys.argv[2]).read_bytes();n={"__name__":"probe","__file__":str(s),"_EXECUTED_SOURCE":b,"_EXECUTED_LAUNCHER_SOURCE":l};exec(compile(b,str(s),"exec"),n);print(json.dumps(n["macho_text"](pathlib.Path(sys.argv[3]),sys.argv[4]),sort_keys=True))\n'
+        return subprocess.run([sys.executable, "-I", "-S", "-B", "-c", program, str(GENERATOR), str(ROOT / LAUNCHER), str(path), architecture], cwd=ROOT, check=False, capture_output=True, text=True)
+    def macho_identity(self, path, architecture="aarch64-apple-darwin"):
+        result = self.inspect_macho(path, architecture); self.assertEqual(result.returncode, 0, result.stderr); return json.loads(result.stdout)
     def fixture(self, directory):
         root = Path(directory) / "repo"
         for relative in INPUTS: target = root / relative; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / relative, target)
@@ -31,6 +58,94 @@ class DaemonCoreBuildTests(unittest.TestCase):
             extra = root / "crates/turnvector-core/src/extra.rs"; extra.write_text("pub fn value() -> u32 { 1 }\n"); (root / "crates/turnvector-core/src/lib.rs").write_text("mod extra;\n"); expanded = self.generate(root, Path(directory) / "expanded"); self.assertIn("crates/turnvector-core/src/extra.rs", [item["path"] for item in expanded["source_closure"]["files"]])
             (root / "crates/turnvector-daemon/src/main.rs").write_text('fn main() { println!("code drift"); }\n'); changed = self.generate(root, Path(directory) / "code"); self.assertNotEqual(changed["section_identities"]["executable_text"]["sha256"], expanded["section_identities"]["executable_text"]["sha256"])
             root = self.fixture(str(Path(directory) / "b02")); path = root / "schemas/generation-semantics-v1.json"; value = json.loads(path.read_bytes()); value["sampling_rng"]["splits_per_sampled_token"] = 99; blob = canonical(value); path.write_bytes(blob); lock_path = root / "schemas/generation-semantics-v1.lock.json"; lock = json.loads(lock_path.read_bytes()); lock["digest"] = evidence(blob, lock["domain"], lock["hash_schema_version"]); lock_path.write_bytes(canonical(lock)); self.rejects(root, Path(directory) / "b02-out", "current Generation Semantics")
+    def test_catalog_section_is_a_unique_file_backed_readonly_nonexecuting_region(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory); payload, offsets = macho_fixture(); valid = directory / "valid"; valid.write_bytes(payload); self.assertEqual(self.inspect_macho(valid).returncode, 0)
+            mutations = {
+                "section type": (offsets["data_section"] + 64, "<I", 1),
+                "enclosing segment": (offsets["data_segment"] + 8, "16s", b"__DATA".ljust(16, b"\0")),
+                "segment file range": (offsets["data_segment"] + 48, "<Q", offsets["frame"] - 1),
+                "segment outside file": (offsets["data_segment"] + 48, "<Q", len(payload) + 1),
+                "segment vm range": (offsets["data_segment"] + 32, "<Q", offsets["frame"] - 1),
+                "maximum protection": (offsets["data_segment"] + 56, "<i", 7),
+                "initial protection": (offsets["data_segment"] + 60, "<i", 7),
+                "instruction attribute": (offsets["data_section"] + 64, "<I", 0x80000000),
+                "other section attribute": (offsets["data_section"] + 64, "<I", 0x100),
+                "relocation offset": (offsets["data_section"] + 56, "<I", 1),
+                "relocation count": (offsets["data_section"] + 60, "<I", 1),
+                "reserved field": (offsets["data_section"] + 68, "<I", 1),
+                "segment readonly flag": (offsets["data_segment"] + 68, "<I", 0),
+                "section length": (offsets["data_section"] + 40, "<Q", offsets["frame"] - 1),
+                "nonzero placeholder": (offsets["catalog"], "B", 1),
+            }
+            for index, (name, (offset, encoding, value)) in enumerate(mutations.items()):
+                with self.subTest(name=name): candidate = bytearray(payload); struct.pack_into(encoding, candidate, offset, value); path = directory / f"invalid-{index}"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            for count in (0, 2):
+                with self.subTest(catalog_sections=count): candidate, _ = macho_fixture(count); path = directory / f"count-{count}"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            candidate, offsets = macho_fixture(); struct.pack_into("<II", candidate, 4, 0x01000007, 3); struct.pack_into("<ii", candidate, offsets["data_segment"] + 56, 9, 9); path = directory / "x86-user-executable"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path, "x86_64-apple-darwin").returncode, 0)
+            candidate, offsets = macho_fixture(); struct.pack_into("<II", candidate, 4, 0x01000007, 3); struct.pack_into("<ii", candidate, offsets["text_segment"] + 56, 9, 9); path = directory / "x86-instruction-user-executable"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path, "x86_64-apple-darwin").returncode, 0)
+            candidate, offsets = macho_fixture(); struct.pack_into("<II", candidate, 4, 0x01000007, 3); path = directory / "x86-instruction-executable"; path.write_bytes(candidate); self.assertEqual(self.inspect_macho(path, "x86_64-apple-darwin").returncode, 0)
+    def test_mach_o_header_and_load_command_table_are_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory); payload, _ = macho_fixture(); declared = struct.unpack_from("<I", payload, 20)[0]
+            mutations = ((12, "<I", 6), (20, "<I", 0), (20, "<I", declared - 1), (20, "<I", declared + 8), (24, "<I", 0x220085), (28, "<I", 1))
+            for index, (offset, encoding, value) in enumerate(mutations):
+                with self.subTest(index=index): candidate = bytearray(payload); struct.pack_into(encoding, candidate, offset, value); path = directory / f"header-{index}"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            candidate, _ = macho_fixture(data_command_padding=8); path = directory / "padded-segment-command"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            candidate, offsets = macho_fixture(); text_size = struct.unpack_from("<Q", candidate, offsets["text_segment"] + 48)[0]; text_address = struct.unpack_from("<Q", candidate, offsets["text_section"] + 32)[0]; struct.pack_into("<QQ", candidate, offsets["text_segment"] + 40, 1, text_size - 1); struct.pack_into("<Q", candidate, offsets["text_section"] + 32, text_address - 1); path = directory / "nonzero-text-file-offset"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            candidate, offsets = macho_fixture(); text_command = bytes(candidate[offsets["text_segment"]:offsets["text_segment"] + 152]); data_command = bytes(candidate[offsets["data_segment"]:offsets["data_segment"] + 152]); candidate[offsets["text_segment"]:offsets["text_segment"] + 152] = data_command; candidate[offsets["data_segment"]:offsets["data_segment"] + 152] = text_command; path = directory / "reordered-segments"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+    def test_loader_command_semantics_and_order_are_identity_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory); payload, offsets = macho_fixture(); baseline_path = directory / "baseline"; baseline_path.write_bytes(payload); baseline = self.macho_identity(baseline_path)["sha256"]
+            cases = ((offsets["main"] + 8, "<Q", struct.unpack_from("<Q", payload, offsets["main"] + 8)[0] + 1), (offsets["dylinker"] + 12, "B", ord("x")), (offsets["dylib"] + 24, "B", ord("x")), (offsets["dylib"] + 12, "<I", 1), (offsets["code_signature"] + 12, "<I", len(payload[offsets["signature"]:]) - 1))
+            for index, (offset, encoding, value) in enumerate(cases):
+                candidate = bytearray(payload); struct.pack_into(encoding, candidate, offset, value); path = directory / f"loader-{index}"; path.write_bytes(candidate); result = self.inspect_macho(path); self.assertTrue(result.returncode != 0 or json.loads(result.stdout)["sha256"] != baseline)
+            reordered, _ = macho_fixture(reordered_loader=True); path = directory / "loader-order"; path.write_bytes(reordered); result = self.inspect_macho(path); self.assertTrue(result.returncode != 0 or json.loads(result.stdout)["sha256"] != baseline)
+            candidate = bytearray(payload); candidate[offsets["uuid"] + 8] ^= 1; path = directory / "uuid-only"; path.write_bytes(candidate); self.assertEqual(self.macho_identity(path)["sha256"], baseline)
+            candidate = bytearray(payload); candidate[offsets["signature"]] ^= 1; path = directory / "signature-bytes-only"; path.write_bytes(candidate); self.assertEqual(self.macho_identity(path)["sha256"], baseline)
+            candidate = bytearray(payload); candidate.append(0); vm_size, file_size = struct.unpack_from("<Q", payload, offsets["linkedit_segment"] + 32)[0], struct.unpack_from("<Q", payload, offsets["linkedit_segment"] + 48)[0]; struct.pack_into("<Q", candidate, offsets["linkedit_segment"] + 32, vm_size + 1); struct.pack_into("<Q", candidate, offsets["linkedit_segment"] + 48, file_size + 1); path = directory / "linkedit-size"; path.write_bytes(candidate); self.assertNotEqual(self.macho_identity(path)["sha256"], baseline)
+    def test_instruction_sections_are_contained_in_readable_executable_segments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory); payload, offsets = macho_fixture()
+            mutations = (
+                ((offsets["text_segment"] + 8, "16s", b"__FAKE".ljust(16, b"\0")),),
+                ((offsets["text_segment"] + 48, "<Q", 3),),
+                ((offsets["text_segment"] + 32, "<Q", 3),),
+                ((offsets["text_segment"] + 56, "<i", 1),),
+                ((offsets["text_segment"] + 60, "<i", 1),),
+                ((offsets["text_section"] + 32, "<Q", 0x100000001),),
+                ((offsets["text_section"] + 48, "<I", offsets["catalog"]), (offsets["text_segment"] + 40, "<Q", offsets["catalog"]), (offsets["text_segment"] + 48, "<Q", 4)),
+            )
+            for index, changes in enumerate(mutations):
+                with self.subTest(index=index):
+                    candidate = bytearray(payload)
+                    for offset, encoding, value in changes: struct.pack_into(encoding, candidate, offset, value)
+                    path = directory / f"instruction-{index}"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+    def test_vm_layout_and_dyld_fixups_cannot_reach_the_catalog_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory); payload, offsets = macho_fixture(); cases = []
+            candidate = bytearray(payload); struct.pack_into("<Q", candidate, offsets["data_segment"] + 32, offsets["frame"] + 1); struct.pack_into("<Q", candidate, offsets["data_section"] + 32, 0x200000001); cases.append(("catalog-mapping", candidate))
+            candidate = bytearray(payload); struct.pack_into("<Q", candidate, offsets["data_segment"] + 24, 0x100000000); struct.pack_into("<Q", candidate, offsets["data_section"] + 32, 0x100000000); cases.append(("vm-overlap", candidate))
+            cases.extend((("rebase", macho_fixture(rebase=b"\x21\x00\x51\x00")[0]), ("bind", macho_fixture(bind=b"\x11\x40x\x00\x51\x71\x00\x90\x00")[0]), ("chained", macho_fixture(chained=True)[0])))
+            for name, candidate in cases:
+                path = directory / name; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0, name)
+            shifted = bytearray(payload); struct.pack_into("<Q", shifted, offsets["text_segment"] + 24, struct.unpack_from("<Q", payload, offsets["text_segment"] + 24)[0] + 0x1000); struct.pack_into("<Q", shifted, offsets["text_section"] + 32, struct.unpack_from("<Q", payload, offsets["text_section"] + 32)[0] + 0x1000)
+            baseline, changed = directory / "baseline", directory / "shifted"; baseline.write_bytes(payload); changed.write_bytes(shifted); self.assertNotEqual(self.macho_identity(baseline)["sha256"], self.macho_identity(changed)["sha256"])
+    def test_dyld_sources_states_stride_and_segment_topology_are_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory); streams = dict(rebase=b"\0", bind=b"\0", weak=b"\0", lazy=b"\0", export=b"\0"); payload, offsets = macho_fixture(**streams); baseline = directory / "baseline"; baseline.write_bytes(payload); identity = self.macho_identity(baseline)
+            for index in range(5):
+                candidate = bytearray(payload); struct.pack_into("<I", candidate, offsets["dyld_info"] + 8 + index * 8, offsets["catalog"]); path = directory / f"stream-{index}"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0, index)
+            candidate = bytearray(payload); struct.pack_into("<I", candidate, offsets["dyld_info"] + 40, struct.unpack_from("<I", candidate, offsets["dyld_info"] + 8)[0]); path = directory / "overlapping-streams"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            changed = bytearray(payload); changed[offsets["signature"] - 1] = 1; path = directory / "export-drift"; path.write_bytes(changed); self.assertNotEqual(identity["sha256"], self.macho_identity(path)["sha256"])
+            vectors = ((b"\x12\x20\x00\x52\x00", (0, 8)), (b"\x13\x20\x00\x30\x08\x51\x00", (8,)), (b"\x13\x20\x00\x80\x02\x04\x00", (0, 12)))
+            for index, (stream, addresses) in enumerate(vectors): typed, _ = macho_fixture(rebase=stream); path = directory / f"typed-{index}"; path.write_bytes(typed); proof = self.macho_identity(path)["fixup_proof"]; self.assertEqual(proof["sha256"], hashlib.sha256(canonical([["rebase", 0x100000000 + address, 4] for address in addresses])).hexdigest())
+            invalid = (macho_fixture(rebase=b"\x20\x00\x51\x00")[0], macho_fixture(bind=b"\x40x\0\x51\x72\x00\x90\x00")[0], macho_fixture(bind=b"\x30\x51\x72\x00\x90\x00")[0], macho_fixture(bind=b"\x30\x40x\0\x72\x00\x90\x00")[0], macho_fixture(weak=b"\x11\x40x\0\x51\x72\x00\x90\x00")[0], macho_fixture(lazy=b"\x11\x40x\0\x51\x72\x00\x90\x00")[0], macho_fixture(lazy=b"\x30\x40x\0\x72\x00\x90\x00\x90\x00")[0])
+            for index, candidate in enumerate(invalid): path = directory / f"state-{index}"; path.write_bytes(candidate); self.assertNotEqual(self.inspect_macho(path).returncode, 0, index)
+            for name, field, value in (("file", 40, offsets["catalog"]), ("vm", 24, 0x200000000)):
+                alias = bytearray(payload); struct.pack_into("<Q", alias, offsets["writable_segment"] + field, value); path = directory / f"segment-{name}-alias"; path.write_bytes(alias); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            rwx = bytearray(payload); struct.pack_into("<ii", rwx, offsets["writable_segment"] + 56, 7, 7); path = directory / "writable-executable"; path.write_bytes(rwx); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
+            unsupported = bytearray(payload); struct.pack_into("<I", unsupported, offsets["dyld_info"], 0x80000033); path = directory / "unsupported-range-command"; path.write_bytes(unsupported); self.assertNotEqual(self.inspect_macho(path).returncode, 0)
     def test_trace_policy_vendor_and_source_stability(self):
         with tempfile.TemporaryDirectory() as directory:
             cases = []; root = self.fixture(str(Path(directory) / "source")); (root / "hidden.txt").write_text("hidden\n"); (root / "crates/turnvector-core/src/lib.rs").write_text('const X: &str = include_str!("../../../hidden.txt");\n'); cases.append((root, "undeclared runtime input")); root = self.fixture(str(Path(directory) / "env")); (root / "crates/turnvector-daemon/src/main.rs").write_text('fn main() { println!("{}", env!("CARGO_HOME")); }\n'); cases.append((root, "undeclared environment input"))
@@ -54,7 +169,7 @@ class DaemonCoreBuildTests(unittest.TestCase):
             root, target, output = self.fixture(str(Path(directory) / "output-link")), Path(directory) / "real-output", Path(directory) / "linked-output"; target.mkdir(); output.symlink_to(target, target_is_directory=True); sentinel = target / DESCRIPTOR; sentinel.write_text("unchanged\n"); result = self.run_generator(root, "--output", str(output)); self.assertNotEqual(result.returncode, 0); self.assertEqual(sentinel.read_text(), "unchanged\n"); self.assertFalse((target / LOCK).exists())
             root, wrapper, output = self.fixture(str(Path(directory) / "directory-race")), Path(directory) / "directory-bin/cargo", Path(directory) / "directory-output"; wrapper.parent.mkdir(); output.mkdir(); marker, moved = Path(directory) / "directory-marker", Path(directory) / "directory-moved"; wrapper.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ] && [ -d "{output}" ] && [ ! -e "{marker}" ]; then mv "{output}" "{moved}"; mkdir "{output}"; touch "{marker}"; fi\nexec "{real}" "$@"\n'); wrapper.chmod(0o755); env["PATH"] = f'{wrapper.parent}:{os.environ["PATH"]}'; result = self.run_generator(root, "--output", str(output), env=env); self.assertNotEqual(result.returncode, 0); self.assertIn("output directory changed", result.stderr); self.assertFalse((output / DESCRIPTOR).exists() or (moved / DESCRIPTOR).exists())
     def test_structural_and_self_hash_drift_are_rejected(self):
-        descriptor, lock = json.loads((SCHEMAS / DESCRIPTOR).read_bytes()), json.loads((SCHEMAS / LOCK).read_bytes()); paths = (("catalog", "schema_version"), ("catalog", "capacity", "max_entries"), ("support", "start_count", "max_horizons"), ("support", "start_count", "max_physical_credits"), ("support", "funding_claim", "max_claims_per_obligation"), ("support", "funding_claim", "variants", 0), ("support", "outstanding_credit_vector", "max_dimensions"), ("support", "records", "ordinary_claims"), ("support", "records", "conditional_obligations"), ("support", "records", "pending_obligations"), ("support", "records", "entitlement_tombstones"), ("support", "records", "funding_claims"), ("support", "records", "lifecycle_reserves"), ("support", "records", "total_operation_obligations"), ("cardinality_inputs", "ingress", "global_warming"), ("prepared_carry", "slots"), ("prepared_carry", "mandatory_suballocation_max"), ("prepared_carry", "safety_suballocation_max"), ("event_registry", "max_entries"), ("build_variants", "profiles", 0), ("native_inputs", "interface_revision"), ("section_identities", "executable_text", "cpu_type"), ("section_identities", "executable_text", "cpu_subtype"), ("section_identities", "executable_text", "sections", 0, "sha256"), ("section_identities", "native_text", "sha256"), ("toolchain", "python", "runtime_files", "sha256"), ("toolchain", "native_link", "sdk", "sha256"), ("toolchain", "native_link", "link_inputs", "sha256"), ("toolchain", "native_link", "linker_libraries", "sha256"))
+        descriptor, lock = json.loads((SCHEMAS / DESCRIPTOR).read_bytes()), json.loads((SCHEMAS / LOCK).read_bytes()); paths = (("catalog", "schema_version"), ("catalog", "capacity", "max_entries"), ("catalog", "frame", "section_bytes"), ("support", "start_count", "max_horizons"), ("support", "start_count", "max_physical_credits"), ("support", "funding_claim", "max_claims_per_obligation"), ("support", "funding_claim", "variants", 0), ("support", "outstanding_credit_vector", "max_dimensions"), ("support", "records", "ordinary_claims"), ("support", "records", "conditional_obligations"), ("support", "records", "pending_obligations"), ("support", "records", "entitlement_tombstones"), ("support", "records", "funding_claims"), ("support", "records", "lifecycle_reserves"), ("support", "records", "total_operation_obligations"), ("cardinality_inputs", "ingress", "global_warming"), ("prepared_carry", "slots"), ("prepared_carry", "mandatory_suballocation_max"), ("prepared_carry", "safety_suballocation_max"), ("event_registry", "max_entries"), ("build_variants", "profiles", 0), ("native_inputs", "interface_revision"), ("section_identities", "executable_text", "cpu_type"), ("section_identities", "executable_text", "cpu_subtype"), ("section_identities", "executable_text", "sections", 0, "sha256"), ("section_identities", "native_text", "sha256"), ("section_identities", "catalog_payload", "byte_length"), ("toolchain", "python", "runtime_files", "sha256"), ("toolchain", "native_link", "sdk", "sha256"), ("toolchain", "native_link", "link_inputs", "sha256"), ("toolchain", "native_link", "linker_libraries", "sha256"))
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             for path in paths:
