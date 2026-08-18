@@ -5794,6 +5794,10 @@ _Avoid_: Control command, Backend Interface
 The privileged initialization, configuration, Model Residency, Backend capability management, explicit repair, and Exclusive Mode operations exposed on a separate, more restrictive local Unix socket with no network listener. Connection acceptance verifies the peer's effective UID or one kernel-reported group against the daemon's fixed Installation Policy snapshot stricter Control allowlist; Uninitialized and repair states expose only their authorized subsets, while Identity Conflict exposes authenticated status and Sequence Exhausted exposes read-only status outside the Runtime Event Loop.
 _Avoid_: Inference request, output stream
 
+**Compatibility Gateway**:
+An optional separate edge process that implements one explicit external compatibility profile by translating it into one supported TurnVector Data Plane major over the authenticated local Unix socket. It owns network presentation, external authentication, immutable Revision and tokenizer/template routing, bounded text and stream translation, and external error mapping, but has no Control Plane, Scheduler, Admission, Residency, Backend, retry, replay, or recovery authority.
+_Avoid_: C++ shim, Backend gateway, daemon network listener, transparent proxy
+
 **Maintenance Capability**:
 The connection-scoped Control Plane capability derived from that connection's negotiated support and peer credentials under the daemon's fixed Installation Policy snapshot live-maintenance allowlist. It is neither persisted nor transferable, expires on disconnect or daemon-session change, and must be reacquired to create or resume live maintenance work; already accepted durable work is not rolled back by expiry.
 _Avoid_: Control Plane authorization alone, binary attestation, maintenance socket
