@@ -31,10 +31,14 @@ use std::fmt;
 use std::num::{NonZeroU64, NonZeroU128};
 
 mod bounded;
+mod core;
 mod scheduling;
 mod turns;
 
 pub use bounded::{BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec};
+pub use core::{
+    Core, CoreEvent, CoreFault, CoreOutcome, CoreState, CoreTransition, DomainRejection, Effect,
+};
 pub use scheduling::{
     AuthorizedCapabilitySet, BatchBucket, CandidateCoordinates, CandidateExclusion,
     CandidateExclusionReason, CandidateMember, CandidateValidationError, CapabilityKey,
