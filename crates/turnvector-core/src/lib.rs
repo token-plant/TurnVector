@@ -30,6 +30,10 @@ use std::error::Error;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroU128};
 
+mod bounded;
+
+pub use bounded::{BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec};
+
 /// Failure to construct or advance a checked domain value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DomainValueError {
@@ -152,6 +156,14 @@ nonzero_sequence!(/// A successful acceptance position within one connection.
 RequestSequence);
 nonzero_sequence!(/// An externally visible request-state version.
 RequestStatusVersion);
+nonzero_sequence!(/// The version of Scheduler-owned request and obligation state.
+SchedulerGeneration);
+nonzero_sequence!(/// The version of Backend state that affects execution validity.
+BackendGeneration);
+nonzero_sequence!(/// The version of effective resource restrictions.
+SafetyGeneration);
+nonzero_sequence!(/// The version of applicable daemon runtime-overhead evidence.
+RuntimeOverheadGeneration);
 
 checked_unit!(/// A count of bytes.
 ByteCount);
@@ -247,4 +259,81 @@ impl MonotonicTime {
             .map(Duration)
             .ok_or(DomainValueError::Underflow)
     }
+}
+
+/// The generations captured by a Scheduling Snapshot and copied into a Turn Plan.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GenerationVector {
+    scheduler: SchedulerGeneration,
+    backend: BackendGeneration,
+    safety: SafetyGeneration,
+    runtime_overhead: RuntimeOverheadGeneration,
+}
+
+impl GenerationVector {
+    #[must_use]
+    pub const fn new(
+        scheduler: SchedulerGeneration,
+        backend: BackendGeneration,
+        safety: SafetyGeneration,
+        runtime_overhead: RuntimeOverheadGeneration,
+    ) -> Self {
+        Self {
+            scheduler,
+            backend,
+            safety,
+            runtime_overhead,
+        }
+    }
+
+    pub fn validate_current(self, current: Self) -> Result<(), GenerationMismatch> {
+        [
+            (
+                GenerationComponent::Scheduler,
+                self.scheduler.get(),
+                current.scheduler.get(),
+            ),
+            (
+                GenerationComponent::Backend,
+                self.backend.get(),
+                current.backend.get(),
+            ),
+            (
+                GenerationComponent::Safety,
+                self.safety.get(),
+                current.safety.get(),
+            ),
+            (
+                GenerationComponent::RuntimeOverhead,
+                self.runtime_overhead.get(),
+                current.runtime_overhead.get(),
+            ),
+        ]
+        .into_iter()
+        .find(|(_, planned, now)| planned != now)
+        .map_or(Ok(()), |(component, planned, current)| {
+            Err(GenerationMismatch {
+                component,
+                planned,
+                current,
+            })
+        })
+    }
+}
+
+/// One member of the four-part Generation Vector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenerationComponent {
+    Scheduler,
+    Backend,
+    Safety,
+    RuntimeOverhead,
+}
+
+/// The first stale component found in deterministic Generation Vector order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationMismatch {
+    pub component: GenerationComponent,
+    pub planned: u64,
+    pub current: u64,
 }
