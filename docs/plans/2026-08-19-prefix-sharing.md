@@ -4,6 +4,10 @@ Status: design only; post-P0 optional route; no Certification, capacity, or perf
 
 Governing decision: `docs/adr/0044-qualify-prefix-sharing-as-a-separate-execution-route.md`
 
+Required predecessor: ADR 0042, Distinguish Paged KV Layout from Attention
+Execution. Its independent Paged KV/cache ABI and Attention Path identities must
+be accepted before this plan can be accepted or implemented.
+
 ## Objective
 
 Allow compatible requests for one exact Model Revision to reuse completed prefix
@@ -37,8 +41,10 @@ P0 Service Readiness.
 
 ## Terminology
 
-**Prefix Reuse** avoids recomputing an exact compatible token prefix. The
-consumer may still own a private physical copy.
+**Prefix Reuse** avoids recomputing an exact compatible token prefix. Its exact
+Execution Route member is a Prefix Reuse plan with stable kind `NONE`,
+`PRIVATE_REUSE`, or `NATIVE_PAGE_SHARING`; the consumer may still own a private
+physical copy under `PRIVATE_REUSE`.
 
 **Native Prefix Sharing** means two live request states retain references to the
 same immutable physical KV pages. It is stronger than Prefix Reuse and requires
@@ -83,18 +89,34 @@ the owner-thread support bound.
 
 ## Compatibility Identity
 
-A native entry and consumer match only when all applicable identity fields are
-equal:
+A native entry and consumer match only when their complete route and additional
+prefix identities are equal.
 
-- exact Model Revision and registered artifact/weight digest set;
-- Model Descriptor and Execution Route Identity;
-- graph ABI and graph artifact identities;
-- KV/cache layout ABI, page geometry, dtype, quantization, layer topology, and
-  Attention path compatibility;
+The route and Capability witnesses are:
+
+- exact Model Revision, registered artifact/weight digest set, and Model
+  Descriptor;
+- one exact Execution Route Identity carrying a `NATIVE_PAGE_SHARING` Prefix
+  Reuse plan; and
+- that route's graph ABI and artifact, KV/cache layout ABI, page geometry, dtype,
+  quantization, layer topology, and Attention Path identities.
+
+Execution Route Identity equality already subsumes the decomposed graph,
+KV/cache, Attention Path, and Prefix Reuse plan fields. They are revalidated as
+integrity and mismatch-diagnostic witnesses; they are not additional authority,
+and cannot make unequal route identities compatible. The Materialization Result
+binds the adopted route identity; Core accepts it only when at least one exact
+Capability Key in the request's frozen Authorized Capability Set carries that
+identity. The Adapter never receives or chooses the Set, and no witness can
+authorize a missing Key.
+
+The additional prefix-entry compatibility fields not subsumed by Execution
+Route Identity are:
+
 - adapter/overlay identity, including any model-affecting fine-tune or sidecar;
 - Generation Semantics identity and every prompt-state parameter that affects
   KV construction;
-- position, mask, rotary, and cache-offset semantics;
+- exact request position, mask, rotary, and cache-offset values;
 - media or other non-token input identity when the route supports it;
 - exact prefix token count, canonical token-byte encoding, content hash, and
   byte-for-byte token equality after hash match; and
@@ -128,7 +150,8 @@ one deterministic policy and cannot create two mutable authorities for a page.
 
 ### Adoption
 
-The preferred first integration point is owner-thread Request Materialization:
+PS04 commits the first route to owner-thread Request Materialization as its only
+adoption operation:
 
 1. Admission has already reserved the complete no-hit private-KV worst case and
    authorized every possible route in the request's finite capability closure.
@@ -136,15 +159,18 @@ The preferred first integration point is owner-thread Request Materialization:
    request and entry count.
 3. A hit transactionally retains every referenced page and constructs one
    opaque request KV view. Partial retain failure rolls back every increment.
-4. The request records the exact adopted-prefix identity and Backend Generation.
+4. The Materialization Result records the exact adopted-prefix and Execution
+   Route identities plus Backend Generation; Core validates the route against
+   the request's frozen Authorized Capability Set before accepting the Result.
 5. Later Candidate Formation emits only a Capability Key compatible with that
    materialized state.
 6. A miss creates the ordinary private baseline state; it is not a failure.
 
-If adoption is later moved to a separate support operation, that operation must
-receive its own bounded Backend Interface member, Support Operation Obligation,
-watchdog, lifecycle legality, and exact result contract. It cannot be hidden
-inside Candidate Formation.
+This plan does not permit adoption in another operation. A future design may add
+a separate synchronized adoption operation only through its own architecture
+decision, bounded Backend Interface member, Support Operation Obligation,
+watchdog, lifecycle legality, and exact result contract; it cannot be hidden
+inside Candidate Formation or added under PS04.
 
 Mutable cache presence is not frozen before Admission. A hit may reduce actual
 Prefill work, but Timing Commitments and Resource Reservations remain valid for
@@ -285,7 +311,7 @@ microbenchmark cannot promote the serving route.
 
 | ID | Deliverable | Required verification |
 |---|---|---|
-| PS01 | Add canonical Prefix Reuse/Sharing route members, stable identity schema, and finite capability closure. | Double generation, field drift, unknown/missing rejection. |
+| PS01 | Add the canonical Prefix Reuse plan member, three stable kinds, identity schema, and finite capability closure. | Double generation, kind/field drift, unknown/missing rejection. |
 | PS02 | Implement bounded private Prefix Reuse by copy/repage. | No-hit/private parity, exact identity, resource bounds. |
 | PS03 | Add an in-memory immutable page pool and atomic publication behind a separate route. | Refcount, publication rollback, page/generation invariants. |
 | PS04 | Add Materialization-time longest-prefix adoption with full per-request reservation retained. | Hit/miss, rollback, Backend Generation, candidate compatibility. |

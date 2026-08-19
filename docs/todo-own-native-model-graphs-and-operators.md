@@ -49,7 +49,8 @@ The descriptor fixes:
 - KV/cache layout ABI whose exact identity distinguishes non-paged and PagedKV
   layouts;
 - Speculative Decode plan or explicit `NONE`;
-- Prefix Reuse plan or explicit `NONE`; and
+- Prefix Reuse plan with stable kind `NONE`, `PRIVATE_REUSE`, or
+  `NATIVE_PAGE_SHARING`; and
 - command-submission or replay plan or explicit `NONE`.
 
 The Profile is only a compact read-only projection of the existing Certification
