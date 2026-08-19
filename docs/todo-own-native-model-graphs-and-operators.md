@@ -48,9 +48,23 @@ The descriptor fixes:
 - kernel-bundle and fusion-plan identities;
 - KV/cache layout ABI whose exact identity distinguishes non-paged and PagedKV
   layouts;
+- independent Attention Path identity;
 - Speculative Decode plan or explicit `NONE`;
 - Prefix Reuse plan or explicit `NONE`; and
 - command-submission or replay plan or explicit `NONE`.
+
+The Attention Path is a composition identity, not a second owner of its
+constituents. It owns the stable path kind, compilation timing and no-fallback
+policies, and canonical references to the exact graph, kernel/fusion, KV/cache,
+memory, and command members. Attention compute input/output and accumulation
+dtype semantics plus mask/position ABIs remain owned by the graph member;
+model-weight storage, quantization, packing, and dequantization by the
+weight-layout ABI; dispatch, kernel artifacts, and compilation inputs by the
+kernel/fusion member; KV storage dtype/quantization, access, page encoding, and
+block-table reader by the KV/cache member; scratch by the memory-plan member;
+and submission/replay by the command member. Execution Phase and runtime Shape
+remain in the exact Capability Key and Case Bound Table rather than being
+duplicated in the route descriptor.
 
 The Profile is only a compact read-only projection of the existing Certification
 Record, Environment Qualification, and Case Bound Table authority. It is not a
@@ -121,18 +135,31 @@ Each step keeps the coarse Backend Interface unchanged and adds a new exact
 Execution Route rather than widening the prior Profile:
 
 1. Own exact Prefill/Decode graphs and a preallocated fixed-offset arena.
-2. Add separately identified specialized kernels and operator-fusion plans.
+2. Design the Attention and KV Layout Module contracts together, including the
+   exact route fields, block-table reader ABI, mask/position semantics, scratch
+   bounds, and Turn Receipt observations shared by native page-reading routes.
 3. Add a PagedKV layout with an exact page, dtype, quantization, allocation,
-   update, and release ABI.
-4. Add Prefix Reuse only on a qualified PagedKV/cache ABI and bind the complete
+   update, and release ABI, retaining a gathered pinned-MLX-SDPA reference
+   route.
+4. Add separately identified phase-specific attention paths and operator-fusion
+   plans. The PagedAttention delivery owns the first native block-table Decode
+   slice; the later FlashAttention delivery owns tiled Prefill. Qualify them
+   independently and never represent the family with a `flash_attention`
+   boolean.
+5. Add Prefix Reuse only on a qualified PagedKV/cache ABI and bind the complete
    model, token-prefix, graph, KV, producer, and publication identities.
-5. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
+6. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
    synchronization points, and additional memory/time bounds.
-6. Add Metal command replay or ICB only when the pinned implementation exposes
+7. Add Metal command replay or ICB only when the pinned implementation exposes
    a stable contract and correctness, cancellation, command-buffer, and
    performance qualification passes.
 
 No later step is a prerequisite for shipping or certifying an earlier route.
+The attention/KV ownership boundary, sequential delivery order, route matrix,
+and promotion gates are defined in
+[ADR 0045](adr/0045-qualify-flash-attention-as-exact-phase-specific-routes.md)
+and its
+[detailed design](plans/2026-08-19-flash-attention-route-design.md).
 
 ## Transition Work
 
