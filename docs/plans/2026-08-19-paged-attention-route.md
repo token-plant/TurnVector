@@ -6,7 +6,7 @@ Governing decision: `docs/adr/0042-distinguish-paged-kv-layout-from-attention-ex
 
 ## Objective
 
-Add a native Attention path that can read a qualified paged KV layout directly
+Add a native Attention Path that can read a qualified paged KV layout directly
 through a block table, without widening the Rust-facing Backend Interface or
 making Paged KV, Prefix Sharing, or native Paged Attention a P0 prerequisite.
 
@@ -15,7 +15,7 @@ The design deliberately separates two questions:
 1. How persistent K/V state is allocated, addressed, updated, and released.
 2. How one exact Attention implementation consumes that state for one Turn.
 
-The first question is the KV layout. The second is the Attention path. They may
+The first question is the KV layout. The second is the Attention Path. They may
 evolve independently and must never share Certification by implication.
 
 ## Non-Goals
@@ -68,14 +68,14 @@ The canonical Execution Route descriptor must record independent identities for:
 - memory plan and arena;
 - KV/cache layout ABI, including page size, block-table encoding, dtype,
   quantization, allocation, append, trim, and release semantics;
-- Attention path, including implementation kind, kernel bundle, mask and
+- Attention Path, including implementation kind, kernel bundle, mask and
   position ABI, supported phase and Shape domain, block-table reader ABI, and
   route-local scratch plan;
 - fusion, Speculative Decode, Prefix Reuse, and command-submission/replay plans.
 
-The first three Attention path kinds are:
+The first three Attention Path kinds are:
 
-| Attention path | KV input | Meaning |
+| Attention Path | KV input | Meaning |
 |---|---|---|
 | `CONTIGUOUS_MLX_SDPA` | Contiguous | Baseline path over contiguous K/V. |
 | `PAGED_GATHER_MLX_SDPA` | Paged | Gather the exact logical K/V view, then call the pinned MLX SDPA path. |
@@ -89,24 +89,31 @@ Execution Route Identity.
 
 ## Route Selection Laws
 
-1. Candidate Formation may present only an exact route contained in every
-   member's Authorized Capability Set.
-2. The Work Candidate and Turn Plan freeze one Attention path and one KV layout.
+1. The Model Planner may propose only a structurally supported exact route.
+   Core may associate the returned Candidate only when its exact Capability Key
+   belongs to every member's Authorized Capability Set.
+2. The Work Candidate and Turn Plan freeze one Attention Path and one KV layout.
 3. The Adapter validates phase, Shape, dtype, layout, page-table, memory-plan,
-   and kernel applicability before MLX execution begins.
-4. An applicability mismatch returns Plan Rejection and consumes zero Engine
-   Service. It cannot substitute another route within the call.
-5. A failed or untrustworthy started native execution follows the existing Turn
+   and kernel applicability before any route operation begins.
+4. An applicability mismatch detected before any route operation starts returns
+   Plan Rejection and consumes zero Engine Service. It cannot substitute another
+   route within the call.
+5. Beginning first-use compilation starts the Turn even when no MLX kernel has
+   executed. Compile failure is a typed started-Turn failure, compile-bound excess
+   is a Bound Violation, and neither can be relabeled as Plan Rejection.
+6. A failed or untrustworthy started native execution follows the existing Turn
    failure or fail-stop contract; it cannot be relabeled as a gather route.
-6. A later fresh Scheduling Snapshot may select a separately authorized gather
+7. A later fresh Scheduling Snapshot may select a separately authorized gather
    route after a rejection, subject to its own Capability Key and bounds.
-7. Receipt telemetry records the intended route and typed actual outcome without
+8. Receipt telemetry records the intended route and typed actual outcome without
    turning observation into authorization.
 
 An implementation may compile a kernel lazily only when the complete compile
-operation and failure path are covered by the route's certified bound. A
-runtime-generated kernel variant has a distinct artifact identity; geometry
-success observed on one host cannot authorize another geometry or environment.
+operation and failure path are covered by the route's certified bound. A missing
+required precompiled artifact may reject before start, but lazy compilation may
+not begin and later return Plan Rejection. A runtime-generated kernel variant has
+a distinct artifact identity; geometry success observed on one host cannot
+authorize another geometry or environment.
 
 ## Resource And Failure Contract
 
@@ -138,7 +145,7 @@ Qualification is exact for one Capability Key and includes:
   domains, with explicit exclusions for every unsupported layout;
 - block-table bounds, duplicate/reused-page rejection where illegal, and stale
   generation rejection;
-- Plan Rejection before execution for every unsupported geometry;
+- Plan Rejection before route work for every unsupported geometry;
 - owner-thread, synchronization, cleanup, and request-release fault injection;
 - route identity drift and most-specific quarantine behavior.
 
@@ -168,10 +175,10 @@ An isolated kernel microbenchmark is supporting evidence, not a serving claim.
 
 | ID | Deliverable | Required verification |
 |---|---|---|
-| PA01 | Add canonical KV-layout and Attention-path descriptor members and stable discriminants. | Double-generation identity, one-member drift, malformed/unknown rejection. |
+| PA01 | Add canonical KV-layout and Attention Path descriptor members and stable discriminants. | Double-generation identity, one-member drift, malformed/unknown rejection. |
 | PA02 | Add complete Capability Requirement, Profile, quarantine, and telemetry propagation for the exact path. | Fake/native conformance and exact-key isolation. |
 | PA03 | Implement and qualify `PAGED_GATHER_MLX_SDPA` over private Paged KV. | Baseline parity, page/trim/exhaustion cases, gather resource bounds. |
-| PA04 | Add one predeclared native decode geometry behind a separate route identity. | Kernel oracle, unsupported geometry rejection, no silent fallback. |
+| PA04 | Add one predeclared native decode geometry behind a separate route identity. | Kernel oracle, unsupported geometry rejection, compile-start outcome classification, no silent fallback. |
 | PA05 | Expand only to explicitly qualified page, batch, Shape, dtype, mask, and model domains. | Complete case matrix and per-domain identity drift. |
 | PA06 | Run serving, memory, and command-buffer qualification against the gather and contiguous routes. | Fixed thresholds, distributions, artifacts, and failure preservation. |
 | PA07 | Consider promotion for exact profiles whose complete gates pass. | Profile-specific decision record; unchanged P0 baseline. |
@@ -183,12 +190,12 @@ block PA03, and no native route is a prerequisite for Paged KV correctness.
 
 This plan is complete only when:
 
-- the canonical descriptor makes KV layout and Attention path independently
+- the canonical descriptor makes KV layout and Attention Path independently
   visible to exact Certification and quarantine;
 - no native details cross the Rust/native Seam;
 - every supported native case has exact correctness, resource, and performance
   evidence, with unsupported cases rejected before execution;
-- no started Turn silently changes Attention paths;
+- no started Turn silently changes Attention Paths;
 - route-specific memory and cleanup remain conservative under cancellation,
   exhaustion, and failure; and
 - product wording remains limited to the strongest completed evidence gate.

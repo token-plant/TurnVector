@@ -48,6 +48,7 @@ The descriptor fixes:
 - kernel-bundle and fusion-plan identities;
 - KV/cache layout ABI whose exact identity distinguishes non-paged and PagedKV
   layouts;
+- independent Attention Path identity;
 - Speculative Decode plan or explicit `NONE`;
 - Prefix Reuse plan or explicit `NONE`; and
 - command-submission or replay plan or explicit `NONE`.
