@@ -355,17 +355,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     try:
-        source = tree_entry(str(git("rev-parse", "HEAD")).strip(), "scripts/check_commit_policy.py")
+        base = str(git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")).strip()
+        head = str(git("rev-parse", "--verify", "--end-of-options", f"{head}^{{commit}}")).strip()
+        source = tree_entry(base, "scripts/check_commit_policy.py")
         if source is None or source[0] != "100755" or Path(__file__).read_bytes() != git(
                 "cat-file", "blob", source[1], binary=True):
-            raise ValueError("post-commit policy helper is not the accepted HEAD blob")
-        globs, _history = config_history(str(base), str(head))
+            raise ValueError("post-commit policy helper is not the explicit accepted base blob")
+        globs, _history = config_history(base, head)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"Policy check failed: {error}", file=sys.stderr)
         return 1
     errors = validate(
-        str(base),
-        str(head),
+        base,
+        head,
         str(branch),
         str(title),
         str(body),

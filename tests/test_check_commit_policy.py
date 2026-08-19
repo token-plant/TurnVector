@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_commit_policy.py"
 WORKTREE_SCRIPT = ROOT / "scripts" / "check_worktree_policy.py"
+CHECKOUT_HEAD_HELPER_BLOB = "42f5566f7553f3c6d5e654642dca70123ed880fd"
 SPEC = importlib.util.spec_from_file_location("check_commit_policy", SCRIPT)
 POLICY = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -123,6 +124,33 @@ class PolicyIntegrationTests(unittest.TestCase):
         raw = path.read_bytes()
         self.assertEqual(hashlib.sha256(raw).hexdigest(), fields["MANIFEST_SHA256"])
         return json.loads(raw), path
+
+    def post_commit_block(self):
+        plan = (ROOT / "docs/plans/2026-08-16-p0-runtime-implementation.md").read_text(encoding="utf-8")
+        block = plan.split("After a commit is signed, its one-commit policy check is:\n\n```sh\n", 1)[1].split("\n```", 1)[0]
+        lines = block.splitlines()
+        verified = next(i for i, line in enumerate(lines) if "verify-commit --raw" in line)
+        lines[verified - 1:verified + 1] = ["true"]
+        return "\n".join(lines)
+
+    def checkout_head_predecessor(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        start = source.index('    try:\n        base = str(git("rev-parse"')
+        end = source.index("    except (OSError, ValueError, subprocess.CalledProcessError)", start)
+        authentication = (
+            '    try:\n        source = tree_entry(str(git("rev-parse", "HEAD")).strip(), '
+            '"scripts/check_commit_policy.py")\n        if source is None or source[0] != "100755" '
+            'or Path(__file__).read_bytes() != git(\n                "cat-file", "blob", source[1], '
+            'binary=True):\n            raise ValueError("post-commit policy helper is not the accepted '
+            'HEAD blob")\n        globs, _history = config_history(str(base), str(head))\n'
+        )
+        source = source[:start] + authentication + source[end:]
+        source = source.replace("    errors = validate(\n        base,\n        head,\n",
+                                "    errors = validate(\n        str(base),\n        str(head),\n", 1)
+        content = source.encode()
+        identity = hashlib.sha1(f"blob {len(content)}\0".encode() + content).hexdigest()
+        self.assertEqual(identity, CHECKOUT_HEAD_HELPER_BLOB)
+        return content
 
     def test_worktree_auditor_records_path_kinds_and_loc(self):
         fixtures = {
@@ -352,6 +380,29 @@ class PolicyIntegrationTests(unittest.TestCase):
         self.assertEqual(self.worktree_check(env=environment).returncode, 0)
         self.assertFalse(marker.exists())
 
+    def test_post_commit_authenticates_explicit_accepted_base(self):
+        candidate = self.repo / "scripts/check_commit_policy.py"
+        candidate.write_bytes(candidate.read_bytes() + b"# candidate helper\n")
+        updated = self.commit("build: update contribution policy helper")
+
+        accepted = self.check(script=SCRIPT, base=self.base, head=updated)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        wrong_source = self.check(script=candidate, base=self.base, head=updated)
+        self.assertEqual(wrong_source.returncode, 1)
+        self.assertIn("explicit accepted base blob", wrong_source.stderr)
+
+    def test_post_commit_migrates_checkout_head_predecessor(self):
+        helper = self.repo / "scripts/check_commit_policy.py"
+        helper.write_bytes(self.checkout_head_predecessor())
+        self.commit("build: install checkout-head predecessor")
+        helper.write_bytes(SCRIPT.read_bytes())
+        self.commit("fix(policy): authenticate explicit accepted base")
+
+        block = self.post_commit_block()
+        for shell in ("/bin/sh", "/bin/zsh"):
+            migrated = subprocess.run((shell, "-c", block), cwd=self.repo)
+            self.assertEqual(migrated.returncode, 0)
+
     def test_base_sync_merge_commit_is_exempt(self):
         self.git("switch", "-c", "feat/policy-check")
         self.write("src/policy.rs", "feature\n")
@@ -368,11 +419,11 @@ class PolicyIntegrationTests(unittest.TestCase):
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("EXEMPT clean base-sync merge commit", result.stdout)
-        block = (ROOT / "docs/plans/2026-08-16-p0-runtime-implementation.md").read_text(encoding="utf-8").split("After a commit is signed, its one-commit policy check is:\n\n```sh\n", 1)[1].split("\n```", 1)[0]; lines = block.splitlines(); verified = next(i for i, line in enumerate(lines) if "verify-commit --raw" in line); lines[verified - 1:verified + 1] = ["true"]; self.assertEqual(subprocess.run(("/bin/sh", "-c", "\n".join(lines)), cwd=self.repo).returncode, 0); self.assertEqual(subprocess.run(("/bin/zsh", "-c", "\n".join(lines)), cwd=self.repo).returncode, 0)
+        block = self.post_commit_block(); self.assertEqual(subprocess.run(("/bin/sh", "-c", block), cwd=self.repo).returncode, 0); self.assertEqual(subprocess.run(("/bin/zsh", "-c", block), cwd=self.repo).returncode, 0)
         self.write("src/merge-payload.py", "payload\n"); self.git("add", "."); self.git("commit", "--amend", "--no-edit")
         self.assertIn("merge commit contains non-base payload", self.check().stderr)
         feature = self.git("rev-parse", "HEAD^1").strip(); initial_base = self.git("rev-parse", "HEAD^1^").strip(); self.git("reset", "--hard", feature); self.git("switch", "-c", "unrelated", initial_base); self.write("unrelated.txt", "unrelated\n"); self.commit("chore: advance unrelated branch")
-        self.git("switch", "feat/policy-check"); self.git("merge", "unrelated", "--no-ff", "-m", "Merge unrelated"); self.assertNotEqual(subprocess.run(("/bin/sh", "-c", "\n".join(lines)), cwd=self.repo).returncode, 0)
+        self.git("switch", "feat/policy-check"); self.git("merge", "unrelated", "--no-ff", "-m", "Merge unrelated"); self.assertNotEqual(subprocess.run(("/bin/sh", "-c", block), cwd=self.repo).returncode, 0)
 
     def test_squashed_policy_installation_blocks_t02_replay(self):
         owners = (".github/workflows/contribution-policy.yml", POLICY.PLAN, "tests/test_check_commit_policy.py")
@@ -388,7 +439,11 @@ class PolicyIntegrationTests(unittest.TestCase):
         install("installed"); installed = self.commit("build: bind contribution-policy authority")
         helper.write_bytes(t01_source); restored = self.commit("build: restore bootstrap helper")
         self.git("switch", "-c", "replay", parent); install("replay"); replay = self.commit("build: bind contribution-policy authority")
-        self.assertEqual(self.check(script=helper, base=parent, head=replay).returncode, 0); self.git("switch", "--detach", installed)
+        self.assertIn("explicit accepted base blob", self.check(script=helper, base=parent, head=replay).stderr)
+        with tempfile.NamedTemporaryFile() as accepted_helper:
+            accepted_helper.write(t01_source); accepted_helper.flush()
+            self.assertEqual(self.check(script=Path(accepted_helper.name), base=parent, head=replay).returncode, 0)
+        self.git("switch", "--detach", installed)
         self.assertTrue("cannot restore bootstrap helper" in self.check(script=helper, base=installed, head=restored).stderr and "reviewed one-time predecessor" in self.check(script=helper, base=installed, head=replay).stderr)
         self.base = installed; self.git("update-ref", "refs/remotes/origin/main", installed); helper.write_bytes(t01_source); self.assertIn("cannot restore bootstrap helper", self.worktree_check(script=self.repo / "scripts/check_worktree_policy.py").stderr); self.git("reset", "--hard", installed); self.git("merge", remote, "--no-ff", "-m", "Merge pre-policy remote"); self.git("update-ref", "refs/remotes/origin/main", remote); continued = self.worktree_check(script=self.repo / "scripts/check_worktree_policy.py", policy_base=False); self.assertEqual(continued.returncode, 0, continued.stderr)
 
