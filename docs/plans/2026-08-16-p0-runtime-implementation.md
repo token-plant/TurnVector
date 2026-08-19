@@ -1081,15 +1081,24 @@ required contract tests measured 449 counted non-documentation changed lines
 global 420-line plan ceiling. It is therefore delivered as two consecutive,
 independently green rows without changing the sole `support_ledger` owner, its
 private interface, or any domain authority. The formatted implementation
-estimates are 145-165 counted lines for C08a and 305-335 incremental counted
-lines for C08b; their fixed caps of 180 and 360 retain review margin and each
-remains below 420.
+estimate is 145-165 counted lines for C08a, whose fixed cap remains 180. The
+exact Rust 1.97.1 `rustfmt`-normalized, focused-green C08b source diff is 344
+additions plus 13 deletions, or 357 counted lines. Its normal B03-B05 and three-
+fixture generated cascade adds 18 counted lines, projecting 375 and leaving a
+five-line margin below the fixed C08b row cap of 380 and a 45-line margin below
+the global 420-line ceiling.
 
 C08a preserves C07's generic `LifecycleReserve` behavior as a compatibility
 placeholder and installs no typed lifecycle-reserve authority. C08b depends on
 C08a, replaces that placeholder path with typed lifecycle authority, and
 completes every lifecycle behavior formerly assigned to C08. Neither row may
 borrow the other's LOC cap or be reviewed as one combined commit.
+
+C08b remains one independently green row because its typed lifecycle reserves,
+held-capacity accounting, closed result matrix, and closure of the generic
+`LifecycleReserve` construction bypass are one transition of the sole
+`support_ledger` authority. Splitting those responsibilities would temporarily
+create duplicate lifecycle authority or leave the generic bypass open.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
@@ -1101,7 +1110,7 @@ borrow the other's LOC cap or be reviewed as one combined commit.
 | C06 | `feat(core): establish hot-path work budgets` | Incremental witness types, binary maxima, counted transition shell, and hard rejection | Exact base counts, overflow, no truncation or full-state scan | <= 380 |
 | C07 | `feat(core): define support ledger capacity` | Sole fixed-capacity Support Charge Ledger foundation with Support Ledger Generation, nonborrowable ordinary/mandatory-completion/safety pools, B04 Support Start Count Bound enforcement, fixed typed physical credits, canonical nonempty Support Funding Claim sets, and closed unstarted `conditional`/`pending` plus active/retained record states; every unstarted obligation owns one credit and all funder claims from creation, `conditional` can only become `pending` or typed-impossible closed, and standalone `begin_support` moves one `pending` obligation/credit to one active absolute-time charge after its predecessor envelope | Capacity and generation edges; exact-window/one-past; conditional/pending/active/retained credit and claim conservation; conditional cannot begin, disappear, or release headroom; predecessor-end and no-refund rules; nonborrowable pools; no Event Loop/Backend owner or public unchecked constructor | <= 380 |
 | C08a | `feat(core): start ordinary support reservations` | Extend the sole ledger with exact support-call scope and atomic optional Ordinary Reservation Claim, matching one-operation obligation, legal credit, and scoped active-record creation; C07 generic lifecycle records retain their zero compatibility scope and behavior | Optional nonempty claim/type/scope, ordinary exhaustion before Effect, legal start/usage/scoped-record identity, exact prior state and no Effect on rejection or fault, C07 lifecycle regression, stable generation, and Hot-Path Work | <= 180 |
-| C08b | `feat(core): reserve lifecycle support` | Extend the same scoped ledger with typed bounded pre-trigger post-load/post-observation description and first/next safety lifecycle reserves; an exact reserved trigger moves its obligation to `pending` or typed impossibility closes it, no trigger allocates capacity, and the generic `LifecycleReserve` construction bypass now rejects | Description and safety maxima; load/observation/sample success, failure, and cancel branches; first pre-ready and next-before-expiry reserve; real post-observation and next-before-expiry public transitions; wrong/duplicate trigger, pending/begin/impossible-close, expiry/capacity edges, mandatory/safety nonborrowability, exact prior state and no Effect on rejection or fault, stable generation, and Hot-Path Work | <= 360 |
+| C08b | `feat(core): reserve lifecycle support` | Extend the same scoped ledger with typed bounded pre-trigger post-load/post-observation description and first/next safety lifecycle reserves; an exact reserved trigger moves its obligation to `pending` or typed impossibility closes it, no trigger allocates capacity, and the generic `LifecycleReserve` construction bypass now rejects | Description and safety maxima; load/observation/sample success, failure, and cancel branches; first pre-ready and next-before-expiry reserve; real post-observation and next-before-expiry public transitions; wrong/duplicate trigger, pending/begin/impossible-close, expiry/capacity edges, mandatory/safety nonborrowability, exact prior state and no Effect on rejection or fault, stable generation, and Hot-Path Work | <= 380 |
 | C09 | `feat(core): manage immutable model revisions` | Manifest identities, Alias freeze, Available/Retiring/Unavailable lifecycle | No alias repoint, registry limits, and incremental counts | <= 400 |
 | C10 | `feat(core): describe model registrations` | Only after C08a's optional branch atomically creates one Ordinary Reservation Claim, matching `describe_model` obligation, credit, and active charge, emit the registration's stateless Model Descriptor Effect; then validate and retain the complete canonical descriptor, nonzero `u32` vocabulary, and hash or reject | No Effect without the exact active charge; optional ordinary exhaustion; no Revision or vocabulary authority exists before descriptor validation; in-memory record preserves exact bytes/hash and post-load equality | <= 380 |
 | C11 | `feat(core): accept requests into preparing` | Ownership, frozen Revision, descriptor-authoritative Top K validation, explicit Service Class, closed Generation Parameters, immutable effective `u64` Sampling Seed plus origin, status version, and preparation timeout | Descriptor vocabulary bounds, explicit zero/caller/daemon origin; Acceptance is not Admission; retries never inherit state | <= 400 |

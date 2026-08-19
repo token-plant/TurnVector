@@ -69,8 +69,10 @@ private interface:
   formatted estimate is 145-165 counted lines and its fixed cap is 180.
 - C08b, `feat(core): reserve lifecycle support`, depends on C08a and adds the
   typed pre-trigger description and safety reserves and their result
-  transitions. Its incremental formatted estimate is 305-335 counted lines and
-  its fixed cap is 360.
+  transitions. Its exact Rust 1.97.1 `rustfmt`-normalized, focused-green source
+  diff is 344 additions plus 13 deletions, or 357 counted lines. The normal
+  B03-B05 and three-fixture generated cascade adds 18 counted lines, projecting
+  375 against its fixed cap of 380 and leaving a five-line margin.
 
 C08a deliberately preserves C07's generic `LifecycleReserve` behavior as a
 compatibility placeholder. C08b alone replaces that placeholder with typed
@@ -78,6 +80,12 @@ lifecycle authority, rejects the generic construction bypass, and completes the
 original C08 behavior. The split creates no second ledger, module, public trait,
 or transition authority; neither row may borrow the other's cap, and C09 remains
 ordered after C08b.
+
+C08b remains one independently green row because its typed lifecycle reserves,
+held-capacity accounting, closed result matrix, and closure of the generic
+`LifecycleReserve` construction bypass are one transition of the sole
+`support_ledger` authority. Splitting those responsibilities would temporarily
+create duplicate lifecycle authority or leave the generic bypass open.
 
 The accepted implementation order contains 187 rows after C07.
 
