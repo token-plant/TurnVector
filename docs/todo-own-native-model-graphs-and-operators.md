@@ -46,7 +46,8 @@ The descriptor fixes:
 - weight-layout ABI;
 - memory-plan and arena identity;
 - kernel-bundle and fusion-plan identities;
-- KV/cache layout ABI;
+- KV/cache layout ABI whose exact identity distinguishes non-paged and PagedKV
+  layouts;
 - Speculative Decode plan or explicit `NONE`;
 - Prefix Reuse plan or explicit `NONE`; and
 - command-submission or replay plan or explicit `NONE`.
@@ -60,12 +61,13 @@ compressor, and Pending Reclaim remain dynamic Resource Evidence. An exact
 Profile match can therefore be temporarily infeasible, while favorable runtime
 memory observations can never authorize a missing Profile.
 
-A baseline route represents every absent optimization as `NONE`. Changing any
-route member produces a new identity and requires exact applicability and bound
-evidence; it never mutates the meaning of an existing Profile. A fixed arena
-means a qualified preallocated lifetime and stable offsets. It does not promise
-a permanent raw GPU virtual address unless the pinned Metal/MLX implementation
-exposes and separately qualifies that property.
+A baseline route uses exact identities for every required member, including its
+non-paged KV/cache layout ABI, and represents every absent optional plan as
+`NONE`. Changing any route member produces a new identity and requires exact
+applicability and bound evidence; it never mutates the meaning of an existing
+Profile. A fixed arena means a qualified preallocated lifetime and stable
+offsets. It does not promise a permanent raw GPU virtual address unless the
+pinned Metal/MLX implementation exposes and separately qualifies that property.
 
 ## Required Ownership
 
