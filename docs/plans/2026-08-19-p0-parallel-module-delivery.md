@@ -14,9 +14,10 @@ at a time, records the interfaces between those modules, and defines how
 independent agents may develop in parallel without creating multiple commit
 authorities or weakening the ordered P0 ledger.
 
-The split is a delivery mechanism. It does not change the P0 architecture,
-reorder ledger rows, combine independently green behaviors, authorize a new
-process, or make private Core modules public.
+The module assignment and approved C08 refinement are delivery mechanisms. They
+do not change the P0 architecture, reorder later ledger rows, combine
+independently green behaviors, authorize a new process, or make private Core
+modules public.
 
 ## Non-Goals
 
@@ -56,11 +57,33 @@ Results as later Core Events.
 
 ## Remaining Ledger Inventory
 
-The accepted implementation order contains 186 rows after C07.
+The original combined C08 implementation measured 449 `rustfmt`-normalized,
+counted non-documentation changed lines: 281 production and 168 focused-test
+lines. That exceeded both C08's 400-line target and the global 420-line plan
+ceiling. The base ledger therefore replaces C08 with two consecutive,
+independently green delivery rows under the same sole `support_ledger` owner and
+private interface:
+
+- C08a, `feat(core): start ordinary support reservations`, contains the scoped
+  record foundation and atomic optional ordinary reservation transition. Its
+  formatted estimate is 145-165 counted lines and its fixed cap is 180.
+- C08b, `feat(core): reserve lifecycle support`, depends on C08a and adds the
+  typed pre-trigger description and safety reserves and their result
+  transitions. Its incremental formatted estimate is 305-335 counted lines and
+  its fixed cap is 360.
+
+C08a deliberately preserves C07's generic `LifecycleReserve` behavior as a
+compatibility placeholder. C08b alone replaces that placeholder with typed
+lifecycle authority, rejects the generic construction bypass, and completes the
+original C08 behavior. The split creates no second ledger, module, public trait,
+or transition authority; neither row may borrow the other's cap, and C09 remains
+ordered after C08b.
+
+The accepted implementation order contains 187 rows after C07.
 
 | Area | Rows | Count | Delivery result |
 |---|---:|---:|---|
-| Core foundations | C08-C18 | 11 | Support, registry, request, Certification, and resource foundations |
+| Core foundations | C08a-C08b, C09-C18 | 12 | Support, registry, request, Certification, and resource foundations |
 | Core lifecycle | C19-C31 | 13 | Admission, materialization, invalidation, carry, cancellation, output, and release |
 | Scheduling and Plan lifecycle | C32-C45 | 14 | Exclusive, scheduling, Turn results, replay, and performance |
 | Backend runtime | E01-E24 | 24 | Backend Interface, Fake Adapter, Device Executor, Event Loop, and qualification |
@@ -70,7 +93,7 @@ The accepted implementation order contains 186 rows after C07.
 | Volume and durable authority | U01-U03, S01-S31 | 34 | Volume qualification, Control Store, Audit, recovery, readiness, and shutdown |
 | Aggregate gate | K01-K05 | 5 | Integrated Core properties, sequences, faults, and work bounds |
 | Release and qualification | L01-L02, Q00-Q15 | 18 | Closure freeze, subject adapters, qualification, and finding resolution |
-| **Total** |  | **186** |  |
+| **Total** |  | **187** |  |
 
 Rows remain ordered exactly as written in the base plan. A row may depend on
 several modules, but it has one primary implementation owner and one integrated
@@ -82,7 +105,7 @@ commit result.
 
 | Module | Primary rows or private contribution | Owns | Must not own |
 |---|---|---|---|
-| `support_ledger` | C08, C16-C18, C26 | Support Ledger Generation, pools, Funding Claims, credits, obligations, entitlements, lifecycle reserves, retained history, and Prepared Carry | Lifecycle witness selection, Resource Capacity, Admission, or Control publication outcome |
+| `support_ledger` | C08a-C08b, C16-C18, C26 | Support Ledger Generation, pools, Funding Claims, credits, obligations, entitlements, lifecycle reserves, retained history, and Prepared Carry | Lifecycle witness selection, Resource Capacity, Admission, or Control publication outcome |
 | `model_registry` | C09-C10 | Immutable Model Revision, Alias freeze, lifecycle, Model Descriptor retention, and incremental registry counts | Request state, Backend handles, Residency, or scheduling policy |
 | `request_book` | C11-C12, C21, C30-C31 | Preparing and later request states, description freshness, ownership identity, release lifecycle, and bounded terminal history | Support or Resource capacity, Certification applicability, or Backend execution |
 | `certification` | C13-C14, C23-C24 | Exact Authorization Index access, Environment Fingerprint, finite Applicability Selection, invalidation, and quarantine decisions | Online widening, lifecycle evidence selection, Resource Evidence policy, or ledger mutation |
@@ -144,16 +167,16 @@ Coordinator, row ordering, cross-module tests, and generated identity output.
 
 | Owner | Source ownership | Primary rows and private contributions |
 |---|---|---|
-| Agent A: Support | `support_ledger` | C08, C16-C18, C26 |
+| Agent A: Support | `support_ledger` | C08a-C08b, C16-C18, C26 |
 | Agent B: Registry and Request Capacity | `model_registry`, `request_book`, `resource_ledger` | C09-C12, C15, C21, C29-C31 |
 | Agent C: Certification and Scheduling | `certification`, `admission`, `scheduler`, `turn_plans`, `closure_control` | C13-C14, C19, C23-C25, C32-C38, C43-C45; private Plan changes for C39-C42 |
 | Integration owner | `transition_coordinator`, `core.rs`, cross-module fixtures, generated identity cascade | C20, C22, C27-C28, C39-C42 |
 
-This is parallel authoring, not parallel authority. The merge order is still
-C08, C09, and onward through C45. An agent may prepare a later row locally, but
-that row cannot become ready or retain generated artifacts until every
-predecessor has landed and the branch is synchronized with the exact current
-`main`.
+This is parallel authoring, not parallel authority. The merge order is now
+C08a, C08b, C09, and onward through C45. An agent may prepare a later row
+locally, but that row cannot become ready or retain generated artifacts until
+every predecessor has landed and the branch is synchronized with the exact
+current `main`.
 
 For C39-C42, Agent C remains the sole editor of `turn_plans`, while the
 integration owner is the sole editor of the Transition Coordinator and shared
@@ -357,7 +380,8 @@ P0 readiness gate.
 This module split is ready to drive implementation only when:
 
 - the base plan links this delivery plan;
-- every C08-Q15 row belongs to one active wave and one primary owner;
+- every row from C08a through Q15 belongs to one active wave and one primary
+  owner;
 - private interface laws preserve atomic Core transitions and Hot-Path Work
   accounting;
 - no public interface or production placeholder precedes its ledger row;
