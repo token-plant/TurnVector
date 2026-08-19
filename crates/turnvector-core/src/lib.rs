@@ -32,6 +32,7 @@ use std::num::{NonZeroU64, NonZeroU128};
 
 mod bounded;
 mod core;
+mod model_registry;
 mod scheduling;
 pub mod support;
 mod turns;
