@@ -44,6 +44,8 @@ impl SupportFundingClaim {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SupportCausalPredecessorId(pub [u8; 32]);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupportCallScopeId(pub(crate) [u8; 32]);
 pub struct SupportObligationSpec<'a> {
     pub id: SupportOperationObligationId,
     pub operation: SupportOperation,
@@ -51,6 +53,14 @@ pub struct SupportObligationSpec<'a> {
     pub physical_credit: PhysicalStartCreditId,
     pub predecessor: SupportCausalPredecessorId,
     pub claims: &'a [SupportFundingClaim],
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OrdinarySupportSpec {
+    pub(crate) id: SupportOperationObligationId,
+    pub(crate) operation: SupportOperation,
+    pub(crate) physical_credit: PhysicalStartCreditId,
+    pub(crate) scope: SupportCallScopeId,
+    pub(crate) claim: SupportFundingClaim,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportTransition {
@@ -84,6 +94,7 @@ type Record = (
     SupportCausalPredecessorId,
     SupportObligationState,
     MonotonicTime,
+    SupportCallScopeId,
 );
 pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     generation: SupportLedgerGeneration,
@@ -159,11 +170,56 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             spec.predecessor,
             Conditional,
             Default::default(),
+            SupportCallScopeId([0; 32]),
         );
         self.records.try_push(keys, record, spec.claims, work)?;
         self.usage[CONDITIONAL][pool] += 1;
         self.usage[CREDITS][pool] += 1;
         self.usage[CLAIMS][pool] += claims;
+        self.generation = next;
+        Ok(next)
+    }
+    #[allow(dead_code, reason = "C10 and C12 install the ordinary support callers")]
+    pub(crate) fn begin_ordinary(
+        &mut self,
+        expected: SupportLedgerGeneration,
+        spec: OrdinarySupportSpec,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        let next = self.next(expected, work)?;
+        work.record(WorkDimension::InvariantChecks, 3)?;
+        let valid = [spec.id.0, spec.physical_credit.0, spec.scope.0]
+            .into_iter()
+            .all(|id| id != [0; 32])
+            && matches!(spec.claim, SupportFundingClaim::OrdinaryReservation(id) if id != [0; 32]);
+        check!(work, valid, SupportLedgerError::InvalidInput)?;
+        let pool = SupportPool::Ordinary as usize;
+        for class in [ACTIVE, CREDITS, CLAIMS] {
+            check!(work, self.available(class, pool, 1), CAPACITY_ERROR)?;
+        }
+        for identity in [key(0, spec.id.0), key(1, spec.physical_credit.0)] {
+            let absent = self.records.find(identity, work)?.is_none();
+            check!(work, absent, FixedStorageError::Duplicate)?;
+        }
+        work.ensure(insertion_work())?;
+        self.starts
+            .try_start(spec.operation as usize * POOLS + pool, at, work)?;
+        let record = (
+            spec.operation,
+            SupportPool::Ordinary,
+            SupportCausalPredecessorId([0; 32]),
+            Active,
+            at,
+            spec.scope,
+        );
+        let keys = [key(0, spec.id.0), key(1, spec.physical_credit.0)];
+        self.records
+            .try_push(keys, record, &[spec.claim], work)
+            .expect("ordinary insertion was fully prevalidated");
+        for class in [ACTIVE, CREDITS, CLAIMS] {
+            self.usage[class][pool] += 1;
+        }
         self.generation = next;
         Ok(next)
     }
@@ -235,6 +291,10 @@ fn total(values: impl IntoIterator<Item = u32>) -> u64 {
 fn state_class(state: SupportObligationState) -> usize {
     [CONDITIONAL, PENDING, ACTIVE, ACTIVE, CONDITIONAL, PENDING][state as usize]
 }
+fn insertion_work() -> HotPathWorkWitness {
+    let copied = std::mem::size_of::<(Record, SupportFundingClaim)>() as u64 + 172;
+    HotPathWorkWitness::new([1_662, copied, 0, 0, 16])
+}
 fn key(tag: u8, id: [u8; 32]) -> [u8; 33] {
     let mut key = [0; 33];
     key[0] = tag;
@@ -262,6 +322,13 @@ mod tests {
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         Ledger::try_new(generation, capacities, 2, starts).unwrap()
+    }
+    fn ordinary_ledger() -> Ledger {
+        let mut ledger = new_ledger();
+        for class in [ACTIVE, CREDITS, CLAIMS] {
+            ledger.capacities[class][0] = 2;
+        }
+        ledger
     }
     fn work() -> WorkMeter {
         WorkMeter::new(HotPathWorkBudget::binary_maximum())
@@ -340,6 +407,7 @@ mod tests {
         );
         add(&mut ledger, 1, 1).unwrap();
         put(&mut ledger, 9, 9, Safety, &[Lifecycle([9; 32])]).unwrap();
+        assert_eq!(ledger.records.get(1).unwrap().5.0, [0; 32]);
         go(&mut ledger, 1, Close).unwrap();
         fail(add(&mut ledger, 2, 1), Duplicate.into());
         add(&mut ledger, 2, 2).unwrap();
@@ -353,5 +421,98 @@ mod tests {
         let id = SupportOperationObligationId([2; 32]);
         let result = ledger.transition(stale, id, end(2, 1), &mut work());
         fail(result, Stale);
+    }
+
+    fn ordinary(parts: (u8, u8, u8, Claim)) -> OrdinarySupportSpec {
+        let (id, credit, scope, claim) = parts;
+        OrdinarySupportSpec {
+            id: SupportOperationObligationId([id; 32]),
+            operation: SupportOperation::DescribeRequest,
+            physical_credit: PhysicalStartCreditId([credit; 32]),
+            scope: SupportCallScopeId([scope; 32]),
+            claim,
+        }
+    }
+    fn begin(ledger: &mut Ledger, spec: OrdinarySupportSpec, at: MonotonicTime) -> Result {
+        ledger.begin_ordinary(ledger.generation(), spec, at, &mut work())
+    }
+    #[test]
+    fn c08a_ordinary_reservation_contract() {
+        let snapshot = |ledger: &Ledger| {
+            let claims = |index| ledger.records.claims(index).map(<[_]>::to_vec);
+            (
+                ledger.generation(),
+                std::array::from_fn::<_, 12, _>(|index| ledger.records.get(index).copied()),
+                std::array::from_fn::<_, 12, _>(claims),
+                std::array::from_fn::<_, 21, _>(|cell| ledger.starts.len(cell)),
+                ledger.usage,
+            )
+        };
+        macro_rules! rejected {
+            ($ledger:ident, $action:expr, $error:expr) => {{
+                let before = snapshot(&$ledger);
+                assert_eq!($action, Err($error));
+                assert_eq!(snapshot(&$ledger), before);
+            }};
+        }
+
+        let at = MonotonicTime::from_micros;
+        let valid = ordinary((1, 21, 41, Reserved([1; 32])));
+        let mut ledger = ordinary_ledger();
+        for invalid in [
+            ordinary((0, 21, 41, Reserved([1; 32]))),
+            ordinary((1, 0, 41, Reserved([1; 32]))),
+            ordinary((1, 21, 0, Reserved([1; 32]))),
+            ordinary((1, 21, 41, Reserved([0; 32]))),
+            ordinary((1, 21, 41, Initial([1; 32]))),
+        ] {
+            rejected!(ledger, begin(&mut ledger, invalid, at(1)), InvalidInput);
+        }
+        let initial = ledger.generation();
+        let next = begin(&mut ledger, valid, at(5)).unwrap();
+        let record = ledger.records.get(0).unwrap();
+        assert_eq!(next, initial.next().unwrap());
+        let predecessor = SupportCausalPredecessorId([0; 32]);
+        assert_eq!(
+            (record.0, record.1, record.2),
+            (valid.operation, Ordinary, predecessor)
+        );
+        assert_eq!((record.3, record.4, record.5), (Active, at(5), valid.scope));
+        assert_eq!(ledger.records.claims(0), Some(&[valid.claim][..]));
+        for class in [ACTIVE, CREDITS, CLAIMS] {
+            assert_eq!(ledger.usage[class][0], 1);
+        }
+        assert_eq!(ledger.starts.len(valid.operation as usize * POOLS), Some(1));
+
+        let second = ordinary((2, 22, 42, Reserved([2; 32])));
+        let error = SupportLedgerError::Storage(Duplicate);
+        for (id, credit) in [(1, 22), (2, 21)] {
+            let duplicate = ordinary((id, credit, 42, Reserved([2; 32])));
+            rejected!(ledger, begin(&mut ledger, duplicate, at(6)), error);
+        }
+        let error = SupportLedgerError::Storage(WindowExceeded);
+        rejected!(ledger, begin(&mut ledger, second, at(6)), error);
+        rejected!(
+            ledger,
+            ledger.begin_ordinary(initial, second, at(15), &mut work()),
+            Stale
+        );
+
+        let mut ledger = new_ledger();
+        begin(&mut ledger, valid, at(5)).unwrap();
+        rejected!(ledger, begin(&mut ledger, second, at(15)), CAPACITY_ERROR);
+
+        let mut ledger = new_ledger();
+        let mut exhausted = work();
+        exhausted
+            .record(WorkDimension::VisitedEntities, 999_998)
+            .unwrap();
+        let before = snapshot(&ledger);
+        let fault = ledger.begin_ordinary(ledger.generation(), valid, at(1), &mut exhausted);
+        assert!(matches!(
+            fault,
+            Err(SupportLedgerError::Storage(FixedStorageError::Work(_)))
+        ));
+        assert_eq!(snapshot(&ledger), before);
     }
 }
