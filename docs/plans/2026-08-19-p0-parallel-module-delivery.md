@@ -88,14 +88,24 @@ held-capacity accounting, closed result matrix, and closure of the generic
 create duplicate lifecycle authority or leave the generic bypass open.
 
 The combined descriptor-registration implementation has three separately owned
-delivery responsibilities. Rust 1.97.1 `rustfmt`-normalized estimates are
-115-145 human counted lines for C10a's Support prepared-change seam, 165-185 for
-C10b's descriptor-bound Model Registry state, and 180-230 for C10c's integrated
-Core transitions: 460-560 human lines before generated output, above both the
-former 380-line row cap and the global 420-line ceiling. Each row also carries
-the normal fixed 18-line B03-B05 and three-fixture cascade, projecting 133-163
-against C10a's fixed cap of 180, 183-203 against C10b's fixed cap of 220, and
-198-248 against C10c's fixed cap of 280.
+delivery responsibilities. The exact Rust 1.97.1 `rustfmt`-normalized,
+focused-green C10a source diff is 224 human-counted lines: `bounded.rs`
+contributes 21 additions plus 3 deletions, and `support.rs` contributes 172
+additions plus 28 deletions. C10b's descriptor-bound Model Registry state remains
+estimated at 165-185 human lines and C10c's integrated Core transitions at
+180-230, for 569-639 human lines before generated cascades, above both the former
+380-line row cap and the global 420-line ceiling. Each row also carries the
+normal fixed 18-line B03-B05 and three-fixture cascade. C10a therefore projects
+242 lines against a fixed cap of 260, leaving 18 lines under that row cap and
+178 under the global ceiling; C10b remains at 183-203 against its fixed cap of
+220, and C10c remains at 198-248 against its fixed cap of 280.
+
+C10a remains one independently green row because its prepared
+`FixedWindowCounter` start, opaque generation-bound `SupportChange`, and direct
+ordinary-start/active-finish exact-Work regression form one prepared-change seam
+in the sole `support_ledger`. Splitting those responsibilities would either
+duplicate start/commit authority or lose independently-green compatibility
+evidence that the legacy C07/C08 entry points preserve state and Hot-Path Work.
 
 C10a, C10b, and C10c are consecutive and independently green. C10a installs a
 crate-private, non-forgeable, generation-bound `SupportChange` and prepared
