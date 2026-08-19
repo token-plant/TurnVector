@@ -39,7 +39,7 @@ Runtime Core
   Eligibility Index
   Dirty Model Set
   Formation Result Cache
-  Current Candidate Associations
+  Candidate Associations
   fresh Scheduling Snapshot
              |
              | eligible handles + hard constraints
@@ -75,7 +75,9 @@ The Runtime Core owns:
   Configuration, and Control dependency generations;
 - the dirty-Model set and typed reason each Model became dirty;
 - immutable Formation Results returned by completed Candidate Formation;
-- current candidate associations that bind those results to Core-owned evidence;
+- current Candidate Associations that bind those results to Core-owned evidence;
+- exact cause-to-Support Operation Obligation conservation for every actual
+  Candidate Formation call;
 - invalidation before a stale candidate or Plan can execute; and
 - fresh Snapshot construction and global Turn selection.
 
@@ -88,12 +90,14 @@ The Model Planner owns:
 - request-local phase, cursor, KV, Shape, graph, and route compatibility facts;
 - bounded compatibility partitions for one Model;
 - canonical batch construction within each partition;
+- structurally supported exact route proposals without Certification
+  Applicability or Authorized Capability Set input;
 - route-specific cost and Resource Impact facts; and
 - one typed Candidate Exclusion for every supplied eligible handle absent from
   all returned candidates.
 
-It cannot read Model Weight, service debt, global urgency, or another Model's
-candidate set.
+It cannot read Model Weight, service debt, global urgency, another Model's
+candidate set, Certification Applicability, or any Authorized Capability Set.
 
 ## Incremental Formation Model
 
@@ -112,7 +116,7 @@ Every cached Formation Result binds:
   identities; and
 - ordered member handles plus their current request-status versions.
 
-Every current candidate association separately binds one Formation Result to:
+Every current Candidate Association separately binds one Formation Result to:
 
 - the fresh Scheduler Generation and Scheduling Snapshot;
 - Runtime Overhead Generation and exact Bound Set witness shared by members;
@@ -122,31 +126,54 @@ Every current candidate association separately binds one Formation Result to:
 - current timing, output-capacity, entitlement, and hard-feasibility witnesses.
 
 A Model-local Formation dependency change invalidates that Model's Formation
-Result and requires a bounded `form_candidates` call. A Core evidence, resource,
-time, fairness, or global-generation change invalidates only the current
-association unless it also changes a hard constraint supplied to formation.
-Core can then re-associate an unchanged Formation Result without calling the
-Model Planner. The fresh Snapshot may use an association only when both levels
-match, and it never reuses an older Turn Plan.
+Result. It requires a bounded `form_candidates` call only when one of the
+already defined typed Candidate Formation causes has a conserved pending Support
+Operation Obligation. A Core evidence, resource, time, fairness, authorization,
+or global-generation change invalidates only the current Candidate Association
+unless it also changes a hard structural constraint supplied to formation. Core
+can then re-associate an unchanged Formation Result without calling the Model
+Planner. The fresh Snapshot may use a Candidate Association only when both
+levels match, and it never reuses an older Turn Plan.
 
 ### Dirtying Rules
 
-Local changes dirty only the affected Model:
+Local changes may invalidate or dirty only the affected Model:
 
 - successful Materialization or first eligibility;
 - accepted Receipt progress, phase transition, completion, or member failure;
 - accepted Cost Profile update;
 - cancellation that removes eligible or candidate membership;
-- model-local Plan Rejection or local stale disposition;
-- Model load, unload, route, or Backend Generation change.
+- model-local Plan Rejection or local stale disposition; and
+- Model load, unload, route-catalog, or Backend Generation change that alters
+  structural planner output.
 
-Global evidence or policy changes invalidate exactly their declared association
-scope. A Monotonic Time advance, Model service charge, urgency change, ledger
-advance, or new Bound Set does not require rebuilding unchanged backend
-compatibility; Core re-associates current Formation Results and the fresh Turn
-Arbiter reevaluates those facts. An authorization, route-catalog, or hard
-formation-constraint change dirties only the Models whose possible candidates
-can change.
+Dirty state is an invalidation fact, not authority to call the Backend. Every
+actual recomputation maps to the existing closed cause set:
+
+| Recompute cause | Existing Support Operation Obligation |
+|---|---|
+| First eligible progress after Materialization | Admission-reserved initial Candidate Formation obligation. |
+| Receipt continuation, including an accepted Cost Profile update that changes formation | The Turn's already conserved conditional continuation obligation, made pending only by the accepted observation Result. |
+| Plan Rejection | The Turn's mutually exclusive rejection/local-stale obligation. |
+| Local stale disposition | The same mutually exclusive rejection/local-stale obligation. |
+| Terminal membership change after cancellation | The affected members' entitlement-funded terminal membership-change obligation. |
+
+No dirty cause allocates another obligation after the fact. Authorization,
+resource, time, fairness, quarantine, policy, or other Core-only drift invalidates
+Candidate Associations and is handled by re-association. Route-catalog, Backend
+Generation, Model load/unload, or hard-constraint drift that changes structural
+planner output invalidates the Formation Result and removes its Candidates from
+scheduling, but it does not start formation by itself. Affected work waits for
+one listed funded cause; eager recomputation for generic drift is outside this
+plan and would require a separate architecture decision, pre-reserved obligation
+kind, Support Start Count Bound, interference coverage, and qualification.
+
+Global evidence or policy changes invalidate exactly their declared Candidate
+Association scope. A Monotonic Time advance, Model service charge, urgency
+change, ledger advance, authorization change, quarantine change, or new Bound
+Set does not require rebuilding unchanged Backend compatibility; Core
+re-associates current Formation Results and the fresh Turn Arbiter reevaluates
+those facts.
 
 ### Bounded Call Scope
 
@@ -174,19 +201,24 @@ rejects before accepted state could exceed the binary limits.
 For each affected Model, the Model Planner performs this deterministic order:
 
 1. Validate supplied handles and exact current Backend-owned request state.
-2. Exclude handles lacking an authorized exact route or hard resource/timing fit.
+2. Exclude handles lacking a structurally supported exact route or violating a
+   Backend-owned phase, Shape, KV, or graph compatibility constraint. The
+   Planner neither receives nor evaluates current authorization or Core
+   resource/timing evidence.
 3. Partition by Model Revision, Execution Phase, Service Class, exact Execution
    Route, and Shape/KV compatibility identity.
 4. Order members by the canonical stable request key defined by the domain
    schema, never by global urgency, Model Weight, or service debt.
-5. For each configured certified batch bucket, construct at most one candidate
-   using the canonical compatible prefix of that order.
+5. For each configured structurally supported batch bucket, construct at most
+   one candidate using the canonical compatible prefix of that order.
 6. Emit complete typed exclusions for every supplied handle absent from all
    candidates, including exact incompatibility or bounded-capacity cause.
 
-The configured bucket set is finite and versioned. B1, B2, B4, or any other
-bucket is available only when the exact route and Shape have applicable
-Certification; this plan does not preselect a universal bucket set.
+The configured bucket set is finite and versioned. The Model Planner may propose
+B1, B2, B4, or another bucket only when its route catalog structurally supports
+it. The Candidate enters scheduling only when Core creates a current Candidate
+Association whose exact Capability Key is present in every member's Authorized
+Capability Set; this plan does not preselect a universal bucket set.
 
 Candidates for different buckets may overlap because they describe alternatives.
 The Turn Arbiter selects one complete presented candidate and cannot edit it.
@@ -205,9 +237,13 @@ The native route must distinguish at least:
 
 Any change to assembly, padding, mask construction, graph artifacts, kernels,
 or member reduction order changes the bounded Execution Route descriptor. The
-Capability Key already fixes configured batch and Shape; implementation must
-also bind the exact batch assembly identity into the route's graph, kernel, and
-memory-plan members before a multi-member route can be certified.
+configured batch and Shape members of the Capability Key do not distinguish
+execution semantics. For every multi-member route, the graph ABI must therefore
+carry a stable Batch Execution Kind discriminant that distinguishes at least
+`TENSOR_BATCH` from `SEQUENTIAL_MEMBER_LOOP`, while the graph, kernel, and
+memory-plan identities bind the exact assembly implementation. Two routes at the
+same bucket with different kinds have different Execution Route Identities and
+Capability Keys and cannot share Certification or tensor-batch telemetry.
 
 One member cannot be inserted, removed, or reordered after execution starts.
 Cancellation observed before the safe point rejects or invalidates the Plan;
@@ -224,7 +260,7 @@ Receipt accepted
   -> complete required observation and formation support envelopes
   -> rebuild only dirty Model candidates
   -> create a fresh Scheduling Snapshot
-  -> reuse only dependency-current unaffected candidate associations
+  -> reuse only dependency-current unaffected Candidate Associations
   -> Turn Arbiter selects under current safety/urgency/fairness policy
   -> create and revalidate one fresh Turn Plan
 ```
@@ -268,13 +304,14 @@ identities, environment, inputs, and seeds are fixed before a qualification run.
    the affected Model's dirty state.
 3. An unaffected Model performs zero compatibility scans and preserves its
    Formation Result identity when its local dependency vector is unchanged;
-   Core-only drift may replace the association without a planner call.
+   Core-only drift may replace the Candidate Association without a planner call.
 4. Every accepted Receipt is followed by a fresh Snapshot and Plan before any
    continuation executes.
 5. Every eligible handle appears in a candidate or one typed exclusion.
 6. Candidate counts and work stay within every Hot-Path Work Budget dimension.
-7. Candidate reuse cannot survive request, route, evidence, resource, cost, or
-   generation drift.
+7. No Formation Result survives request, route-catalog, Cost Profile, or other
+   Model-local dependency drift, and no Candidate Association survives evidence,
+   resource, timing, authorization, quarantine, or global-generation drift.
 8. Fake and native Backends pass the same formation and member-local Receipt
    conformance fixtures.
 9. Batch-invariant sampling and stable member output order hold for every
@@ -286,10 +323,10 @@ identities, environment, inputs, and seeds are fixed before a qualification run.
 |---|---|---|
 | CB01 | Add operation-count instrumentation and a bounded full-recompute oracle. | Exact counts, maxima, deterministic candidates/exclusions. |
 | CB02 | Add Core per-Model eligibility indexes and typed dirty causes. | Add/remove/phase/cancel/generated sequences and no full-state scan. |
-| CB03 | Add two-level Formation Result reuse and current Core association for unaffected Models. | Model-local versus Core-only one-field drift and unchanged result reuse. |
+| CB03 | Add two-level Formation Result reuse and current Core Candidate Association for unaffected Models. | Model-local versus Core-only one-field drift and unchanged result reuse. |
 | CB04 | Add private Model Planner compatibility partitions and canonical bucket fill. | No arbitrary subsets, stable order, complete exclusions. |
 | CB05 | Integrate fresh Snapshot/Plan selection over cached and rebuilt associations. | Receipt, rejection, local stale, cancellation, and timing cases. |
-| CB06 | Add exact native multi-member batch assembly routes. | B1/multi-member logits, KV, RNG, output, and failure parity. |
+| CB06 | Add exact native multi-member batch assembly routes. | B1/multi-member logits, KV, RNG, output, and failure parity plus same-bucket Batch Execution Kind drift and Certification isolation. |
 | CB07 | Run mixed prefill/decode and cross-Model qualification. | Planning overhead, TTFT/TPOT/throughput, fairness, memory artifacts. |
 
 CB01-CB05 optimize the P0 scheduling Implementation without changing its
