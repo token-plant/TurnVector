@@ -499,6 +499,12 @@ gate remain explicitly pending rather than being reported as passed.
 
 ## Module Seams
 
+Parallel implementation ownership, crate-private interface laws, agent waves,
+and serialized landing are defined in the
+[P0 Parallel Module Delivery Plan](2026-08-19-p0-parallel-module-delivery.md).
+That delivery split does not change the ledger order or create independent Core
+commit authorities.
+
 The stable external Runtime Core Interface is deliberately deep:
 
 ```text
