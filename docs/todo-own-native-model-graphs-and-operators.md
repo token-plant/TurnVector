@@ -35,6 +35,40 @@ optimization choices outside TurnVector's ownership. TurnVector needs that
 ownership to evolve model support, KV behavior, batching, graph specialization,
 and fused operators under its own compatibility and qualification rules.
 
+## Exact Execution Profiles
+
+Every native baseline or optimization is represented by one canonical bounded
+Execution Route descriptor. Its Evidence Hash is the Execution Route Identity
+carried by the exact Capability Key and the compiled Certified Execution Profile.
+The descriptor fixes:
+
+- graph ABI and graph artifact identities;
+- weight-layout ABI;
+- memory-plan and arena identity;
+- kernel-bundle and fusion-plan identities;
+- KV/cache layout ABI whose exact identity distinguishes non-paged and PagedKV
+  layouts;
+- Speculative Decode plan or explicit `NONE`;
+- Prefix Reuse plan or explicit `NONE`; and
+- command-submission or replay plan or explicit `NONE`.
+
+The Profile is only a compact read-only projection of the existing Certification
+Record, Environment Qualification, and Case Bound Table authority. It is not a
+Serving Profile or a mutable Backend configuration. Installed unified-memory
+size and the exact Mac/GPU/macOS build remain stable Environment facts; current
+allocator state, process footprint, available memory, pressure, swap,
+compressor, and Pending Reclaim remain dynamic Resource Evidence. An exact
+Profile match can therefore be temporarily infeasible, while favorable runtime
+memory observations can never authorize a missing Profile.
+
+A baseline route uses exact identities for every required member, including its
+non-paged KV/cache layout ABI, and represents every absent optional plan as
+`NONE`. Changing any route member produces a new identity and requires exact
+applicability and bound evidence; it never mutates the meaning of an existing
+Profile. A fixed arena means a qualified preallocated lifetime and stable
+offsets. It does not promise a permanent raw GPU virtual address unless the
+pinned Metal/MLX implementation exposes and separately qualifies that property.
+
 ## Required Ownership
 
 TurnVector-owned source and tests should eventually define:
@@ -81,12 +115,32 @@ pinned MLX C++ interface -> Metal -> Apple GPU
 - Treat native model implementations as internal Modules, not public plugins or
   independently authoritative schedulers.
 
+## Optimization Order
+
+Each step keeps the coarse Backend Interface unchanged and adds a new exact
+Execution Route rather than widening the prior Profile:
+
+1. Own exact Prefill/Decode graphs and a preallocated fixed-offset arena.
+2. Add separately identified specialized kernels and operator-fusion plans.
+3. Add a PagedKV layout with an exact page, dtype, quantization, allocation,
+   update, and release ABI.
+4. Add Prefix Reuse only on a qualified PagedKV/cache ABI and bind the complete
+   model, token-prefix, graph, KV, producer, and publication identities.
+5. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
+   synchronization points, and additional memory/time bounds.
+6. Add Metal command replay or ICB only when the pinned implementation exposes
+   a stable contract and correctness, cancellation, command-buffer, and
+   performance qualification passes.
+
+No later step is a prerequisite for shipping or certifying an earlier route.
+
 ## Transition Work
 
 - [ ] Define the private native model Module Interface for model construction,
   Prefill, Decode, KV operations, and teardown.
-- [ ] Define repository-owned configuration, weight-layout, graph, operator,
-  and KV ABI identities and bind them into the Model Manifest.
+- [ ] Define the canonical Execution Route descriptor and repository-owned
+  configuration, weight-layout, graph, operator, memory-plan, and KV ABI
+  identities; bind them into the Model Manifest and exact Capability Key.
 - [ ] Implement the first supported Dense model graph and its required
   operators using the pinned MLX C++ interface.
 - [ ] Implement the first supported MoE model graph, including deterministic
@@ -103,6 +157,9 @@ pinned MLX C++ interface -> Metal -> Apple GPU
   Prefill/Decode matrices.
 - [ ] Qualify cancellation, partial progress, cleanup, load/unload, memory
   pressure, and fail-stop behavior through the production Backend Interface.
+- [ ] Compile each qualified route into finite exact-key Certified Execution
+  Profile entries and prove that every one-field route or environment drift
+  fails closed.
 - [ ] Make the TurnVector-owned path the production default only after its
   complete correctness, resource, performance, and failure envelopes pass.
 - [ ] Decide through a later reviewed change whether the exported-graph path
@@ -114,8 +171,9 @@ pinned MLX C++ interface -> Metal -> Apple GPU
 The TurnVector-owned path must not replace the interim baseline until all of the
 following are true:
 
-1. Exact supported-model revisions, weights, graph/operator identities, MLX
-   build, hardware/software Envelope, and shape coverage are recorded.
+1. Exact supported-model revisions, weights, Execution Route and graph/operator/
+   memory/KV identities, MLX build, hardware/software Envelope, and shape
+   coverage are recorded.
 2. Logits, updated KV, token selection, stop handling, and seeded multi-token
    generation pass the required deterministic parity matrix.
 3. Owner-thread, call-order, synchronization, cancellation, typed-result,
@@ -135,6 +193,8 @@ following are true:
 - Calling MLX operators individually across the Rust/C++ seam.
 - Expanding the public Data or Control Plane protocol.
 - Adding concurrent Metal Turns or changing the P0 owner-thread topology.
+- Promising permanent raw GPU addresses from a fixed-offset arena without a
+  separately exposed and qualified Metal/MLX contract.
 - Claiming that native ownership is faster before complete comparative evidence
   passes its declared gates.
 - Supporting arbitrary model families without explicit implementation,
