@@ -14,10 +14,10 @@ at a time, records the interfaces between those modules, and defines how
 independent agents may develop in parallel without creating multiple commit
 authorities or weakening the ordered P0 ledger.
 
-The module assignment and approved C08 refinement are delivery mechanisms. They
-do not change the P0 architecture, reorder later ledger rows, combine
-independently green behaviors, authorize a new process, or make private Core
-modules public.
+The module assignment and approved C08 and C10a-C10c refinements are delivery
+mechanisms. They do not change the P0 architecture, reorder later ledger rows,
+combine independently green behaviors, authorize a new process, or make
+private Core modules public.
 
 ## Non-Goals
 
@@ -87,11 +87,34 @@ held-capacity accounting, closed result matrix, and closure of the generic
 `support_ledger` authority. Splitting those responsibilities would temporarily
 create duplicate lifecycle authority or leave the generic bypass open.
 
-The accepted implementation order contains 187 rows after C07.
+The combined descriptor-registration implementation has three separately owned
+delivery responsibilities. Rust 1.97.1 `rustfmt`-normalized estimates are
+115-145 human counted lines for C10a's Support prepared-change seam, 165-185 for
+C10b's descriptor-bound Model Registry state, and 180-230 for C10c's integrated
+Core transitions: 460-560 human lines before generated output, above both the
+former 380-line row cap and the global 420-line ceiling. Each row also carries
+the normal fixed 18-line B03-B05 and three-fixture cascade, projecting 133-163
+against C10a's fixed cap of 180, 183-203 against C10b's fixed cap of 220, and
+198-248 against C10c's fixed cap of 280.
+
+C10a, C10b, and C10c are consecutive and independently green. C10a installs a
+crate-private, non-forgeable, generation-bound `SupportChange` and prepared
+`FixedWindowCounter` start while legacy C07/C08 entry points delegate with no
+new runtime behavior. C10b installs a private bounded `DescriptionPlan`,
+canonical descriptor bytes/hash and nonzero `u32` vocabulary, removes the bare
+`Register` bypass, and proves post-load equality without gaining Core, Support,
+Effect, or runtime authority. C10c gives the integration owner Core custody of
+both private modules, requires the exact C08a active charge before a Describe
+Model Effect, retains pending-plan custody, and atomically finishes Support plus
+commits the `RegistryChange` on the accepted Result or commits neither. Only
+C10c completes the original descriptor-registration behavior; C11 and every
+later row retain their existing identities and order.
+
+The accepted implementation order contains 189 rows after C07.
 
 | Area | Rows | Count | Delivery result |
 |---|---:|---:|---|
-| Core foundations | C08a-C08b, C09-C18 | 12 | Support, registry, request, Certification, and resource foundations |
+| Core foundations | C08a-C08b, C09, C10a-C10c, C11-C18 | 14 | Support, registry, request, Certification, and resource foundations |
 | Core lifecycle | C19-C31 | 13 | Admission, materialization, invalidation, carry, cancellation, output, and release |
 | Scheduling and Plan lifecycle | C32-C45 | 14 | Exclusive, scheduling, Turn results, replay, and performance |
 | Backend runtime | E01-E24 | 24 | Backend Interface, Fake Adapter, Device Executor, Event Loop, and qualification |
@@ -101,7 +124,7 @@ The accepted implementation order contains 187 rows after C07.
 | Volume and durable authority | U01-U03, S01-S31 | 34 | Volume qualification, Control Store, Audit, recovery, readiness, and shutdown |
 | Aggregate gate | K01-K05 | 5 | Integrated Core properties, sequences, faults, and work bounds |
 | Release and qualification | L01-L02, Q00-Q15 | 18 | Closure freeze, subject adapters, qualification, and finding resolution |
-| **Total** |  | **187** |  |
+| **Total** |  | **189** |  |
 
 Rows remain ordered exactly as written in the base plan. A row may depend on
 several modules, but it has one primary implementation owner and one integrated
@@ -113,8 +136,8 @@ commit result.
 
 | Module | Primary rows or private contribution | Owns | Must not own |
 |---|---|---|---|
-| `support_ledger` | C08a-C08b, C16-C18, C26 | Support Ledger Generation, pools, Funding Claims, credits, obligations, entitlements, lifecycle reserves, retained history, and Prepared Carry | Lifecycle witness selection, Resource Capacity, Admission, or Control publication outcome |
-| `model_registry` | C09-C10 | Immutable Model Revision, Alias freeze, lifecycle, Model Descriptor retention, and incremental registry counts | Request state, Backend handles, Residency, or scheduling policy |
+| `support_ledger` | C08a-C08b, C10a, C16-C18, C26 | Support Ledger Generation, prepared Support changes and fixed-window starts, pools, Funding Claims, credits, obligations, entitlements, lifecycle reserves, retained history, and Prepared Carry | Lifecycle witness selection, Resource Capacity, Admission, or Control publication outcome |
+| `model_registry` | C09, C10b | Immutable Model Revision, Alias freeze, lifecycle, Description Plan, Model Descriptor retention, and incremental registry counts | Request state, Backend handles, Residency, Effect emission, or scheduling policy |
 | `request_book` | C11-C12, C21, C30-C31 | Preparing and later request states, description freshness, ownership identity, release lifecycle, and bounded terminal history | Support or Resource capacity, Certification applicability, or Backend execution |
 | `certification` | C13-C14, C23-C24 | Exact Authorization Index access, Environment Fingerprint, finite Applicability Selection, invalidation, and quarantine decisions | Online widening, lifecycle evidence selection, Resource Evidence policy, or ledger mutation |
 | `resource_ledger` | C15, C29 | Request Backend Allocation Budgets, daemon output capacity, transient headroom, Pending Reclaim, checked generation, and atomic reserve or settlement | Support charges, Governor policy, Backend mutation, or request lifecycle authority |
@@ -122,10 +145,12 @@ commit result.
 | `turn_plans` | C38; private contribution to C39-C42 | Frozen candidate and Batch membership, Plan provenance and lifecycle, Local Stale and Result progression, and cost-profile update staging | Support credits, output publication, cross-module commit, Backend execution, or scheduler policy |
 | `scheduler` | C32-C37, C43-C45 | Exclusive feasibility, bounded candidate filtering, service accounting, deadline closure, deterministic selection, replay, and scheduler measurement | Request lifecycle, candidate execution, ledger mutation, Plan result progression, or native state |
 | `closure_control` | C25 | Runtime Closure Gate state and zero-request-liability stability | Event Loop cancel gate, lifecycle evidence selection, Store publication, or Prepared Carry ownership |
-| `transition_coordinator` | C20, C22, C27-C28, C39-C42 | Cross-module staging, generation revalidation, all-or-nothing commit, ordered Effects, and integrated dispositions | A duplicate ledger, durable authority, native execution, or policy hidden from the owning module |
+| `transition_coordinator` | C10c, C20, C22, C27-C28, C39-C42 | Cross-module staging, generation revalidation, all-or-nothing commit, ordered Effects, and integrated dispositions | A duplicate ledger, durable authority, native execution, or policy hidden from the owning module |
 
-C17 remains implemented in `support_ledger` because Plan-scoped obligations are
-Support Ledger facts. C28 and C30 consult request state and ledger owners, but
+C10c coordinates C10a and C10b changes without moving either module's local
+invariants into Core. C17 remains implemented in `support_ledger` because
+Plan-scoped obligations are Support Ledger facts. C28 and C30 consult request
+state and ledger owners, but
 their row owner must deliver one atomic integrated transition. C29's capacity
 fact remains Resource Ledger-owned even when its Effect is coordinated by
 `Core::handle`.
@@ -175,13 +200,14 @@ Coordinator, row ordering, cross-module tests, and generated identity output.
 
 | Owner | Source ownership | Primary rows and private contributions |
 |---|---|---|
-| Agent A: Support | `support_ledger` | C08a-C08b, C16-C18, C26 |
-| Agent B: Registry and Request Capacity | `model_registry`, `request_book`, `resource_ledger` | C09-C12, C15, C21, C29-C31 |
+| Agent A: Support | `support_ledger`, including C10a's crate-private `FixedWindowCounter` preparation helper | C08a-C08b, C10a, C16-C18, C26 |
+| Agent B: Registry and Request Capacity | `model_registry`, `request_book`, `resource_ledger` | C09, C10b, C11-C12, C15, C21, C29-C31 |
 | Agent C: Certification and Scheduling | `certification`, `admission`, `scheduler`, `turn_plans`, `closure_control` | C13-C14, C19, C23-C25, C32-C38, C43-C45; private Plan changes for C39-C42 |
-| Integration owner | `transition_coordinator`, `core.rs`, cross-module fixtures, generated identity cascade | C20, C22, C27-C28, C39-C42 |
+| Integration owner | `transition_coordinator`, `core.rs`, cross-module fixtures, generated identity cascade | C10c, C20, C22, C27-C28, C39-C42 |
 
 This is parallel authoring, not parallel authority. The merge order is now
-C08a, C08b, C09, and onward through C45. An agent may prepare a later row
+C08a, C08b, C09, C10a, C10b, C10c, C11, and onward through C45. An agent may
+prepare a later row
 locally, but that row cannot become ready or retain generated artifacts until
 every predecessor has landed and the branch is synchronized with the exact
 current `main`.
