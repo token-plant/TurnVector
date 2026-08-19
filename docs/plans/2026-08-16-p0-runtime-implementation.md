@@ -1445,11 +1445,42 @@ entry="${entry#* }"; test "${entry%% *}" = blob
 env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git -C . \
   cat-file blob "${base}:scripts/check_commit_policy.py" >"$helper"
 test -s "$helper"
-env -i PATH="$PATH" LC_ALL=C python3 -I -B "$helper" \
-  --base "$base" \
-  --head "$commit" \
-  --branch feat/p0-runtime-implementation \
-  --title 'feat: implement P0 runtime'
+env -i PATH="$PATH" LC_ALL=C BASE="$base" \
+  COMMIT="$commit" HELPER="$helper" python3 -I -B - <<'PY'
+import os, subprocess, tempfile
+git_env = {"PATH": os.environ["PATH"], "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1"}
+root = os.fsdecode(subprocess.check_output(
+    ("git", "-C", ".", "rev-parse", "--show-toplevel"), env=git_env
+).removesuffix(b"\n"))
+with tempfile.TemporaryDirectory(prefix="turnvector-policy-repo-") as sandbox:
+    subprocess.run(("git", "init", "--quiet", "--bare", sandbox),
+                   check=True, env=git_env)
+    refs = ((os.environ["BASE"], "refs/turnvector/accepted-base"),
+            (os.environ["COMMIT"], "refs/turnvector/candidate"))
+    subprocess.run(("git", "-C", sandbox, "fetch", "--quiet", "--no-tags",
+                    "--no-write-fetch-head", "--", root,
+                    *(f"{oid}:{ref}" for oid, ref in refs)),
+                   check=True, env=git_env)
+    for expected, ref in refs:
+        actual = subprocess.check_output(
+            ("git", "-C", sandbox, "rev-parse", "--verify", f"{ref}^{{commit}}"),
+            env=git_env, text=True).strip()
+        if actual != expected:
+            raise SystemExit(f"sandbox object mismatch for {ref}")
+    subprocess.run(("git", "-C", sandbox, "update-ref", "--no-deref", "HEAD",
+                    os.environ["BASE"]), check=True, env=git_env)
+    actual = subprocess.check_output(("git", "-C", sandbox, "rev-parse", "HEAD"),
+                                     env=git_env, text=True).strip()
+    if actual != os.environ["BASE"]:
+        raise SystemExit("accepted-base sandbox HEAD mismatch")
+    command = ("python3", "-I", "-B", os.environ["HELPER"],
+               "--base", os.environ["BASE"], "--head", os.environ["COMMIT"],
+               "--branch", "feat/p0-runtime-implementation",
+               "--title", "feat: implement P0 runtime")
+    raise SystemExit(subprocess.run(command, cwd=sandbox,
+                                    env={"PATH": os.environ["PATH"], "LC_ALL": "C"}).returncode)
+PY
 test -z "$remote" || test "$remote" = "$(env -i PATH="$PATH" LC_ALL=C \
   GIT_NO_REPLACE_OBJECTS=1 git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
 test "$commit" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
@@ -1457,11 +1488,17 @@ test "$commit" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
 ```
 
 The helper is always extracted from the already accepted `base` object, never
-from the commit under audit. The helper treats `--base` as its explicit policy
-source and authenticates its executing bytes against that tree rather than the
-checkout `HEAD`. T02 is therefore checked by its reviewed T01 predecessor;
-later commits, including policy-only helper updates, are checked by the
-installed predecessor authority without executing candidate policy code.
+from the commit under audit. It runs in an automatically removed bare repository
+that fetches the frozen accepted-base and candidate object closures into private
+refs, verifies both identities, and pins `HEAD` to the accepted base while the
+immutable candidate SHA remains data. This also covers an accepted remote tip
+that is not reachable from candidate `HEAD`. It makes the migration from the
+installed helper's older checkout-`HEAD` self-authentication independently green
+without granting the candidate authority. The successor helper treats `--base`
+as its explicit policy source and authenticates its executing bytes against that
+tree. T02 is therefore checked by its reviewed T01 predecessor; later commits,
+including policy-only helper updates, are checked by the installed predecessor
+authority without executing candidate policy code.
 
 After Q00 and a separately authorized compatible Benchmark contract are both
 present, qualification commands are exact wrappers:
