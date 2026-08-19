@@ -63,15 +63,29 @@ remain on the Device Executor owner thread.
 
 The canonical Execution Route descriptor must record independent identities for:
 
-- graph ABI and graph artifacts;
-- weight-layout ABI;
-- memory plan and arena;
+- graph ABI and graph artifacts, which own attention mathematics,
+  mask/position semantics, and compute input/output and accumulation dtypes;
+- weight-layout ABI, which owns weight storage, packing, quantization, and
+  dequantization;
+- memory plan and arena, which own route scratch plans and bounds;
+- kernel-bundle and fusion plans, which own dispatch, artifacts, and compilation
+  inputs;
 - KV/cache layout ABI, including page size, block-table encoding, dtype,
-  quantization, allocation, append, trim, and release semantics;
-- Attention Path, including implementation kind, kernel bundle, mask and
-  position ABI, supported phase and Shape domain, block-table reader ABI, and
-  route-local scratch plan;
-- fusion, Speculative Decode, Prefix Reuse, and command-submission/replay plans.
+  quantization, allocation, append, trim, release, access, and block-table reader
+  semantics;
+- Attention Path composition identity, which owns the stable implementation
+  kind, compilation timing and no-fallback policies, and exact references to the
+  graph, kernel/fusion, KV/cache, memory, and command members without copying
+  their payloads;
+- Speculative Decode, Prefix Reuse, and command-submission/replay plans, with the
+  command member owning submission and replay; and
+- phase and configured runtime Shape in the exact Capability Key and Case Bound
+  Table rather than duplicated in the route descriptor.
+
+The offline compiler rejects an Attention Path whose reference differs from the
+corresponding canonical route member, targets an unknown member, or declares
+support outside that member. Changing the stable kind or any referenced member
+changes both the Attention Path and Execution Route identities.
 
 The first three Attention Path kinds are:
 

@@ -279,7 +279,7 @@ A versioned Execution Backend claim authorized by one or more Certification Reco
 _Avoid_: Work Kind, Backend process, model support
 
 **Attention Path**:
-The exact Adapter-internal execution member that consumes one KV/cache layout for one Turn. Its stable kind is `CONTIGUOUS_MLX_SDPA`, `PAGED_GATHER_MLX_SDPA`, or `NATIVE_BLOCK_TABLE_ATTENTION`, and its identity fixes the implementation kind, kernel bundle, mask and position ABI, supported phase and Shape domain, block-table reader ABI, route-local scratch plan, compilation policy, and fallback policy. KV/cache layout and Attention Path vary independently; changing either creates a new Execution Route Identity and requires exact qualification.
+The exact Adapter-internal attention execution plan composed with one KV/cache layout for one Turn. Its identity owns the stable implementation kind, compilation timing and no-fallback policies, and canonical composition of the route's graph, kernel/fusion, KV/cache, memory/scratch, and command members without redefining their ABIs; phase and Shape applicability remain Capability Key and Case Bound Table facts.
 _Avoid_: PagedKV layout, runtime fallback, environment flag
 
 **Execution Route Identity**:
