@@ -1,0 +1,1 @@
+{"algorithm":"sha256","descriptor":"generation-semantics-v1.json","digest":"b305a633f4734a06f5adbaf00c1817ae21457859305819a319d4754076ac6208","domain":"turnvector:evidence:generation-semantics","hash_schema_version":1,"kind":"generation_semantics","preimage":"utf8(domain)||0x00||u32be(hash_schema_version)||descriptor_bytes"}

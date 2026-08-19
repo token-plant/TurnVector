@@ -28,4 +28,12 @@ jobs:
         run: git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head:refs/remotes/policy/pr-head"
 
       - name: Validate contribution policy
-        run: python3 scripts/check_commit_policy.py --event "$GITHUB_EVENT_PATH"
+        env: {EVENT_BASE_SHA: "${{ github.event.pull_request.base.sha }}", EVENT_HEAD_SHA: "${{ github.event.pull_request.head.sha }}"}
+        run: |
+          set -eu; helper="$(mktemp "${RUNNER_TEMP}/turnvector-policy.XXXXXX")"; trap 'rm -f "$helper"' EXIT
+          base="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify HEAD^{commit})"; head="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git rev-parse --verify refs/remotes/policy/pr-head^{commit})"
+          test "$base" = "$EVENT_BASE_SHA"; test "$head" = "$EVENT_HEAD_SHA"
+          entry="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git ls-tree "$base" -- scripts/check_commit_policy.py)"
+          test "${entry%% *}" = 100755; entry="${entry#* }"; test "${entry%% *}" = blob
+          env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git cat-file blob "${base}:scripts/check_commit_policy.py" >"$helper"; test -s "$helper"
+          env -i PATH="$PATH" LC_ALL=C python3 -I -B "$helper" --event "$GITHUB_EVENT_PATH" --base "$base" --head "$head"

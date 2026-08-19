@@ -4,9 +4,11 @@
 import argparse
 import fnmatch
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -28,15 +30,31 @@ CONVENTIONAL_RE = re.compile(
 )
 BRANCH_RE = re.compile(rf"^(?:{TYPE_PATTERN})/[a-z0-9]+(?:-[a-z0-9]+)*$")
 DOCUMENTATION_SUFFIXES = {".md", ".mdx", ".rst", ".adoc"}
-DOCUMENTATION_NAMES = ("README", "LICENSE", "NOTICE")
+DOCUMENTATION_NAMES = {"LICENSE", "NOTICE", "README"}
 SIZE_LIMIT = 500
 SIZE_EXCEPTION_LABEL = "commit-size-exception"
+DIFF_OPTIONS = ("--find-renames=50%", "-l0", "--no-ext-diff", "--no-textconv",
+                "--diff-algorithm=myers", "--no-indent-heuristic", "--no-color", "--text")
+POLICY_MODES = {".commit-policy.json": "100644", ".github/workflows/contribution-policy.yml": "100644",
+                "scripts/check_commit_policy.py": "100755", "scripts/check_worktree_policy.py": "100755", "tests/test_check_commit_policy.py": "100644"}
+PLAN = "docs/plans/2026-08-16-p0-runtime-implementation.md"
+T01_PARENT, T01_COMMIT = "35d9109d4e3f9686c5b9acfd5324f5bb31bf003c", "b222afb0cac506b34fa682df389c37611ba3d116"
+T01_HELPER_BLOB = "bf18ca8b6e04adbe49f0cb25ad29b9710714f548"
+ONE_TIME_TRANSITIONS = {
+    "build: audit unstaged commit scope": (T01_PARENT, T01_COMMIT, {PLAN: "M",
+        "scripts/check_worktree_policy.py": "A", "tests/test_check_commit_policy.py": "M"}),
+    "build: bind contribution-policy authority": (T01_COMMIT, None, {path: "M" for path in
+        (PLAN, ".github/workflows/contribution-policy.yml", "scripts/check_commit_policy.py",
+         "scripts/check_worktree_policy.py", "tests/test_check_commit_policy.py")}),
+}
+GIT_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_LITERAL_PATHSPECS": "1", "GIT_NO_REPLACE_OBJECTS": "1"}
 
 
-def git(*args: str, binary: bool = False) -> object:
+def git(*args: str, binary: bool = False, env=None) -> object:
     result = subprocess.run(
         ("git",) + args,
         check=True,
+        env=GIT_ENV if env is None else env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=not binary,
@@ -44,20 +62,92 @@ def git(*args: str, binary: bool = False) -> object:
     return result.stdout
 
 
-def load_config(path: Path) -> Dict[str, object]:
-    if not path.exists():
-        return {"counted_documentation_globs": []}
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+def parse_config(content: bytes) -> Tuple[str, ...]:
+    config = json.loads(content)
+    globs = config.get("counted_documentation_globs") if isinstance(config, dict) else None
+    if (not isinstance(config, dict) or set(config) != {"counted_documentation_globs"}
+            or not isinstance(globs, list) or any(not isinstance(item, str) for item in globs)):
+        raise ValueError("policy config must contain only a string-list counted_documentation_globs")
+    return tuple(globs)
 
 
 def is_documentation(path: str, counted_globs: Sequence[str]) -> bool:
     if any(fnmatch.fnmatch(path, pattern) for pattern in counted_globs):
         return False
     name = Path(path).name.upper()
-    return Path(path).suffix.lower() in DOCUMENTATION_SUFFIXES or any(
-        name.startswith(prefix) for prefix in DOCUMENTATION_NAMES
-    )
+    return Path(path).suffix.lower() in DOCUMENTATION_SUFFIXES or name in DOCUMENTATION_NAMES
+
+
+def tree_entry(revision: str, path: str) -> Optional[Tuple[str, str]]:
+    records = [item for item in git("ls-tree", "-z", revision, "--", path, binary=True).split(b"\0") if item]
+    if not records:
+        return None
+    metadata, raw_path = records[0].split(b"\t", 1)
+    mode, kind, blob = metadata.split()
+    if len(records) != 1 or raw_path.decode("utf-8", "surrogateescape") != path or kind != b"blob":
+        raise ValueError(f"invalid policy tree entry for {path!r}")
+    return mode.decode(), blob.decode()
+
+
+def config_history(base: str, head: str, proposed=None):
+    merge_base = str(git("merge-base", base, head)).strip()
+    revisions = [merge_base]
+    for endpoint in (base, head):
+        revisions.extend(commit for commit, _parents in commits_between(merge_base, endpoint) if commit not in revisions)
+    globs, history = set(), []
+    for revision in revisions:
+        entry = tree_entry(revision, ".commit-policy.json")
+        if entry is None or entry[0] != POLICY_MODES[".commit-policy.json"]:
+            raise ValueError("policy config must be a 100644 Git blob")
+        values = parse_config(git("cat-file", "blob", entry[1], binary=True))
+        globs.update(values); history.append({"revision": revision, "blob": entry[1], "globs": sorted(values)})
+    if proposed is not None:
+        blob, content = proposed
+        values = parse_config(content)
+        globs.update(values); history.append({"revision": "WORKTREE", "blob": blob, "globs": sorted(values)})
+    return tuple(sorted(globs)), history
+
+
+def parse_changes(raw: bytes):
+    fields = iter(raw.split(b"\0"))
+    for metadata in fields:
+        if not metadata:
+            return
+        old_mode, mode, _old_object, _object_id, status = metadata[1:].decode().split()
+        old_path = next(fields).decode("utf-8", "surrogateescape") if status[0] in "RC" else None
+        path = next(fields).decode("utf-8", "surrogateescape")
+        yield status, path, old_path, None if set(old_mode) == {"0"} else old_mode, \
+            None if set(mode) == {"0"} else mode
+
+
+def policy_transition_errors(changes, one_time=None, policy_installed=False, helper_blob=None) -> List[str]:
+    errors = ["installed policy cannot restore bootstrap helper"] if policy_installed and helper_blob == T01_HELPER_BLOB else []
+    if one_time is False:
+        return errors + ["bootstrap transition is not at its reviewed one-time predecessor"]
+    modes = {**POLICY_MODES, **({PLAN: "100644"} if one_time is not None else {})}
+    changed = {value for _status, path, old_path, _old_mode, _mode in changes for value in (old_path, path) if value is not None}
+    policy = changed.intersection(modes)
+    allowed = set(POLICY_MODES) if one_time is None else set(one_time)
+    if policy and (changed - allowed or one_time is not None and changed != allowed):
+        errors.append("policy paths must change alone")
+    for _status, path, old_path, _old_mode, mode in changes:
+        owners = {value for value in (old_path, path) if value in modes}
+        if any(old_path is not None and old_path != path or mode != modes[value]
+               for value in owners):
+            errors.append(f"policy path has invalid rename, deletion, or mode: {path!r}")
+        if one_time is not None and path in one_time and _status != one_time[path]:
+            errors.append(f"bootstrap policy path has invalid status: {path!r}")
+    return errors
+
+
+def bootstrap_transition(subject: str, commit: str, parent: str, seen: Set[str], policy_installed=False):
+    if (transition := ONE_TIME_TRANSITIONS.get(subject)) is None:
+        return None
+    expected_parent, expected_commit, paths = transition
+    allowed = (subject not in seen and parent == expected_parent and expected_commit in (None, commit)
+               and (expected_commit is not None or not policy_installed))
+    seen.add(subject)
+    return paths if allowed else False
 
 
 def parse_numstat(raw: bytes) -> Iterable[Tuple[str, str, str, Optional[str]]]:
@@ -82,18 +172,54 @@ def parse_numstat(raw: bytes) -> Iterable[Tuple[str, str, str, Optional[str]]]:
 def changed_lines(
     parent: str, commit: str, counted_globs: Sequence[str]
 ) -> Tuple[int, List[str]]:
-    raw = git("diff", "--numstat", "-z", "-M", parent, commit, binary=True)
+    raw = git("diff", "--numstat", "-z", *DIFF_OPTIONS, parent, commit, binary=True)
     total = 0
     binaries: List[str] = []
     for added, deleted, path, old_path in parse_numstat(raw):
-        paths = [path] if old_path is None else [old_path, path]
-        if all(is_documentation(item, counted_globs) for item in paths):
-            continue
-        if added == "-" or deleted == "-":
+        old_entry = tree_entry(parent, old_path or path)
+        new_entry = tree_entry(commit, path)
+        old_content = b"" if old_entry is None else git("cat-file", "blob", old_entry[1], binary=True)
+        new_content = b"" if new_entry is None else git("cat-file", "blob", new_entry[1], binary=True)
+        old_doc = old_entry is None or is_documentation(old_path or path, counted_globs)
+        new_doc = new_entry is None or is_documentation(path, counted_globs)
+        if b"\0" in old_content or b"\0" in new_content:
             binaries.append(path)
             continue
-        total += int(added) + int(deleted)
+        if old_doc and new_doc:
+            continue
+        if old_doc != new_doc:
+            total += text_lines(new_content if old_doc else old_content)
+        else:
+            total += int(added) + int(deleted)
     return total, binaries
+
+
+def text_lines(content: bytes) -> int:
+    return content.count(b"\n") + bool(content and not content.endswith(b"\n"))
+
+
+def quote_alternate(path: Path) -> str:
+    quoted = (chr(byte) if 32 <= byte < 127 and byte not in (34, 92)
+              else f"\\{byte:03o}" for byte in os.fsencode(path))
+    return '"' + "".join(quoted) + '"'
+
+
+def clean_base_merge(base: str, commit: str, parents: Sequence[str]) -> bool:
+    if len(parents) != 2 or subprocess.run(
+        ("git", "merge-base", "--is-ancestor", parents[1], base), env=GIT_ENV,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode:
+        return False
+    with tempfile.TemporaryDirectory() as temporary:
+        objects = Path(temporary) / "objects"
+        objects.mkdir()
+        common = Path(os.fsdecode(git("rev-parse", "--path-format=absolute", "--git-common-dir", binary=True).removesuffix(b"\n"))) / "objects"
+        env = {**GIT_ENV, "GIT_OBJECT_DIRECTORY": str(objects), "GIT_ALTERNATE_OBJECT_DIRECTORIES": quote_alternate(common)}
+        try:
+            expected = str(git("merge-tree", "--write-tree", *parents, env=env)).splitlines()[0]
+        except subprocess.CalledProcessError:
+            return False
+    return expected == str(git("show", "-s", "--format=%T", commit)).strip()
 
 
 def pull_request_event(path: Optional[Path]) -> Dict[str, object]:
@@ -132,6 +258,7 @@ def validate(
     body: str,
     labels: Set[str],
     counted_globs: Sequence[str],
+    enforce_size: bool = True,
 ) -> List[str]:
     errors: List[str] = []
     oversized: List[Tuple[str, int]] = []
@@ -142,12 +269,17 @@ def validate(
         errors.append(f"PR title is not conventional: {title!r}")
 
     commits = commits_between(base, head)
+    policy_installed = any(tree_entry(revision, "scripts/check_commit_policy.py") != ("100755", T01_HELPER_BLOB) for revision in str(git("rev-list", base, "--", "scripts/check_commit_policy.py")).splitlines())
+    seen_transitions = set(str(git("log", "--format=%s", base)).splitlines()) & ONE_TIME_TRANSITIONS.keys()
     if not commits:
         errors.append("pull request contains no commits")
 
     for commit, parents in commits:
         if len(parents) > 1:
-            print(f"EXEMPT merge commit {commit[:12]}")
+            if clean_base_merge(base, commit, parents):
+                print(f"EXEMPT clean base-sync merge commit {commit[:12]}")
+            else:
+                errors.append(f"merge commit contains non-base payload: {commit[:12]}")
             continue
         subject = str(git("show", "-s", "--format=%s", commit)).strip()
         if not CONVENTIONAL_RE.fullmatch(subject):
@@ -155,13 +287,20 @@ def validate(
         if not parents:
             errors.append(f"commit {commit[:12]} has no parent")
             continue
+        raw = git("diff", "--raw", "-z", "--no-abbrev", *DIFF_OPTIONS,
+                  parents[0], commit, "--", binary=True)
+        changes = list(parse_changes(raw))
+        helper = tree_entry(commit, "scripts/check_commit_policy.py"); transition = bootstrap_transition(subject, commit, parents[0], seen_transitions, policy_installed)
+        errors.extend(policy_transition_errors(changes, transition, policy_installed, None if helper is None else helper[1]))
+        policy_installed |= helper != ("100755", T01_HELPER_BLOB)
         line_count, binaries = changed_lines(parents[0], commit, counted_globs)
         print(f"COUNT {commit[:12]} {line_count} non-documentation changed lines")
         for path in binaries:
-            print(f"REVIEW binary file in {commit[:12]}: {path}")
+            print(f"REVIEW binary file in {commit[:12]}: {json.dumps(path, ensure_ascii=True)}")
         if line_count > SIZE_LIMIT:
             oversized.append((commit, line_count))
 
+    if not enforce_size: oversized.clear()
     has_exception = SIZE_EXCEPTION_LABEL in labels
     if oversized and not has_exception:
         for commit, line_count in oversized:
@@ -194,11 +333,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--body", default="")
     parser.add_argument("--label", action="append", default=[])
     parser.add_argument("--event", type=Path)
-    parser.add_argument("--config", type=Path, default=Path(".commit-policy.json"))
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if not sys.flags.isolated:
+        print("run this checker with python3 -I -B", file=sys.stderr)
+        return 2
     args = parse_args(argv)
     event = pull_request_event(args.event)
     base = args.base or event.get("base")
@@ -213,15 +354,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"missing required input: {', '.join(missing)}", file=sys.stderr)
         return 2
 
-    config = load_config(args.config)
+    try:
+        base = str(git("rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")).strip()
+        head = str(git("rev-parse", "--verify", "--end-of-options", f"{head}^{{commit}}")).strip()
+        source = tree_entry(base, "scripts/check_commit_policy.py")
+        if source is None or source[0] != "100755" or Path(__file__).read_bytes() != git(
+                "cat-file", "blob", source[1], binary=True):
+            raise ValueError("post-commit policy helper is not the explicit accepted base blob")
+        globs, _history = config_history(base, head)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"Policy check failed: {error}", file=sys.stderr)
+        return 1
     errors = validate(
-        str(base),
-        str(head),
+        base,
+        head,
         str(branch),
         str(title),
         str(body),
         labels,
-        list(config.get("counted_documentation_globs", [])),
+        globs,
     )
     if errors:
         print("Policy check failed:", file=sys.stderr)
