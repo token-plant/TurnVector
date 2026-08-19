@@ -33,6 +33,7 @@ use std::num::{NonZeroU64, NonZeroU128};
 mod bounded;
 mod core;
 mod scheduling;
+pub mod support;
 mod turns;
 mod work;
 
@@ -191,6 +192,8 @@ nonzero_sequence!(/// The version of effective resource restrictions.
 SafetyGeneration);
 nonzero_sequence!(/// The version of applicable daemon runtime-overhead evidence.
 RuntimeOverheadGeneration);
+nonzero_sequence!(/// The version of the Core-owned Support Charge Ledger.
+SupportLedgerGeneration);
 
 checked_unit!(/// A count of bytes.
 ByteCount);
