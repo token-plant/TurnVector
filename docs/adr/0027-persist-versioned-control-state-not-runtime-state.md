@@ -1,5 +1,7 @@
 # Persist Versioned Control State, Not Runtime State
 
+Every persisted Model Descriptor is one complete canonical V1 frame plus its independently derived field-private Model Descriptor ID, typed Model Descriptor Hash, and nonzero vocabulary, accepted only as a Verified Model Descriptor from the private `turnvector-core::model_descriptor` verifier. Control mutation, Bootstrap, Restore, Clone, and post-load comparison use that same verifier and exact sealed equality; none trusts individually plausible stored or Backend fields, regenerates bytes from a digest, or normalizes the opaque payload.
+
 Before a P0 Control Mutation Operation ID exists, the synchronized owner-creation check jointly revalidates the complete mutation token, exact Prepared Carry Reservation, current Support Ledger Generation, current next assignable Event Sequence, and full build-derived headroom. Every nonfatal failure after carry creation closes that unowned carry and resumes ordinary support atomically with the no-ID result. Only a successful joint check may allocate the Operation ID and create the Core publication Effect/owner; abbreviated references below to complete token revalidation include this full set.
 
 Within this decision, a stable zero-request-liability proof means a current witness from a pure Core validator held under the already closed Runtime Closure Gate. The validator is not a second gate; only the gate makes the witness stable because no permitted transition can recreate request liability before barrier entry.
