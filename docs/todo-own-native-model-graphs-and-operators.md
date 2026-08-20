@@ -187,6 +187,10 @@ and its
 - [ ] Compile each qualified route into finite exact-key Certified Execution
   Profile entries and prove that every one-field route or environment drift
   fails closed.
+- [ ] Bind each Attention Path to `PRECOMPILED_REQUIRED` or independently
+  qualified `BOUNDED_FIRST_USE`; prove exact compilation, cold resource and
+  Engine Service bounds, compile-period cancellation to the first qualified
+  boundary, started-Turn failure typing, and no in-Turn fallback.
 - [ ] Make the TurnVector-owned path the production default only after its
   complete correctness, resource, performance, and failure envelopes pass.
 - [ ] Decide through a later reviewed change whether the exported-graph path
