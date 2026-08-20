@@ -796,7 +796,9 @@ throughput, fairness, or multi-tenant security. A serving claim requires real
 end-to-end runs with exact Gateway Build, profile, route, daemon build, Model
 Revision, tokenizer/template, protocol descriptor, hardware/OS, workload, and
 artifact hashes. Benchmark-project changes require a separate explicitly scoped
-TurnVectorBenchmark task.
+TurnVectorBenchmark task. The versioned observation, model, CasePlan, evidence,
+and claim contract for response-lifetime and Unix-connection validation is
+`docs/plans/2026-08-20-gateway-lifecycle-uds-validation.md`.
 
 ## 16. Implementation order and gates
 
@@ -824,7 +826,7 @@ Recommended delivery slices are:
 | G05 | JSON/SSE StreamBridge and disconnect cancellation | Ordered publication, backpressure, no-replay, and slow-reader tests |
 | G06 | HTTPS, fixed authenticator, rate limits, health, and launch configuration | Real UID/TLS/Control-denial tests |
 | G07 | End-to-end fault, fuzz, resource-bound, and drain suite | All preceding gates green |
-| G08 | Qualification adapter and evidence report | Separate Benchmark scope and claim review |
+| G08 | Content-free qualification observations, real-system adapter, and evidence report | `turnvector.gateway-validation.v1`, separate Benchmark scope, and claim review |
 
 Each slice remains independently green. A production listener stays disabled
 until G01 through G07 and all named daemon dependencies pass.
