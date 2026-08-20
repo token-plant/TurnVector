@@ -42,7 +42,8 @@ Execution Route descriptor. Its Evidence Hash is the Execution Route Identity
 carried by the exact Capability Key and the compiled Certified Execution Profile.
 The descriptor fixes:
 
-- graph ABI and graph artifact identities;
+- graph ABI and graph artifact identities, including a stable Batch Execution
+  Kind for every multi-member route;
 - weight-layout ABI;
 - memory-plan and arena identity;
 - kernel-bundle and fusion-plan identities;
@@ -51,7 +52,7 @@ The descriptor fixes:
 - independent Attention Path identity;
 - Speculative Decode plan or explicit `NONE`;
 - Prefix Reuse plan with stable kind `NONE`, `PRIVATE_REUSE`, or
-  `NATIVE_PAGE_SHARING`; and
+  `NATIVE_PAGE_SHARING` and its bounded implementation identity; and
 - command-submission or replay plan or explicit `NONE`.
 
 The Attention Path is a composition identity, not a second owner of its
@@ -136,18 +137,38 @@ Each step keeps the coarse Backend Interface unchanged and adds a new exact
 Execution Route rather than widening the prior Profile:
 
 1. Own exact Prefill/Decode graphs and a preallocated fixed-offset arena.
-2. Add separately identified specialized kernels and operator-fusion plans.
+2. Design the Attention and KV Layout Module contracts together, including the
+   exact route fields, block-table reader ABI, mask/position semantics, scratch
+   bounds, and Turn Receipt observations shared by native page-reading routes.
 3. Add a PagedKV layout with an exact page, dtype, quantization, allocation,
-   update, and release ABI.
-4. Add Prefix Reuse only on a qualified PagedKV/cache ABI and bind the complete
-   model, token-prefix, graph, KV, producer, and publication identities.
-5. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
+   update, and release ABI, retaining a gathered pinned-MLX-SDPA reference
+   route.
+4. Add separately identified phase-specific attention paths and operator-fusion
+   plans. The PagedAttention delivery owns the first native block-table Decode
+   slice; the later FlashAttention delivery owns tiled Prefill. Qualify them
+   independently and never represent the family with a `flash_attention`
+   boolean.
+5. Add Continuous Batching compositions as separately qualified multi-member
+   routes. The graph ABI distinguishes `TENSOR_BATCH` from
+   `SEQUENTIAL_MEMBER_LOOP`; the same batch/Shape bucket yields different
+   Route/Key identities, and the Turn Plan freezes ordered membership through
+   its synchronized Turn Receipt.
+6. Add Prefix Reuse only on a qualified PagedKV/cache ABI. Its static route binds
+   only the stable plan kind and bounded implementation; owner-thread Request
+   Materialization validates dynamic prefix-entry compatibility and its
+   Materialization Result binds any adoption.
+7. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
    synchronization points, and additional memory/time bounds.
-6. Add Metal command replay or ICB only when the pinned implementation exposes
+8. Add Metal command replay or ICB only when the pinned implementation exposes
    a stable contract and correctness, cancellation, command-buffer, and
    performance qualification passes.
 
 No later step is a prerequisite for shipping or certifying an earlier route.
+The attention/KV ownership boundary, sequential delivery order, route matrix,
+and promotion gates are defined in
+[ADR 0045](adr/0045-qualify-flash-attention-as-exact-phase-specific-routes.md)
+and its
+[detailed design](plans/2026-08-19-flash-attention-route-design.md).
 
 ## Transition Work
 
@@ -175,6 +196,13 @@ No later step is a prerequisite for shipping or certifying an earlier route.
 - [ ] Compile each qualified route into finite exact-key Certified Execution
   Profile entries and prove that every one-field route or environment drift
   fails closed.
+- [ ] Bind each Attention Path to `PRECOMPILED_REQUIRED` or independently
+  qualified `BOUNDED_FIRST_USE`; prove exact compilation, cold resource and
+  Engine Service bounds, existing model-load rollback/generation/description
+  semantics, compile-period Device Control Signal versus Core cancellation
+  ordering at the qualified Turn boundary, exact Decode B1 signal-only/no-output
+  and Decode B4 one/some/all-member cancellation fixtures, per-member output
+  discard, started-Turn failure typing, and no in-Turn fallback.
 - [ ] Make the TurnVector-owned path the production default only after its
   complete correctness, resource, performance, and failure envelopes pass.
 - [ ] Decide through a later reviewed change whether the exported-graph path
