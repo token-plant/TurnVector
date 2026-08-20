@@ -20,6 +20,15 @@ For TurnVector work:
 
 Before changing evidence policy or creating or revising research, benchmark, experiment, model, trace, or product-claim artifacts, read `docs/evidence-policy.md` in addition to the required internal references.
 
+# Design Proposal Gate
+
+Before creating or materially revising a design, read
+`docs/design-proposal-gate.md` completely. Before reporting any substantive
+design content, the same frozen Review Bundle must pass both its Mathematical
+Gate and one three-reviewer Unanimous Review Round. Until then, report only
+scope questions, progress, review findings, or blockers without disclosing the
+proposal itself.
+
 # Change Delivery
 
 Analysis, research, review, and discussion are read-only unless the user explicitly requests repository changes. Unless the user requests `local-only`, `no commit`, or `no PR`, a task that changes repository files is complete only after a ready pull request has been opened and verified.
