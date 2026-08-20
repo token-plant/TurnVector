@@ -50,7 +50,8 @@ The descriptor fixes:
   layouts;
 - independent Attention Path identity;
 - Speculative Decode plan or explicit `NONE`;
-- Prefix Reuse plan or explicit `NONE`; and
+- Prefix Reuse plan with stable kind `NONE`, `PRIVATE_REUSE`, or
+  `NATIVE_PAGE_SHARING`; and
 - command-submission or replay plan or explicit `NONE`.
 
 The Attention Path is a composition identity, not a second owner of its
