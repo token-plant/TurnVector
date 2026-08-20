@@ -150,13 +150,13 @@ it owns no copied ABI payload.
 
 | Authority or route member | Attention-specific content |
 | --- | --- |
-| Graph ABI and graph artifacts | `attention_semantics_abi` and `mask_position_abi`, uniquely fixing compute input/output and accumulation dtypes, scaling, softmax, causal alignment, positions, grouped-query mapping, and output semantics. |
+| Graph ABI and graph artifacts | `attention_semantics_abi` and `mask_position_abi`, uniquely fixing compute input/output and accumulation dtypes, scaling, softmax, causal alignment, positions, grouped-query mapping, and output semantics. Every multi-member graph ABI also fixes a stable Batch Execution Kind of `TENSOR_BATCH` or `SEQUENTIAL_MEMBER_LOOP`. |
 | Weight-layout ABI | Model-weight storage dtype, packing, quantization metadata, and dequantization contract; attention consumes this ABI but does not redefine it. |
 | Kernel-bundle and fusion-plan identities | `dispatch_policy`, exact reachable MLX/Metal `kernel_bundle_id`, compilation inputs, and conformance to the graph and weight ABIs. |
 | KV/cache layout ABI | `kv_layout_abi`, `kv_access_path`, KV storage dtype/quantization, page encoding, and exact `block_table_reader_abi` or `NONE`. |
 | Memory-plan and arena identity | Exact gather, temporary, online-softmax, reduction, and command-buffer `scratch_plan_id` and bounds. |
 | Attention Path identity | Stable `attention_path_kind`, exact `PRECOMPILED_REQUIRED` or `BOUNDED_FIRST_USE` compilation timing policy, `NONE_AFTER_START` fallback behavior, and canonical references to the exact graph, kernel/fusion, KV/cache, memory, and command members that form the path. It defines composition and lifecycle policy, not those members' payloads. |
-| Speculative Decode and Prefix Reuse plans | Existing exact plan identity or explicit `NONE`; Prefix Reuse carries its producer, publication, immutable-sharing, and lifetime contract. |
+| Speculative Decode and Prefix Reuse plans | Existing exact plan identity or explicit `NONE`; Prefix Reuse fixes only its stable kind `NONE`, `PRIVATE_REUSE`, or `NATIVE_PAGE_SHARING` and bounded implementation identity. Producer publication generation, complete token prefix, and other entry-compatibility facts are dynamic Request Materialization compatibility facts, not route members. |
 | Command-submission or replay plan | Exact submission/replay behavior or explicit `NONE`; it never authorizes route substitution. |
 | Capability Key and Case Bound Table, outside the route descriptor | Exact `attention_phase` and configured runtime batch/Shape case. They reference, rather than redefine, the route-owned model geometry, compute dtype, weight layout, KV storage/page ABI, kernel tile, and scratch identities. |
 
@@ -316,15 +316,20 @@ relying on current cache warmth.
 
 ### Candidate Formation And Turn Plan
 
-Candidate Formation may emit only a Work Candidate whose exact Capability Key
-is already in every member's Authorized Capability Set. Known route
-inapplicability produces a Candidate Exclusion; it is not a fallback. Selection
-of a Work Candidate creates a Turn Plan that records its exact route, case
-bounds, worst-case Engine Service, reservation, transient headroom, scratch
-plan, output bound, and typed preconditions. Applicability includes phase, mask,
-position, graph-owned compute dtype, weight-layout ABI, KV storage ABI, model
-geometry, sequence bounds, runtime batch/Shape, dependency revision, compiled
-kernel identity, and environment.
+Candidate Formation may emit only a structurally declared Work Candidate whose
+exact Capability Key is compatible with the eligible request facts and supplied
+hard constraints. Known structural incompatibility produces a Candidate
+Exclusion; it is not a fallback. The Model Planner receives no Certification
+Applicability or Authorized Capability Set. Core creates a current Candidate
+Association only after the exact Key is present in every member's Authorized
+Capability Set and all current Core evidence admits it. The Turn Arbiter may
+select only that associated Candidate, and selection creates a Turn Plan that
+records its exact route, case bounds, worst-case Engine Service, reservation,
+transient headroom, scratch plan, output bound, and typed preconditions. The
+associated Key, route, and case bind phase, mask, position, graph-owned compute
+dtype, weight-layout ABI, KV storage ABI, model geometry, sequence bounds,
+runtime batch/Shape, dependency revision, compiled kernel identity, and
+environment.
 
 If Backend-owned pre-execution validation finds that a still-current Turn Plan
 cannot begin, `execute_turn` returns Plan Rejection only before any route
@@ -406,12 +411,15 @@ This design owns the consumer side of that reader ABI. Native attention must
 reject malformed, stale, out-of-bound, semantically incompatible, or illegally
 aliased tables before submitting GPU work. Duplicate mutable references,
 cross-pool aliases, and sharing outside the exact ownership ABI are illegal.
-Separately identified Prefix Reuse routes may permit reference-counted immutable
-physical pages to appear in multiple request block tables only when their exact
-producer, publication, generation, pool, copy-on-write, and release contract is
-bound and validated. The combined route binds both the producer layout ABI and
-consumer reader ABI so either side can evolve without silently changing an
-existing identity.
+An Execution Route whose Prefix Reuse plan kind is `NATIVE_PAGE_SHARING` may
+permit reference-counted immutable physical pages to appear in multiple request
+block tables. Its static route binds the stable plan implementation, KV/cache
+layout ABI, pool, copy-on-write, release, and consumer reader ABI. Only
+owner-thread Request Materialization may adopt a dynamic entry after validating
+complete route equality and every additional prefix-entry compatibility field,
+including producer publication generation and exact token prefix; the
+Materialization Result binds the adopted prefix, route, and Backend Generation.
+`PRIVATE_REUSE` retains private physical state and cannot authorize shared pages.
 
 The detailed PagedAttention proposal in
 [PR #16](https://github.com/token-plant/TurnVector/pull/16) has merged. Its shared
@@ -444,18 +452,35 @@ revalidate this design before merge; a PR-head SHA is not an authority.
 
 ## Continuous Batching And Prefix Reuse
 
-Continuous Batching changes the member/row shape and scheduling case. Prefix
-Reuse changes the KV producer, publication, sharing, and lifetime identities.
-Neither is implied by qualifying a single-request attention route.
+The accepted
+[Continuous Batching design](2026-08-19-continuous-batching-optimization.md) and
+[Prefix Sharing design](2026-08-19-prefix-sharing.md) own their canonical
+semantics. This plan owns only their composition with attention routes.
+Continuous Batching changes the member/row shape, graph ABI, and scheduling
+case. Prefix Reuse changes the static plan kind and bounded implementation in the
+route, while dynamic prefix-entry compatibility remains Request Materialization
+facts. Neither capability is implied by qualifying a single-request attention
+route.
 
 Expansion follows these rules:
 
 - first qualify one-request exact Prefill and Decode cases;
-- represent same-model multi-member batches as separate exact route cases;
-- bind padding/ragged representation and row-removal semantics into the batch
-  route;
-- bind prefix producer, complete token prefix, graph, model, KV layout, page
-  geometry, publication, and sharing identities into a Prefix Reuse route;
+- represent same-Model multi-member batches as separate exact route cases;
+- bind `TENSOR_BATCH` versus `SEQUENTIAL_MEMBER_LOOP` into the graph ABI's stable
+  Batch Execution Kind, so the same batch/Shape bucket has different Execution
+  Route Identities and Capability Keys and shares neither Certification nor
+  tensor-batch telemetry;
+- bind padding, packing, ragged representation, assembly, and member reduction
+  order into the graph, kernel, and memory-plan members, then freeze ordered
+  membership and member-local work ceilings in the Turn Plan through its
+  synchronized Turn Receipt with no mid-Turn insertion, removal, or reordering;
+  after route work starts, cancellation follows the frozen member-local
+  Turn Receipt contract rather than changing Plan membership;
+- bind only the stable Prefix Reuse plan kind and bounded implementation into the
+  static route. For `NATIVE_PAGE_SHARING`, owner-thread Request Materialization
+  validates the complete additional entry compatibility fields defined by the
+  Prefix Sharing design, and the Materialization Result binds the adopted prefix,
+  Execution Route, and Backend Generation;
 - rerun correctness and bound evidence for every supported combination; and
 - omit unsupported Cartesian combinations rather than adding wildcard keys.
 
@@ -521,7 +546,9 @@ single isolated kernel call. The matrix includes:
 - rejection of mutable duplicates, cross-pool aliases, and aliases outside the
   exact KV ownership ABI;
 - acceptance and copy-on-write isolation of immutable shared pages only for an
-  exact qualified Prefix Reuse route;
+  exact qualified route whose Prefix Reuse plan kind is `NATIVE_PAGE_SHARING`,
+  after owner-thread Request Materialization validates complete dynamic entry
+  compatibility and its Materialization Result binds the adoption;
 - gathered and direct-reader equivalence;
 - finite-value and error-tolerance policies declared before results; and
 - load, cancellation, release, and subsequent-request isolation.
@@ -643,9 +670,15 @@ reimplements nor independently certifies the Decode route.
 
 ### FA05: Batch And Prefix Compositions
 
-- add exact Continuous Batching combinations only after its own design lands;
-- add exact Prefix Reuse combinations only after its publication/lifetime
-  contract and PagedKV ABI qualify;
+- consume the accepted Continuous Batching contract and add separately qualified
+  multi-member routes whose graph ABI fixes `TENSOR_BATCH` or
+  `SEQUENTIAL_MEMBER_LOOP`; the same batch/Shape bucket produces different
+  Route/Key identities, and every Turn Plan freezes ordered membership through
+  its synchronized Turn Receipt;
+- add exact Prefix Reuse combinations only after the applicable static plan
+  implementation and PagedKV ABI qualify; keep dynamic entry compatibility and
+  adoption exclusively in owner-thread Request Materialization and its
+  Materialization Result;
 - account for shared resource attribution and row/member lifecycle; and
 - leave every unsupported combination absent.
 

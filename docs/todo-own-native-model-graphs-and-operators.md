@@ -42,7 +42,8 @@ Execution Route descriptor. Its Evidence Hash is the Execution Route Identity
 carried by the exact Capability Key and the compiled Certified Execution Profile.
 The descriptor fixes:
 
-- graph ABI and graph artifact identities;
+- graph ABI and graph artifact identities, including a stable Batch Execution
+  Kind for every multi-member route;
 - weight-layout ABI;
 - memory-plan and arena identity;
 - kernel-bundle and fusion-plan identities;
@@ -51,7 +52,7 @@ The descriptor fixes:
 - independent Attention Path identity;
 - Speculative Decode plan or explicit `NONE`;
 - Prefix Reuse plan with stable kind `NONE`, `PRIVATE_REUSE`, or
-  `NATIVE_PAGE_SHARING`; and
+  `NATIVE_PAGE_SHARING` and its bounded implementation identity; and
 - command-submission or replay plan or explicit `NONE`.
 
 The Attention Path is a composition identity, not a second owner of its
@@ -147,11 +148,18 @@ Execution Route rather than widening the prior Profile:
    slice; the later FlashAttention delivery owns tiled Prefill. Qualify them
    independently and never represent the family with a `flash_attention`
    boolean.
-5. Add Prefix Reuse only on a qualified PagedKV/cache ABI and bind the complete
-   model, token-prefix, graph, KV, producer, and publication identities.
-6. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
+5. Add Continuous Batching compositions as separately qualified multi-member
+   routes. The graph ABI distinguishes `TENSOR_BATCH` from
+   `SEQUENTIAL_MEMBER_LOOP`; the same batch/Shape bucket yields different
+   Route/Key identities, and the Turn Plan freezes ordered membership through
+   its synchronized Turn Receipt.
+6. Add Prefix Reuse only on a qualified PagedKV/cache ABI. Its static route binds
+   only the stable plan kind and bounded implementation; owner-thread Request
+   Materialization validates dynamic prefix-entry compatibility and its
+   Materialization Result binds any adoption.
+7. Add Speculative Decode with exact draft/verifier models, acceptance semantics,
    synchronization points, and additional memory/time bounds.
-7. Add Metal command replay or ICB only when the pinned implementation exposes
+8. Add Metal command replay or ICB only when the pinned implementation exposes
    a stable contract and correctness, cancellation, command-buffer, and
    performance qualification passes.
 
