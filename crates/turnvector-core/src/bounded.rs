@@ -198,17 +198,20 @@ impl From<WorkBudgetError> for FixedIndexError {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct IndexLeaf<V> {
     key: [u8; 33],
     value: V,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct IndexBranch {
     bit: u16,
     zero: u32,
     one: u32,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct FixedIdentityIndex<V> {
     leaves: Vec<IndexLeaf<V>>,
     branches: Vec<IndexBranch>,
@@ -429,6 +432,7 @@ impl From<FixedIndexError> for FixedStorageError {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct FixedRecordArena<V, C, const KEYS: usize> {
     records: Vec<V>,
     claims: Vec<C>,
@@ -530,6 +534,7 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FixedStartCountBound(pub Duration, pub u32);
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct FixedWindowCounter<const CELLS: usize, const H: usize> {
     bounds: [[FixedStartCountBound; H]; CELLS],
     history: [VecDeque<MonotonicTime>; CELLS],

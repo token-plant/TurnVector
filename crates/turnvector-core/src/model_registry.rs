@@ -1,4 +1,4 @@
-#![allow(dead_code, reason = "C09 Core wiring belongs to the integration row")]
+#![allow(dead_code, reason = "C10e wires registration; later rows wire more")]
 use crate::WorkDimension::{CopiedBytes, InvariantChecks, VisitedEntities};
 use crate::model_descriptor::{
     MAX_FRAME_BYTES, ModelDescriptorHash, ModelDescriptorId, VerifiedModelDescriptor,
@@ -113,6 +113,7 @@ pub(crate) struct RegistryChange<'a> {
     after: RegistryCounts,
     delta: PreparedDelta<'a>,
 }
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ModelRegistry<
     const REVISIONS: usize,
     const ALIASES: usize,
