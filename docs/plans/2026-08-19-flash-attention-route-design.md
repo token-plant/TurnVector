@@ -249,10 +249,11 @@ Every Attention Path fixes exactly one compilation timing policy:
   the Residency Reservation and route resource evidence. Successful load
   advances Backend Generation, and the Revision remains unavailable for
   Candidate Formation until post-load `describe_model` reproduces the registered
-  Model Descriptor exactly. Failed or cancelled load strongly rolls back to zero
-  retained Backend residency ownership. Failure marks the Revision Unavailable
-  and receives no automatic retry; cancellation leaves it non-resident under the
-  existing Residency Demand policy.
+  Model Descriptor exactly. A failed or cooperatively cancelled started load is
+  a Residency Failure: it strongly rolls back to zero retained Backend residency
+  ownership, marks the Revision Unavailable, fails every Warming waiter, and
+  stops automatic retry. Cancellation by the last waiter before loading starts
+  remains ordinary Residency Demand withdrawal and makes no Backend load call.
 - `BOUNDED_FIRST_USE` permits compilation only inside `execute_turn`. Beginning
   that compilation starts the Turn, and the complete direct-call interval is
   Engine Service. The exact Case Bound Table and Resource Reservation include
@@ -378,9 +379,12 @@ before route work as Plan Rejection; compilation followed by success, typed
 failure, or bound excess as started-Turn paths requiring either a trustworthy
 Turn Receipt or fail-stop; Device Control Signal observation versus a
 Core-ordered cancellation; and queued cancellation before versus after
-Turn Receipt commit. Batch fixtures cover one, some, and all members, including
-cases with no staged output. Every started case asserts the frozen route identity
-and proves that no alternate path executed.
+Turn Receipt commit. Decode B1 fixtures include a compile-period Device Control
+Signal with no matching Core cancellation and no staged output. Decode B4
+fixtures order authorized cancellation for exactly one, some, and all four
+members both before and after Turn Receipt commit, including no-output discard.
+Every started case asserts the frozen route identity and proves that no alternate
+path executed.
 
 ## PagedKV Coordination
 
@@ -592,8 +596,9 @@ Ownership is singular:
 - compile finite exact Capability Keys and reject wildcard combinations; and
 - add contract-level fake/native fixtures proving Candidate Exclusion for an
   absent pair, Plan Rejection before route work, started-Turn classification
-  after compile begins, signal-versus-Core cancellation ordering, per-member
-  Batch behavior, no-output discard, and no fallback.
+  after compile begins, exact Decode B1 signal-only/no-output behavior, exact
+  Decode B4 one/some/all-member cancellation ordering, no-output discard, and no
+  fallback.
 
 ### FA02: Baseline Dispatch Evidence
 

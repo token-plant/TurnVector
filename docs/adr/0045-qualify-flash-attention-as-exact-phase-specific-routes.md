@@ -71,8 +71,11 @@ evidence; load does not add a Residency variant or mutate a Backend Capability
 descriptor, Certification Authorization Index, or Authorized Capability Set.
 Successful load advances Backend Generation, and the Revision remains
 unavailable for Candidate Formation until post-load Model Descriptor equality
-succeeds. Failed or cancelled load strongly rolls back; failure marks the
-Revision Unavailable under the existing Residency contract. A
+succeeds. A failed or cooperatively cancelled started load is a Residency
+Failure: it strongly rolls back to zero retained Backend residency ownership,
+marks the Revision Unavailable, fails every Warming waiter, and stops automatic
+retry. Cancellation by the last waiter before loading starts remains ordinary
+Residency Demand withdrawal. A
 `BOUNDED_FIRST_USE` route is a distinct exact route whose Case Bound Table and
 resource evidence conservatively include cold compilation on every use; a warm
 observation cannot narrow that bound. Compilation inside `execute_turn` is

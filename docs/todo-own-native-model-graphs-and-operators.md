@@ -191,8 +191,9 @@ and its
   qualified `BOUNDED_FIRST_USE`; prove exact compilation, cold resource and
   Engine Service bounds, existing model-load rollback/generation/description
   semantics, compile-period Device Control Signal versus Core cancellation
-  ordering at the qualified Turn boundary, per-member output discard,
-  started-Turn failure typing, and no in-Turn fallback.
+  ordering at the qualified Turn boundary, exact Decode B1 signal-only/no-output
+  and Decode B4 one/some/all-member cancellation fixtures, per-member output
+  discard, started-Turn failure typing, and no in-Turn fallback.
 - [ ] Make the TurnVector-owned path the production default only after its
   complete correctness, resource, performance, and failure envelopes pass.
 - [ ] Decide through a later reviewed change whether the exported-graph path
