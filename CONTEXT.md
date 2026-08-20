@@ -642,8 +642,8 @@ The canonical local root registered in a Model Manifest from which the in-proces
 _Avoid_: Model Alias, caller path, mutable Model Revision
 
 **Model Alias**:
-A Control Plane-managed mutable name resolved exactly once to a Model Revision before Warming. Alias changes affect only later requests; existing requests continue on their original revision, and old and new revisions may coexist temporarily.
-_Avoid_: Model Revision, per-Turn lookup
+A Control Plane-managed name bound exactly once to one Model Revision and resolved exactly once before Warming. Once bound, the Alias cannot be rebound or repointed, including around a Retiring or Unavailable target; existing requests remain frozen to their original revision.
+_Avoid_: Model Revision, per-Turn lookup, alias repoint
 
 **Retiring Revision**:
 A registered Model Revision that accepts no new alias binding or request but remains available to existing requests. After its final request and Reservation release, Residency Policy may unload it and the Control Plane may remove its registration.

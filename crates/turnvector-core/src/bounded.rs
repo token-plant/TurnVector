@@ -535,6 +535,8 @@ pub struct FixedWindowCounter<const CELLS: usize, const H: usize> {
     history: [VecDeque<MonotonicTime>; CELLS],
 }
 
+pub(crate) struct FixedWindowStart(usize, MonotonicTime);
+
 impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
     pub fn try_new(bounds: [[FixedStartCountBound; H]; CELLS]) -> Result<Self, FixedStorageError> {
         if CELLS == 0 || H == 0 || H > 8 {
@@ -566,11 +568,22 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         at: MonotonicTime,
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
+        let start = self.prepare_start(cell, at, work)?;
+        self.apply_start(start);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_start(
+        &self,
+        cell: usize,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<FixedWindowStart, FixedStorageError> {
         work.record(WorkDimension::InvariantChecks, 1)?;
         let (bounds, history) = self
             .bounds
             .get(cell)
-            .zip(self.history.get_mut(cell))
+            .zip(self.history.get(cell))
             .ok_or(FixedStorageError::Capacity)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
         if history.back().is_some_and(|prior| at < *prior) {
@@ -593,11 +606,16 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
             WorkDimension::CopiedBytes,
             size_of::<MonotonicTime>() as u64,
         )?;
-        if history.len() == bounds[H - 1].1 as usize {
+        Ok(FixedWindowStart(cell, at))
+    }
+
+    pub(crate) fn apply_start(&mut self, start: FixedWindowStart) {
+        let FixedWindowStart(cell, at) = start;
+        let history = &mut self.history[cell];
+        if history.len() == self.bounds[cell][H - 1].1 as usize {
             history.pop_front();
         }
         history.push_back(at);
-        Ok(())
     }
 
     pub fn len(&self, cell: usize) -> Option<usize> {
