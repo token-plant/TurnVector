@@ -161,31 +161,37 @@ it owns no copied ABI payload.
 | Capability Key and Case Bound Table, outside the route descriptor | Exact `attention_phase` and configured runtime batch/Shape case. They reference, rather than redefine, the route-owned model geometry, compute dtype, weight layout, KV storage/page ABI, kernel tile, and scratch identities. |
 
 There is one authority for each concept and no independently mutable Attention
-Path by KV-layout compatibility matrix. The finite canonical Execution Route
-descriptors declared by the Backend Capability descriptor are the sole
-representation of structural path/layout compatibility, and the Model Planner
-is its sole runtime owner. It may propose only a complete declared composition;
-it cannot infer a new pair.
+Path by KV-layout compatibility matrix. The complete canonical Execution Route
+descriptor is the sole representation of one structural composition. The Model
+Descriptor binds its finite route identities, the Capability Requirement Set
+enumerates them per request, and the Model Planner is the sole runtime owner of
+structural path/layout compatibility. It may consider only complete declared
+compositions compatible with the eligible request facts and supplied hard
+constraints; it cannot infer a new pair.
 
-The offline Certification compiler is the separate sole authorization authority
-that accepts such a composition into the Certification Authorization Index. It
+The offline Certification compiler verifies the Coverage Manifest and evidence
+for each declared composition and emits a read-only Certified Execution Profile
+into the Certification Authorization Index; it is not an authorization owner. It
 rejects an Attention Path whose reference does not equal the corresponding
 canonical route member, targets an unknown member, declares support outside that
 member, or combines members whose support declarations do not intersect for the
-exact Key. A change to the path kind or any referenced member changes the
+exact Key. The immutable Certification Record supplies authorization, and
+Admission alone derives runtime applicability and each request's Authorized
+Capability Set. A change to the path kind or any referenced member changes the
 Attention Path and Execution Route identities. Phase and shape are not
 duplicated as route members; graph, kernel, KV, and memory members declare only
 the exact support that their Capability Key and Case Bound Table may reference.
 
-During Candidate Formation the Model Planner receives only the finite exact Keys
-allowed by its hard constraints; an absent composition cannot be proposed, and
-if that leaves an eligible request out of every Candidate the result carries a
-Candidate Exclusion. Core associates a returned Candidate only when every
+During Candidate Formation the Model Planner receives eligible request facts and
+hard constraints, not an Authorized Capability Set or Certification
+Applicability evidence. It may propose only a finite structurally declared exact
+Key; if no compatible Candidate contains an eligible request, the result carries
+a Candidate Exclusion. Core associates a returned Candidate only when every
 member's Authorized Capability Set contains that Key. The Adapter performs final
-canonical equality and applicability validation on a still-current Turn Plan;
-drift may return Plan Rejection only before any route operation starts. This
-locates each rejection at the earliest layer that can prove it without creating
-a second compatibility authority.
+canonical equality and route/state applicability validation on a still-current
+Turn Plan; drift may return Plan Rejection only before any route operation
+starts. This locates each rejection at the earliest layer that can prove it
+without creating a second compatibility or authorization owner.
 
 The canonical members produce one Execution Route Identity. The Capability Key
 combines that identity with Model Revision, phase, configured batch/Shape,
@@ -231,21 +237,32 @@ evidence even when they share source files or compiled libraries.
 
 Every Attention Path fixes exactly one compilation timing policy:
 
-- `PRECOMPILED_REQUIRED` compiles or loads the exact kernel bundle during a
-  bounded owner-thread Residency Transition. This is artifact preparation, not
-  Attention Path selection or execution. The route is absent from installed
-  capabilities and Scheduling Snapshots until the transition succeeds and the
-  exact artifact identity is revalidated. Its compilation time is Residency
-  Service under the applicable Backend Operation Bound Set, while the retained
-  artifact and load allocations remain part of route resource evidence.
+- `PRECOMPILED_REQUIRED` prepares the exact kernel bundle inside the existing
+  model-load variant of the bounded owner-thread Residency Transition. This is
+  artifact preparation, not a new Residency variant, Attention Path selection,
+  or execution. The route and policy already exist in the immutable Model
+  Descriptor, Certification Record, and Certification Authorization Index; a
+  later Capability Requirement Set may enumerate them, but load mutates none of
+  those artifacts and cannot rewrite a frozen Authorized Capability Set. Its
+  compilation time is Residency Service under the applicable Backend Operation
+  Bound Set, while the retained artifact and load allocations remain covered by
+  the Residency Reservation and route resource evidence. Successful load
+  advances Backend Generation, and the Revision remains unavailable for
+  Candidate Formation until post-load `describe_model` reproduces the registered
+  Model Descriptor exactly. Failed or cancelled load strongly rolls back to zero
+  retained Backend residency ownership. Failure marks the Revision Unavailable
+  and receives no automatic retry; cancellation leaves it non-resident under the
+  existing Residency Demand policy.
 - `BOUNDED_FIRST_USE` permits compilation only inside `execute_turn`. Beginning
   that compilation starts the Turn, and the complete direct-call interval is
   Engine Service. The exact Case Bound Table and Resource Reservation include
   worst-case cold compilation time, allocations, inference, synchronization,
-  and failure cleanup. The same Key always schedules against that conservative
-  cold bound; warm-cache telemetry cannot narrow it or authorize a warm-only
-  case. A tighter warm-only bound requires a distinct `PRECOMPILED_REQUIRED`
-  route identity and complete independent qualification.
+  and failure cleanup. The Model Descriptor and Residency Reservation reserve
+  any compiled artifact retained after first use before Admission; the Turn
+  cannot grow unreserved persistent model state. The same Key always schedules
+  against the conservative cold bound; warm-cache telemetry cannot narrow it or
+  authorize a warm-only case. A tighter warm-only bound requires a distinct
+  `PRECOMPILED_REQUIRED` route identity and complete independent qualification.
 
 Shared-production promotion defaults to `PRECOMPILED_REQUIRED`. A
 `BOUNDED_FIRST_USE` route may be promoted only through an explicit product gate
@@ -253,19 +270,30 @@ that accepts its cold-start availability consequence and after repeated exact
 compile success, failure, resource, and bound qualification on the named MLX,
 Metal, macOS, Adapter, and device Envelope. A missing required precompiled
 artifact detected before a route operation starts may produce Plan Rejection. A
-first-use compile failure after start is a typed started-Turn failure: the user's
-Turn fails, no gathered or automatic route runs in its place, and only a later
-fresh Scheduling Snapshot may select a separately authorized alternative.
+first-use compile failure after start is a typed started-Turn failure: that
+started Turn fails, no gathered or automatic route runs in its place, and only a
+later fresh Scheduling Snapshot may select a separately authorized alternative.
 
-Compilation is not assumed to expose an interruptible interval. A cancellation
-ordered while it is active enters Cancel Pending without force-aborting the MLX
-or Metal compiler. Execution continues to the first qualified synchronized
-state-safe boundary within the exact Turn bound. If compile completion is a
-qualified boundary, the Adapter submits no inference work and returns the
-cancelled Member Outcome in the Turn Receipt; otherwise the route continues to
-its next qualified boundary. The rule applies even when no output has been
-staged. An external command that has merely arrived is not Cancellation Accepted
-until Core orders it. A route with no conservative bound to that boundary is
+Compilation is not assumed to expose an interruptible interval, and compile
+completion is not a P0 cancellation boundary. While the synchronous owner-thread
+call is active, an external thread may set the read-only Device Control Signal.
+That atomic flag asks the operation to reach its next declared safe point but
+carries no semantic order, cannot enter Cancel Pending, cannot identify the
+winning cancellation/Turn Receipt order, is not Cancellation Accepted, and
+cannot select one Batch member's terminal outcome. The Adapter does not
+force-abort MLX or Metal compilation; it continues the exact planned route to
+its next qualified synchronized Turn boundary and returns a trustworthy
+Turn Receipt within the exact bound.
+
+Once owner-thread control returns, the Event Loop reconciles the queued
+cancellation command and returned Turn Receipt through the existing contiguous
+Event Sequence before Output Publication. If Core orders an authorized
+cancellation first, that member enters Cancel Pending; Turn Receipt commit
+consumes the started result and discards the member's staged output, including
+when none exists. If Turn Receipt commit and Output Publication order first, a
+later cancellation cannot revoke them. A signal without a matching Core-ordered
+command cannot cancel a request, fabricate a Member Outcome, or determine Batch
+scope. A route with no conservative bound to the synchronized boundary is
 ineligible for shared execution.
 
 ## Scheduling, Execution, And Fallback Laws
@@ -280,9 +308,10 @@ The Scheduling Snapshot contains the loaded immutable Revision, exact installed
 and qualified route identities, bounded reusable allocations,
 allocator/resource observations, and relevant Pending Reclaim state. It does
 not dynamically discover a new fused path and add authority. A
-`PRECOMPILED_REQUIRED` route appears only after its exact artifact has compiled
-or loaded successfully; a `BOUNDED_FIRST_USE` route carries its complete cold
-bound without relying on current cache warmth.
+`PRECOMPILED_REQUIRED` route is declared before load but remains infeasible while
+the Revision is non-resident or awaiting exact post-load Model Descriptor
+revalidation; a `BOUNDED_FIRST_USE` route carries its complete cold bound without
+relying on current cache warmth.
 
 ### Candidate Formation And Turn Plan
 
@@ -319,9 +348,10 @@ return a trustworthy synchronized Turn Receipt with typed outcomes under the
 existing isolation/quarantine rules. If it cannot, the process fail-stops and
 fabricates no Turn Receipt.
 
-Cancellation remains cooperative at qualified Turn boundaries, including the
-compile-completion boundary only where that exact boundary was qualified. A
-compiler or kernel that cannot reach the next boundary within the declared bound
+Cancellation remains cooperative at qualified synchronized Turn boundaries.
+Compile completion alone is not such a boundary in P0, and Device Control Signal
+observation supplies no cancellation order. A compiler or kernel that cannot
+return the Turn Receipt within the declared bound and next-safe-point allowance
 is ineligible rather than made interruptible by adding unbounded polling,
 force-abort, or concurrent Metal work.
 
@@ -345,10 +375,12 @@ as Turn start.
 
 The contract fixture must distinguish at least: unsupported or missing state
 before route work as Plan Rejection; compilation followed by success, typed
-failure, bound excess, or ordered cancellation as started-Turn paths requiring a
-trustworthy Receipt or fail-stop; and a cancellation request that has merely
-arrived from one that Core has ordered. Every started case asserts the frozen
-route identity and proves that no alternate path executed.
+failure, or bound excess as started-Turn paths requiring either a trustworthy
+Turn Receipt or fail-stop; Device Control Signal observation versus a
+Core-ordered cancellation; and queued cancellation before versus after
+Turn Receipt commit. Batch fixtures cover one, some, and all members, including
+cases with no staged output. Every started case asserts the frozen route identity
+and proves that no alternate path executed.
 
 ## PagedKV Coordination
 
@@ -453,11 +485,13 @@ overrun, cancellation, backend loss, teardown, and failure to observe reclaim
 convergence. They distinguish a missing `PRECOMPILED_REQUIRED` artifact before
 route work, which may be Plan Rejection, from a `BOUNDED_FIRST_USE` compile that
 has begun, whose failure is a typed started-Turn failure and whose excess is a
-Bound Violation. They also order cancellation during compilation, prove no
-force-abort, reach the first qualified state-safe boundary within the bound, and
-return a trustworthy cancelled Receipt even with no staged output. An
-untrustworthy started result fail-stops, and a started-Turn failure never
-triggers hidden replay through the gathered reference route.
+Bound Violation. They also prove that a compile-period Device Control Signal
+neither force-aborts compilation nor orders cancellation, the Turn reaches its
+qualified synchronized boundary within the bound, and only the later contiguous
+Event Sequence can place a member in Cancel Pending and discard its staged
+output, including the no-output case. An untrustworthy started result fail-stops,
+and a started-Turn failure never triggers hidden replay through the gathered
+reference route.
 
 ## Correctness Qualification
 
@@ -521,9 +555,11 @@ Promotion requires all of the following:
    one-field drift.
 2. Correctness, multi-turn KV state, cancellation, cleanup, and isolation pass.
 3. The exact artifact compiles and loads on the named Envelope;
-   `PRECOMPILED_REQUIRED` routes remain unavailable until that succeeds, while
-   any promoted `BOUNDED_FIRST_USE` route passes its cold-start availability,
-   resource, cancellation, and failure gates.
+   `PRECOMPILED_REQUIRED` routes remain infeasible until the existing model-load
+   transition, Backend Generation advance, and post-load Model Descriptor
+   equality succeed without mutating capability or authorization descriptors,
+   while any promoted `BOUNDED_FIRST_USE` route passes its cold-start
+   availability, resource, cancellation, and failure gates.
 4. Resource and Engine Service bounds pass with the declared safety margins.
 5. End-to-end comparison meets predeclared thresholds for every promoted case.
 6. Turn Receipt telemetry proves the intended route ran without being used as
@@ -556,7 +592,8 @@ Ownership is singular:
 - compile finite exact Capability Keys and reject wildcard combinations; and
 - add contract-level fake/native fixtures proving Candidate Exclusion for an
   absent pair, Plan Rejection before route work, started-Turn classification
-  after compile begins, cancellation-to-boundary behavior, and no fallback.
+  after compile begins, signal-versus-Core cancellation ordering, per-member
+  Batch behavior, no-output discard, and no fallback.
 
 ### FA02: Baseline Dispatch Evidence
 
@@ -565,7 +602,9 @@ Ownership is singular:
 - qualify pinned automatic dispatch only when all reachable variants are
   enumerated and bounded;
 - prove exact precompile/load success or the complete first-use cold path on the
-  named Envelope; and
+  named Envelope, including load failure/cancellation rollback, Backend
+  Generation advance only on success, post-load Model Descriptor equality, and
+  no descriptor, index, or Authorized Capability Set mutation; and
 - optionally add required-fused cases as separate routes, never as fallback.
 
 ### PA03 Shared Dependency: PagedKV Gather Reference

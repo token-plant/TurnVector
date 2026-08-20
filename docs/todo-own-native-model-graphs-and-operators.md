@@ -189,8 +189,10 @@ and its
   fails closed.
 - [ ] Bind each Attention Path to `PRECOMPILED_REQUIRED` or independently
   qualified `BOUNDED_FIRST_USE`; prove exact compilation, cold resource and
-  Engine Service bounds, compile-period cancellation to the first qualified
-  boundary, started-Turn failure typing, and no in-Turn fallback.
+  Engine Service bounds, existing model-load rollback/generation/description
+  semantics, compile-period Device Control Signal versus Core cancellation
+  ordering at the qualified Turn boundary, per-member output discard,
+  started-Turn failure typing, and no in-Turn fallback.
 - [ ] Make the TurnVector-owned path the production default only after its
   complete correctness, resource, performance, and failure envelopes pass.
 - [ ] Decide through a later reviewed change whether the exported-graph path

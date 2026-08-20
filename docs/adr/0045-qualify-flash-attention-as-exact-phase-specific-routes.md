@@ -19,12 +19,13 @@ memory owns scratch; and the command member owns submission and replay. A
 canonical mismatch between a path reference and its route member is invalid.
 There is no separate mutable Attention Path by KV-layout compatibility matrix.
 A production combination exists only as one complete canonical Execution Route
-declared by the Backend Capability descriptor and accepted by the offline
-Certification compiler as an exact Certified Execution Profile. The Model
-Planner is the sole runtime owner of structural path/layout compatibility and
-may propose only those finite declared compositions; Core enforces exact-key
-authorization, and the Adapter may reject later drift only before a route
-operation starts.
+bound by the Model Descriptor, enumerated by the Capability Requirement Set, and
+covered by an immutable Certification Record. The Model Planner is the sole
+runtime owner of structural path/layout compatibility and may propose only those
+finite declared compositions. The offline Certification compiler verifies their
+evidence and emits the read-only index; Admission alone derives each Authorized
+Capability Set, Core enforces exact-key membership, and the Adapter may reject
+later drift only before a route operation starts.
 
 The PagedKV and attention contracts are designed together because a native
 page-reading kernel depends on the block-table reader ABI, mask and position
@@ -63,28 +64,37 @@ No started Turn silently falls back.
 
 Every Attention Path fixes either `PRECOMPILED_REQUIRED` or
 `BOUNDED_FIRST_USE` as its compilation timing policy. Shared-production routes
-default to `PRECOMPILED_REQUIRED`: the exact artifact is compiled or loaded by a
-bounded owner-thread Residency Transition and the route is not installed or
-eligible for a Scheduling Snapshot until that operation succeeds on the exact
-qualified MLX, Metal, OS, Adapter, and device Envelope. A
+default to `PRECOMPILED_REQUIRED`: the exact artifact is prepared inside the
+existing bounded owner-thread model-load Residency Transition. The route and
+policy are already fixed in the immutable Model Descriptor and certification
+evidence; load does not add a Residency variant or mutate a Backend Capability
+descriptor, Certification Authorization Index, or Authorized Capability Set.
+Successful load advances Backend Generation, and the Revision remains
+unavailable for Candidate Formation until post-load Model Descriptor equality
+succeeds. Failed or cancelled load strongly rolls back; failure marks the
+Revision Unavailable under the existing Residency contract. A
 `BOUNDED_FIRST_USE` route is a distinct exact route whose Case Bound Table and
 resource evidence conservatively include cold compilation on every use; a warm
 observation cannot narrow that bound. Compilation inside `execute_turn` is
 Engine Service, not Runtime Overhead. Qualification must prove exact
 compilability and the declared cold-start availability policy. If compilation
 nevertheless fails after the Turn starts, that Turn fails rather than degrading
-to another route; only a later fresh Snapshot may select a separately authorized
-alternative.
+to another route; only a later fresh Scheduling Snapshot may select a separately
+authorized alternative.
 
-Compilation is not assumed interruptible. A cancellation ordered while
-compilation is active enters Cancel Pending, but does not force-abort MLX or
-Metal compilation. The route continues to its first qualified synchronized
-state-safe boundary within the exact Turn bound. If compile completion is such a
-boundary, no inference submission starts and the Adapter returns the cancelled
-Member Outcome in the Turn Receipt; otherwise it continues to the next qualified
-boundary. This rule does not depend on staged output existing. A command that has
-only arrived at an external queue is not Cancellation Accepted until the Core
-orders it, and an unbounded or untrustworthy path to the boundary is ineligible.
+Compilation is not assumed interruptible, and compile completion is not a P0
+cancellation boundary. While the owner-thread call is active, an external Device
+Control Signal may request timely return but carries no semantic order, cannot
+enter Cancel Pending, constitute Cancellation Accepted, or select a Batch member
+or terminal outcome. The Adapter does not force-abort MLX or Metal compilation;
+it continues the exact planned route to its next qualified synchronized Turn
+boundary and returns one trustworthy Turn Receipt within the exact bound. After
+owner-thread control returns, the Event Loop orders the queued cancellation
+command and Turn Receipt commit through the existing contiguous Event Sequence.
+Only a cancellation ordered first enters Cancel Pending and discards that
+member's staged output, including the no-output case; a signal alone has no
+cancellation authority, and a later cancellation cannot revoke published
+output. An unbounded or untrustworthy path to that boundary is ineligible.
 
 This decision does not change the P0 baseline or claim that a fused or tiled
 route is faster. A route is promoted only after exact correctness, resource,
