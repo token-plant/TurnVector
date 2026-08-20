@@ -10,6 +10,9 @@ First external profile: `turnvector.openai-chat.v1`
 
 Required local protocol: TurnVector Data Plane major 1
 
+Performance contract:
+`docs/plans/2026-08-20-compatibility-gateway-performance-architecture.md`
+
 ## 1. Purpose
 
 TurnVector deliberately exposes only authenticated, bounded local Data and
@@ -141,6 +144,12 @@ Private implementation modules are:
 Only the private `DataPlanePort` is an internal seam. The production adapter
 uses the local Unix socket and a scripted in-memory adapter drives module-level
 tests. No other private module gets a public trait merely for mocking.
+
+Performance refinement does not change this Interface or Seam. Request-local
+stage values, immutable route/codec objects, reusable buffers, and work counters
+remain private Implementation details and are tested through
+`OpenAiChatGateway.handle`. Their single-work, allocation, copy, and
+observability laws are defined by the performance contract named above.
 
 The intended crate layout is:
 
@@ -678,6 +687,13 @@ Tokenization runs on a bounded CPU executor outside the async socket loop.
 Output decoding and JSON/SSE framing are charged to gateway budgets only; they
 never enter TurnVector Runtime Overhead or Backend service accounting.
 
+Before production enablement, the Gateway build also declares the compositional
+Gateway Work Budget required by the performance contract. The budget accounts
+for entries examined, tokenizer/template invocations,
+allocations, categorized copied bytes, local and external frames, partial
+writes, and queue occupancy. It does not relabel these observations as Backend
+Engine Service or claim that an unmeasured copy is zero-cost.
+
 ## 13. Security and privacy
 
 The gateway is the network trust boundary. Non-loopback listeners require TLS;
@@ -799,6 +815,9 @@ artifact hashes. Benchmark-project changes require a separate explicitly scoped
 TurnVectorBenchmark task. The versioned observation, model, CasePlan, evidence,
 and claim contract for response-lifetime and Unix-connection validation is
 `docs/plans/2026-08-20-gateway-lifecycle-uds-validation.md`.
+The broader Gateway stage, work, allocation, copy, queue, and instrumentation
+contract is
+`docs/plans/2026-08-20-compatibility-gateway-performance-architecture.md`.
 
 ## 16. Implementation order and gates
 
@@ -830,6 +849,9 @@ Recommended delivery slices are:
 
 Each slice remains independently green. A production listener stays disabled
 until G01 through G07 and all named daemon dependencies pass.
+The performance contract adds gates to these existing slices; it does not add
+another delivery sequence or authorize a production listener after a failed
+resource, single-work, backpressure, or evidence gate.
 
 ## 17. Upgrade and deployment
 

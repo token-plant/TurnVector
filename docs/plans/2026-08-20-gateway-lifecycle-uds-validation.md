@@ -11,7 +11,8 @@ Related architecture:
 - `docs/adr/0030-bound-ingress-and-keep-external-io-off-the-device-loop.md`;
 - `docs/adr/0034-acknowledge-and-bound-the-live-request-lifecycle.md`;
 - `docs/adr/0041-run-compatibility-gateways-outside-the-daemon.md`;
-- `docs/plans/2026-08-19-compatibility-gateway-design.md`.
+- `docs/plans/2026-08-19-compatibility-gateway-design.md`;
+- `docs/plans/2026-08-20-compatibility-gateway-performance-architecture.md`.
 
 ## 1. Decision and scope
 
@@ -34,6 +35,13 @@ The analysis answers two questions:
 The first question is a correctness and ownership question. The second is a
 performance and architecture-decision input. Neither permits a performance
 claim from formulas, a fixture, or an in-memory Data Plane adapter.
+
+This contract does not own the complete Gateway hot-path performance model.
+Stage work, allocation, categorized copy bytes, queue occupancy,
+instrumentation overhead, and semantic-only Data Plane placement are defined by
+the Gateway performance architecture. This document retains sole ownership of
+the `t0` through `t5` lifecycle decision and the per-request Unix connection
+candidate rule so the same cost is not judged under two contracts.
 
 "Model lifetime" is not used for this analysis. Model Residency can span many
 requests and is governed independently. The measured lifetime is one request's
@@ -271,8 +279,8 @@ Decision order after a real run:
    before the run;
 2. retain per-request connections if even perfect reuse cannot repay the
    budgeted complexity or material latency/CPU cost;
-3. if it can, prototype a pre-negotiated single-use connection pool and measure
-   its real `M` in a paired same-session contract;
+3. if it can, prototype a pre-negotiated single-borrower connection pool and
+   measure its real `M` in a paired same-session contract;
 4. retain one-request ownership and discard the candidate if the measured
    inequality does not hold or any lifecycle/isolation gate regresses;
 5. require a new ADR and a new qualification contract before multiplexing,
