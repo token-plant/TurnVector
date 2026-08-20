@@ -1104,14 +1104,18 @@ The combined descriptor-registration implementation is likewise refined only
 for delivery. The exact Rust 1.97.1 `rustfmt`-normalized, focused-green C10a
 source diff is 224 human-counted lines: `bounded.rs` contributes 21 additions
 plus 3 deletions, and `support.rs` contributes 172 additions plus 28 deletions.
-C10b's descriptor-bound Model Registry state remains estimated at 165-185 human
-lines and C10c's integrated Core transitions at 180-230, for 569-639 human lines
-before generated cascades, above both the former 380-line row cap and the global
-420-line ceiling. Each runtime-source row also carries the normal fixed 18-line
-B03-B05 and three-fixture generated cascade. C10a therefore projects 242 lines
-against a fixed cap of 260, leaving 18 lines under that row cap and 178 under the
-global ceiling; C10b remains at 183-203 against its fixed cap of 220, and C10c
-remains at 198-248 against its fixed cap of 280.
+The exact Rust 1.97.1 `rustfmt`-normalized, focused-green C10b source diff is 344
+human-counted lines: its production region contributes 159 additions plus 37
+deletions, and its test region contributes 124 additions plus 24 deletions, for
+283 additions plus 61 deletions overall. C10c's integrated Core transitions
+remain estimated at 180-230 human lines, so the three rows total 748-798 human
+lines before generated cascades, above both the former 380-line row cap and the
+global 420-line ceiling. Each runtime-source row also carries the normal fixed
+18-line B03-B05 and three-fixture generated cascade. C10a therefore projects 242
+lines against a fixed cap of 260, leaving 18 lines under that row cap and 178
+under the global ceiling; C10b projects 362 against its fixed cap of 380, leaving
+18 lines under that row cap and 58 under the global ceiling; and C10c remains at
+198-248 against its fixed cap of 280.
 
 C10a, C10b, and C10c are ordered, independently green delivery rows. C10a adds
 only the `support_ledger` prepared-change seam and preserves C07/C08 behavior;
@@ -1128,6 +1132,13 @@ in the sole `support_ledger`. Splitting those responsibilities would either
 duplicate start/commit authority or lose independently-green compatibility
 evidence that the legacy C07/C08 entry points preserve state and Hot-Path Work.
 
+C10b remains one independently green row because its opaque `DescriptionPlan`,
+bounded durable canonical descriptor bytes, hash and nonzero vocabulary,
+descriptor-bound `RegistryChange`, and exact readback and post-load equality
+form one invariant in the sole private `model_registry`. Splitting those
+responsibilities would expose a partially registered or partially validated
+interface.
+
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
 | C01 | `feat(core): add checked domain identities` | Distinct IDs, units, sequences, durations, and Monotonic Time | Overflow, zero, and cross-type rejection | <= 360 |
@@ -1141,7 +1152,7 @@ evidence that the legacy C07/C08 entry points preserve state and Hot-Path Work.
 | C08b | `feat(core): reserve lifecycle support` | Extend the same scoped ledger with typed bounded pre-trigger post-load/post-observation description and first/next safety lifecycle reserves; an exact reserved trigger moves its obligation to `pending` or typed impossibility closes it, no trigger allocates capacity, and the generic `LifecycleReserve` construction bypass now rejects | Description and safety maxima; load/observation/sample success, failure, and cancel branches; first pre-ready and next-before-expiry reserve; real post-observation and next-before-expiry public transitions; wrong/duplicate trigger, pending/begin/impossible-close, expiry/capacity edges, mandatory/safety nonborrowability, exact prior state and no Effect on rejection or fault, stable generation, and Hot-Path Work | <= 380 |
 | C09 | `feat(core): manage immutable model revisions` | Manifest identities, Alias freeze, Available/Retiring/Unavailable lifecycle | No alias repoint, registry limits, and incremental counts | <= 400 |
 | C10a | `feat(core): prepare support charge changes` | Add one crate-private, non-forgeable, Support-Ledger-Generation-bound `SupportChange` prepare/validate/commit seam for ordinary start and finish plus a prepared `FixedWindowCounter` start; existing C07/C08 entry points delegate without changing runtime behavior | Read-only preparation, exact-generation stale rejection, single-use commit, ordinary start/finish identity and state, fixed capacity, exact prior state on rejection or fault, stable Hot-Path Work witnesses, and all C07/C08 regressions | <= 260 |
-| C10b | `feat(core): retain model descriptors` | Extend the private `model_registry` with a bounded `DescriptionPlan`, complete canonical Model Descriptor bytes and hash, nonzero `u32` vocabulary, descriptor-bound registration changes, and exact post-load equality; remove the bare `Register` bypass | Bounded bytes, canonical identity/hash/vocabulary validation, plan and Registry Generation binding, stale/duplicate/capacity rejection, post-load exact equality and drift, no bare registration, and no Core, Support, Effect, or runtime authority before C10c | <= 220 |
+| C10b | `feat(core): retain model descriptors` | Extend the private `model_registry` with a bounded `DescriptionPlan`, complete canonical Model Descriptor bytes and hash, nonzero `u32` vocabulary, descriptor-bound registration changes, and exact post-load equality; remove the bare `Register` bypass | Bounded bytes, canonical identity/hash/vocabulary validation, plan and Registry Generation binding, stale/duplicate/capacity rejection, post-load exact equality and drift, no bare registration, and no Core, Support, Effect, or runtime authority before C10c | <= 380 |
 | C10c | `feat(core): describe model registrations` | Give Core sole custody of Support and Registry state; only after an exact C08a ordinary claim, `describe_model` obligation, credit, and active charge commits may it retain one pending `DescriptionPlan` and emit the stateless Model Descriptor Effect; an accepted Result atomically finishes that charge and commits its `RegistryChange`, or commits neither | `Core::handle` start/Result observability; no Effect without the exact active charge; optional ordinary exhaustion; pending-plan identity/generation/result validation; duplicate, stale, malformed, hash, vocabulary, and Registry rejection; exact rollback with no Effects; retained bytes/hash and post-load equality | <= 280 |
 | C11 | `feat(core): accept requests into preparing` | Ownership, frozen Revision, descriptor-authoritative Top K validation, explicit Service Class, closed Generation Parameters, immutable effective `u64` Sampling Seed plus origin, status version, and preparation timeout | Descriptor vocabulary bounds, explicit zero/caller/daemon origin; Acceptance is not Admission; retries never inherit state | <= 400 |
 | C12 | `feat(core): drive and refresh request descriptions` | Sole initial/post-load/post-observation/stale-generation description owner with O(1) invalidation, stable resident reissue, and deferred Warming refresh; initial description emits an Effect only after C08a atomically creates its typed optional ordinary claim/obligation/credit/active charge, while post-load/post-observation refresh consumes only exact pending lifecycle obligations from the C08b set reserved before the causal load or observation starts and never creates support capacity | Initial optional exhaustion/no-Effect, cross-model advance/counts, exact post-load equality, bounded model/request set, failure/cancel/impossible close, no stale rejection/Admission, no unreserved refresh, original timeout, registry, handle, or Resource Reservation | <= 400 |
