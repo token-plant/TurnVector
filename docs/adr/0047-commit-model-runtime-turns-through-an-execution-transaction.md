@@ -1,5 +1,11 @@
 # Commit Model Runtime Turns Through an Execution Transaction
 
+Related decisions: ADR 0016 defines the pre-start rejection and started-Turn
+terminal law; ADR 0043 fixes batch membership and requires fresh arbitration;
+and ADR 0045 preserves that start barrier for first-use compilation. ADR 0042
+governs the paged KV/COW specialization below; contiguous B=1 does not depend
+on paged KV.
+
 TurnVector will execute each accepted Turn Plan through one private,
 owner-thread-confined Execution Transaction inside the selected Model Runtime.
 The transaction is a deep implementation boundary behind the existing coarse
@@ -11,8 +17,8 @@ tensor batch is one transaction with fixed ordered membership.
 The Device Executor thread remains the sole mutable owner. At most one
 transaction may be active per Model Runtime, and the current single Device
 Executor still runs at most one Backend operation at a time. Each transaction
-binds the exact Turn Plan, Model Runtime generation, Execution Route, Batch
-Execution Kind, route bucket, and ordered member `{slot, generation}` handles.
+binds the exact Turn Plan, Model Runtime generation, Execution Route Identity,
+Batch Execution Kind, route bucket, and ordered member `{slot, generation}` handles.
 Membership, order, and route cannot change after preflight.
 
 The non-fatal state machine is:

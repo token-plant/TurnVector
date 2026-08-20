@@ -108,7 +108,7 @@ Every transaction identity binds:
 
 - the exact Turn Plan identity or digest and Engine Service identity;
 - Model Runtime generation;
-- exact Execution Route and route bucket;
+- exact Execution Route Identity and route bucket;
 - Batch Execution Kind; and
 - ordered member handles.
 
@@ -582,6 +582,13 @@ current native behavior or performance. P-1B remains pending and P-1C remains
 RED in the required historical evidence. Exact coefficients, capacities,
 allocator behavior, aliasing, synchronization cost, and route measurements are
 still implementation and qualification obligations.
+
+Per-member isolation-evidence obtainability and cost are explicit
+route-qualification questions. A route may authorize isolated recovery only
+when it can construct and validate canonical backing, disjointness/COW,
+failure-class, and unaffected-result evidence within its declared work, copy,
+memory, and latency bounds. Otherwise that route must qualify only whole-batch
+quarantine; isolated recovery is not a required capability.
 
 The permitted design claim is:
 
