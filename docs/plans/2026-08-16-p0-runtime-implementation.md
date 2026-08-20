@@ -1269,8 +1269,9 @@ memory, macOS `26.4.1` build `25E253`, and Metal 4 support, for Decode B1
 context 512 and Prefill B1 chunk 64. Its baseline Execution Route uses the exact
 exported graph plus one preallocated memory arena with stable offsets. The
 kernel bundle, fusion plan, and non-paged KV/cache layout use exact baseline
-identities; Speculative Decode, Prefix Reuse, and command replay are explicit
-`NONE`. These values define a qualification target, not completed Certification:
+identities, and the Attention Path is exactly `CONTIGUOUS_MLX_SDPA`;
+Speculative Decode, Prefix Reuse, and command replay are explicit `NONE`. These
+values define a qualification target, not completed Certification:
 the environment and every bound require a fresh run, and P-1A remains `YELLOW`,
 P-1B `PENDING`, and P-1C `RED`.
 
