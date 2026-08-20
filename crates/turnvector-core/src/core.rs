@@ -1,19 +1,73 @@
+use crate::model_descriptor::{
+    MAX_FRAME_BYTES, ModelDescriptorError, ModelDescriptorHash, RawModelDescriptor, verify,
+};
+use crate::model_registry::{
+    DescriptionPlan, MODEL_REGISTRY_LIMIT, ModelRegistry, RegistrationIntent, RegistryError,
+};
+use crate::support::{
+    OrdinarySupportSpec, SupportChangeInput, SupportChargeLedger, SupportLedgerError,
+    SupportOperation,
+};
 use crate::work::WorkMeter;
 use crate::{
-    BoundedVec, EventSequence, GenerationVector, HotPathWorkBudget, HotPathWorkWitness,
-    OperationId, WorkBudgetError, WorkDimension,
+    BoundedVec, EventSequence, FixedIndexError, FixedStorageError, GenerationVector,
+    HotPathWorkBudget, HotPathWorkWitness, MonotonicTime, OperationId,
+    SupportOperationObligationId, WorkBudgetError, WorkDimension,
 };
 const TRANSITION_EFFECT_CAPACITY: usize = 2;
 const MAX_OPERATION_ENTRIES: usize = 32_768;
+#[cfg(not(test))]
+const CORE_SUPPORT_RECORDS: usize = 32_768;
+#[cfg(test)]
+const CORE_SUPPORT_RECORDS: usize = 12;
+#[cfg(not(test))]
+const CORE_SUPPORT_CLAIMS: usize = 4_194_304;
+#[cfg(test)]
+const CORE_SUPPORT_CLAIMS: usize = 12;
+const CORE_SUPPORT_HORIZONS: usize = 3;
+const RAW_DESCRIPTOR_STORAGE: usize = MAX_FRAME_BYTES + 1;
 type Effects = BoundedVec<Effect, TRANSITION_EFFECT_CAPACITY>;
 type Operations<const N: usize> = BoundedVec<OperationId, N>;
 type Positions = [usize; TRANSITION_EFFECT_CAPACITY];
+type CoreSupport =
+    SupportChargeLedger<CORE_SUPPORT_RECORDS, CORE_SUPPORT_CLAIMS, CORE_SUPPORT_HORIZONS>;
+type CoreRegistry = ModelRegistry<MODEL_REGISTRY_LIMIT, MODEL_REGISTRY_LIMIT>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnedRawModelDescriptor {
+    frame: [u8; RAW_DESCRIPTOR_STORAGE],
+    frame_len: u16,
+    id: [u8; 32],
+    hash_schema_version: u32,
+    hash: [u8; 32],
+    vocabulary: u32,
+}
+impl OwnedRawModelDescriptor {
+    #[rustfmt::skip]
+    fn new(raw: RawModelDescriptor<'_>) -> Self { let length = raw.frame.len().min(RAW_DESCRIPTOR_STORAGE); let mut frame = [0; RAW_DESCRIPTOR_STORAGE]; frame[..length].copy_from_slice(&raw.frame[..length]); Self { frame, frame_len: u16::try_from(length).expect("bounded descriptor length fits u16"), id: raw.id, hash_schema_version: raw.hash_schema_version, hash: raw.hash, vocabulary: raw.vocabulary } }
+    #[rustfmt::skip]
+    fn as_raw(&self) -> RawModelDescriptor<'_> { RawModelDescriptor { frame: &self.frame[..usize::from(self.frame_len)], id: self.id, hash_schema_version: self.hash_schema_version, hash: self.hash, vocabulary: self.vocabulary } }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "bounded inline ownership preserves allocation-free Copy events"
+)]
+#[allow(
+    dead_code,
+    reason = "the runtime adapter constructs registration events after C10e"
+)]
+enum RegistrationEvent {
+    Start(RegistrationIntent, OrdinarySupportSpec, MonotonicTime),
+    Result(GenerationVector, OwnedRawModelDescriptor),
+}
 /// One validated operation request presented at an exact Event Sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreEvent {
     sequence: EventSequence,
     operation: OperationId,
     follow_up: Option<OperationId>,
+    registration: Option<RegistrationEvent>,
 }
 impl CoreEvent {
     #[must_use]
@@ -26,14 +80,22 @@ impl CoreEvent {
             sequence,
             operation,
             follow_up,
+            registration: None,
         }
     }
+    #[allow(dead_code, reason = "the runtime adapter constructs registration events after C10e")]
+    #[rustfmt::skip]
+    pub(crate) const fn describe_model(sequence: EventSequence, operation: OperationId, intent: RegistrationIntent, support: OrdinarySupportSpec, at: MonotonicTime) -> Self { Self { sequence, operation, follow_up: None, registration: Some(RegistrationEvent::Start(intent, support, at)) } }
+    #[allow(dead_code, reason = "the runtime adapter constructs registration events after C10e")]
+    #[rustfmt::skip]
+    pub(crate) fn model_descriptor_result(sequence: EventSequence, operation: OperationId, generations: GenerationVector, result: RawModelDescriptor<'_>) -> Self { Self { sequence, operation, follow_up: None, registration: Some(RegistrationEvent::Result(generations, OwnedRawModelDescriptor::new(result))) } }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Effect {
     operation: OperationId,
     generations: GenerationVector,
     depends_on: Option<OperationId>,
+    registration: Option<RegistrationIntent>,
 }
 impl Effect {
     #[must_use]
@@ -48,12 +110,26 @@ impl Effect {
     pub const fn depends_on(self) -> Option<OperationId> {
         self.depends_on
     }
+    #[allow(
+        dead_code,
+        reason = "the runtime adapter reads registration effects after C10e"
+    )]
+    #[must_use]
+    pub(crate) const fn registration(self) -> Option<RegistrationIntent> {
+        self.registration
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DomainRejection {
     OperationIdCollision(OperationId),
     OperationCapacityExceeded,
     HotPathWorkBudget(WorkBudgetError),
+    ModelRegistrationUnavailable,
+    ModelRegistrationPending,
+    ModelRegistrationResultMismatch,
+    ModelRegistrationSupport,
+    ModelRegistrationDescriptor,
+    ModelRegistrationRegistry,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoreFault {
@@ -123,9 +199,16 @@ pub struct Core<const OPERATIONS: usize> {
     state: CoreState<OPERATIONS>,
     fault: Option<CoreFault>,
     work_budget: HotPathWorkBudget,
+    registration: Option<RegistrationState>,
     #[cfg(test)]
     force_candidate_invariant_failure: bool,
 }
+#[rustfmt::skip]
+#[derive(Debug, Eq, PartialEq)]
+struct RegistrationState { support: CoreSupport, registry: CoreRegistry, pending: Option<PendingRegistration> }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[rustfmt::skip]
+struct PendingRegistration { operation: OperationId, generations: GenerationVector, obligation: SupportOperationObligationId, expected_hash: ModelDescriptorHash, plan: DescriptionPlan }
 impl<const OPERATIONS: usize> Core<OPERATIONS> {
     #[must_use]
     pub fn bootstrap(first_sequence: EventSequence, generations: GenerationVector) -> Self {
@@ -150,10 +233,14 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
             },
             fault: None,
             work_budget,
+            registration: None,
             #[cfg(test)]
             force_candidate_invariant_failure: false,
         }
     }
+    #[allow(dead_code, reason = "the runtime bootstrap adapter lands after the Core foundation")]
+    #[rustfmt::skip]
+    pub(crate) fn bootstrap_with_registration(first_sequence: EventSequence, generations: GenerationVector, support: CoreSupport, registry: CoreRegistry) -> Self { let mut core = Self::bootstrap(first_sequence, generations); core.registration = Some(RegistrationState { support, registry, pending: None }); core }
     #[must_use]
     pub const fn state(&self) -> &CoreState<OPERATIONS> {
         &self.state
@@ -196,9 +283,20 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
                 );
             }
         };
-        match self.stage(&event, &mut work) {
-            Ok((positions, effects)) => {
+        let applied = match event.registration {
+            None => self.stage(&event, &mut work).map(|(positions, effects)| {
                 self.commit(&positions, &effects);
+                effects
+            }),
+            Some(RegistrationEvent::Start(intent, support, at)) => {
+                self.start_registration(&event, intent, support, at, &mut work)
+            }
+            Some(RegistrationEvent::Result(generations, result)) => {
+                self.finish_registration(event.operation, generations, result, &mut work)
+            }
+        };
+        match applied {
+            Ok(effects) => {
                 self.state.expected_sequence = next_sequence;
                 transition(
                     event.sequence,
@@ -236,6 +334,12 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
             &mut effects,
             event.operation,
             None,
+            event
+                .registration
+                .and_then(|registration| match registration {
+                    RegistrationEvent::Start(intent, ..) => Some(intent),
+                    RegistrationEvent::Result(..) => None,
+                }),
             self.state.generations,
             work,
         )?;
@@ -246,6 +350,7 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
                 &mut effects,
                 follow_up,
                 Some(event.operation),
+                None,
                 self.state.generations,
                 work,
             )?;
@@ -271,6 +376,35 @@ impl<const OPERATIONS: usize> Core<OPERATIONS> {
         let copied = copied_operation_bytes(self.state.operations.len(), &positions, &effects);
         work.record(WorkDimension::CopiedBytes, copied)?;
         Ok((positions, effects))
+    }
+    #[rustfmt::skip]
+    fn start_registration(&mut self, event: &CoreEvent, intent: RegistrationIntent, support: OrdinarySupportSpec, at: MonotonicTime, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+        let state = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationUnavailable))?;
+        if state.pending.is_some() { return Err(registration_rejection(DomainRejection::ModelRegistrationPending)); }
+        if support.operation != SupportOperation::DescribeModel { return Err(registration_rejection(DomainRejection::ModelRegistrationSupport)); }
+        let (positions, effects) = self.stage(event, work)?;
+        let plan = state.registry.prepare_description(state.registry.generation(), intent, work).map_err(registry_failure)?;
+        let change = state.support.prepare(state.support.generation(), SupportChangeInput::BeginOrdinary(support, at), work).map_err(support_failure)?;
+        state.support.validate(&change).map_err(support_failure)?;
+        let state = self.registration.as_mut().expect("registration state was checked");
+        state.support.commit(change, work).map_err(support_failure)?;
+        state.pending = Some(PendingRegistration { operation: event.operation, generations: self.state.generations, obligation: support.id, expected_hash: intent.expected_descriptor_hash, plan });
+        self.commit(&positions, &effects); Ok(effects)
+    }
+    #[rustfmt::skip]
+    fn finish_registration(&mut self, operation: OperationId, generations: GenerationVector, result: OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+        let state = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationUnavailable))?;
+        let pending = state.pending.ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationResultMismatch))?;
+        if (operation, generations, self.state.generations) != (pending.operation, pending.generations, pending.generations) { return Err(registration_rejection(DomainRejection::ModelRegistrationResultMismatch)); }
+        let descriptor = verify(result.as_raw(), pending.expected_hash, work).map_err(descriptor_failure)?;
+        let registry_change = state.registry.prepare_registration(pending.plan, &descriptor, work).map_err(registry_failure)?;
+        let support_change = state.support.prepare(state.support.generation(), SupportChangeInput::FinishActive(pending.obligation), work).map_err(support_failure)?;
+        state.registry.validate(&registry_change).map_err(registry_failure)?;
+        state.support.validate(&support_change).map_err(support_failure)?;
+        let state = self.registration.as_mut().expect("registration state was checked");
+        state.support.commit(support_change, work).expect("revalidated support finish is infallible");
+        state.registry.commit(registry_change).expect("revalidated registry insertion is infallible");
+        state.pending = None; Ok(BoundedVec::new())
     }
     fn commit(&mut self, positions: &Positions, effects: &Effects) {
         for index in 0..effects.len() {
@@ -299,12 +433,17 @@ impl From<WorkBudgetError> for StageFailure {
         Self::Rejected(DomainRejection::HotPathWorkBudget(error))
     }
 }
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper stages the complete Effect contract without allocation"
+)]
 fn stage_operation<const OPERATIONS: usize>(
     operations: &Operations<OPERATIONS>,
     positions: &mut Positions,
     effects: &mut Effects,
     operation: OperationId,
     depends_on: Option<OperationId>,
+    registration: Option<RegistrationIntent>,
     generations: GenerationVector,
     work: &mut WorkMeter,
 ) -> Result<(), StageFailure> {
@@ -333,9 +472,18 @@ fn stage_operation<const OPERATIONS: usize>(
             operation,
             generations,
             depends_on,
+            registration,
         })
         .map_err(|_| StageFailure::Invariant)
 }
+#[rustfmt::skip]
+fn registration_rejection(reason: DomainRejection) -> StageFailure { StageFailure::Rejected(reason) }
+#[rustfmt::skip]
+fn support_failure(error: SupportLedgerError) -> StageFailure { match error { SupportLedgerError::Storage(FixedStorageError::Work(error)) => error.into(), _ => registration_rejection(DomainRejection::ModelRegistrationSupport) } }
+#[rustfmt::skip]
+fn descriptor_failure(error: ModelDescriptorError) -> StageFailure { match error { ModelDescriptorError::Work(error) => error.into(), _ => registration_rejection(DomainRejection::ModelRegistrationDescriptor) } }
+#[rustfmt::skip]
+fn registry_failure(error: RegistryError) -> StageFailure { match error { RegistryError::Work(error) | RegistryError::Index(FixedIndexError::Work(error)) => error.into(), _ => registration_rejection(DomainRejection::ModelRegistrationRegistry) } }
 fn reject(reason: DomainRejection) -> Result<(), StageFailure> {
     Err(StageFailure::Rejected(reason))
 }
@@ -366,18 +514,45 @@ fn transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_registry::{ModelManifestId, ModelRevisionId, RegistryGeneration};
+    use crate::support::{LifecycleReserveMaxima, SupportCallScopeId, SupportFundingClaim};
     use crate::{
-        BackendGeneration, RuntimeOverheadGeneration, SafetyGeneration, SchedulerGeneration,
+        BackendGeneration, Duration, FixedStartCountBound, ModelId, MonotonicTime,
+        PhysicalStartCreditId, RuntimeOverheadGeneration, SafetyGeneration, SchedulerGeneration,
+        SupportLedgerGeneration, SupportOperationObligationId,
     };
+    const FRAME: [u8; 13] = [0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 1, b'x'];
+    #[rustfmt::skip]
+    const ID: [u8; 32] = [0xc9, 0x1c, 0x14, 0x09, 0x1c, 0xea, 0x08, 0xf4, 0x58, 0xa4, 0xe2, 0x75, 0x96, 0xc1, 0x5b, 0x2c, 0xf0, 0xc8, 0x74, 0x34, 0x2d, 0x30, 0x3e, 0xad, 0xe8, 0x9f, 0x29, 0x0e, 0xd0, 0x13, 0x38, 0x21];
+    #[rustfmt::skip]
+    const HASH: [u8; 32] = [0xe2, 0x24, 0x6d, 0x47, 0x7f, 0x70, 0xd3, 0xe6, 0x58, 0x8b, 0xb5, 0x45, 0xe2, 0x14, 0xc0, 0xbb, 0xa1, 0x76, 0x6e, 0xf3, 0x39, 0x7a, 0x50, 0x71, 0x89, 0x29, 0xc9, 0x4f, 0xe9, 0x62, 0x1e, 0x9b];
+    #[rustfmt::skip]
+    fn generations_with(scheduler: u64, backend: u64, safety: u64, overhead: u64) -> GenerationVector { GenerationVector::new(SchedulerGeneration::new(scheduler).unwrap(), BackendGeneration::new(backend).unwrap(), SafetyGeneration::new(safety).unwrap(), RuntimeOverheadGeneration::new(overhead).unwrap()) }
+    fn generations() -> GenerationVector {
+        generations_with(1, 1, 1, 1)
+    }
+    #[rustfmt::skip]
+    fn registration(hash: [u8; 32]) -> RegistrationIntent { RegistrationIntent { model: ModelId::new(1).unwrap(), revision: ModelRevisionId::new([2; 32]).unwrap(), manifest: ModelManifestId::new([3; 32]).unwrap(), expected_descriptor_hash: ModelDescriptorHash::from_manifest(1, hash).unwrap() } }
+    #[rustfmt::skip]
+    fn ordinary(n: u8) -> OrdinarySupportSpec { OrdinarySupportSpec { id: SupportOperationObligationId([n; 32]), operation: SupportOperation::DescribeModel, physical_credit: PhysicalStartCreditId([n + 1; 32]), scope: SupportCallScopeId([n + 2; 32]), claim: SupportFundingClaim::OrdinaryReservation([n + 3; 32]) } }
+    #[rustfmt::skip]
+    fn raw<'a>(frame: &'a [u8], id: [u8; 32], hash: [u8; 32], vocabulary: u32) -> RawModelDescriptor<'a> { RawModelDescriptor { frame, id, hash_schema_version: 1, hash, vocabulary } }
+    #[rustfmt::skip]
+    fn start(core: &mut Core<4>, sequence: u64, operation: u128, intent: RegistrationIntent, support: u8) -> CoreTransition { core.handle(CoreEvent::describe_model(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), intent, ordinary(support), MonotonicTime::from_micros(sequence))) }
+    #[rustfmt::skip]
+    fn result(core: &mut Core<4>, sequence: u64, operation: u128, descriptor: RawModelDescriptor<'_>) -> CoreTransition { core.handle(CoreEvent::model_descriptor_result(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), generations(), descriptor)) }
+    #[rustfmt::skip]
+    fn registration_core(capacity: u32) -> Core<4> {
+        let mut capacities = [[0; 3]; 5]; for class in [2, 3, 4] { capacities[class][0] = capacity; }
+        let starts = std::array::from_fn(|_| [FixedStartCountBound(Duration::from_micros(10), 2), FixedStartCountBound(Duration::from_micros(20), 2), FixedStartCountBound(Duration::from_micros(30), 2)]);
+        let support = CoreSupport::try_new(SupportLedgerGeneration::new(1).unwrap(), capacities, 1, starts, LifecycleReserveMaxima([1; 5])).unwrap();
+        let registry = CoreRegistry::try_new(RegistryGeneration::new(1).unwrap()).unwrap();
+        Core::bootstrap_with_registration(EventSequence::new(1).unwrap(), generations(), support, registry)
+    }
     #[test]
     fn candidate_invariant_failure_preserves_state_and_latches_fault() {
         let sequence = EventSequence::new(1).unwrap();
-        let generations = GenerationVector::new(
-            SchedulerGeneration::new(1).unwrap(),
-            BackendGeneration::new(1).unwrap(),
-            SafetyGeneration::new(1).unwrap(),
-            RuntimeOverheadGeneration::new(1).unwrap(),
-        );
+        let generations = generations();
         let mut core = Core::<1>::bootstrap(sequence, generations);
         core.force_candidate_invariant_failure = true;
         let before = core.state().clone();
@@ -393,5 +568,42 @@ mod tests {
         assert!(result.effects().is_empty());
         assert_eq!(core.state(), &before);
         assert_eq!(core.fault(), Some(CoreFault::CandidateInvariant));
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn describe_model_starts_only_after_support_charge() {
+        fn public_contract<T: std::fmt::Debug + Eq + PartialEq>() {} public_contract::<Core<4>>(); let _: Option<CoreEvent> = None;
+        let registration = registration(HASH); let mut core = registration_core(2); let transition = core.handle(CoreEvent::describe_model(EventSequence::new(1).unwrap(), OperationId::new(1).unwrap(), registration, ordinary(5), MonotonicTime::from_micros(1)));
+        assert_eq!(transition.outcome(), &CoreOutcome::Accepted);
+        assert_eq!((transition.effects().len(), transition.effects().get(0).unwrap().registration()), (1, Some(registration)));
+        assert_eq!(transition.work(), HotPathWorkWitness::new([3, 448, 0, 1, 30]));
+        let result = core.handle(CoreEvent::model_descriptor_result(EventSequence::new(2).unwrap(), OperationId::new(1).unwrap(), generations(), raw(&FRAME, ID, HASH, 7)));
+        assert_eq!((result.outcome(), result.effects().is_empty()), (&CoreOutcome::Accepted, true));
+        assert_eq!(result.work(), HotPathWorkWitness::new([833, 823, 0, 2, 29]));
+        let state = core.registration.as_ref().unwrap();
+        assert_eq!((state.pending.is_none(), state.registry.counts().registered, state.support.generation()), (true, 1, SupportLedgerGeneration::new(3).unwrap()));
+        let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        let descriptor = state.registry.descriptor(ModelRevisionId::new([2; 32]).unwrap(), &mut work).unwrap().unwrap();
+        let sealed = verify(raw(&FRAME, ID, HASH, 7), ModelDescriptorHash::from_manifest(1, HASH).unwrap(), &mut work).unwrap();
+        assert!(descriptor.exactly_matches(&sealed, &mut work).unwrap());
+    }
+    #[test]
+    #[rustfmt::skip]
+    fn registration_rejections_commit_neither_owner_and_emit_nothing() {
+        let snapshot = |core: &Core<4>| { let state = core.registration.as_ref().unwrap(); (state.support.generation(), state.registry.counts(), state.pending.map(|pending| pending.operation), core.state.generations, core.state.operation_count()) };
+        let assert_rejected = |transition: CoreTransition, rejection, witness| { assert_eq!(transition.outcome(), &CoreOutcome::Rejected(rejection)); assert!(transition.effects().is_empty()); assert_eq!(transition.work(), HotPathWorkWitness::new(witness)); };
+        let mut unavailable = Core::<4>::bootstrap(EventSequence::new(1).unwrap(), generations()); assert_rejected(start(&mut unavailable, 1, 1, registration(HASH), 5), DomainRejection::ModelRegistrationUnavailable, [1, 0, 0, 0, 0]); assert_eq!(unavailable.state.operation_count(), 0);
+        let mut exhausted = registration_core(0); let before = snapshot(&exhausted); assert_rejected(start(&mut exhausted, 1, 1, registration(HASH), 5), DomainRejection::ModelRegistrationSupport, [1, 160, 0, 1, 15]); assert_eq!(snapshot(&exhausted), before);
+        let mut wrong = registration_core(2); let before = snapshot(&wrong); let mut support = ordinary(5); support.operation = SupportOperation::DescribeRequest; assert_rejected(wrong.handle(CoreEvent::describe_model(EventSequence::new(1).unwrap(), OperationId::new(1).unwrap(), registration(HASH), support, MonotonicTime::from_micros(1))), DomainRejection::ModelRegistrationSupport, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&wrong), before);
+        let mut core = registration_core(2); assert_eq!(start(&mut core, 1, 1, registration(HASH), 5).outcome(), &CoreOutcome::Accepted); let pending = snapshot(&core);
+        assert_rejected(start(&mut core, 2, 2, registration(HASH), 9), DomainRejection::ModelRegistrationPending, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&core), pending);
+        assert_rejected(result(&mut core, 3, 2, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationResultMismatch, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&core), pending);
+        for current in [generations_with(2, 1, 1, 1), generations_with(1, 2, 1, 1), generations_with(1, 1, 2, 1), generations_with(1, 1, 1, 2)] { let mut shifted = registration_core(2); assert_eq!(start(&mut shifted, 1, 1, registration(HASH), 5).outcome(), &CoreOutcome::Accepted); shifted.state.generations = current; let before = snapshot(&shifted); assert_rejected(result(&mut shifted, 2, 1, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationResultMismatch, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&shifted), before); }
+        let oversize = [0; MAX_FRAME_BYTES + 2];
+        for (sequence, descriptor, witness) in [(4, raw(&FRAME[..12], ID, HASH, 7), [2, 0, 0, 0, 6]), (5, raw(&FRAME, [0; 32], HASH, 7), [4, 108, 0, 2, 10]), (6, raw(&FRAME, ID, HASH, 8), [4, 108, 0, 2, 10]), (7, raw(&FRAME, ID, [0; 32], 7), [4, 108, 0, 2, 10]), (8, raw(&oversize, ID, HASH, 7), [2, 0, 0, 0, 1])] { assert_rejected(result(&mut core, sequence, 1, descriptor), DomainRejection::ModelRegistrationDescriptor, witness); assert_eq!(snapshot(&core), pending); }
+        assert_eq!(result(&mut core, 9, 1, raw(&FRAME, ID, HASH, 7)).outcome(), &CoreOutcome::Accepted); let committed = snapshot(&core); assert_rejected(start(&mut core, 10, 2, registration(HASH), 9), DomainRejection::ModelRegistrationRegistry, [3, 0, 0, 1, 8]); assert_eq!(snapshot(&core), committed);
+        let mut manifest = registration_core(2); assert_eq!(start(&mut manifest, 1, 1, registration([0; 32]), 5).outcome(), &CoreOutcome::Accepted); let before = snapshot(&manifest); assert_rejected(result(&mut manifest, 2, 1, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationDescriptor, [4, 108, 0, 2, 10]); assert_eq!(snapshot(&manifest), before);
+        let mut stale = registration_core(2); assert_eq!(start(&mut stale, 1, 1, registration(HASH), 5).outcome(), &CoreOutcome::Accepted); { let state = stale.registration.as_mut().unwrap(); let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum()); let sealed = verify(raw(&FRAME, ID, HASH, 7), ModelDescriptorHash::from_manifest(1, HASH).unwrap(), &mut work).unwrap(); let mut other = registration(HASH); other.revision = ModelRevisionId::new([9; 32]).unwrap(); let plan = state.registry.prepare_description(state.registry.generation(), other, &mut work).unwrap(); let change = state.registry.prepare_registration(plan, &sealed, &mut work).unwrap(); state.registry.commit(change).unwrap(); } let before = snapshot(&stale); assert_rejected(result(&mut stale, 2, 1, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationRegistry, [4, 121, 0, 2, 16]); assert_eq!(snapshot(&stale), before);
     }
 }

@@ -153,6 +153,7 @@ type Record = (
     Option<LifecycleReservation>,
 );
 type LifecycleReservation = (LifecycleReserveKind, SupportOperationObligationId, u16);
+#[derive(Debug, Eq, PartialEq)]
 pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     generation: SupportLedgerGeneration,
     capacities: [[u32; POOLS]; 5],
