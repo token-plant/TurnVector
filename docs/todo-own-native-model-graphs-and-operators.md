@@ -48,10 +48,24 @@ The descriptor fixes:
 - kernel-bundle and fusion-plan identities;
 - KV/cache layout ABI whose exact identity distinguishes non-paged and PagedKV
   layouts;
+- independent Attention Path identity;
 - Speculative Decode plan or explicit `NONE`;
 - Prefix Reuse plan with stable kind `NONE`, `PRIVATE_REUSE`, or
   `NATIVE_PAGE_SHARING`; and
 - command-submission or replay plan or explicit `NONE`.
+
+The Attention Path is a composition identity, not a second owner of its
+constituents. It owns the stable path kind, compilation timing and no-fallback
+policies, and canonical references to the exact graph, kernel/fusion, KV/cache,
+memory, and command members. Attention compute input/output and accumulation
+dtype semantics plus mask/position ABIs remain owned by the graph member;
+model-weight storage, quantization, packing, and dequantization by the
+weight-layout ABI; dispatch, kernel artifacts, and compilation inputs by the
+kernel/fusion member; KV storage dtype/quantization, access, page encoding, and
+block-table reader by the KV/cache member; scratch by the memory-plan member;
+and submission/replay by the command member. Execution Phase and runtime Shape
+remain in the exact Capability Key and Case Bound Table rather than being
+duplicated in the route descriptor.
 
 The Profile is only a compact read-only projection of the existing Certification
 Record, Environment Qualification, and Case Bound Table authority. It is not a

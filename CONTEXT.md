@@ -65,7 +65,7 @@ The single synchronized outcome corresponding to a started Turn Plan. It records
 _Avoid_: Receipt, success response, telemetry event
 
 **Plan Rejection**:
-The Backend non-execution result returned from `execute_turn` when a still-current Turn Plan fails a Backend-owned pre-execution Candidate, state, or bound validation before MLX execution starts. It consumes no Engine Service and produces no Turn Receipt; the Scheduler must take a new Scheduling Snapshot rather than substitute work. A daemon-detectable Generation Vector or Runtime Overhead Bound Set mismatch is instead a local Stale Turn Plan disposition before the call and cannot fabricate this result.
+The Backend non-execution result returned from `execute_turn` when a still-current Turn Plan fails a Backend-owned pre-execution Candidate, state, or bound validation before any route operation, including first-use compilation, starts. It consumes no Engine Service and produces no Turn Receipt; the Scheduler must take a new Scheduling Snapshot rather than substitute work. Beginning first-use compilation starts the Turn even when no MLX kernel has executed: compile failure is a typed started-Turn failure, compile-bound excess is a Bound Violation, and neither can be relabeled as Plan Rejection. A daemon-detectable Generation Vector or Runtime Overhead Bound Set mismatch is instead a local Stale Turn Plan disposition before the call and cannot fabricate this result.
 _Avoid_: Failed Turn, retry Receipt
 
 **Member Outcome**:
@@ -278,8 +278,12 @@ _Avoid_: Ordinary estimate error, automatic bound expansion
 A versioned Execution Backend claim authorized by one or more Certification Records that a class of work satisfies specific execution, synchronization, resource, cancellation, and output bounds within a named Certification Envelope. Its complete descriptor binds the exact Generation Semantics Identity and has a content identity fixed in the Backend Bootstrap Manifest and checked against Backend Initialization; the Backend cannot supply its own expected value. The MVP shared-execution contract declares `max_overlapping_turns = 1` and authorizes Cooperative Turn Interleaving with exactly one Backend Turn in flight; this limit is an explicit capability, not an accidental property of the Device Executor Implementation. Individually valid Capability Keys never imply simultaneous multi-stream safety. Any future concurrent-stream mode requires a separate architecture decision and correctness, attribution, latency, throughput, and peak-memory certification for the complete co-running set. A capability is never universal across Apple Silicon, model revisions, Adapter or MLX builds, Backend Interface revisions, OS versions, memory sizes, or generation semantics. A quarantined Capability Key cannot form shared Work Candidates until recertified.
 _Avoid_: Work Kind, Backend process, model support
 
+**Attention Path**:
+The exact Adapter-internal attention execution plan composed with one KV/cache layout for one Turn. Its identity owns the stable implementation kind, compilation timing and no-fallback policies, and canonical composition of the route's graph, kernel/fusion, KV/cache, memory/scratch, and command members without redefining their ABIs; phase and Shape applicability remain Capability Key and Case Bound Table facts.
+_Avoid_: PagedKV layout, runtime fallback, environment flag
+
 **Execution Route Identity**:
-The immutable Evidence Hash of one canonical bounded descriptor fixing an exact Adapter-internal execution route: graph ABI and artifact identities, weight-layout ABI, memory-plan and arena identity, kernel-bundle and fusion-plan identities, KV/cache layout ABI whose identity distinguishes non-paged and PagedKV layouts, Speculative Decode plan or explicit `NONE`, Prefix Reuse plan or explicit `NONE`, and command-submission or replay plan or explicit `NONE`. Every absent optional plan is represented explicitly, every required member carries one exact baseline or optimized identity, and changing any route member creates a new identity rather than inheriting old Certification. A fixed memory plan may promise a preallocated lifetime and stable arena offsets; it does not promise a permanent raw GPU virtual address unless that stronger property is separately exposed and qualified by the pinned Metal/MLX implementation.
+The immutable Evidence Hash of one canonical bounded descriptor fixing an exact Adapter-internal execution route: graph ABI and artifact identities, weight-layout ABI, memory-plan and arena identity, kernel-bundle and fusion-plan identities, KV/cache layout ABI whose identity distinguishes non-paged and PagedKV layouts, independent Attention Path identity, Speculative Decode plan or explicit `NONE`, Prefix Reuse plan or explicit `NONE`, and command-submission or replay plan or explicit `NONE`. Every absent optional plan is represented explicitly, every required member carries one exact baseline or optimized identity, and changing any route member creates a new identity rather than inheriting old Certification. A fixed memory plan may promise a preallocated lifetime and stable arena offsets; it does not promise a permanent raw GPU virtual address unless that stronger property is separately exposed and qualified by the pinned Metal/MLX implementation.
 _Avoid_: Cost Profile, Backend options map, implicit optimization default
 
 **Capability Key**:
@@ -638,8 +642,8 @@ The canonical local root registered in a Model Manifest from which the in-proces
 _Avoid_: Model Alias, caller path, mutable Model Revision
 
 **Model Alias**:
-A Control Plane-managed mutable name resolved exactly once to a Model Revision before Warming. Alias changes affect only later requests; existing requests continue on their original revision, and old and new revisions may coexist temporarily.
-_Avoid_: Model Revision, per-Turn lookup
+A Control Plane-managed name bound exactly once to one Model Revision and resolved exactly once before Warming. Once bound, the Alias cannot be rebound or repointed, including around a Retiring or Unavailable target; existing requests remain frozen to their original revision.
+_Avoid_: Model Revision, per-Turn lookup, alias repoint
 
 **Retiring Revision**:
 A registered Model Revision that accepts no new alias binding or request but remains available to existing requests. After its final request and Reservation release, Residency Policy may unload it and the Control Plane may remove its registration.
