@@ -282,8 +282,20 @@ _Avoid_: Work Kind, Backend process, model support
 The exact Adapter-internal attention execution plan composed with one KV/cache layout for one Turn. Its identity owns the stable implementation kind, compilation timing and no-fallback policies, and canonical composition of the route's graph, kernel/fusion, KV/cache, memory/scratch, and command members without redefining their ABIs; phase and Shape applicability remain Capability Key and Case Bound Table facts.
 _Avoid_: PagedKV layout, runtime fallback, environment flag
 
+**Prefix Reuse**:
+The avoidance of recomputing an exact compatible token prefix by adopting compatible prefix state into a consumer that may still own a private physical copy. The Execution Route's Prefix Reuse plan has exactly one stable kind: `NONE`, `PRIVATE_REUSE`, or `NATIVE_PAGE_SHARING`; changing the kind or its bounded implementation identity creates a new Execution Route Identity.
+_Avoid_: Tokenizer cache, approximate prefix match, Admission authority
+
+**Native Prefix Sharing**:
+Prefix Reuse in which multiple live request states retain the same immutable physical KV pages and obtain private ownership before divergent mutation. It is the `NATIVE_PAGE_SHARING` Prefix Reuse plan kind and is stronger than private copy or repage reuse.
+_Avoid_: Private Prefix Reuse, shared mutable KV, shared Resource Reservation
+
+**Prefix Publication**:
+The owner-thread atomic transition that makes one synchronized immutable prefix state eligible for later exact lookup. Publication grants no Admission, scheduling, Certification, or capacity authority.
+_Avoid_: Output Publication, cache observation, mutable page exposure
+
 **Execution Route Identity**:
-The immutable Evidence Hash of one canonical bounded descriptor fixing an exact Adapter-internal execution route: graph ABI and artifact identities, weight-layout ABI, memory-plan and arena identity, kernel-bundle and fusion-plan identities, KV/cache layout ABI whose identity distinguishes non-paged and PagedKV layouts, independent Attention Path identity, Speculative Decode plan or explicit `NONE`, Prefix Reuse plan or explicit `NONE`, and command-submission or replay plan or explicit `NONE`. Every absent optional plan is represented explicitly, every required member carries one exact baseline or optimized identity, and changing any route member creates a new identity rather than inheriting old Certification. A fixed memory plan may promise a preallocated lifetime and stable arena offsets; it does not promise a permanent raw GPU virtual address unless that stronger property is separately exposed and qualified by the pinned Metal/MLX implementation.
+The immutable Evidence Hash of one canonical bounded descriptor fixing an exact Adapter-internal execution route: graph ABI and artifact identities, weight-layout ABI, memory-plan and arena identity, kernel-bundle and fusion-plan identities, KV/cache layout ABI whose identity distinguishes non-paged and PagedKV layouts, independent Attention Path identity, Speculative Decode plan or explicit `NONE`, Prefix Reuse plan with stable kind `NONE`, `PRIVATE_REUSE`, or `NATIVE_PAGE_SHARING`, and command-submission or replay plan or explicit `NONE`. Every absent optional plan is represented explicitly, every required member carries one exact baseline or optimized identity, and changing any route member creates a new identity rather than inheriting old Certification. A fixed memory plan may promise a preallocated lifetime and stable arena offsets; it does not promise a permanent raw GPU virtual address unless that stronger property is separately exposed and qualified by the pinned Metal/MLX implementation.
 _Avoid_: Cost Profile, Backend options map, implicit optimization default
 
 **Capability Key**:
