@@ -1,3 +1,4 @@
+use crate::bounded::FixedWindowStart;
 use crate::{
     FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
     HotPathWorkWitness, MonotonicTime, PhysicalStartCreditId, SupportLedgerGeneration,
@@ -61,6 +62,19 @@ pub(crate) struct OrdinarySupportSpec {
     pub(crate) physical_credit: PhysicalStartCreditId,
     pub(crate) scope: SupportCallScopeId,
     pub(crate) claim: SupportFundingClaim,
+}
+pub(crate) enum SupportChangeInput {
+    BeginOrdinary(OrdinarySupportSpec, MonotonicTime),
+    FinishActive(SupportOperationObligationId),
+}
+enum SupportDelta {
+    BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart),
+    FinishActive(usize, Record),
+}
+pub(crate) struct SupportChange {
+    expected: SupportLedgerGeneration,
+    records: usize,
+    delta: SupportDelta,
 }
 #[allow(dead_code, reason = "C12, G01, and G09 construct lifecycle reserves")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,7 +254,30 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         at: MonotonicTime,
         work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
-        let next = self.next(expected, work)?;
+        let change = self.prepare(expected, SupportChangeInput::BeginOrdinary(spec, at), work)?;
+        self.commit(change, work)
+    }
+    pub(crate) fn prepare(
+        &self,
+        expected: SupportLedgerGeneration,
+        input: SupportChangeInput,
+        work: &mut WorkMeter,
+    ) -> Result<SupportChange, SupportLedgerError> {
+        match input {
+            SupportChangeInput::BeginOrdinary(spec, at) => {
+                self.prepare_begin(expected, spec, at, work)
+            }
+            SupportChangeInput::FinishActive(id) => self.prepare_finish(expected, id, work),
+        }
+    }
+    fn prepare_begin(
+        &self,
+        expected: SupportLedgerGeneration,
+        spec: OrdinarySupportSpec,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<SupportChange, SupportLedgerError> {
+        self.next(expected, work)?;
         work.record(WorkDimension::InvariantChecks, 3)?;
         let valid = [spec.id.0, spec.physical_credit.0, spec.scope.0]
             .into_iter()
@@ -256,24 +293,75 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
         work.ensure(insertion_work(1))?;
-        self.starts
-            .try_start(spec.operation as usize * POOLS + pool, at, work)?;
-        let record = (
-            spec.operation,
-            SupportPool::Ordinary,
-            SupportCausalPredecessorId([0; 32]),
-            Active,
-            at,
-            spec.scope,
-            None,
-        );
-        let keys = [key(0, spec.id.0), key(1, spec.physical_credit.0)];
-        self.records
-            .try_push(keys, record, &[spec.claim], work)
-            .expect("ordinary insertion was fully prevalidated");
-        for class in [ACTIVE, CREDITS, CLAIMS] {
-            self.usage[class][pool] += 1;
+        let start = self
+            .starts
+            .prepare_start(spec.operation as usize * POOLS + pool, at, work)?;
+        Ok(SupportChange {
+            expected,
+            records: self.records.len(),
+            delta: SupportDelta::BeginOrdinary(spec, at, start),
+        })
+    }
+    fn prepare_finish(
+        &self,
+        expected: SupportLedgerGeneration,
+        id: SupportOperationObligationId,
+        work: &mut WorkMeter,
+    ) -> Result<SupportChange, SupportLedgerError> {
+        self.next(expected, work)?;
+        let (index, record) = self.find_record(id, work)?;
+        check!(
+            work,
+            record.3 == Active,
+            SupportLedgerError::InvalidTransition
+        )?;
+        Ok(SupportChange {
+            expected,
+            records: self.records.len(),
+            delta: SupportDelta::FinishActive(index, record),
+        })
+    }
+    pub(crate) fn validate(&self, change: &SupportChange) -> Result<(), SupportLedgerError> {
+        let target = match &change.delta {
+            SupportDelta::BeginOrdinary(..) => true,
+            SupportDelta::FinishActive(index, record) => self.records.get(*index) == Some(record),
+        };
+        (self.generation == change.expected && self.records.len() == change.records && target)
+            .then_some(())
+            .ok_or(SupportLedgerError::Generation)
+    }
+    pub(crate) fn commit(
+        &mut self,
+        change: SupportChange,
+        work: &mut WorkMeter,
+    ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        self.validate(&change)?;
+        match change.delta {
+            SupportDelta::BeginOrdinary(spec, at, start) => {
+                let record = (
+                    spec.operation,
+                    SupportPool::Ordinary,
+                    SupportCausalPredecessorId([0; 32]),
+                    Active,
+                    at,
+                    spec.scope,
+                    None,
+                );
+                let keys = [key(0, spec.id.0), key(1, spec.physical_credit.0)];
+                self.records.try_push(keys, record, &[spec.claim], work)?;
+                self.starts.apply_start(start);
+                for class in [ACTIVE, CREDITS, CLAIMS] {
+                    self.usage[class][SupportPool::Ordinary as usize] += 1;
+                }
+            }
+            SupportDelta::FinishActive(index, _) => {
+                self.records
+                    .get_mut(index)
+                    .expect("validated support record")
+                    .3 = Retained;
+            }
         }
+        let next = change.expected.next().expect("prepared support generation");
         self.generation = next;
         Ok(next)
     }
@@ -411,20 +499,17 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         transition: SupportTransition,
         work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        if transition == FinishSupport {
+            let change = self.prepare(expected, SupportChangeInput::FinishActive(id), work)?;
+            return self.commit(change, work);
+        }
         let next = self.next(expected, work)?;
-        work.record(WorkDimension::CopiedBytes, 33)?;
-        let found = self.records.find(key(0, id.0), work)?;
-        work.record(WorkDimension::InvariantChecks, 1)?;
-        let index = found.ok_or(SupportLedgerError::InvalidTransition)?;
-        let record_bytes = std::mem::size_of::<Record>() as u64;
-        work.record(WorkDimension::CopiedBytes, record_bytes)?;
-        let record = *self.records.get(index).expect("indexed support record");
+        let (index, record) = self.find_record(id, work)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
         let generic = record.6.is_none();
         let (state, time) = match (record.3, transition) {
             (Conditional, PredecessorEnded(id, at)) if id == record.2 && generic => (Pending, at),
             (Pending, BeginSupport(at)) if at >= record.4 => (Active, at),
-            (Active, FinishSupport) => (Retained, record.4),
             (Conditional, CloseCausalCallImpossible) if generic => (ClosedConditional, record.4),
             (Pending, CloseCausalCallImpossible) => (ClosedPending, record.4),
             _ => return Err(SupportLedgerError::InvalidTransition),
@@ -451,6 +536,20 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         record.4 = time;
         self.generation = next;
         Ok(next)
+    }
+    fn find_record(
+        &self,
+        id: SupportOperationObligationId,
+        work: &mut WorkMeter,
+    ) -> Result<(usize, Record), SupportLedgerError> {
+        work.record(WorkDimension::CopiedBytes, 33)?;
+        let found = self.records.find(key(0, id.0), work)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let index = found.ok_or(SupportLedgerError::InvalidTransition)?;
+        let record_bytes = std::mem::size_of::<Record>() as u64;
+        work.record(WorkDimension::CopiedBytes, record_bytes)?;
+        let record = *self.records.get(index).expect("indexed support record");
+        Ok((index, record))
     }
     fn next(
         &self,
@@ -667,6 +766,7 @@ mod tests {
 
         let at = MonotonicTime::from_micros;
         let valid = ordinary((1, 21, 41, Reserved([1; 32])));
+        let second = ordinary((2, 22, 42, Reserved([2; 32])));
         let mut ledger = ordinary_ledger();
         for invalid in [
             ordinary((0, 21, 41, Reserved([1; 32]))),
@@ -678,7 +778,32 @@ mod tests {
             rejected!(ledger, begin(&mut ledger, invalid, at(1)), InvalidInput);
         }
         let initial = ledger.generation();
-        let next = begin(&mut ledger, valid, at(5)).unwrap();
+        let before = snapshot(&ledger);
+        let mut measured = work();
+        let change = ledger
+            .prepare(
+                initial,
+                SupportChangeInput::BeginOrdinary(valid, at(5)),
+                &mut measured,
+            )
+            .unwrap();
+        let replay = ledger
+            .prepare(
+                initial,
+                SupportChangeInput::BeginOrdinary(second, at(15)),
+                &mut work(),
+            )
+            .unwrap();
+        assert_eq!(snapshot(&ledger), before);
+        assert_eq!(ledger.validate(&change), Ok(()));
+        let next = ledger.commit(change, &mut measured).unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([2, 288, 0, 0, 20])
+        );
+        let mut rejected_work = work();
+        rejected!(ledger, ledger.commit(replay, &mut rejected_work), Stale);
+        assert_eq!(rejected_work.witness(), HotPathWorkWitness::default());
         let record = ledger.records.get(0).unwrap();
         assert_eq!(next, initial.next().unwrap());
         let predecessor = SupportCausalPredecessorId([0; 32]);
@@ -692,8 +817,27 @@ mod tests {
             assert_eq!(ledger.usage[class][0], 1);
         }
         assert_eq!(ledger.starts.len(valid.operation as usize * POOLS), Some(1));
+        let before = snapshot(&ledger);
+        let mut finished = work();
+        let change = ledger
+            .prepare(
+                next,
+                SupportChangeInput::FinishActive(valid.id),
+                &mut finished,
+            )
+            .unwrap();
+        assert_eq!(snapshot(&ledger), before);
+        assert_eq!(ledger.validate(&change), Ok(()));
+        assert_eq!(
+            ledger.commit(change, &mut finished).unwrap(),
+            next.next().unwrap()
+        );
+        assert_eq!(
+            finished.witness(),
+            HotPathWorkWitness::new([2, 177, 0, 0, 4])
+        );
+        assert_eq!(ledger.records.get(0).unwrap().3, Retained);
 
-        let second = ordinary((2, 22, 42, Reserved([2; 32])));
         let error = SupportLedgerError::Storage(Duplicate);
         for (id, credit) in [(1, 22), (2, 21)] {
             let duplicate = ordinary((id, credit, 42, Reserved([2; 32])));
