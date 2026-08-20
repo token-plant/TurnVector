@@ -1130,7 +1130,8 @@ Support, Effect, or runtime authority. C10d adapts the sole `model_registry` to
 consume sealed values without Effect or runtime authority. C10e alone installs
 the original descriptor-registration behavior through `Core::handle`. The
 refinement creates no second ledger, registry, descriptor verifier, or commit
-authority and does not renumber C11 or any later row.
+authority. The later C11a/C11b/C11c delivery refinement does not renumber C12
+or any later row.
 
 C10a remains one independently green row because its prepared
 `FixedWindowCounter` start, opaque generation-bound `SupportChange`, and direct
@@ -1151,6 +1152,51 @@ Splitting C10d would expose a partially registered interface; folding it into
 C10c would leak registry state and authority into the descriptor integrity
 module.
 
+C11a, C11b, and C11c refine the original C11 delivery boundary without changing
+its domain contract or renumbering C12 or any later row. A frozen compact but
+incomplete implementation pass measured 620 human-authored non-documentation
+changed lines before the fixed 18-line B03-B05 identity cascade. Delivering
+those exact bytes in the original C11 row would total `620 + 18 = 638`, or 238
+lines above its cap of 400. This measurement does not prove a lower bound for
+every equivalent implementation; it establishes that the measured object is
+not a landing candidate and motivates an explicit risk-controlled split rather
+than an unbounded compression pass.
+
+C11a freezes the complete bounded Token Request value, including exactly one
+direct immutable Model Revision or Model Alias selector, plus its closed
+parameter, service, seed, input, output, and optional stop-sequence invariants.
+C11b extends the immutable registered Manifest facts and the existing C10e
+registration path with the Manifest's nonzero context limit. The integration
+owner carries and tests that fact through `Core::handle`, while the sole
+`request_book` receives the registry-derived frozen Revision fact and has
+generation-bound preparation and commit authority: it derives the next
+connection-local Request ID, checks availability, descriptor vocabulary, and
+the checked input-plus-output context bound, and stages status version one,
+Preparing, and the preparation deadline. C11c gives the integration owner the
+sole `Core::handle` acceptance transition, resolves the selector stored in the
+C11a request exactly once, revalidates registry and request-book generations,
+commits ID high-water advancement and request insertion together, and reports
+success only after that commit.
+
+The split preserves one request module and one visible acceptance authority.
+C11a has no Request ID, resolved Revision fact, lifecycle, or state-mutation
+surface; its selector construction admits exactly one direct Revision or Alias,
+its optional outer Stop Token Sequence collection may be empty, and every
+present sequence is nonempty. C11b does not redefine Token Request validation
+or expose Request Acceptance; its integration-owned contribution only carries
+the immutable context limit through the already existing registration
+transition. C11c owns no duplicate request invariant. Each row
+independently triggers the fixed 18-line generated identity cascade. Planning
+ranges are 170-240 human lines for C11a, 330-400 for C11b, and 140-280 for C11c,
+so their projected totals are `188..258 <= 300`, `348..418 <= 420`, and
+`158..298 <= 320`. Their human hard stops are 282, 402, and 302 lines. The
+combined human ceilings sum to 986, leaving 366 lines above the measured
+incomplete object for all remaining behavior, tests, split duplication, less
+any structural savings. The projected combined human maximum is 920, leaving
+66 lines below those ceilings. If any individual hard stop is exceeded,
+implementation stops for a new delivery decision instead of weakening an
+invariant or test.
+
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
 | C01 | `feat(core): add checked domain identities` | Distinct IDs, units, sequences, durations, and Monotonic Time | Overflow, zero, and cross-type rejection | <= 360 |
@@ -1168,7 +1214,9 @@ module.
 | C10c | `feat(core): validate canonical model descriptors` | Complete the private deep `model_descriptor` module: parse an exact V1 frame of at most 16,384 bytes, derive independent field-private `ModelDescriptorId` and typed `ModelDescriptorHash`, compare all untrusted Backend claims plus the Manifest expectation, and return only non-forgeable `VerifiedModelDescriptor` | Version/vocabulary/payload length, zero/oversize/trailing/padding, every byte and domain drift, ID/hash independence, wrong raw claim or Manifest hash, stable sealed equality, exact parse/compare/copy/two-hash Work, zero allocation, no mutation, registry/Backend/Core authority, or unchecked constructor | <= 300 |
 | C10d | `feat(core): retain model descriptors` | Extend the private `model_registry` with a bounded `DescriptionPlan`, fixed 256-Revision cardinality and independent 4,194,304-byte retained-frame arena, only C10c-sealed complete frame/ID/hash/vocabulary values, descriptor-bound registration changes, and exact readback/post-load equality; remove the bare `Register` and raw-field bypasses | Plan and Registry Generation binding, stale/duplicate/count/arena-capacity rejection at exact and one-past bounds, sealed readback and exact equality/drift, no borrowing, raw construction, or partial registration, and no Core, Support, Effect, or runtime authority before C10e | <= 380 |
 | C10e | `feat(core): describe model registrations` | Give Core sole custody of Support and Registry state; only after an exact C08a ordinary claim, `describe_model` obligation, credit, and active charge commits may it retain one pending `DescriptionPlan` and emit the stateless raw Model Descriptor Effect; an accepted Result must pass C10c verification and atomically finish that charge and commit C10d's `RegistryChange`, or commit neither | `Core::handle` start/Result observability; no Effect without the exact active charge; optional ordinary exhaustion; pending-plan identity/generation/result validation; duplicate, stale, malformed frame, raw-claim, Manifest-hash, vocabulary, and Registry rejection; exact rollback with no Effects; retained sealed values and post-load equality | <= 280 |
-| C11 | `feat(core): accept requests into preparing` | Ownership, frozen Revision, C10c/C10d sealed-descriptor-authoritative Top K validation, explicit Service Class, closed Generation Parameters, immutable effective `u64` Sampling Seed plus origin, status version, and preparation timeout | Verified descriptor vocabulary bounds, explicit zero/caller/daemon origin; Acceptance is not Admission; retries never inherit state | <= 400 |
+| C11a | `feat(core): define bounded token requests` | Complete bounded Token Request value with exactly one direct immutable Model Revision or Model Alias selector, explicit Service Class, closed Generation Parameters, immutable effective `u64` Sampling Seed plus origin, bounded input tokens, required Max Output Tokens, and an optional bounded outer collection of nonempty Stop Token Sequences | Exclusive direct/Alias construction; exact binary32 domains and greedy/categorical rules; zero/caller/daemon seed origin; input/output/outer-stop/inner-stop exact and one-past bounds; no Request ID, resolved Revision fact, lifecycle, acceptance, or state mutation | <= 300 |
+| C11b | `feat(core): prepare request acceptance state` | Extend the immutable registered Manifest facts and existing C10e registration path with a nonzero context limit through an integration-owner `core.rs` contribution that exposes no Request Acceptance; the sole `request_book` consumes a C11a Token Request and C10d registry-derived frozen Revision fact, derives the next connection-local Request ID, validates availability and descriptor-authoritative Top K plus checked input-token-count and Max Output Tokens against that context limit, and stages status version one, Preparing, and a checked preparation deadline through a generation-bound prepare/validate/commit change | Registration-path context-limit retention/readback; fixed 1,024-request and 64-connection bounds; exact/one-past/overflow context limits; internal Request ID high-water exhaustion and continuity corruption, unavailable Revision, Top K, timeout, capacity, Work, and registry/request generation rejection preserve exact request state and ID high-water; no caller-supplied Request ID or public acceptance transition before C11c | <= 420 |
+| C11c | `feat(core): accept requests into preparing` | Give the integration owner the sole `Core::handle` Request Acceptance transition over C11b: resolve the exact selector stored in the C11a Token Request once, prepare bounded request state without mutation, revalidate Registry and Request Book generations, atomically commit connection-local ID assignment/high-water plus request insertion, and expose the frozen Revision, effective Sampling Seed and origin, status version one, and Preparing only after commit | Direct and Alias selection, including unknown direct Revision and unknown Alias; unavailable, context, Top K, timeout, capacity, ID-high-water exhaustion, stale-generation, and Work rejection assign no ID, preserve exact state, and expose no success; Acceptance is not Admission; retries receive new IDs and inherit no state | <= 320 |
 | C12 | `feat(core): drive and refresh request descriptions` | Sole initial/post-load/post-observation/stale-generation description owner with O(1) invalidation, stable resident reissue, and deferred Warming refresh; initial description emits an Effect only after C08a atomically creates its typed optional ordinary claim/obligation/credit/active charge, while post-load/post-observation refresh consumes only exact pending lifecycle obligations from the C08b set reserved before the causal load or observation starts and never creates support capacity | Initial optional exhaustion/no-Effect, cross-model advance/counts, C10c verification plus C10d sealed post-load equality, bounded model/request set, failure/cancel/impossible close, no stale rejection/Admission, no unreserved refresh, original timeout, registry, handle, or Resource Reservation | <= 400 |
 | C13 | `feat(core): authorize exact certification keys` | Current-generation finite requirement-to-Key closure over immutable records and the read-only exact-key Authorization Index; every Key includes one exact Execution Route Identity and resolves to one Certified Execution Profile entry | Stale routes to C12 without lookup; omitted/overflowed/missing/drifted/quarantined Route or other Key member fails closed | <= 400 |
 | C14 | `feat(core): derive certification applicability` | Fresh Environment Fingerprint including exact daemon/Capability/Generation Semantics/Resource Signal/Operation Bound identities, fixed recency cache, and complete finite immutable Applicability Selection over exact Profile entries | Every hit and complete selection recheck freshness/evidence; build/schema/algorithm/Route/other drift and selection-race invalidate; miss/eviction; Resource Evidence never creates applicability | <= 400 |

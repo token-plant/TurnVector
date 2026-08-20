@@ -136,14 +136,21 @@ integration owner Core custody of Support and Registry changes, requires the
 exact C08a active charge before a Describe Model Effect, retains pending-plan
 custody, verifies the raw Result through C10c, and atomically finishes Support
 plus commits C10d's `RegistryChange` or commits neither. Only C10e completes the
-original descriptor-registration behavior; C11 and every
-later row retain their existing identities and order.
+original descriptor-registration behavior. C11a, C11b, and C11c refine the
+original C11 delivery boundary; C12 and every later row retain their existing
+identities and order. C11a owns the complete bounded Token Request, including
+its exclusive direct-Revision-or-Alias selector. C11b keeps Manifest request
+facts and acceptance preparation in the sole `model_registry` and
+`request_book`; its integration-owner contribution carries and tests the
+context limit through the existing registration path but exposes no Request
+Acceptance. C11c alone resolves the request's selector and integrates the
+prepared change through `Core::handle` to expose successful Request Acceptance.
 
-The accepted implementation order contains 191 rows after C07.
+The accepted implementation order contains 193 rows after C07.
 
 | Area | Rows | Count | Delivery result |
 |---|---:|---:|---|
-| Core foundations | C08a-C08b, C09, C10a-C10e, C11-C18 | 16 | Support, descriptor integrity, registry, request, Certification, and resource foundations |
+| Core foundations | C08a-C08b, C09, C10a-C10e, C11a-C11c, C12-C18 | 18 | Support, descriptor integrity, registry, request, Certification, and resource foundations |
 | Core lifecycle | C19-C31 | 13 | Admission, materialization, invalidation, carry, cancellation, output, and release |
 | Scheduling and Plan lifecycle | C32-C45 | 14 | Exclusive, scheduling, Turn results, replay, and performance |
 | Backend runtime | E01-E24 | 24 | Backend Interface, Fake Adapter, Device Executor, Event Loop, and qualification |
@@ -153,7 +160,7 @@ The accepted implementation order contains 191 rows after C07.
 | Volume and durable authority | U01-U03, S01-S31 | 34 | Volume qualification, Control Store, Audit, recovery, readiness, and shutdown |
 | Aggregate gate | K01-K05 | 5 | Integrated Core properties, sequences, faults, and work bounds |
 | Release and qualification | L01-L02, Q00-Q15 | 18 | Closure freeze, subject adapters, qualification, and finding resolution |
-| **Total** |  | **191** |  |
+| **Total** |  | **193** |  |
 
 Rows remain ordered exactly as written in the base plan. A row may depend on
 several modules, but it has one primary implementation owner and one integrated
@@ -168,14 +175,14 @@ commit result.
 | `support_ledger` | C08a-C08b, C10a, C16-C18, C26 | Support Ledger Generation, prepared Support changes and fixed-window starts, pools, Funding Claims, credits, obligations, entitlements, lifecycle reserves, retained history, and Prepared Carry | Lifecycle witness selection, Resource Capacity, Admission, or Control publication outcome |
 | `model_descriptor` | C10b-C10c | Exact V1 frame parsing, private SHA-256-only one-shot implementation, independent descriptor ID/hash derivation, untrusted-claim comparison, and field-private verified values | Registry lifecycle/counts, Core transitions, Backend semantics, public crypto, or general hashing |
 | `model_registry` | C09, C10d | Immutable Model Revision, Alias freeze, lifecycle, Description Plan, sealed Model Descriptor retention/arena accounting, and incremental registry counts | Descriptor parsing/hashing, request state, Backend handles, Residency, Effect emission, or scheduling policy |
-| `request_book` | C11-C12, C21, C30-C31 | Preparing and later request states, description freshness, ownership identity, release lifecycle, and bounded terminal history | Support or Resource capacity, Certification applicability, or Backend execution |
+| `request_book` | C11a-C12, C21, C30-C31 | Bounded Token Request values, prepared acceptance, Preparing and later request states, description freshness, ownership identity, release lifecycle, and bounded terminal history | Support or Resource capacity, Certification applicability, Backend execution, or visible transition coordination |
 | `certification` | C13-C14, C23-C24 | Exact Authorization Index access, Environment Fingerprint, finite Applicability Selection, invalidation, and quarantine decisions | Online widening, lifecycle evidence selection, Resource Evidence policy, or ledger mutation |
 | `resource_ledger` | C15, C29 | Request Backend Allocation Budgets, daemon output capacity, transient headroom, Pending Reclaim, checked generation, and atomic reserve or settlement | Support charges, Governor policy, Backend mutation, or request lifecycle authority |
 | `admission` | C19 | Pure bound construction and complete accepted or rejected Admission decision | Allocation, Effect emission, evidence selection, or state mutation |
 | `turn_plans` | C38; private contribution to C39-C42 | Frozen candidate and Batch membership, Plan provenance and lifecycle, Local Stale and Result progression, and cost-profile update staging | Support credits, output publication, cross-module commit, Backend execution, or scheduler policy |
 | `scheduler` | C32-C37, C43-C45 | Exclusive feasibility, bounded candidate filtering, service accounting, deadline closure, deterministic selection, replay, and scheduler measurement | Request lifecycle, candidate execution, ledger mutation, Plan result progression, or native state |
 | `closure_control` | C25 | Runtime Closure Gate state and zero-request-liability stability | Event Loop cancel gate, lifecycle evidence selection, Store publication, or Prepared Carry ownership |
-| `transition_coordinator` | C10e, C20, C22, C27-C28, C39-C42 | Cross-module staging, generation revalidation, all-or-nothing commit, ordered Effects, and integrated dispositions | A duplicate ledger, descriptor verifier, durable authority, native execution, or policy hidden from the owning module |
+| `transition_coordinator` | C10e; registration-path contribution to C11b; C11c, C20, C22, C27-C28, C39-C42 | Cross-module staging, generation revalidation, all-or-nothing commit, ordered Effects, and integrated dispositions | A duplicate ledger, descriptor verifier, request invariant, durable authority, native execution, or policy hidden from the owning module |
 
 C10e coordinates C10a, C10c, and C10d changes without moving any module's local
 invariants into Core. C10c alone consumes C10b's private SHA primitive. C17
@@ -233,12 +240,12 @@ Coordinator, row ordering, cross-module tests, and generated identity output.
 | Owner | Source ownership | Primary rows and private contributions |
 |---|---|---|
 | Agent A: Support | `support_ledger`, including C10a's crate-private `FixedWindowCounter` preparation helper | C08a-C08b, C10a, C16-C18, C26 |
-| Agent B: Descriptor, Registry, and Request Capacity | `model_descriptor`, `model_registry`, `request_book`, `resource_ledger` | C09, C10b-C10d, C11-C12, C15, C21, C29-C31 |
+| Agent B: Descriptor, Registry, and Request Capacity | `model_descriptor`, `model_registry`, `request_book`, `resource_ledger` | C09, C10b-C10d, C11a-C11b, C12, C15, C21, C29-C31 |
 | Agent C: Certification and Scheduling | `certification`, `admission`, `scheduler`, `turn_plans`, `closure_control` | C13-C14, C19, C23-C25, C32-C38, C43-C45; private Plan changes for C39-C42 |
-| Integration owner | `transition_coordinator`, `core.rs`, cross-module fixtures, generated identity cascade | C10e, C20, C22, C27-C28, C39-C42 |
+| Integration owner | `transition_coordinator`, `core.rs`, cross-module fixtures, generated identity cascade | C10e, C11b registration-path contribution, C11c, C20, C22, C27-C28, C39-C42 |
 
 This is parallel authoring, not parallel authority. The merge order is now
-C08a, C08b, C09, C10a, C10b, C10c, C10d, C10e, C11, and onward through C45. An agent may
+C08a, C08b, C09, C10a, C10b, C10c, C10d, C10e, C11a, C11b, C11c, and onward through C45. An agent may
 prepare a later row
 locally, but that row cannot become ready or retain generated artifacts until
 every predecessor has landed and the branch is synchronized with the exact
@@ -248,6 +255,10 @@ For C39-C42, Agent C remains the sole editor of `turn_plans`, while the
 integration owner is the sole editor of the Transition Coordinator and shared
 cross-module fixtures. Those contributions form one row-scoped commit and one
 atomic `Core::handle` behavior; they are not independent commit authorities.
+Likewise, C11b is one independently-green row: Agent B owns the Manifest fact
+and request-state seams, while the integration owner alone carries that fact
+through the existing registration transition and owns its cross-module tests.
+That contribution does not add Request Acceptance, which remains wholly C11c.
 
 ## Later Agent Waves
 
