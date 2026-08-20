@@ -1270,8 +1270,9 @@ context 512 and Prefill B1 chunk 64. Its baseline Execution Route uses the exact
 exported graph plus one preallocated memory arena with stable offsets. The
 kernel bundle, fusion plan, and non-paged KV/cache layout use exact baseline
 identities, and the Attention Path is exactly `CONTIGUOUS_MLX_SDPA`;
-Speculative Decode, Prefix Reuse, and command replay are explicit `NONE`. These
-values define a qualification target, not completed Certification:
+Speculative Decode and command replay are explicit `NONE`, and the Prefix Reuse
+plan kind is `NONE`. These values define a qualification target, not completed
+Certification:
 the environment and every bound require a fresh run, and P-1A remains `YELLOW`,
 P-1B `PENDING`, and P-1C `RED`.
 
