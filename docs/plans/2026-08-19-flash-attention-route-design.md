@@ -443,8 +443,7 @@ The resulting shared contract is:
 3. PagedAttention owns the gathered reference and first native block-table
    Decode slices. FlashAttention does not redefine them.
 4. First-use compilation starts the Turn; compile failure is a typed started-Turn
-   failure, compile-bound excess is a Bound Violation, and neither is Plan
-   Rejection.
+   failure, compile-bound excess is a Bound Violation, and neither is Plan Rejection.
 
 This change adds only the Flash-specific decision, detailed route design, and
 remaining delivery order. Any later edit to a canonical shared source must
@@ -475,7 +474,7 @@ Expansion follows these rules:
   membership and member-local work ceilings in the Turn Plan through its
   synchronized Turn Receipt with no mid-Turn insertion, removal, or reordering;
   after route work starts, cancellation follows the frozen member-local
-  Turn Receipt contract rather than changing Plan membership;
+  Turn Receipt contract rather than changing Turn Plan membership;
 - bind only the stable Prefix Reuse plan kind and bounded implementation into the
   static route. For `NATIVE_PAGE_SHARING`, owner-thread Request Materialization
   validates the complete additional entry compatibility fields defined by the
