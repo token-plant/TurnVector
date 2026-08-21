@@ -133,11 +133,11 @@ fn operation_lookup_uses_counted_binary_work_without_a_full_state_scan() {
 }
 #[test]
 fn work_budgets_reject_overflow_and_truncation() {
-    assert!(HotPathWorkBudget::try_new(work([1_000_001, 2_097_152, 0, 2, 2_100])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_704_576, 2_097_152, 0, 2, 28_708])).is_err());
     assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_153, 0, 2, 2_100])).is_err());
     assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 1, 2, 2_100])).is_err());
     assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 0, 3, 2_100])).is_err());
-    assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 0, 2, 2_101])).is_err());
+    assert!(HotPathWorkBudget::try_new(work([1_000_000, 2_097_152, 0, 2, 28_709])).is_err());
     assert!(matches!(
         work([u64::MAX, 0, 0, 0, 0]).checked_add(work([1, 0, 0, 0, 0])),
         Err(WorkBudgetError::CounterOverflow(

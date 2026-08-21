@@ -179,13 +179,13 @@ mod tests {
 
         let input = [0_u8; MAX_INPUT_BYTES];
         let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
-        work.record(WorkDimension::VisitedEntities, 999_744)
+        work.record(WorkDimension::VisitedEntities, 1_704_319)
             .unwrap();
         let before = work.witness();
         let expected = Sha256Error::Work(WorkBudgetError::BudgetExceeded(
             WorkDimension::VisitedEntities,
-            1_000_000,
-            1_000_001,
+            1_704_575,
+            1_704_576,
         ));
         assert_eq!(digest(&input, &mut work), Err(expected));
         assert_eq!(work.witness(), before);

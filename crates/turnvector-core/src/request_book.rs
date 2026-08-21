@@ -2,17 +2,19 @@
 
 use crate::WorkDimension::{CopiedBytes, InvariantChecks, VisitedEntities};
 use crate::model_registry::{
-    ModelAliasId, ModelRevisionId, RegistryGeneration, RequestRevision, RevisionLifecycle,
-    RevisionSelection,
+    MODEL_REGISTRY_LIMIT, ModelAliasId, ModelRevisionId, RegistryGeneration, RequestRevision,
+    RevisionLifecycle, RevisionSelection,
 };
 use crate::{
-    BoundedVec, ConnectionId, DaemonInstanceId, Duration, MonotonicTime, RequestId,
-    RequestSequence, RequestStatusVersion, ServiceClass, TokenCount, WorkBudgetError, WorkMeter,
+    BackendGeneration, BatchBucket, BoundedVec, ByteCount, ConnectionId, DaemonInstanceId,
+    Duration, ExecutionPhase, MonotonicTime, RequestId, RequestSequence, RequestStatusVersion,
+    ServiceClass, TokenCount, WorkBudgetError, WorkMeter,
 };
 use std::mem::size_of;
 
 pub(crate) const REQUEST_LIMIT: usize = 1_024;
 pub(crate) const CONNECTION_LIMIT: usize = 64;
+pub(crate) const REQUEST_REQUIREMENT_LIMIT: usize = 256;
 type RequestResult<T> = Result<T, RequestError>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +111,8 @@ pub(crate) enum RequestError {
     StopSequenceCapacity,
     EmptyStopTokenSequence,
     StopTokenCapacity,
+    UnknownRequest,
+    DescriptionState,
 }
 impl From<WorkBudgetError> for RequestError {
     fn from(error: WorkBudgetError) -> Self {
@@ -183,17 +187,29 @@ impl<const I: usize, const S: usize, const T: usize> TokenRequest<I, S, T> {
     pub(crate) const fn stops(&self) -> &BoundedVec<BoundedVec<u32, T>, S> { &self.stops }
     #[rustfmt::skip]
     pub(crate) const fn seed(&self) -> EffectiveSamplingSeed { self.seed }
+    #[rustfmt::skip]
+    pub(crate) fn exactly_matches(&self, other: &Self, work: &mut WorkMeter) -> Result<bool, WorkBudgetError> { work.record(InvariantChecks, 7)?; if (self.selector, self.parameters, self.service, self.max_output, self.seed, self.input.len(), self.stops.len()) != (other.selector, other.parameters, other.service, other.max_output, other.seed, other.input.len(), other.stops.len()) { return Ok(false); } for (left, right) in self.input.iter().zip(other.input.iter()) { work.record(VisitedEntities, 1)?; work.record(InvariantChecks, 1)?; if left != right { return Ok(false); } } for (left, right) in self.stops.iter().zip(other.stops.iter()) { work.record(VisitedEntities, 1)?; work.record(InvariantChecks, 1)?; if left.len() != right.len() { return Ok(false); } for (left, right) in left.iter().zip(right.iter()) { work.record(VisitedEntities, 1)?; work.record(InvariantChecks, 1)?; if left != right { return Ok(false); } } } Ok(true) }
 }
 
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RequestLifecycle { Preparing }
+pub(crate) enum RequestLifecycle { Preparing, Warming }
+#[rustfmt::skip] #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CapabilityRequirement { pub(crate) phase: ExecutionPhase, pub(crate) batch: BatchBucket, pub(crate) shape: u16, pub(crate) route: [u8; 32], pub(crate) adapter_build: [u8; 32], pub(crate) mlx_build: [u8; 32], pub(crate) backend_interface: u32 }
+#[rustfmt::skip] #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestDescriptionFacts { pub(crate) requirements: BoundedVec<CapabilityRequirement, REQUEST_REQUIREMENT_LIMIT>, pub(crate) backend_capabilities: [u8; 32], pub(crate) ordinary_estimate: Duration, pub(crate) conservative_time: Duration, pub(crate) resource_bytes: ByteCount, pub(crate) output_bytes: ByteCount, pub(crate) residency_bytes: ByteCount }
+#[rustfmt::skip]
+impl RequestDescriptionFacts { pub(crate) fn valid(&self, work: &mut WorkMeter) -> Result<bool, WorkBudgetError> { work.record(InvariantChecks, 7)?; if self.requirements.is_empty() || self.backend_capabilities == [0; 32] || self.ordinary_estimate.as_micros() == 0 || self.conservative_time < self.ordinary_estimate || [self.resource_bytes, self.output_bytes, self.residency_bytes].contains(&ByteCount::new(0)) { return Ok(false); } for requirement in self.requirements.iter() { work.record(VisitedEntities, 1)?; work.record(InvariantChecks, 5)?; if requirement.shape == 0 || requirement.route == [0; 32] || requirement.adapter_build == [0; 32] || requirement.mlx_build == [0; 32] || requirement.backend_interface == 0 { return Ok(false); } } Ok(true) } }
+#[rustfmt::skip] #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DescriptionState { Missing, InFlight(BackendGeneration), Ready(BackendGeneration) }
+#[rustfmt::skip] #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DescriptionRefreshScope { Observation, Loaded(ModelRevisionId) }
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptanceInput<const I: usize, const S: usize, const T: usize> { pub(crate) connection: ConnectionId, pub(crate) request: TokenRequest<I, S, T>, pub(crate) accepted_at: MonotonicTime, pub(crate) preparation_timeout: Duration }
 #[rustfmt::skip]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AcceptedRequest<const I: usize, const S: usize, const T: usize> { id: RequestId, revision: RequestRevision, request: TokenRequest<I, S, T>, status: RequestStatusVersion, lifecycle: RequestLifecycle, deadline: MonotonicTime }
+pub(crate) struct AcceptedRequest<const I: usize, const S: usize, const T: usize> { id: RequestId, revision: RequestRevision, request: TokenRequest<I, S, T>, status: RequestStatusVersion, lifecycle: RequestLifecycle, deadline: MonotonicTime, description: DescriptionState }
 #[rustfmt::skip]
 impl<const I: usize, const S: usize, const T: usize> AcceptedRequest<I, S, T> {
     pub(crate) const fn id(&self) -> RequestId { self.id }
@@ -202,6 +218,7 @@ impl<const I: usize, const S: usize, const T: usize> AcceptedRequest<I, S, T> {
     pub(crate) const fn status(&self) -> RequestStatusVersion { self.status }
     pub(crate) const fn lifecycle(&self) -> RequestLifecycle { self.lifecycle }
     pub(crate) const fn deadline(&self) -> MonotonicTime { self.deadline }
+    pub(crate) const fn description(&self) -> DescriptionState { self.description }
 }
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -214,12 +231,17 @@ impl<const I: usize, const S: usize, const T: usize> RequestChange<I, S, T> {
     pub(crate) const fn accepted(&self) -> &AcceptedRequest<I, S, T> { &self.accepted }
     pub(crate) const fn revision(&self) -> RequestRevision { self.accepted.revision }
 }
+#[rustfmt::skip] #[derive(Debug)] #[allow(clippy::type_complexity, reason = "the prepared change retains one bounded warming-slot transition")]
+pub(crate) struct DescriptionChange<'a> { expected: RequestBookGeneration, index: usize, before_lifecycle: RequestLifecycle, before: DescriptionState, after_lifecycle: RequestLifecycle, after: DescriptionState, before_facts: bool, after_facts: Option<&'a RequestDescriptionFacts>, described_before: u16, described_after: u16, warming: Option<(usize, Option<(ModelRevisionId, u16)>, Option<(ModelRevisionId, u16)>)> }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RequestBook<const R: usize, const I: usize, const S: usize, const T: usize> {
     daemon: DaemonInstanceId,
     generation: RequestBookGeneration,
     requests: Vec<AcceptedRequest<I, S, T>>,
+    description_facts: Vec<Option<RequestDescriptionFacts>>,
     connections: [Option<Cursor>; CONNECTION_LIMIT],
+    described: u16,
+    warming: [Option<(ModelRevisionId, u16)>; MODEL_REGISTRY_LIMIT],
 }
 impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook<R, I, S, T> {
     #[cfg(test)]
@@ -240,11 +262,18 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         requests
             .try_reserve_exact(R)
             .map_err(|_| RequestError::Allocation)?;
+        let mut description_facts = Vec::new();
+        description_facts
+            .try_reserve_exact(R)
+            .map_err(|_| RequestError::Allocation)?;
         Ok(Self {
             daemon,
             generation,
             requests,
+            description_facts,
             connections: [None; CONNECTION_LIMIT],
+            described: 0,
+            warming: [None; MODEL_REGISTRY_LIMIT],
         })
     }
     #[rustfmt::skip]
@@ -291,7 +320,7 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         let id = RequestId::new(self.daemon, input.connection, sequence);
         let unused = self.find(id, work)?.is_none();
         require(work, unused, RequestError::Continuity)?;
-        let accepted = AcceptedRequest { id, revision, request: input.request, status: RequestStatusVersion::new(1).expect("one is nonzero"), lifecycle: RequestLifecycle::Preparing, deadline };
+        let accepted = AcceptedRequest { id, revision, request: input.request, status: RequestStatusVersion::new(1).expect("one is nonzero"), lifecycle: RequestLifecycle::Preparing, deadline, description: DescriptionState::Missing };
         let copied = size_of::<RequestChange<I, S, T>>() as u64;
         work.ensure(crate::HotPathWorkWitness::new([0, copied, 0, 0, 1]))?;
         work.record(CopiedBytes, copied)?;
@@ -316,9 +345,32 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
             last: change.accepted.id.sequence(),
         });
         self.requests.push(change.accepted);
+        self.description_facts.push(None);
         self.generation = next;
         Ok(self.generation)
     }
+    #[rustfmt::skip]
+    pub(crate) fn prepare_description(&self, expected: RequestBookGeneration, id: RequestId, target: BackendGeneration, at: MonotonicTime, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'static>> { require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?; let request = &self.requests[index]; require(work, at < request.deadline, RequestError::PreparationTimeout)?; require(work, request.lifecycle == RequestLifecycle::Preparing && request.description == DescriptionState::Missing, RequestError::DescriptionState)?; self.description_change(expected, index, request.lifecycle, DescriptionState::InFlight(target), None, work) }
+    #[rustfmt::skip]
+    pub(crate) fn prepare_warming(&self, expected: RequestBookGeneration, id: RequestId, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'static>> { require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?; let request = &self.requests[index]; require(work, request.lifecycle == RequestLifecycle::Preparing && request.description == DescriptionState::Missing, RequestError::DescriptionState)?; self.description_change(expected, index, RequestLifecycle::Warming, DescriptionState::Missing, None, work) }
+    #[rustfmt::skip]
+    pub(crate) fn prepare_description_result<'a>(&self, expected: RequestBookGeneration, id: RequestId, target: BackendGeneration, facts: &'a RequestDescriptionFacts, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'a>> { require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?; let request = &self.requests[index]; require(work, request.description == DescriptionState::InFlight(target), RequestError::DescriptionState)?; self.description_change(expected, index, RequestLifecycle::Preparing, DescriptionState::Ready(target), Some(facts), work) }
+    #[rustfmt::skip]
+    pub(crate) fn refresh_count(&self, scope: DescriptionRefreshScope, work: &mut WorkMeter) -> RequestResult<usize> { let warming = match scope { DescriptionRefreshScope::Observation => 0, DescriptionRefreshScope::Loaded(revision) => { let mut count = 0; for entry in &self.warming { work.record(VisitedEntities, 1)?; if let Some((candidate, value)) = entry && *candidate == revision { count = usize::from(*value); break; } } count } }; Ok(usize::from(self.described) + warming) }
+    #[rustfmt::skip]
+    pub(crate) fn prepare_refresh(&self, expected: RequestBookGeneration, scope: DescriptionRefreshScope, target: BackendGeneration, after: Option<RequestId>, at: MonotonicTime, work: &mut WorkMeter) -> RequestResult<(RequestId, Option<DescriptionChange<'static>>)> {
+        require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let mut selected = None; for (index, request) in self.requests.iter().enumerate() { work.record(VisitedEntities, 1)?; if description_candidate(request, scope, target) && after.is_none_or(|cursor| request.id > cursor) && selected.is_none_or(|prior: usize| request.id < self.requests[prior].id) { selected = Some(index); } } let index = selected.ok_or(RequestError::DescriptionState)?; let request = &self.requests[index]; work.record(InvariantChecks, 1)?; if at >= request.deadline { return Ok((request.id, None)); } Ok((request.id, Some(self.description_change(expected, index, RequestLifecycle::Preparing, DescriptionState::InFlight(target), None, work)?)))
+    }
+    #[rustfmt::skip]
+    pub(crate) fn validate_description(&self, change: &DescriptionChange<'_>) -> RequestResult<()> { let warming = change.warming.is_none_or(|(slot, before, _)| self.warming.get(slot) == Some(&before)); (self.generation == change.expected && self.described == change.described_before && warming && self.description_facts.get(change.index).is_some_and(|facts| facts.is_some() == change.before_facts) && self.requests.get(change.index).is_some_and(|request| request.lifecycle == change.before_lifecycle && request.description == change.before)).then_some(()).ok_or(RequestError::PreparedChangeStale) }
+    #[rustfmt::skip]
+    pub(crate) fn description_request(&self, change: &DescriptionChange<'_>) -> RequestResult<&AcceptedRequest<I, S, T>> { self.validate_description(change)?; Ok(&self.requests[change.index]) }
+    #[rustfmt::skip]
+    pub(crate) fn description_facts(&self, id: RequestId, work: &mut WorkMeter) -> RequestResult<Option<&RequestDescriptionFacts>> { Ok(match self.find(id, work)? { Some(index) => self.description_facts[index].as_ref(), None => None }) }
+    #[rustfmt::skip]
+    pub(crate) fn commit_description(&mut self, change: DescriptionChange<'_>) -> RequestResult<RequestBookGeneration> { self.validate_description(&change)?; self.requests[change.index].lifecycle = change.after_lifecycle; self.requests[change.index].description = change.after; self.description_facts[change.index] = change.after_facts.copied(); self.described = change.described_after; if let Some((slot, _, after)) = change.warming { self.warming[slot] = after; } self.generation = change.expected.next()?; Ok(self.generation) }
+    #[rustfmt::skip]
+    fn description_change<'a>(&self, expected: RequestBookGeneration, index: usize, after_lifecycle: RequestLifecycle, after: DescriptionState, after_facts: Option<&'a RequestDescriptionFacts>, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'a>> { let request = &self.requests[index]; let was_described = request.lifecycle == RequestLifecycle::Preparing && request.description != DescriptionState::Missing; let is_described = after_lifecycle == RequestLifecycle::Preparing && after != DescriptionState::Missing; let described_after = match (was_described, is_described) { (false, true) => self.described.checked_add(1), (true, false) => self.described.checked_sub(1), _ => Some(self.described) }.ok_or(RequestError::DescriptionState)?; let entering = request.lifecycle != RequestLifecycle::Warming && after_lifecycle == RequestLifecycle::Warming; let leaving = request.lifecycle == RequestLifecycle::Warming && after_lifecycle != RequestLifecycle::Warming; let warming = if entering || leaving { let revision = request.revision.revision(); let mut slot = None; for (index, entry) in self.warming.iter().enumerate() { work.record(VisitedEntities, 1)?; if entry.is_some_and(|(candidate, _)| candidate == revision) || entering && entry.is_none() && slot.is_none() { slot = Some(index); if entry.is_some() { break; } } } let slot = slot.ok_or(RequestError::DescriptionState)?; let before = self.warming[slot]; let count = before.map_or(0, |(_, count)| count); let after_count = if entering { count.checked_add(1) } else { count.checked_sub(1) }.ok_or(RequestError::DescriptionState)?; Some((slot, before, (after_count != 0).then_some((revision, after_count)))) } else { None }; let copied = size_of::<DescriptionChange<'_>>() as u64 + after_facts.map_or(0, |_| size_of::<RequestDescriptionFacts>() as u64); work.ensure(crate::HotPathWorkWitness::new([0, copied, 0, 0, 1]))?; work.record(CopiedBytes, copied)?; work.record(InvariantChecks, 1)?; Ok(DescriptionChange { expected, index, before_lifecycle: request.lifecycle, before: request.description, after_lifecycle, after, before_facts: self.description_facts[index].is_some(), after_facts, described_before: self.described, described_after, warming }) }
     fn prepare_cursor(
         &self,
         connection: ConnectionId,
@@ -362,6 +414,8 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         Ok(None)
     }
 }
+#[rustfmt::skip]
+fn description_candidate<const I: usize, const S: usize, const T: usize>(request: &AcceptedRequest<I, S, T>, scope: DescriptionRefreshScope, target: BackendGeneration) -> bool { let stale = match request.description { DescriptionState::Missing => true, DescriptionState::InFlight(generation) | DescriptionState::Ready(generation) => generation != target }; stale && match (request.lifecycle, scope) { (RequestLifecycle::Preparing, _) => request.description != DescriptionState::Missing, (RequestLifecycle::Warming, DescriptionRefreshScope::Loaded(revision)) => request.revision.revision() == revision, (RequestLifecycle::Warming, DescriptionRefreshScope::Observation) => false } }
 #[cfg(not(test))]
 impl<const I: usize, const S: usize, const T: usize> RequestBook<REQUEST_LIMIT, I, S, T> {
     #[rustfmt::skip]
@@ -418,7 +472,7 @@ mod tests {
     #[rustfmt::skip]
     fn book<const R: usize>() -> Book<R> { Book::try_new(DaemonInstanceId::new(1).unwrap(), RequestBookGeneration::new(1).unwrap()).unwrap() }
     #[rustfmt::skip]
-    fn snapshot<const R: usize>(book: &Book<R>) -> (RequestBookGeneration, Vec<AcceptedRequest<2, 1, 2>>, [Option<Cursor>; CONNECTION_LIMIT]) { (book.generation, book.requests.clone(), book.connections) }
+    #[allow(clippy::type_complexity, reason = "the rollback witness captures the complete bounded state")] fn snapshot<const R: usize>(book: &Book<R>) -> (RequestBookGeneration, Vec<AcceptedRequest<2, 1, 2>>, Vec<Option<RequestDescriptionFacts>>, [Option<Cursor>; CONNECTION_LIMIT], u16, [Option<(ModelRevisionId, u16)>; MODEL_REGISTRY_LIMIT]) { (book.generation, book.requests.clone(), book.description_facts.clone(), book.connections, book.described, book.warming) }
     #[rustfmt::skip]
     fn rejected<const R: usize>(book: &Book<R>, expected: RequestBookGeneration, registry: RegistryGeneration, input: AcceptanceInput<2, 1, 2>, fact: crate::model_registry::RequestRevision, mut work: WorkMeter) -> (RequestError, HotPathWorkWitness) { let before = snapshot(book); let error = book.prepare(expected, registry, input, fact, &mut work).unwrap_err(); assert_eq!(snapshot(book), before); (error, work.witness()) }
 
@@ -479,6 +533,9 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
+    fn description_counts_do_not_scan_requests() { let revision = ModelRevisionId::new([1; 32]).unwrap(); let mut small = book::<1>(); small.described = 1; small.warming[0] = Some((revision, 1)); let mut large = book::<1>(); large.described = u16::MAX; large.warming[0] = Some((revision, u16::MAX)); for (scope, counts) in [(DescriptionRefreshScope::Observation, (1, usize::from(u16::MAX))), (DescriptionRefreshScope::Loaded(revision), (2, 2 * usize::from(u16::MAX)))] { let mut small_work = meter(); let mut large_work = meter(); assert_eq!((small.refresh_count(scope, &mut small_work).unwrap(), large.refresh_count(scope, &mut large_work).unwrap(), small_work.witness()), (counts.0, counts.1, large_work.witness())); } }
+    #[test]
+    #[rustfmt::skip]
     fn acceptance_state_is_prepared_before_commit() {
         let mut requests = book::<2>();
         let before = (requests.generation(), requests.len());
@@ -489,8 +546,8 @@ mod tests {
         requests.validate(&change).unwrap(); requests.commit(change).unwrap();
         let accepted = requests.get(id, &mut meter()).unwrap().unwrap();
         assert_eq!((accepted.id(), accepted.revision_fact().revision(), accepted.status().get(), accepted.lifecycle(), accepted.deadline().as_micros()), (id, ModelRevisionId::new([1; 32]).unwrap(), 1, RequestLifecycle::Preparing, 15));
-        assert_eq!(work.witness(), HotPathWorkWitness::new([1, 496, 0, 0, 13]));
-        let alias = ModelAliasId::new([3; 32]).unwrap(); let fact = revision_fact(RevisionSelection::Alias(alias), RevisionLifecycle::Available); let mut alias_book = book::<1>(); let mut alias_work = meter(); let change = alias_book.prepare(alias_book.generation(), fact.generation(), acceptance(RequestSelector::Alias(alias), &[], 8, 0, 3, 20, 1), fact, &mut alias_work).unwrap(); alias_book.commit(change).unwrap(); assert_eq!((alias_book.requests[0].revision_fact().selection(), alias_work.witness()), (RevisionSelection::Alias(alias), HotPathWorkWitness::new([1, 496, 0, 0, 13])));
+        assert_eq!(work.witness(), HotPathWorkWitness::new([1, 512, 0, 0, 13]));
+        let alias = ModelAliasId::new([3; 32]).unwrap(); let fact = revision_fact(RevisionSelection::Alias(alias), RevisionLifecycle::Available); let mut alias_book = book::<1>(); let mut alias_work = meter(); let change = alias_book.prepare(alias_book.generation(), fact.generation(), acceptance(RequestSelector::Alias(alias), &[], 8, 0, 3, 20, 1), fact, &mut alias_work).unwrap(); alias_book.commit(change).unwrap(); assert_eq!((alias_book.requests[0].revision_fact().selection(), alias_work.witness()), (RevisionSelection::Alias(alias), HotPathWorkWitness::new([1, 512, 0, 0, 13])));
     }
 
     #[test]
@@ -520,6 +577,6 @@ mod tests {
         let mut corrupt = book::<2>(); corrupt.connections[0] = Some(Cursor { connection: ConnectionId::new(2).unwrap(), last: RequestSequence::new(1).unwrap() }); assert_eq!(rejected(&corrupt, corrupt.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, meter()), (RequestError::Continuity, HotPathWorkWitness::new([1, 0, 0, 0, 12])));
         let mut overflow = book::<2>(); overflow.generation = RequestBookGeneration(u64::MAX); assert_eq!(rejected(&overflow, overflow.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, meter()), (RequestError::GenerationOverflow, HotPathWorkWitness::new([0, 0, 0, 0, 2])));
         let mut stale = book::<2>(); let first = stale.prepare(stale.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, &mut meter()).unwrap(); let old = stale.prepare(stale.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, &mut meter()).unwrap(); stale.commit(first).unwrap(); let before = snapshot(&stale); assert_eq!(stale.validate(&old), Err(RequestError::PreparedChangeStale)); assert_eq!(stale.commit(old), Err(RequestError::PreparedChangeStale)); assert_eq!(snapshot(&stale), before);
-        let constrained = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); assert_eq!(rejected(&book::<2>(), RequestBookGeneration::new(1).unwrap(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, WorkMeter::new(constrained)), (RequestError::Work(WorkBudgetError::BudgetExceeded(CopiedBytes, 0, 496)), HotPathWorkWitness::new([1, 0, 0, 0, 12])));
+        let constrained = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); assert_eq!(rejected(&book::<2>(), RequestBookGeneration::new(1).unwrap(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, WorkMeter::new(constrained)), (RequestError::Work(WorkBudgetError::BudgetExceeded(CopiedBytes, 0, 512)), HotPathWorkWitness::new([1, 0, 0, 0, 12])));
     }
 }

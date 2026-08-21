@@ -728,13 +728,13 @@ mod fixed_index_tests {
 
         let mut visited_meter = WorkMeter::new(HotPathWorkBudget::binary_maximum());
         visited_meter
-            .record(WorkDimension::VisitedEntities, 999_500)
+            .record(WorkDimension::VisitedEntities, 1_704_075)
             .unwrap();
         assert!(matches!(
             constrained.try_insert_sorted(&[([1; 33], 1)], &mut visited_meter),
             Err(FixedIndexError::Work(WorkBudgetError::BudgetExceeded(
                 WorkDimension::VisitedEntities,
-                1_000_000,
+                1_704_575,
                 _
             )))
         ));
