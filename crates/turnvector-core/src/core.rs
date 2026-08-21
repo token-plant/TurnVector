@@ -910,39 +910,388 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         }
         Ok(BoundedVec::new())
     }
-    #[rustfmt::skip]
-    fn drive_request_description(&mut self, operation: OperationId, at: MonotonicTime, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
-        if self.pending_description.is_some() { return Err(registration_rejection(DomainRejection::RequestDescriptionPending)); } let refresh = self.description_refresh.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionRefreshSet))?; if refresh.target != self.state.generations.backend { return Err(registration_rejection(DomainRejection::RequestDescriptionState)); } else if let Some((obligation, revision)) = refresh.model { return self.start_post_load_model_description(operation, obligation, revision, at, work); } let obligation = *refresh.obligations.get(refresh.next).ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionRefreshSet))?; let (scope, target, cursor) = (refresh.scope, refresh.target, refresh.cursor);
-        let requests = self.requests.as_ref().expect("refresh has request state"); let change = match requests.prepare_refresh(requests.generation(), scope, target, cursor, at, work) { Ok((_, Some(change))) => change, Ok((selected, None)) => { let generation = self.registration.as_ref().unwrap().support.generation(); self.registration.as_mut().unwrap().support.transition(generation, obligation, crate::support::SupportTransition::CloseCausalCallImpossible, work).map_err(request_support_failure)?; let refresh = self.description_refresh.as_mut().unwrap(); refresh.cursor = Some(selected); refresh.next += 1; if refresh.next == refresh.obligations.len() { self.description_refresh = None; } return Ok(BoundedVec::new()); }, Err(error) => return Err(request_description_failure(error)) }; let accepted = requests.description_request(&change).map_err(request_description_failure)?; let registration = self.registration.as_ref().expect("refresh has registration state"); let descriptor = registration.registry.descriptor(accepted.revision_fact().revision(), work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
-        let request = accepted.id(); let input = OwnedRequestDescriptionInput::new(accepted, descriptor, target, work)?; let (positions, effects) = self.stage(operation, None, None, Some(request), work)?; let kind = match scope { DescriptionRefreshScope::Loaded(_) => LifecycleReserveKind::PostLoadRequestDescription, DescriptionRefreshScope::Observation => LifecycleReserveKind::PostObservationRequestDescription }; let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::BeginPending(obligation, kind, at), work).map_err(request_support_failure)?;
-        requests.validate_description(&change).map_err(request_description_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?;
-        self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated pending support begin is infallible"); self.requests.as_mut().unwrap().commit_description(change).expect("revalidated refresh start is infallible"); let refresh = self.description_refresh.as_mut().unwrap(); refresh.cursor = Some(request); refresh.next += 1; self.pending_description = Some(PendingDescription::Request { operation, obligation, input }); self.commit(&positions, &effects); Ok(effects)
+    fn drive_request_description(
+        &mut self,
+        operation: OperationId,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        if self.pending_description.is_some() {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionPending,
+            ));
+        }
+        let refresh = self
+            .description_refresh
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionRefreshSet))?;
+        if refresh.target != self.state.generations.backend {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionState,
+            ));
+        } else if let Some((obligation, revision)) = refresh.model {
+            return self
+                .start_post_load_model_description(operation, obligation, revision, at, work);
+        }
+        let obligation = *refresh
+            .obligations
+            .get(refresh.next)
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionRefreshSet))?;
+        let (scope, target, cursor) = (refresh.scope, refresh.target, refresh.cursor);
+        let requests = self.requests.as_ref().expect("refresh has request state");
+        let change = match requests.prepare_refresh(
+            requests.generation(),
+            scope,
+            target,
+            cursor,
+            at,
+            work,
+        ) {
+            Ok((_, Some(change))) => change,
+            Ok((selected, None)) => {
+                let generation = self.registration.as_ref().unwrap().support.generation();
+                self.registration
+                    .as_mut()
+                    .unwrap()
+                    .support
+                    .transition(
+                        generation,
+                        obligation,
+                        crate::support::SupportTransition::CloseCausalCallImpossible,
+                        work,
+                    )
+                    .map_err(request_support_failure)?;
+                let refresh = self.description_refresh.as_mut().unwrap();
+                refresh.cursor = Some(selected);
+                refresh.next += 1;
+                if refresh.next == refresh.obligations.len() {
+                    self.description_refresh = None;
+                }
+                return Ok(BoundedVec::new());
+            }
+            Err(error) => return Err(request_description_failure(error)),
+        };
+        let accepted = requests
+            .description_request(&change)
+            .map_err(request_description_failure)?;
+        let registration = self
+            .registration
+            .as_ref()
+            .expect("refresh has registration state");
+        let descriptor = registration
+            .registry
+            .descriptor(accepted.revision_fact().revision(), work)
+            .map_err(request_registry_failure)?
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
+        let request = accepted.id();
+        let input = OwnedRequestDescriptionInput::new(accepted, descriptor, target, work)?;
+        let (positions, effects) = self.stage(operation, None, None, Some(request), work)?;
+        let kind = match scope {
+            DescriptionRefreshScope::Loaded(_) => LifecycleReserveKind::PostLoadRequestDescription,
+            DescriptionRefreshScope::Observation => {
+                LifecycleReserveKind::PostObservationRequestDescription
+            }
+        };
+        let support_change = registration
+            .support
+            .prepare(
+                registration.support.generation(),
+                SupportChangeInput::BeginPending(obligation, kind, at),
+                work,
+            )
+            .map_err(request_support_failure)?;
+        requests
+            .validate_description(&change)
+            .map_err(request_description_failure)?;
+        registration
+            .support
+            .validate(&support_change)
+            .map_err(request_support_failure)?;
+        self.registration
+            .as_mut()
+            .unwrap()
+            .support
+            .commit(support_change, work)
+            .expect("revalidated pending support begin is infallible");
+        self.requests
+            .as_mut()
+            .unwrap()
+            .commit_description(change)
+            .expect("revalidated refresh start is infallible");
+        let refresh = self.description_refresh.as_mut().unwrap();
+        refresh.cursor = Some(request);
+        refresh.next += 1;
+        self.pending_description = Some(PendingDescription::Request {
+            operation,
+            obligation,
+            input,
+        });
+        self.commit(&positions, &effects);
+        Ok(effects)
     }
-    #[rustfmt::skip]
-    fn start_post_load_model_description(&mut self, operation: OperationId, obligation: SupportOperationObligationId, revision: ModelRevisionId, at: MonotonicTime, work: &mut WorkMeter) -> Result<Effects, StageFailure> { let registration = self.registration.as_ref().expect("refresh has registration state"); let record = registration.registry.revision(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let descriptor = registration.registry.descriptor(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let intent = RegistrationIntent { model: record.model, revision, manifest: record.manifest, expected_descriptor_hash: descriptor.values().2, context_limit: record.context_limit }; let (positions, effects) = self.stage(operation, None, Some(intent), None, work)?; let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::BeginPending(obligation, LifecycleReserveKind::PostLoadModelDescription, at), work).map_err(request_support_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?; self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated post-load model begin is infallible"); self.pending_description = Some(PendingDescription::Model { operation, obligation, revision }); self.commit(&positions, &effects); Ok(effects) }
-    #[rustfmt::skip]
-    fn finish_request_description(&mut self, operation: OperationId, result: &RawRequestDescription<I, S, T>, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
-        let pending = self.pending_description.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionResultMismatch))?; let PendingDescription::Request { operation: pending_operation, obligation, input } = pending else { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); }; if *pending_operation != operation || !input.matches(result, work)? { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); } let (request, target, obligation) = (input.request, input.backend, *obligation);
-        let registration = self.registration.as_ref().expect("pending description has registration state"); let requests = self.requests.as_ref().expect("pending description has request state"); let request_change = requests.prepare_description_result(requests.generation(), request, target, &result.facts, work).map_err(request_description_failure)?; let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::FinishActive(obligation), work).map_err(request_support_failure)?;
-        requests.validate_description(&request_change).map_err(request_description_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?;
-        self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated support finish is infallible"); self.requests.as_mut().unwrap().commit_description(request_change).expect("revalidated description result is infallible"); self.pending_description = None; if self.description_refresh.as_ref().is_some_and(|refresh| refresh.model.is_none() && refresh.next == refresh.obligations.len()) { self.description_refresh = None; } Ok(BoundedVec::new())
+    fn start_post_load_model_description(
+        &mut self,
+        operation: OperationId,
+        obligation: SupportOperationObligationId,
+        revision: ModelRevisionId,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self
+            .registration
+            .as_ref()
+            .expect("refresh has registration state");
+        let record = registration
+            .registry
+            .revision(revision, work)
+            .map_err(request_registry_failure)?
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
+        let descriptor = registration
+            .registry
+            .descriptor(revision, work)
+            .map_err(request_registry_failure)?
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
+        let intent = RegistrationIntent {
+            model: record.model,
+            revision,
+            manifest: record.manifest,
+            expected_descriptor_hash: descriptor.values().2,
+            context_limit: record.context_limit,
+        };
+        let (positions, effects) = self.stage(operation, None, Some(intent), None, work)?;
+        let support_change = registration
+            .support
+            .prepare(
+                registration.support.generation(),
+                SupportChangeInput::BeginPending(
+                    obligation,
+                    LifecycleReserveKind::PostLoadModelDescription,
+                    at,
+                ),
+                work,
+            )
+            .map_err(request_support_failure)?;
+        registration
+            .support
+            .validate(&support_change)
+            .map_err(request_support_failure)?;
+        self.registration
+            .as_mut()
+            .unwrap()
+            .support
+            .commit(support_change, work)
+            .expect("revalidated post-load model begin is infallible");
+        self.pending_description = Some(PendingDescription::Model {
+            operation,
+            obligation,
+            revision,
+        });
+        self.commit(&positions, &effects);
+        Ok(effects)
     }
-    #[rustfmt::skip]
-    fn finish_post_load_model_description(&mut self, operation: OperationId, result: &OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> { let pending = self.pending_description.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionResultMismatch))?; let PendingDescription::Model { operation: pending_operation, obligation, revision } = pending else { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); }; if *pending_operation != operation { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); } let (obligation, revision) = (*obligation, *revision); let registration = self.registration.as_ref().expect("pending description has registration state"); let registered = registration.registry.descriptor(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let verified = verify(result.as_raw(), registered.values().2, work).map_err(request_descriptor_failure)?; if !registered.exactly_matches(&verified, work).map_err(request_registry_failure)? { return Err(registration_rejection(DomainRejection::RequestDescriptionDescriptor)); } let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::FinishActive(obligation), work).map_err(request_support_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?; self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated post-load model finish is infallible"); self.pending_description = None; self.description_refresh.as_mut().expect("post-load model has refresh state").model = None; if self.description_refresh.as_ref().is_some_and(|refresh| refresh.obligations.is_empty()) { self.description_refresh = None; } Ok(BoundedVec::new()) }
-    #[rustfmt::skip]
-    fn finish_registration(&mut self, operation: OperationId, generations: GenerationVector, result: &OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
-        let state = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationUnavailable))?;
-        let pending = state.pending.ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationResultMismatch))?;
-        if (operation, generations, self.state.generations) != (pending.operation, pending.generations, pending.generations) { return Err(registration_rejection(DomainRejection::ModelRegistrationResultMismatch)); }
-        let descriptor = verify(result.as_raw(), pending.expected_hash, work).map_err(descriptor_failure)?;
-        let registry_change = state.registry.prepare_registration(pending.plan, &descriptor, work).map_err(registry_failure)?;
-        let support_change = state.support.prepare(state.support.generation(), SupportChangeInput::FinishActive(pending.obligation), work).map_err(support_failure)?;
-        state.registry.validate(&registry_change).map_err(registry_failure)?;
-        state.support.validate(&support_change).map_err(support_failure)?;
-        let state = self.registration.as_mut().expect("registration state was checked");
-        state.support.commit(support_change, work).expect("revalidated support finish is infallible");
-        state.registry.commit(registry_change).expect("revalidated registry insertion is infallible");
-        state.pending = None; Ok(BoundedVec::new())
+    fn finish_request_description(
+        &mut self,
+        operation: OperationId,
+        result: &RawRequestDescription<I, S, T>,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let pending = self.pending_description.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionResultMismatch)
+        })?;
+        let PendingDescription::Request {
+            operation: pending_operation,
+            obligation,
+            input,
+        } = pending
+        else {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionResultMismatch,
+            ));
+        };
+        if *pending_operation != operation || !input.matches(result, work)? {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionResultMismatch,
+            ));
+        }
+        let (request, target, obligation) = (input.request, input.backend, *obligation);
+        let registration = self
+            .registration
+            .as_ref()
+            .expect("pending description has registration state");
+        let requests = self
+            .requests
+            .as_ref()
+            .expect("pending description has request state");
+        let request_change = requests
+            .prepare_description_result(requests.generation(), request, target, &result.facts, work)
+            .map_err(request_description_failure)?;
+        let support_change = registration
+            .support
+            .prepare(
+                registration.support.generation(),
+                SupportChangeInput::FinishActive(obligation),
+                work,
+            )
+            .map_err(request_support_failure)?;
+        requests
+            .validate_description(&request_change)
+            .map_err(request_description_failure)?;
+        registration
+            .support
+            .validate(&support_change)
+            .map_err(request_support_failure)?;
+        self.registration
+            .as_mut()
+            .unwrap()
+            .support
+            .commit(support_change, work)
+            .expect("revalidated support finish is infallible");
+        self.requests
+            .as_mut()
+            .unwrap()
+            .commit_description(request_change)
+            .expect("revalidated description result is infallible");
+        self.pending_description = None;
+        if self.description_refresh.as_ref().is_some_and(|refresh| {
+            refresh.model.is_none() && refresh.next == refresh.obligations.len()
+        }) {
+            self.description_refresh = None;
+        }
+        Ok(BoundedVec::new())
+    }
+    fn finish_post_load_model_description(
+        &mut self,
+        operation: OperationId,
+        result: &OwnedRawModelDescriptor,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let pending = self.pending_description.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionResultMismatch)
+        })?;
+        let PendingDescription::Model {
+            operation: pending_operation,
+            obligation,
+            revision,
+        } = pending
+        else {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionResultMismatch,
+            ));
+        };
+        if *pending_operation != operation {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionResultMismatch,
+            ));
+        }
+        let (obligation, revision) = (*obligation, *revision);
+        let registration = self
+            .registration
+            .as_ref()
+            .expect("pending description has registration state");
+        let registered = registration
+            .registry
+            .descriptor(revision, work)
+            .map_err(request_registry_failure)?
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
+        let verified = verify(result.as_raw(), registered.values().2, work)
+            .map_err(request_descriptor_failure)?;
+        if !registered
+            .exactly_matches(&verified, work)
+            .map_err(request_registry_failure)?
+        {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionDescriptor,
+            ));
+        }
+        let support_change = registration
+            .support
+            .prepare(
+                registration.support.generation(),
+                SupportChangeInput::FinishActive(obligation),
+                work,
+            )
+            .map_err(request_support_failure)?;
+        registration
+            .support
+            .validate(&support_change)
+            .map_err(request_support_failure)?;
+        self.registration
+            .as_mut()
+            .unwrap()
+            .support
+            .commit(support_change, work)
+            .expect("revalidated post-load model finish is infallible");
+        self.pending_description = None;
+        self.description_refresh
+            .as_mut()
+            .expect("post-load model has refresh state")
+            .model = None;
+        if self
+            .description_refresh
+            .as_ref()
+            .is_some_and(|refresh| refresh.obligations.is_empty())
+        {
+            self.description_refresh = None;
+        }
+        Ok(BoundedVec::new())
+    }
+    fn finish_registration(
+        &mut self,
+        operation: OperationId,
+        generations: GenerationVector,
+        result: &OwnedRawModelDescriptor,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let state = self
+            .registration
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationUnavailable))?;
+        let pending = state.pending.ok_or_else(|| {
+            registration_rejection(DomainRejection::ModelRegistrationResultMismatch)
+        })?;
+        if (operation, generations, self.state.generations)
+            != (pending.operation, pending.generations, pending.generations)
+        {
+            return Err(registration_rejection(
+                DomainRejection::ModelRegistrationResultMismatch,
+            ));
+        }
+        let descriptor =
+            verify(result.as_raw(), pending.expected_hash, work).map_err(descriptor_failure)?;
+        let registry_change = state
+            .registry
+            .prepare_registration(pending.plan, &descriptor, work)
+            .map_err(registry_failure)?;
+        let support_change = state
+            .support
+            .prepare(
+                state.support.generation(),
+                SupportChangeInput::FinishActive(pending.obligation),
+                work,
+            )
+            .map_err(support_failure)?;
+        state
+            .registry
+            .validate(&registry_change)
+            .map_err(registry_failure)?;
+        state
+            .support
+            .validate(&support_change)
+            .map_err(support_failure)?;
+        let state = self
+            .registration
+            .as_mut()
+            .expect("registration state was checked");
+        state
+            .support
+            .commit(support_change, work)
+            .expect("revalidated support finish is infallible");
+        state
+            .registry
+            .commit(registry_change)
+            .expect("revalidated registry insertion is infallible");
+        state.pending = None;
+        Ok(BoundedVec::new())
     }
     fn commit(&mut self, positions: &Positions, effects: &Effects) {
         for index in 0..effects.len() {
