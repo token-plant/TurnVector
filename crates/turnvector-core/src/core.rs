@@ -666,25 +666,248 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         self.requests.as_mut().expect("request state was checked").commit(change).expect("revalidated request commit is infallible");
         Ok(accepted)
     }
-    #[rustfmt::skip]
-    fn warm_request(&mut self, request: RequestId, work: &mut WorkMeter) -> Result<Effects, StageFailure> { if self.pending_description.is_some() || self.description_refresh.is_some() { return Err(registration_rejection(DomainRejection::RequestDescriptionPending)); } let requests = self.requests.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let change = requests.prepare_warming(requests.generation(), request, work).map_err(request_description_failure)?; requests.validate_description(&change).map_err(request_description_failure)?; self.requests.as_mut().unwrap().commit_description(change).expect("revalidated Warming transition is infallible"); Ok(BoundedVec::new()) }
-    #[rustfmt::skip]
-    fn start_request_description(&mut self, operation: OperationId, request: RequestId, support: OrdinarySupportSpec, at: MonotonicTime, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
-        if self.pending_description.is_some() || self.description_refresh.is_some() { return Err(registration_rejection(DomainRejection::RequestDescriptionPending)); } else if support.operation != SupportOperation::DescribeRequest { return Err(registration_rejection(DomainRejection::RequestDescriptionSupport)); }
-        let registration = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let requests = self.requests.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let accepted = requests.get(request, work).map_err(request_description_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let revision = accepted.revision_fact(); let descriptor = registration.registry.descriptor(revision.revision(), work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
-        let input = OwnedRequestDescriptionInput::new(accepted, descriptor, self.state.generations.backend, work)?; let change = requests.prepare_description(requests.generation(), request, self.state.generations.backend, at, work).map_err(request_description_failure)?; let (positions, effects) = self.stage(operation, None, None, Some(request), work)?; let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::BeginOrdinary(support, at), work).map_err(request_support_failure)?;
-        requests.validate_description(&change).map_err(request_description_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?;
-        self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated support begin is infallible"); self.requests.as_mut().unwrap().commit_description(change).expect("revalidated description start is infallible"); self.pending_description = Some(PendingDescription::Request { operation, obligation: support.id, input }); self.commit(&positions, &effects); Ok(effects)
+    fn warm_request(
+        &mut self,
+        request: RequestId,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        if self.pending_description.is_some() || self.description_refresh.is_some() {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionPending,
+            ));
+        }
+        let requests = self.requests.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let change = requests
+            .prepare_warming(requests.generation(), request, work)
+            .map_err(request_description_failure)?;
+        requests
+            .validate_description(&change)
+            .map_err(request_description_failure)?;
+        self.requests
+            .as_mut()
+            .unwrap()
+            .commit_description(change)
+            .expect("revalidated Warming transition is infallible");
+        Ok(BoundedVec::new())
     }
-    #[rustfmt::skip]
-    fn resolve_description_refresh(&mut self, refresh: &DescriptionRefresh, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
-        if self.description_refresh.is_some() { return Err(registration_rejection(DomainRejection::RequestDescriptionPending)); }
-        let (scope, required) = match (refresh.result, refresh.next_backend, refresh.loaded_revision) { (LifecycleTriggerResult::LoadSucceeded, Some(_), Some(revision)) => (DescriptionRefreshScope::Loaded(revision), true), (LifecycleTriggerResult::LoadFailed | LifecycleTriggerResult::LoadCancelled, None, Some(revision)) => (DescriptionRefreshScope::Loaded(revision), false), (LifecycleTriggerResult::ObservationDescriptionsRequired, Some(_), None) => (DescriptionRefreshScope::Observation, true), (LifecycleTriggerResult::ObservationUnchanged | LifecycleTriggerResult::ObservationFailed | LifecycleTriggerResult::ObservationCancelled, None, None) => (DescriptionRefreshScope::Observation, false), _ => return Err(registration_rejection(DomainRejection::RequestDescriptionState)) };
-        let registration = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let requests = self.requests.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let mut model = None; let mut obligations = DescriptionObligations::new(); for id in refresh.obligations.iter() { let kind = registration.support.lifecycle_kind(*id, work).map_err(request_support_failure)?; match (scope, kind) { (DescriptionRefreshScope::Loaded(revision), LifecycleReserveKind::PostLoadModelDescription) if model.is_none() => model = Some((*id, revision)), (DescriptionRefreshScope::Loaded(_), LifecycleReserveKind::PostLoadRequestDescription) | (DescriptionRefreshScope::Observation, LifecycleReserveKind::PostObservationRequestDescription) => obligations.try_push(*id).map_err(|_| registration_rejection(DomainRejection::RequestDescriptionRefreshSet))?, _ => return Err(registration_rejection(DomainRejection::RequestDescriptionRefreshSet)), } }
-        if refresh.obligations.is_empty() || matches!(scope, DescriptionRefreshScope::Loaded(_)) && model.is_none() { return Err(registration_rejection(DomainRejection::RequestDescriptionSupport)); }
-        if required { let target = refresh.next_backend.expect("required refresh has generation"); if self.state.generations.backend.next().ok() != Some(target) { return Err(registration_rejection(DomainRejection::RequestDescriptionState)); } else if requests.refresh_count(scope, work).map_err(request_description_failure)? != obligations.len() { return Err(registration_rejection(DomainRejection::RequestDescriptionRefreshSet)); } }
-        let support_generation = registration.support.generation(); let copied = (refresh.obligations.len() * std::mem::size_of::<SupportOperationObligationId>()) as u64; work.ensure(HotPathWorkWitness::new([0, copied, 0, 0, 0]))?; let mut ids = [SupportOperationObligationId([0; 32]); REQUEST_LIMIT + 1]; for (index, id) in refresh.obligations.iter().enumerate() { ids[index] = *id; } work.record(WorkDimension::CopiedBytes, copied)?;
-        self.registration.as_mut().unwrap().support.resolve_lifecycle(support_generation, refresh.predecessor, refresh.at, &ids[..refresh.obligations.len()], refresh.result, work).map_err(request_support_failure)?; if required { let target = refresh.next_backend.unwrap(); self.state.generations.backend = target; self.description_refresh = Some(DescriptionRefreshState { scope, target, model, obligations, cursor: None, next: 0 }); }
+    fn start_request_description(
+        &mut self,
+        operation: OperationId,
+        request: RequestId,
+        support: OrdinarySupportSpec,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        if self.pending_description.is_some() || self.description_refresh.is_some() {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionPending,
+            ));
+        } else if support.operation != SupportOperation::DescribeRequest {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionSupport,
+            ));
+        }
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self.requests.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let accepted = requests
+            .get(request, work)
+            .map_err(request_description_failure)?
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
+        let revision = accepted.revision_fact();
+        let descriptor = registration
+            .registry
+            .descriptor(revision.revision(), work)
+            .map_err(request_registry_failure)?
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?;
+        let input = OwnedRequestDescriptionInput::new(
+            accepted,
+            descriptor,
+            self.state.generations.backend,
+            work,
+        )?;
+        let change = requests
+            .prepare_description(
+                requests.generation(),
+                request,
+                self.state.generations.backend,
+                at,
+                work,
+            )
+            .map_err(request_description_failure)?;
+        let (positions, effects) = self.stage(operation, None, None, Some(request), work)?;
+        let support_change = registration
+            .support
+            .prepare(
+                registration.support.generation(),
+                SupportChangeInput::BeginOrdinary(support, at),
+                work,
+            )
+            .map_err(request_support_failure)?;
+        requests
+            .validate_description(&change)
+            .map_err(request_description_failure)?;
+        registration
+            .support
+            .validate(&support_change)
+            .map_err(request_support_failure)?;
+        self.registration
+            .as_mut()
+            .unwrap()
+            .support
+            .commit(support_change, work)
+            .expect("revalidated support begin is infallible");
+        self.requests
+            .as_mut()
+            .unwrap()
+            .commit_description(change)
+            .expect("revalidated description start is infallible");
+        self.pending_description = Some(PendingDescription::Request {
+            operation,
+            obligation: support.id,
+            input,
+        });
+        self.commit(&positions, &effects);
+        Ok(effects)
+    }
+    fn resolve_description_refresh(
+        &mut self,
+        refresh: &DescriptionRefresh,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        if self.description_refresh.is_some() {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionPending,
+            ));
+        }
+        let (scope, required) = match (
+            refresh.result,
+            refresh.next_backend,
+            refresh.loaded_revision,
+        ) {
+            (LifecycleTriggerResult::LoadSucceeded, Some(_), Some(revision)) => {
+                (DescriptionRefreshScope::Loaded(revision), true)
+            }
+            (
+                LifecycleTriggerResult::LoadFailed | LifecycleTriggerResult::LoadCancelled,
+                None,
+                Some(revision),
+            ) => (DescriptionRefreshScope::Loaded(revision), false),
+            (LifecycleTriggerResult::ObservationDescriptionsRequired, Some(_), None) => {
+                (DescriptionRefreshScope::Observation, true)
+            }
+            (
+                LifecycleTriggerResult::ObservationUnchanged
+                | LifecycleTriggerResult::ObservationFailed
+                | LifecycleTriggerResult::ObservationCancelled,
+                None,
+                None,
+            ) => (DescriptionRefreshScope::Observation, false),
+            _ => {
+                return Err(registration_rejection(
+                    DomainRejection::RequestDescriptionState,
+                ));
+            }
+        };
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self.requests.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let mut model = None;
+        let mut obligations = DescriptionObligations::new();
+        for id in refresh.obligations.iter() {
+            let kind = registration
+                .support
+                .lifecycle_kind(*id, work)
+                .map_err(request_support_failure)?;
+            match (scope, kind) {
+                (
+                    DescriptionRefreshScope::Loaded(revision),
+                    LifecycleReserveKind::PostLoadModelDescription,
+                ) if model.is_none() => model = Some((*id, revision)),
+                (
+                    DescriptionRefreshScope::Loaded(_),
+                    LifecycleReserveKind::PostLoadRequestDescription,
+                )
+                | (
+                    DescriptionRefreshScope::Observation,
+                    LifecycleReserveKind::PostObservationRequestDescription,
+                ) => obligations.try_push(*id).map_err(|_| {
+                    registration_rejection(DomainRejection::RequestDescriptionRefreshSet)
+                })?,
+                _ => {
+                    return Err(registration_rejection(
+                        DomainRejection::RequestDescriptionRefreshSet,
+                    ));
+                }
+            }
+        }
+        if refresh.obligations.is_empty()
+            || matches!(scope, DescriptionRefreshScope::Loaded(_)) && model.is_none()
+        {
+            return Err(registration_rejection(
+                DomainRejection::RequestDescriptionSupport,
+            ));
+        }
+        if required {
+            let target = refresh
+                .next_backend
+                .expect("required refresh has generation");
+            if self.state.generations.backend.next().ok() != Some(target) {
+                return Err(registration_rejection(
+                    DomainRejection::RequestDescriptionState,
+                ));
+            } else if requests
+                .refresh_count(scope, work)
+                .map_err(request_description_failure)?
+                != obligations.len()
+            {
+                return Err(registration_rejection(
+                    DomainRejection::RequestDescriptionRefreshSet,
+                ));
+            }
+        }
+        let support_generation = registration.support.generation();
+        let copied = (refresh.obligations.len()
+            * std::mem::size_of::<SupportOperationObligationId>()) as u64;
+        work.ensure(HotPathWorkWitness::new([0, copied, 0, 0, 0]))?;
+        let mut ids = [SupportOperationObligationId([0; 32]); REQUEST_LIMIT + 1];
+        for (index, id) in refresh.obligations.iter().enumerate() {
+            ids[index] = *id;
+        }
+        work.record(WorkDimension::CopiedBytes, copied)?;
+        self.registration
+            .as_mut()
+            .unwrap()
+            .support
+            .resolve_lifecycle(
+                support_generation,
+                refresh.predecessor,
+                refresh.at,
+                &ids[..refresh.obligations.len()],
+                refresh.result,
+                work,
+            )
+            .map_err(request_support_failure)?;
+        if required {
+            let target = refresh.next_backend.unwrap();
+            self.state.generations.backend = target;
+            self.description_refresh = Some(DescriptionRefreshState {
+                scope,
+                target,
+                model,
+                obligations,
+                cursor: None,
+                next: 0,
+            });
+        }
         Ok(BoundedVec::new())
     }
     #[rustfmt::skip]
