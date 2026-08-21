@@ -13,6 +13,7 @@ fn operation(value: u128) -> OperationId {
 fn work(values: [u64; 5]) -> HotPathWorkWitness {
     HotPathWorkWitness::new(values)
 }
+fn require_copy<T: Copy>() {}
 fn generations() -> GenerationVector {
     GenerationVector::new(
         SchedulerGeneration::new(1).unwrap(),
@@ -23,6 +24,7 @@ fn generations() -> GenerationVector {
 }
 #[test]
 fn contiguous_event_commits_ordered_effects_atomically() {
+    require_copy::<CoreEvent>();
     let mut core = Core::<4>::bootstrap(sequence(1), generations());
     let transition = core.handle(CoreEvent::operation(
         sequence(1),

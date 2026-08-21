@@ -124,7 +124,7 @@ impl RequestBookGeneration {
     fn next(self) -> RequestResult<Self> { self.0.checked_add(1).map(Self).ok_or(RequestError::GenerationOverflow) }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TokenRequest<const INPUT: usize, const STOPS: usize, const STOP_TOKENS: usize> {
     selector: RequestSelector,
     input: BoundedVec<u32, INPUT>,
@@ -189,7 +189,7 @@ impl<const I: usize, const S: usize, const T: usize> TokenRequest<I, S, T> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestLifecycle { Preparing }
 #[rustfmt::skip]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptanceInput<const I: usize, const S: usize, const T: usize> { pub(crate) connection: ConnectionId, pub(crate) request: TokenRequest<I, S, T>, pub(crate) accepted_at: MonotonicTime, pub(crate) preparation_timeout: Duration }
 #[rustfmt::skip]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -214,7 +214,7 @@ impl<const I: usize, const S: usize, const T: usize> RequestChange<I, S, T> {
     pub(crate) const fn accepted(&self) -> &AcceptedRequest<I, S, T> { &self.accepted }
     pub(crate) const fn revision(&self) -> RequestRevision { self.accepted.revision }
 }
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RequestBook<const R: usize, const I: usize, const S: usize, const T: usize> {
     daemon: DaemonInstanceId,
     generation: RequestBookGeneration,
@@ -251,6 +251,9 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
     pub(crate) const fn generation(&self) -> RequestBookGeneration { self.generation }
     #[rustfmt::skip]
     pub(crate) fn len(&self) -> usize { self.requests.len() }
+    #[cfg(test)]
+    #[rustfmt::skip]
+    pub(crate) fn force_cursor(&mut self, connection: ConnectionId, last: RequestSequence) { self.connections[0] = Some(Cursor { connection, last }); }
     pub(crate) fn get(
         &self,
         id: RequestId,

@@ -13,7 +13,7 @@ pub enum BoundedCollectionError {
 }
 
 /// An insertion-ordered vector whose storage and maximum length are fixed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoundedVec<T, const CAPACITY: usize> {
     slots: [Option<T>; CAPACITY],
     len: usize,
