@@ -5,6 +5,7 @@ INPUTS = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "crates/turnvector-
 INPUTS += ("crates/turnvector-core/src/model_registry.rs",)
 INPUTS += ("crates/turnvector-core/src/model_descriptor.rs", "crates/turnvector-core/src/model_descriptor/sha256.rs")
 INPUTS += ("crates/turnvector-core/src/request_book.rs",)
+INPUTS += ("crates/turnvector-core/src/certification.rs",)
 def canonical(value): return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 def evidence(payload, domain="turnvector:evidence:daemon-core-build", version=1): return hashlib.sha256(domain.encode() + b"\0" + version.to_bytes(4, "big") + payload).hexdigest()
 def macho_fixture(catalog_sections=1, data_command_padding=0, rebase=b"", bind=b"", weak=b"", lazy=b"", export=b"", chained=False, reordered_loader=False):

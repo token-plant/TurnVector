@@ -31,6 +31,7 @@ use std::fmt;
 use std::num::{NonZeroU64, NonZeroU128};
 
 mod bounded;
+mod certification;
 mod core;
 mod model_descriptor;
 mod model_registry;
