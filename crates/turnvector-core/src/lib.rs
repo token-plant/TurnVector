@@ -34,6 +34,7 @@ mod bounded;
 mod core;
 mod model_descriptor;
 mod model_registry;
+mod request_book;
 mod scheduling;
 pub mod support;
 mod turns;
