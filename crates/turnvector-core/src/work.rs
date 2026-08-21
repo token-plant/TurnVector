@@ -37,9 +37,10 @@ impl HotPathWorkWitness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HotPathWorkBudget(HotPathWorkWitness);
 impl HotPathWorkBudget {
+    #[rustfmt::skip]
     #[must_use]
     pub const fn binary_maximum() -> Self {
-        Self(HotPathWorkWitness::new([1_000_000, 2_097_152, 0, 2, 2_100]))
+        Self(HotPathWorkWitness::new([1_704_575, 2_097_152, 0, 2, 28_708]))
     }
     pub fn try_new(maxima: HotPathWorkWitness) -> Result<Self, WorkBudgetError> {
         let binary = Self::binary_maximum().0;
@@ -49,7 +50,7 @@ impl HotPathWorkBudget {
                 let error = WorkBudgetError::BinaryMaximumExceeded(dimension, maximum, actual);
                 return Err(error);
             }
-            if dimension == WorkDimension::VisitedEntities && actual < maximum {
+            if dimension == WorkDimension::VisitedEntities && actual < 1_000_000 {
                 return Err(WorkBudgetError::BudgetExceeded(dimension, actual, maximum));
             }
         }

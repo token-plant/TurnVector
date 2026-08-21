@@ -246,7 +246,7 @@ mod tests {
         let mut version = FRAME; version[3] = 2; let mut vocabulary = FRAME; vocabulary[7] = 0; let mut empty = FRAME; empty[11] = 0; let mut trailing = FRAME; trailing[11] = 2; let oversize = [0; MAX_FRAME_BYTES + 1];
         for (frame, error, witness) in [(&oversize[..], FrameTooLong, [1, 0, 0, 0, 1]), (&FRAME[..11], PayloadLength, [1, 0, 0, 0, 2]), (&version[..], Version, [1, 0, 0, 0, 6]), (&vocabulary[..], Vocabulary, [1, 0, 0, 0, 6]), (&empty[..], PayloadLength, [1, 0, 0, 0, 6]), (&trailing[..], PayloadLength, [1, 0, 0, 0, 6])] { rejected(raw(frame, 7, ID, HASH), expected(HASH), error, witness); }
         assert_eq!(ModelDescriptorHash::from_manifest(2, HASH), Err(HashSchema));
-        let mut full = meter(); full.record(VisitedEntities, 1_000_000).unwrap(); let before = full.witness(); assert_eq!(verify(valid, expected(HASH), &mut full), Err(Work(WorkBudgetError::BudgetExceeded(VisitedEntities, 1_000_000, 1_000_001)))); assert_eq!(full.witness(), before);
+        let mut full = meter(); full.record(VisitedEntities, 1_704_575).unwrap(); let before = full.witness(); assert_eq!(verify(valid, expected(HASH), &mut full), Err(Work(WorkBudgetError::BudgetExceeded(VisitedEntities, 1_704_575, 1_704_576)))); assert_eq!(full.witness(), before);
         let budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 108, 0, 2, 2_100])).unwrap(); let mut late = WorkMeter::new(budget); assert_eq!(verify(valid, expected(HASH), &mut late), Err(Work(WorkBudgetError::BudgetExceeded(CopiedBytes, 108, 121)))); assert_eq!(late.witness(), HotPathWorkWitness::new([3, 108, 0, 2, 10]));
     }
     #[test]

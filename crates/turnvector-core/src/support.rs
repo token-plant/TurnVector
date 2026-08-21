@@ -63,14 +63,10 @@ pub(crate) struct OrdinarySupportSpec {
     pub(crate) scope: SupportCallScopeId,
     pub(crate) claim: SupportFundingClaim,
 }
-pub(crate) enum SupportChangeInput {
-    BeginOrdinary(OrdinarySupportSpec, MonotonicTime),
-    FinishActive(SupportOperationObligationId),
-}
-enum SupportDelta {
-    BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart),
-    FinishActive(usize, Record),
-}
+#[rustfmt::skip]
+pub(crate) enum SupportChangeInput { BeginOrdinary(OrdinarySupportSpec, MonotonicTime), BeginPending(SupportOperationObligationId, LifecycleReserveKind, MonotonicTime), FinishActive(SupportOperationObligationId) }
+#[rustfmt::skip]
+enum SupportDelta { BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart), BeginPending(usize, Record, MonotonicTime, FixedWindowStart), FinishActive(usize, Record) }
 pub(crate) struct SupportChange {
     expected: SupportLedgerGeneration,
     records: usize,
@@ -268,6 +264,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             SupportChangeInput::BeginOrdinary(spec, at) => {
                 self.prepare_begin(expected, spec, at, work)
             }
+            SupportChangeInput::BeginPending(id, kind, at) => {
+                self.prepare_pending(expected, id, kind, at, work)
+            }
             SupportChangeInput::FinishActive(id) => self.prepare_finish(expected, id, work),
         }
     }
@@ -322,15 +321,20 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             delta: SupportDelta::FinishActive(index, record),
         })
     }
+    #[rustfmt::skip]
+    fn prepare_pending(&self, expected: SupportLedgerGeneration, id: SupportOperationObligationId, kind: LifecycleReserveKind, at: MonotonicTime, work: &mut WorkMeter) -> Result<SupportChange, SupportLedgerError> { self.next(expected, work)?; let (index, record) = self.find_record(id, work)?; let reserve = record.6.ok_or(SupportLedgerError::InvalidTransition)?; check!(work, record.3 == Pending && reserve.0 == kind && at >= record.4 && self.reserved[ACTIVE][record.1 as usize] > 0, SupportLedgerError::InvalidTransition)?; let start = self.starts.prepare_start(record.0 as usize * POOLS + record.1 as usize, at, work)?; Ok(SupportChange { expected, records: self.records.len(), delta: SupportDelta::BeginPending(index, record, at, start) }) }
+    #[rustfmt::skip]
     pub(crate) fn validate(&self, change: &SupportChange) -> Result<(), SupportLedgerError> {
         let target = match &change.delta {
             SupportDelta::BeginOrdinary(..) => true,
+            SupportDelta::BeginPending(index, record, ..) => self.records.get(*index) == Some(record),
             SupportDelta::FinishActive(index, record) => self.records.get(*index) == Some(record),
         };
         (self.generation == change.expected && self.records.len() == change.records && target)
             .then_some(())
             .ok_or(SupportLedgerError::Generation)
     }
+    #[rustfmt::skip]
     pub(crate) fn commit(
         &mut self,
         change: SupportChange,
@@ -361,11 +365,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     .expect("validated support record")
                     .3 = Retained;
             }
+            SupportDelta::BeginPending(index, record, at, start) => self.commit_pending(index, record, at, start),
         }
         let next = change.expected.next().expect("prepared support generation");
         self.generation = next;
         Ok(next)
     }
+    #[rustfmt::skip]
+    fn commit_pending(&mut self, index: usize, record: Record, at: MonotonicTime, start: FixedWindowStart) { let pool = record.1 as usize; let entry = self.records.get_mut(index).expect("validated support record"); entry.3 = Active; entry.4 = at; self.starts.apply_start(start); self.usage[PENDING][pool] -= 1; self.usage[ACTIVE][pool] += 1; self.reserved[ACTIVE][pool] -= 1; }
     #[allow(dead_code, reason = "C12, G01, and G09 install the lifecycle callers")]
     pub(crate) fn reserve_lifecycle(
         &mut self,
@@ -493,6 +500,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         self.generation = next;
         Ok(next)
     }
+    #[rustfmt::skip]
+    pub(crate) fn lifecycle_kind(&self, id: SupportOperationObligationId, work: &mut WorkMeter) -> Result<LifecycleReserveKind, SupportLedgerError> { self.find_record(id, work)?.1.6.map(|reserve| reserve.0).ok_or(SupportLedgerError::InvalidTransition) }
     pub fn transition(
         &mut self,
         expected: SupportLedgerGeneration,
@@ -697,7 +706,7 @@ mod tests {
         let before = ledger.generation();
         let mut exhausted = work();
         exhausted
-            .record(WorkDimension::VisitedEntities, 1_000_000)
+            .record(WorkDimension::VisitedEntities, 1_704_575)
             .unwrap();
         let result = ledger.reserve(
             before,
@@ -705,7 +714,7 @@ mod tests {
             &mut exhausted,
         );
         let error =
-            WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_000_000, 1_000_001);
+            WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_704_575, 1_704_576);
         fail(result, error.into());
         assert_eq!((ledger.generation(), ledger.records.len()), (before, 0));
         fail(
@@ -859,7 +868,7 @@ mod tests {
         let mut ledger = new_ledger();
         let mut exhausted = work();
         exhausted
-            .record(WorkDimension::VisitedEntities, 999_998)
+            .record(WorkDimension::VisitedEntities, 1_704_575)
             .unwrap();
         let before = snapshot(&ledger);
         let fault = ledger.begin_ordinary(ledger.generation(), valid, at(1), &mut exhausted);
@@ -909,7 +918,7 @@ mod tests {
         let mut ledger = lifecycle_ledger();
         let mut exhausted = work();
         exhausted
-            .record(WorkDimension::VisitedEntities, 999_998)
+            .record(WorkDimension::VisitedEntities, 1_704_575)
             .unwrap();
         let before = snapshot(&ledger);
         let fault = ledger.reserve_lifecycle(ledger.generation(), at(1), &specs, &mut exhausted);

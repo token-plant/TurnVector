@@ -143,7 +143,7 @@ mod turn_plan_contract {
         PlanSupportObligation {
             id: SupportOperationObligationId([seed; 32]),
             physical_credit: PhysicalStartCreditId([seed + 10; 32]),
-            funders: funders.clone(),
+            funders: *funders,
         }
     }
 
