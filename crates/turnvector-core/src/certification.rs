@@ -426,14 +426,14 @@ struct ApplicabilityCacheEntry {
     recent: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ApplicabilityCache<const CAPACITY: usize> {
-    entries: [Option<ApplicabilityCacheEntry>; CAPACITY],
+pub(crate) struct ApplicabilityCache {
+    entries: [Option<ApplicabilityCacheEntry>; 1],
     hand: usize,
 }
-impl<const CAPACITY: usize> ApplicabilityCache<CAPACITY> {
+impl ApplicabilityCache {
     pub(crate) fn new() -> Self {
         Self {
-            entries: [None; CAPACITY],
+            entries: [None; 1],
             hand: 0,
         }
     }
@@ -455,10 +455,7 @@ impl<const CAPACITY: usize> ApplicabilityCache<CAPACITY> {
         Ok(None)
     }
     fn advance(&mut self) {
-        self.hand += 1;
-        if self.hand == CAPACITY {
-            self.hand = 0;
-        }
+        self.hand = 0;
     }
     fn insert(
         &mut self,
@@ -466,16 +463,13 @@ impl<const CAPACITY: usize> ApplicabilityCache<CAPACITY> {
         applicable: bool,
         work: &mut WorkMeter,
     ) -> CertificationResult<()> {
-        if CAPACITY == 0 {
-            return Ok(());
-        }
         work.record(CopiedBytes, size_of::<ApplicabilityCacheEntry>() as u64)?;
         let entry = ApplicabilityCacheEntry {
             key,
             applicable,
             recent: true,
         };
-        for _ in 0..CAPACITY {
+        for _ in 0..1 {
             work.record(VisitedEntities, 1)?;
             if self.entries[self.hand].is_none() {
                 self.entries[self.hand] = Some(entry);
@@ -484,7 +478,7 @@ impl<const CAPACITY: usize> ApplicabilityCache<CAPACITY> {
             }
             self.advance();
         }
-        for _ in 0..CAPACITY {
+        for _ in 0..1 {
             work.record(VisitedEntities, 1)?;
             let current = self.entries[self.hand].as_mut().unwrap();
             if !current.recent {
@@ -534,15 +528,10 @@ fn entry_is_applicable<const R: usize, const P: usize>(
             == environment.environment.backend_interface)
 }
 
-pub(crate) fn select_applicable<
-    const R: usize,
-    const P: usize,
-    const C: usize,
-    const CACHE: usize,
->(
+pub(crate) fn select_applicable<const R: usize, const P: usize, const C: usize>(
     closure: &CertificationClosure<C>,
     index: &CertificationAuthorizationIndex<R, P>,
-    cache: &mut ApplicabilityCache<CACHE>,
+    cache: &mut ApplicabilityCache,
     start: ApplicabilityEvidence,
     finish: ApplicabilityEvidence,
     work: &mut WorkMeter,
@@ -556,7 +545,7 @@ pub(crate) fn select_applicable<
     {
         return Err(CertificationError::StaleEvidence);
     }
-    work.record(CopiedBytes, size_of::<ApplicabilityCache<CACHE>>() as u64)?;
+    work.record(CopiedBytes, size_of::<ApplicabilityCache>() as u64)?;
     let mut next_cache = cache.clone();
     let mut entries = BoundedVec::new();
     let mut covered = [false; C];
@@ -605,7 +594,7 @@ pub(crate) fn select_applicable<
     {
         return Err(CertificationError::MissingApplicableRequirement);
     }
-    work.record(CopiedBytes, size_of::<ApplicabilityCache<CACHE>>() as u64)?;
+    work.record(CopiedBytes, size_of::<ApplicabilityCache>() as u64)?;
     *cache = next_cache;
     Ok(CertificationApplicabilitySelection {
         generation: start.generation,
@@ -636,6 +625,7 @@ mod tests {
     fn index() -> CertificationAuthorizationIndex<1, 3> { CertificationAuthorizationIndex::try_new(evidence(true).generation, evidence(true).index, bounded([environment()]), bounded([record(30)]), bounded([profile(50, 2), profile(51, 2), profile(52, 3)])).unwrap() }
     fn work() -> WorkMeter { WorkMeter::new(HotPathWorkBudget::binary_maximum()) }
     fn current<const C: usize>(facts: &RequestDescriptionFacts, index: &CertificationAuthorizationIndex<1, 3>, work: &mut WorkMeter) -> CertificationResult<CertificationResolution<C>> { let generation = BackendGeneration::new(1).unwrap(); resolve(generation, generation, ModelRevisionId::new(id(1)).unwrap(), facts, index, work) }
+    #[test] fn admission_cache_has_one_fixed_slot() { let cache = ApplicabilityCache::new(); assert_eq!((cache.entries.len(), size_of::<ApplicabilityCache>()), (1, 848)); }
     #[test]
     fn authorizes_the_finite_exact_key_closure() {
         let index = index(); let input = facts(&[requirement(2), requirement(3)]); let mut meter = work();
@@ -670,33 +660,33 @@ mod tests {
     }
     #[test]
     fn derives_fresh_selection_and_rechecks_cache_hits() {
-        let index = index(); let input = facts(&[requirement(2), requirement(3)]); let mut meter = work();
-        let CertificationResolution::Current(closure) = current::<3>(&input, &index, &mut meter).unwrap() else { panic!("current description must resolve"); };
-        let mut cache = ApplicabilityCache::<3>::new(); let snapshot = evidence(true); let mut first_work = work();
+        let index = index(); let input = facts(&[requirement(3)]); let mut meter = work();
+        let CertificationResolution::Current(closure) = current::<1>(&input, &index, &mut meter).unwrap() else { panic!("current description must resolve"); };
+        let mut cache = ApplicabilityCache::new(); let snapshot = evidence(true); let mut first_work = work();
         let first = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut first_work).unwrap();
-        assert_eq!((first.requirement_count, first.entries.len(), first.environment), (2, 3, snapshot.environment));
+        assert_eq!((first.requirement_count, first.entries.len(), first.environment), (1, 1, snapshot.environment));
         let mut hit_work = work(); let hit = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut hit_work).unwrap();
         assert_eq!(hit, first); assert!(hit_work.witness().value(VisitedEntities) < first_work.witness().value(VisitedEntities));
     }
     #[test]
     fn stale_drift_and_selection_race_invalidate_applicability() {
-        let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::<2>::new(); let mut meter = work(); select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap();
+        let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::new(); let mut meter = work(); select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap();
         let mut meter = work(); assert_eq!(select_applicable(&closure, &index, &mut cache, evidence(false), evidence(false), &mut meter), Err(CertificationError::StaleEvidence));
         let mut raced = snapshot; raced.environment.identity.daemon_build = id(90); let mut meter = work(); assert_eq!(select_applicable(&closure, &index, &mut cache, snapshot, raced, &mut meter), Err(CertificationError::EvidenceChanged));
         for drift in [|value: &mut EnvironmentIdentity| value.daemon_build = id(90), |value: &mut EnvironmentIdentity| value.backend_capabilities = id(91), |value: &mut EnvironmentIdentity| value.generation_semantics = id(92), |value: &mut EnvironmentIdentity| value.resource_signal = id(93), |value: &mut EnvironmentIdentity| value.operation_bounds = id(94)] { let mut changed = snapshot; drift(&mut changed.environment.identity); let mut meter = work(); assert_eq!(select_applicable(&closure, &index, &mut cache, changed, changed, &mut meter), Err(CertificationError::MissingApplicableRequirement)); }
     }
-    #[test] fn rejects_a_closure_from_another_index_generation() { let old = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &old, &mut meter).unwrap() else { panic!("current description must resolve"); }; let mut snapshot = evidence(true); snapshot.generation = GenerationHash::try_new(id(62)).unwrap(); snapshot.index = CertificationAuthorizationIndexId::try_new(id(63)).unwrap(); let successor: CertificationAuthorizationIndex<1, 3> = CertificationAuthorizationIndex::try_new(snapshot.generation, snapshot.index, bounded([environment()]), bounded([record(30)]), bounded([profile(50, 2), profile(51, 2), profile(52, 3)])).unwrap(); let mut cache = ApplicabilityCache::<2>::new(); let mut meter = work(); assert_eq!(select_applicable(&closure, &successor, &mut cache, snapshot, snapshot, &mut meter), Err(CertificationError::StaleEvidence)); }
-    #[test] fn backend_capability_state_is_part_of_every_cache_key() { let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::<2>::new(); let mut meter = work(); select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); let mut incompatible = closure.clone(); incompatible.backend_capabilities = id(99); let mut meter = work(); let cached = select_applicable(&incompatible, &index, &mut cache, snapshot, snapshot, &mut meter); let mut cold_cache = ApplicabilityCache::<2>::new(); let mut meter = work(); let cold = select_applicable(&incompatible, &index, &mut cold_cache, snapshot, snapshot, &mut meter); assert_eq!((cached, cold), (Err(CertificationError::MissingApplicableRequirement), Err(CertificationError::MissingApplicableRequirement))); }
-    #[test] fn work_rejection_preserves_the_exact_cache() { let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::<2>::new(); let before = (cache.entries, cache.hand); let budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 1_000_000, 0, 0, 17])).unwrap(); let mut meter = WorkMeter::new(budget); assert_eq!(select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter), Err(CertificationError::Work(WorkBudgetError::BudgetExceeded(WorkDimension::InvariantChecks, 17, 18)))); assert_eq!(meter.witness(), HotPathWorkWitness::new([8, 2_896, 0, 0, 17])); assert_eq!((cache.entries, cache.hand), before); }
+    #[test] fn rejects_a_closure_from_another_index_generation() { let old = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &old, &mut meter).unwrap() else { panic!("current description must resolve"); }; let mut snapshot = evidence(true); snapshot.generation = GenerationHash::try_new(id(62)).unwrap(); snapshot.index = CertificationAuthorizationIndexId::try_new(id(63)).unwrap(); let successor: CertificationAuthorizationIndex<1, 3> = CertificationAuthorizationIndex::try_new(snapshot.generation, snapshot.index, bounded([environment()]), bounded([record(30)]), bounded([profile(50, 2), profile(51, 2), profile(52, 3)])).unwrap(); let mut cache = ApplicabilityCache::new(); let mut meter = work(); assert_eq!(select_applicable(&closure, &successor, &mut cache, snapshot, snapshot, &mut meter), Err(CertificationError::StaleEvidence)); }
+    #[test] fn backend_capability_state_is_part_of_every_cache_key() { let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<1>(&facts(&[requirement(3)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::new(); let mut meter = work(); select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); let mut incompatible = closure.clone(); incompatible.backend_capabilities = id(99); let mut meter = work(); let cached = select_applicable(&incompatible, &index, &mut cache, snapshot, snapshot, &mut meter); let mut cold_cache = ApplicabilityCache::new(); let mut meter = work(); let cold = select_applicable(&incompatible, &index, &mut cold_cache, snapshot, snapshot, &mut meter); assert_eq!((cached, cold), (Err(CertificationError::MissingApplicableRequirement), Err(CertificationError::MissingApplicableRequirement))); }
+    #[test] fn work_rejection_preserves_the_exact_cache() { let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::new(); let before = (cache.entries, cache.hand); let budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 1_000_000, 0, 0, 17])).unwrap(); let mut meter = WorkMeter::new(budget); assert_eq!(select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter), Err(CertificationError::Work(WorkBudgetError::BudgetExceeded(WorkDimension::InvariantChecks, 17, 18)))); assert_eq!(meter.witness(), HotPathWorkWitness::new([7, 2_056, 0, 0, 17])); assert_eq!((cache.entries, cache.hand), before); }
     #[test]
     fn cache_misses_and_eviction_never_replace_complete_selection() {
-        let index = index(); let snapshot = evidence(true); let mut cache = ApplicabilityCache::<1>::new();
+        let index = index(); let snapshot = evidence(true); let mut cache = ApplicabilityCache::new();
         for route in [2, 3, 2] { let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(route)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let mut meter = work(); let selection = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); assert_eq!((selection.requirement_count, selection.entries.len()), (1, if route == 2 { 2 } else { 1 })); }
         assert_eq!(cache.entries[0].unwrap().key.profile.key.identity, CapabilityKey(id(51)));
     }
     #[test]
     fn maximum_applicability_selection_fits_binary_work_budget() {
         let requirements: [_; REQUEST_REQUIREMENT_LIMIT] = std::array::from_fn(maximum_requirement); let index: CertificationAuthorizationIndex<REQUEST_REQUIREMENT_LIMIT, REQUEST_REQUIREMENT_LIMIT> = CertificationAuthorizationIndex::try_new(evidence(true).generation, evidence(true).index, bounded([environment()]), bounded((0..REQUEST_REQUIREMENT_LIMIT).map(maximum_record)), bounded((0..REQUEST_REQUIREMENT_LIMIT).map(maximum_profile))).unwrap(); let generation = BackendGeneration::new(1).unwrap(); let mut meter = work(); let CertificationResolution::Current(closure) = resolve::<REQUEST_REQUIREMENT_LIMIT, REQUEST_REQUIREMENT_LIMIT, REQUEST_REQUIREMENT_LIMIT>(generation, generation, ModelRevisionId::new(id(1)).unwrap(), &facts(&requirements), &index, &mut meter).unwrap() else { panic!("current maximum description must resolve"); };
-        let mut cache = ApplicabilityCache::<1>::new(); let snapshot = evidence(true); let mut meter = work(); let selection = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); assert_eq!((selection.requirement_count, selection.entries.len()), (256, REQUEST_REQUIREMENT_LIMIT)); assert_eq!(meter.witness(), HotPathWorkWitness::new([8_487, 310_944, 0, 0, 12_078]));
+        let mut cache = ApplicabilityCache::new(); let snapshot = evidence(true); let mut meter = work(); let selection = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); assert_eq!((selection.requirement_count, selection.entries.len()), (256, REQUEST_REQUIREMENT_LIMIT)); assert_eq!(meter.witness(), HotPathWorkWitness::new([8_487, 310_944, 0, 0, 12_078]));
     }
 }
