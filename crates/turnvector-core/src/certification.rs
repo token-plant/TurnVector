@@ -276,6 +276,8 @@ pub(crate) struct ResolvedProfile {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CertificationClosure<const CAPACITY: usize> {
+    generation: GenerationHash,
+    index: CertificationAuthorizationIndexId,
     requirement_count: u16,
     backend_capabilities: [u8; 32],
     entries: BoundedVec<ResolvedProfile, CAPACITY>,
@@ -399,6 +401,8 @@ pub(crate) fn resolve<const R: usize, const P: usize, const C: usize>(
         }
     }
     Ok(CertificationResolution::Current(CertificationClosure {
+        generation: index.generation,
+        index: index.identity,
         requirement_count: u16::try_from(facts.requirements.len())
             .map_err(|_| CertificationError::ClosureCapacity)?,
         backend_capabilities: facts.backend_capabilities,
@@ -411,6 +415,7 @@ struct ApplicabilityCacheKey {
     generation: GenerationHash,
     index: CertificationAuthorizationIndexId,
     environment: EnvironmentIdentity,
+    backend_capabilities: [u8; 32],
     profile: CertifiedExecutionProfile,
     record: CertificationRecord,
 }
@@ -420,7 +425,7 @@ struct ApplicabilityCacheEntry {
     applicable: bool,
     recent: bool,
 }
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ApplicabilityCache<const CAPACITY: usize> {
     entries: [Option<ApplicabilityCacheEntry>; CAPACITY],
     hand: usize,
@@ -542,13 +547,17 @@ pub(crate) fn select_applicable<
     finish: ApplicabilityEvidence,
     work: &mut WorkMeter,
 ) -> CertificationResult<CertificationApplicabilitySelection<C>> {
-    work.record(InvariantChecks, 3)?;
+    work.record(InvariantChecks, 5)?;
     if !start.environment.fresh
         || start.generation != index.generation
         || start.index != index.identity
+        || closure.generation != start.generation
+        || closure.index != start.index
     {
         return Err(CertificationError::StaleEvidence);
     }
+    work.record(CopiedBytes, size_of::<ApplicabilityCache<CACHE>>() as u64)?;
+    let mut next_cache = cache.clone();
     let mut entries = BoundedVec::new();
     let mut covered = [false; C];
     for entry in closure.entries.iter().copied() {
@@ -556,15 +565,16 @@ pub(crate) fn select_applicable<
             generation: start.generation,
             index: start.index,
             environment: start.environment.identity,
+            backend_capabilities: closure.backend_capabilities,
             profile: entry.profile,
             record: entry.record,
         };
-        let applicable = if let Some(applicable) = cache.lookup(key, work)? {
+        let applicable = if let Some(applicable) = next_cache.lookup(key, work)? {
             applicable
         } else {
             let applicable =
                 entry_is_applicable(entry, closure.backend_capabilities, start, index, work)?;
-            cache.insert(key, applicable, work)?;
+            next_cache.insert(key, applicable, work)?;
             applicable
         };
         if applicable {
@@ -595,6 +605,8 @@ pub(crate) fn select_applicable<
     {
         return Err(CertificationError::MissingApplicableRequirement);
     }
+    work.record(CopiedBytes, size_of::<ApplicabilityCache<CACHE>>() as u64)?;
+    *cache = next_cache;
     Ok(CertificationApplicabilitySelection {
         generation: start.generation,
         index: start.index,
@@ -673,6 +685,9 @@ mod tests {
         let mut raced = snapshot; raced.environment.identity.daemon_build = id(90); let mut meter = work(); assert_eq!(select_applicable(&closure, &index, &mut cache, snapshot, raced, &mut meter), Err(CertificationError::EvidenceChanged));
         for drift in [|value: &mut EnvironmentIdentity| value.daemon_build = id(90), |value: &mut EnvironmentIdentity| value.backend_capabilities = id(91), |value: &mut EnvironmentIdentity| value.generation_semantics = id(92), |value: &mut EnvironmentIdentity| value.resource_signal = id(93), |value: &mut EnvironmentIdentity| value.operation_bounds = id(94)] { let mut changed = snapshot; drift(&mut changed.environment.identity); let mut meter = work(); assert_eq!(select_applicable(&closure, &index, &mut cache, changed, changed, &mut meter), Err(CertificationError::MissingApplicableRequirement)); }
     }
+    #[test] fn rejects_a_closure_from_another_index_generation() { let old = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &old, &mut meter).unwrap() else { panic!("current description must resolve"); }; let mut snapshot = evidence(true); snapshot.generation = GenerationHash::try_new(id(62)).unwrap(); snapshot.index = CertificationAuthorizationIndexId::try_new(id(63)).unwrap(); let successor: CertificationAuthorizationIndex<1, 3> = CertificationAuthorizationIndex::try_new(snapshot.generation, snapshot.index, bounded([environment()]), bounded([record(30)]), bounded([profile(50, 2), profile(51, 2), profile(52, 3)])).unwrap(); let mut cache = ApplicabilityCache::<2>::new(); let mut meter = work(); assert_eq!(select_applicable(&closure, &successor, &mut cache, snapshot, snapshot, &mut meter), Err(CertificationError::StaleEvidence)); }
+    #[test] fn backend_capability_state_is_part_of_every_cache_key() { let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::<2>::new(); let mut meter = work(); select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); let mut incompatible = closure.clone(); incompatible.backend_capabilities = id(99); let mut meter = work(); let cached = select_applicable(&incompatible, &index, &mut cache, snapshot, snapshot, &mut meter); let mut cold_cache = ApplicabilityCache::<2>::new(); let mut meter = work(); let cold = select_applicable(&incompatible, &index, &mut cold_cache, snapshot, snapshot, &mut meter); assert_eq!((cached, cold), (Err(CertificationError::MissingApplicableRequirement), Err(CertificationError::MissingApplicableRequirement))); }
+    #[test] fn work_rejection_preserves_the_exact_cache() { let index = index(); let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(2)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let snapshot = evidence(true); let mut cache = ApplicabilityCache::<2>::new(); let before = (cache.entries, cache.hand); let budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 1_000_000, 0, 0, 17])).unwrap(); let mut meter = WorkMeter::new(budget); assert_eq!(select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter), Err(CertificationError::Work(WorkBudgetError::BudgetExceeded(WorkDimension::InvariantChecks, 17, 18)))); assert_eq!(meter.witness(), HotPathWorkWitness::new([8, 2_896, 0, 0, 17])); assert_eq!((cache.entries, cache.hand), before); }
     #[test]
     fn cache_misses_and_eviction_never_replace_complete_selection() {
         let index = index(); let snapshot = evidence(true); let mut cache = ApplicabilityCache::<1>::new();
@@ -682,6 +697,6 @@ mod tests {
     #[test]
     fn maximum_applicability_selection_fits_binary_work_budget() {
         let requirements: [_; REQUEST_REQUIREMENT_LIMIT] = std::array::from_fn(maximum_requirement); let index: CertificationAuthorizationIndex<REQUEST_REQUIREMENT_LIMIT, REQUEST_REQUIREMENT_LIMIT> = CertificationAuthorizationIndex::try_new(evidence(true).generation, evidence(true).index, bounded([environment()]), bounded((0..REQUEST_REQUIREMENT_LIMIT).map(maximum_record)), bounded((0..REQUEST_REQUIREMENT_LIMIT).map(maximum_profile))).unwrap(); let generation = BackendGeneration::new(1).unwrap(); let mut meter = work(); let CertificationResolution::Current(closure) = resolve::<REQUEST_REQUIREMENT_LIMIT, REQUEST_REQUIREMENT_LIMIT, REQUEST_REQUIREMENT_LIMIT>(generation, generation, ModelRevisionId::new(id(1)).unwrap(), &facts(&requirements), &index, &mut meter).unwrap() else { panic!("current maximum description must resolve"); };
-        let mut cache = ApplicabilityCache::<1>::new(); let snapshot = evidence(true); let mut meter = work(); let selection = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); assert_eq!((selection.requirement_count, selection.entries.len()), (256, REQUEST_REQUIREMENT_LIMIT));
+        let mut cache = ApplicabilityCache::<1>::new(); let snapshot = evidence(true); let mut meter = work(); let selection = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); assert_eq!((selection.requirement_count, selection.entries.len()), (256, REQUEST_REQUIREMENT_LIMIT)); assert_eq!(meter.witness(), HotPathWorkWitness::new([8_487, 310_944, 0, 0, 12_078]));
     }
 }
