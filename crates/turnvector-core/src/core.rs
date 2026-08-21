@@ -68,12 +68,36 @@ impl OwnedRawModelDescriptor {
     dead_code,
     reason = "the runtime adapter constructs registration events after C10e"
 )]
-#[rustfmt::skip]
-enum CoreAction<const I: usize, const S: usize, const T: usize> { Register(RegistrationIntent, OrdinarySupportSpec, MonotonicTime), RegistrationResult(GenerationVector, OwnedRawModelDescriptor), Warm(RequestId), Describe(OperationId, RequestId, OrdinarySupportSpec, MonotonicTime), DescriptionResult(OperationId, RawRequestDescription<I, S, T>), PostLoadDescriptorResult(OperationId, OwnedRawModelDescriptor), Refresh(DescriptionRefresh), DriveDescription(OperationId, MonotonicTime) }
-#[rustfmt::skip] #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DescriptionRefresh { predecessor: SupportCausalPredecessorId, at: MonotonicTime, obligations: DescriptionObligations, result: LifecycleTriggerResult, next_backend: Option<BackendGeneration>, loaded_revision: Option<ModelRevisionId> }
-#[rustfmt::skip] #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RawRequestDescription<const I: usize, const S: usize, const T: usize> { request: RequestId, token_request: TokenRequest<I, S, T>, descriptor_id: [u8; 32], descriptor_hash_schema: u32, descriptor_hash: [u8; 32], vocabulary: u32, backend: BackendGeneration, facts: RequestDescriptionFacts }
+enum CoreAction<const I: usize, const S: usize, const T: usize> {
+    Register(RegistrationIntent, OrdinarySupportSpec, MonotonicTime),
+    RegistrationResult(GenerationVector, OwnedRawModelDescriptor),
+    Warm(RequestId),
+    Describe(OperationId, RequestId, OrdinarySupportSpec, MonotonicTime),
+    DescriptionResult(OperationId, RawRequestDescription<I, S, T>),
+    PostLoadDescriptorResult(OperationId, OwnedRawModelDescriptor),
+    Refresh(DescriptionRefresh),
+    DriveDescription(OperationId, MonotonicTime),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DescriptionRefresh {
+    predecessor: SupportCausalPredecessorId,
+    at: MonotonicTime,
+    obligations: DescriptionObligations,
+    result: LifecycleTriggerResult,
+    next_backend: Option<BackendGeneration>,
+    loaded_revision: Option<ModelRevisionId>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawRequestDescription<const I: usize, const S: usize, const T: usize> {
+    request: RequestId,
+    token_request: TokenRequest<I, S, T>,
+    descriptor_id: [u8; 32],
+    descriptor_hash_schema: u32,
+    descriptor_hash: [u8; 32],
+    vocabulary: u32,
+    backend: BackendGeneration,
+    facts: RequestDescriptionFacts,
+}
 /// One validated operation request presented at an exact Event Sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CoreEvent<const I: usize = 0, const S: usize = 0, const T: usize = 0> {
@@ -307,12 +331,59 @@ struct RegistrationState { support: CoreSupport, registry: CoreRegistry, pending
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[rustfmt::skip]
 struct PendingRegistration { operation: OperationId, generations: GenerationVector, obligation: SupportOperationObligationId, expected_hash: ModelDescriptorHash, plan: DescriptionPlan }
-#[rustfmt::skip] #[derive(Clone, Debug, Eq, PartialEq)]
-struct OwnedRequestDescriptionInput<const I: usize, const S: usize, const T: usize> { request: RequestId, token_request: TokenRequest<I, S, T>, descriptor_frame: [u8; MAX_FRAME_BYTES], descriptor_len: u16, descriptor_id: ModelDescriptorId, descriptor_hash: ModelDescriptorHash, vocabulary: u32, backend: BackendGeneration }
-#[rustfmt::skip]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedRequestDescriptionInput<const I: usize, const S: usize, const T: usize> {
+    request: RequestId,
+    token_request: TokenRequest<I, S, T>,
+    descriptor_frame: [u8; MAX_FRAME_BYTES],
+    descriptor_len: u16,
+    descriptor_id: ModelDescriptorId,
+    descriptor_hash: ModelDescriptorHash,
+    vocabulary: u32,
+    backend: BackendGeneration,
+}
 impl<const I: usize, const S: usize, const T: usize> OwnedRequestDescriptionInput<I, S, T> {
-    fn new(request: &AcceptedRequest<I, S, T>, descriptor: RegisteredDescriptor<'_>, backend: BackendGeneration, work: &mut WorkMeter) -> Result<Self, StageFailure> { let (frame, descriptor_id, descriptor_hash, vocabulary) = descriptor.values(); let copied = frame.len() as u64 + std::mem::size_of::<TokenRequest<I, S, T>>() as u64; work.ensure(HotPathWorkWitness::new([0, copied, 0, 0, 1]))?; work.record(WorkDimension::CopiedBytes, copied)?; work.record(WorkDimension::InvariantChecks, 1)?; let mut descriptor_frame = [0; MAX_FRAME_BYTES]; descriptor_frame[..frame.len()].copy_from_slice(frame); Ok(Self { request: request.id(), token_request: *request.request(), descriptor_frame, descriptor_len: u16::try_from(frame.len()).expect("registered descriptor is bounded"), descriptor_id, descriptor_hash, vocabulary, backend }) }
-    fn matches(&self, result: RawRequestDescription<I, S, T>, work: &mut WorkMeter) -> Result<bool, WorkBudgetError> { work.record(WorkDimension::InvariantChecks, 6)?; Ok(result.facts.valid(work)? && self.request == result.request && self.token_request.exactly_matches(&result.token_request, work)? && self.descriptor_id.bytes() == result.descriptor_id && self.descriptor_hash.schema_version() == result.descriptor_hash_schema && self.descriptor_hash.digest() == result.descriptor_hash && self.vocabulary == result.vocabulary && self.backend == result.backend) }
+    fn new(
+        request: &AcceptedRequest<I, S, T>,
+        descriptor: RegisteredDescriptor<'_>,
+        backend: BackendGeneration,
+        work: &mut WorkMeter,
+    ) -> Result<Self, StageFailure> {
+        let (frame, descriptor_id, descriptor_hash, vocabulary) = descriptor.values();
+        let copied = frame.len() as u64 + std::mem::size_of::<TokenRequest<I, S, T>>() as u64;
+        work.ensure(HotPathWorkWitness::new([0, copied, 0, 0, 1]))?;
+        work.record(WorkDimension::CopiedBytes, copied)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let mut descriptor_frame = [0; MAX_FRAME_BYTES];
+        descriptor_frame[..frame.len()].copy_from_slice(frame);
+        Ok(Self {
+            request: request.id(),
+            token_request: *request.request(),
+            descriptor_frame,
+            descriptor_len: u16::try_from(frame.len()).expect("registered descriptor is bounded"),
+            descriptor_id,
+            descriptor_hash,
+            vocabulary,
+            backend,
+        })
+    }
+    fn matches(
+        &self,
+        result: &RawRequestDescription<I, S, T>,
+        work: &mut WorkMeter,
+    ) -> Result<bool, WorkBudgetError> {
+        work.record(WorkDimension::InvariantChecks, 6)?;
+        Ok(result.facts.valid(work)?
+            && self.request == result.request
+            && self
+                .token_request
+                .exactly_matches(&result.token_request, work)?
+            && self.descriptor_id.bytes() == result.descriptor_id
+            && self.descriptor_hash.schema_version() == result.descriptor_hash_schema
+            && self.descriptor_hash.digest() == result.descriptor_hash
+            && self.vocabulary == result.vocabulary
+            && self.backend == result.backend)
+    }
 }
 #[rustfmt::skip] #[derive(Clone, Debug, Eq, PartialEq)] #[allow(clippy::large_enum_variant, reason = "the bounded request input remains allocation-free")]
 enum PendingDescription<const I: usize, const S: usize, const T: usize> { Model { operation: OperationId, obligation: SupportOperationObligationId, revision: ModelRevisionId }, Request { operation: OperationId, obligation: SupportOperationObligationId, input: OwnedRequestDescriptionInput<I, S, T> } }
@@ -421,7 +492,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             Some(input) => self
                 .accept_request(input, &mut work)
                 .map(|accepted| (BoundedVec::new(), Some(accepted))),
-            None => match event.action {
+            None => match event.action.as_ref() {
                 Some(action) => self.apply_action(action, event.operation, &mut work),
                 None => self
                     .stage(
@@ -465,8 +536,49 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             ),
         }
     }
-    #[rustfmt::skip]
-    fn apply_action(&mut self, action: CoreAction<I, S, T>, operation: Option<OperationId>, work: &mut WorkMeter) -> Result<(Effects, Option<RequestAcceptance>), StageFailure> { let none = |effects| (effects, None); match action { CoreAction::Register(intent, support, at) => self.start_registration(operation.expect("registration event"), intent, support, at, work).map(none), CoreAction::RegistrationResult(generations, result) => self.finish_registration(operation.expect("registration event"), generations, result, work).map(none), CoreAction::Warm(request) => self.warm_request(request, work).map(none), CoreAction::Describe(operation, request, support, at) => self.start_request_description(operation, request, support, at, work).map(none), CoreAction::DescriptionResult(operation, result) => self.finish_request_description(operation, result, work).map(none), CoreAction::PostLoadDescriptorResult(operation, result) => self.finish_post_load_model_description(operation, result, work).map(none), CoreAction::Refresh(refresh) => self.resolve_description_refresh(refresh, work).map(none), CoreAction::DriveDescription(operation, at) => self.drive_request_description(operation, at, work).map(none) } }
+    fn apply_action(
+        &mut self,
+        action: &CoreAction<I, S, T>,
+        operation: Option<OperationId>,
+        work: &mut WorkMeter,
+    ) -> Result<(Effects, Option<RequestAcceptance>), StageFailure> {
+        let none = |effects| (effects, None);
+        match action {
+            CoreAction::Register(intent, support, at) => self
+                .start_registration(
+                    operation.expect("registration event"),
+                    *intent,
+                    *support,
+                    *at,
+                    work,
+                )
+                .map(none),
+            CoreAction::RegistrationResult(generations, result) => self
+                .finish_registration(
+                    operation.expect("registration event"),
+                    *generations,
+                    result,
+                    work,
+                )
+                .map(none),
+            CoreAction::Warm(request) => self.warm_request(*request, work).map(none),
+            CoreAction::Describe(operation, request, support, at) => self
+                .start_request_description(*operation, *request, *support, *at, work)
+                .map(none),
+            CoreAction::DescriptionResult(operation, result) => self
+                .finish_request_description(*operation, result, work)
+                .map(none),
+            CoreAction::PostLoadDescriptorResult(operation, result) => self
+                .finish_post_load_model_description(*operation, result, work)
+                .map(none),
+            CoreAction::Refresh(refresh) => {
+                self.resolve_description_refresh(refresh, work).map(none)
+            }
+            CoreAction::DriveDescription(operation, at) => self
+                .drive_request_description(*operation, *at, work)
+                .map(none),
+        }
+    }
     fn stage(
         &self,
         operation: OperationId,
@@ -565,7 +677,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated support begin is infallible"); self.requests.as_mut().unwrap().commit_description(change).expect("revalidated description start is infallible"); self.pending_description = Some(PendingDescription::Request { operation, obligation: support.id, input }); self.commit(&positions, &effects); Ok(effects)
     }
     #[rustfmt::skip]
-    fn resolve_description_refresh(&mut self, refresh: DescriptionRefresh, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+    fn resolve_description_refresh(&mut self, refresh: &DescriptionRefresh, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
         if self.description_refresh.is_some() { return Err(registration_rejection(DomainRejection::RequestDescriptionPending)); }
         let (scope, required) = match (refresh.result, refresh.next_backend, refresh.loaded_revision) { (LifecycleTriggerResult::LoadSucceeded, Some(_), Some(revision)) => (DescriptionRefreshScope::Loaded(revision), true), (LifecycleTriggerResult::LoadFailed | LifecycleTriggerResult::LoadCancelled, None, Some(revision)) => (DescriptionRefreshScope::Loaded(revision), false), (LifecycleTriggerResult::ObservationDescriptionsRequired, Some(_), None) => (DescriptionRefreshScope::Observation, true), (LifecycleTriggerResult::ObservationUnchanged | LifecycleTriggerResult::ObservationFailed | LifecycleTriggerResult::ObservationCancelled, None, None) => (DescriptionRefreshScope::Observation, false), _ => return Err(registration_rejection(DomainRejection::RequestDescriptionState)) };
         let registration = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let requests = self.requests.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?; let mut model = None; let mut obligations = DescriptionObligations::new(); for id in refresh.obligations.iter() { let kind = registration.support.lifecycle_kind(*id, work).map_err(request_support_failure)?; match (scope, kind) { (DescriptionRefreshScope::Loaded(revision), LifecycleReserveKind::PostLoadModelDescription) if model.is_none() => model = Some((*id, revision)), (DescriptionRefreshScope::Loaded(_), LifecycleReserveKind::PostLoadRequestDescription) | (DescriptionRefreshScope::Observation, LifecycleReserveKind::PostObservationRequestDescription) => obligations.try_push(*id).map_err(|_| registration_rejection(DomainRejection::RequestDescriptionRefreshSet))?, _ => return Err(registration_rejection(DomainRejection::RequestDescriptionRefreshSet)), } }
@@ -586,16 +698,16 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
     #[rustfmt::skip]
     fn start_post_load_model_description(&mut self, operation: OperationId, obligation: SupportOperationObligationId, revision: ModelRevisionId, at: MonotonicTime, work: &mut WorkMeter) -> Result<Effects, StageFailure> { let registration = self.registration.as_ref().expect("refresh has registration state"); let record = registration.registry.revision(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let descriptor = registration.registry.descriptor(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let intent = RegistrationIntent { model: record.model, revision, manifest: record.manifest, expected_descriptor_hash: descriptor.values().2, context_limit: record.context_limit }; let (positions, effects) = self.stage(operation, None, Some(intent), None, work)?; let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::BeginPending(obligation, LifecycleReserveKind::PostLoadModelDescription, at), work).map_err(request_support_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?; self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated post-load model begin is infallible"); self.pending_description = Some(PendingDescription::Model { operation, obligation, revision }); self.commit(&positions, &effects); Ok(effects) }
     #[rustfmt::skip]
-    fn finish_request_description(&mut self, operation: OperationId, result: RawRequestDescription<I, S, T>, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+    fn finish_request_description(&mut self, operation: OperationId, result: &RawRequestDescription<I, S, T>, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
         let pending = self.pending_description.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionResultMismatch))?; let PendingDescription::Request { operation: pending_operation, obligation, input } = pending else { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); }; if *pending_operation != operation || !input.matches(result, work)? { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); } let (request, target, obligation) = (input.request, input.backend, *obligation);
         let registration = self.registration.as_ref().expect("pending description has registration state"); let requests = self.requests.as_ref().expect("pending description has request state"); let request_change = requests.prepare_description_result(requests.generation(), request, target, &result.facts, work).map_err(request_description_failure)?; let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::FinishActive(obligation), work).map_err(request_support_failure)?;
         requests.validate_description(&request_change).map_err(request_description_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?;
         self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated support finish is infallible"); self.requests.as_mut().unwrap().commit_description(request_change).expect("revalidated description result is infallible"); self.pending_description = None; if self.description_refresh.as_ref().is_some_and(|refresh| refresh.model.is_none() && refresh.next == refresh.obligations.len()) { self.description_refresh = None; } Ok(BoundedVec::new())
     }
     #[rustfmt::skip]
-    fn finish_post_load_model_description(&mut self, operation: OperationId, result: OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> { let pending = self.pending_description.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionResultMismatch))?; let PendingDescription::Model { operation: pending_operation, obligation, revision } = pending else { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); }; if *pending_operation != operation { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); } let (obligation, revision) = (*obligation, *revision); let registration = self.registration.as_ref().expect("pending description has registration state"); let registered = registration.registry.descriptor(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let verified = verify(result.as_raw(), registered.values().2, work).map_err(request_descriptor_failure)?; if !registered.exactly_matches(&verified, work).map_err(request_registry_failure)? { return Err(registration_rejection(DomainRejection::RequestDescriptionDescriptor)); } let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::FinishActive(obligation), work).map_err(request_support_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?; self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated post-load model finish is infallible"); self.pending_description = None; self.description_refresh.as_mut().expect("post-load model has refresh state").model = None; if self.description_refresh.as_ref().is_some_and(|refresh| refresh.obligations.is_empty()) { self.description_refresh = None; } Ok(BoundedVec::new()) }
+    fn finish_post_load_model_description(&mut self, operation: OperationId, result: &OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> { let pending = self.pending_description.as_ref().ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionResultMismatch))?; let PendingDescription::Model { operation: pending_operation, obligation, revision } = pending else { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); }; if *pending_operation != operation { return Err(registration_rejection(DomainRejection::RequestDescriptionResultMismatch)); } let (obligation, revision) = (*obligation, *revision); let registration = self.registration.as_ref().expect("pending description has registration state"); let registered = registration.registry.descriptor(revision, work).map_err(request_registry_failure)?.ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionState))?; let verified = verify(result.as_raw(), registered.values().2, work).map_err(request_descriptor_failure)?; if !registered.exactly_matches(&verified, work).map_err(request_registry_failure)? { return Err(registration_rejection(DomainRejection::RequestDescriptionDescriptor)); } let support_change = registration.support.prepare(registration.support.generation(), SupportChangeInput::FinishActive(obligation), work).map_err(request_support_failure)?; registration.support.validate(&support_change).map_err(request_support_failure)?; self.registration.as_mut().unwrap().support.commit(support_change, work).expect("revalidated post-load model finish is infallible"); self.pending_description = None; self.description_refresh.as_mut().expect("post-load model has refresh state").model = None; if self.description_refresh.as_ref().is_some_and(|refresh| refresh.obligations.is_empty()) { self.description_refresh = None; } Ok(BoundedVec::new()) }
     #[rustfmt::skip]
-    fn finish_registration(&mut self, operation: OperationId, generations: GenerationVector, result: OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+    fn finish_registration(&mut self, operation: OperationId, generations: GenerationVector, result: &OwnedRawModelDescriptor, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
         let state = self.registration.as_ref().ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationUnavailable))?;
         let pending = state.pending.ok_or_else(|| registration_rejection(DomainRejection::ModelRegistrationResultMismatch))?;
         if (operation, generations, self.state.generations) != (pending.operation, pending.generations, pending.generations) { return Err(registration_rejection(DomainRejection::ModelRegistrationResultMismatch)); }
