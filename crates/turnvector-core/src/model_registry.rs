@@ -4,7 +4,8 @@ use crate::model_descriptor::{
     MAX_FRAME_BYTES, ModelDescriptorHash, ModelDescriptorId, VerifiedModelDescriptor,
 };
 use crate::{
-    FixedIdentityIndex, FixedIndexError, HotPathWorkBudget, ModelId, WorkBudgetError, WorkMeter,
+    FixedIdentityIndex, FixedIndexError, HotPathWorkBudget, ModelId, TokenCount, WorkBudgetError,
+    WorkMeter,
 };
 const INDEX_COMMIT_WORK: (u64, u64) = (827, 256); // Fixed-index insert lookup and path.
 pub(crate) const MODEL_REGISTRY_LIMIT: usize = 256;
@@ -50,6 +51,7 @@ pub(crate) struct RegisteredRevision {
     pub(crate) model: ModelId,
     pub(crate) revision: ModelRevisionId,
     pub(crate) manifest: ModelManifestId,
+    pub(crate) context_limit: TokenCount,
     pub(crate) lifecycle: RevisionLifecycle,
     descriptor: RetainedDescriptor,
 }
@@ -64,7 +66,7 @@ pub(crate) struct RegistryCounts {
 }
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RegistrationIntent { pub(crate) model: ModelId, pub(crate) revision: ModelRevisionId, pub(crate) manifest: ModelManifestId, pub(crate) expected_descriptor_hash: ModelDescriptorHash }
+pub(crate) struct RegistrationIntent { pub(crate) model: ModelId, pub(crate) revision: ModelRevisionId, pub(crate) manifest: ModelManifestId, pub(crate) expected_descriptor_hash: ModelDescriptorHash, pub(crate) context_limit: TokenCount }
 #[rustfmt::skip]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DescriptionPlan { expected: RegistryGeneration, before: RegistryCounts, intent: RegistrationIntent }
@@ -77,6 +79,21 @@ impl RegisteredDescriptor<'_> {
     pub(crate) const fn values(&self) -> (&[u8], ModelDescriptorId, ModelDescriptorHash, u32) { (self.frame, self.id, self.hash, self.vocabulary) }
     #[rustfmt::skip]
     pub(crate) fn exactly_matches(&self, descriptor: &VerifiedModelDescriptor, work: &mut WorkMeter) -> RegistryResult<bool> { work.ensure(crate::HotPathWorkWitness::new([self.frame.len() as u64, 0, 0, 0, 4]))?; work.record(InvariantChecks, 4)?; work.record(VisitedEntities, self.frame.len() as u64)?; Ok(self.frame == descriptor.frame() && self.id == descriptor.id() && self.hash == descriptor.hash() && self.vocabulary == descriptor.vocabulary()) }
+}
+#[rustfmt::skip]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RevisionSelection { Direct(ModelRevisionId), Alias(ModelAliasId) }
+#[rustfmt::skip]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestRevision { generation: RegistryGeneration, selection: RevisionSelection, record: RegisteredRevision, vocabulary: u32 }
+#[rustfmt::skip]
+impl RequestRevision {
+    pub(crate) const fn generation(self) -> RegistryGeneration { self.generation }
+    pub(crate) const fn selection(self) -> RevisionSelection { self.selection }
+    pub(crate) const fn revision(self) -> ModelRevisionId { self.record.revision }
+    pub(crate) const fn lifecycle(self) -> RevisionLifecycle { self.record.lifecycle }
+    pub(crate) const fn vocabulary(self) -> u32 { self.vocabulary }
+    pub(crate) const fn context_limit(self) -> TokenCount { self.record.context_limit }
 }
 values! {
     pub(crate) enum RevisionLifecycle { Available, Retiring, Unavailable }
@@ -190,17 +207,35 @@ impl<const R: usize, const A: usize, const D: usize> ModelRegistry<R, A, D> {
         work.record(CopiedBytes, std::mem::size_of_val(&descriptor) as u64)?;
         Ok(Some(descriptor))
     }
+    #[rustfmt::skip]
+    pub(crate) fn request_revision_fact(&self, expected: RegistryGeneration, selection: RevisionSelection, work: &mut WorkMeter) -> RegistryResult<Option<RequestRevision>> {
+        work.record(InvariantChecks, 1)?;
+        if expected != self.generation { return Err(RegistryError::Generation); }
+        let record = match selection {
+            RevisionSelection::Direct(revision) => self.revision(revision, work)?,
+            RevisionSelection::Alias(alias) => self.resolve_alias(alias, work)?,
+        };
+        let Some(record) = record else { return Ok(None); };
+        let fact = RequestRevision { generation: expected, selection, record, vocabulary: record.descriptor.4 };
+        work.record(CopiedBytes, std::mem::size_of_val(&fact) as u64)?;
+        Ok(Some(fact))
+    }
+    #[rustfmt::skip]
+    pub(crate) fn validate_request_revision(&self, fact: RequestRevision) -> RegistryResult<()> { (self.generation == fact.generation()).then_some(()).ok_or(RegistryError::Generation) }
     pub(crate) fn prepare_description(
         &self,
         expected: RegistryGeneration,
         intent: RegistrationIntent,
         work: &mut WorkMeter,
     ) -> RegistryResult<DescriptionPlan> {
-        work.record(InvariantChecks, 4)?;
+        work.record(InvariantChecks, 5)?;
         if expected != self.generation {
             return Err(RegistryError::Generation);
         }
         self.generation.next()?;
+        if intent.context_limit.get() == 0 {
+            return Err(RegistryError::InvalidInput);
+        }
         if self
             .revision_index
             .find(key(intent.revision.0), work)?
@@ -351,6 +386,7 @@ impl<const R: usize, const A: usize, const D: usize> ModelRegistry<R, A, D> {
                     model: intent.model,
                     revision: intent.revision,
                     manifest: intent.manifest,
+                    context_limit: intent.context_limit,
                     lifecycle: Available,
                     descriptor: (
                         offset as u32,
@@ -403,6 +439,7 @@ fn full_work() -> WorkMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TokenCount;
     use crate::model_descriptor::{ModelDescriptorHash, RawModelDescriptor, verify};
     use RegistryError::*;
     type Reg<const R: usize, const A: usize, const D: usize = DESCRIPTOR_ARENA_LIMIT> =
@@ -439,6 +476,7 @@ mod tests {
             revision: rev(value),
             manifest: man(value),
             expected_descriptor_hash: descriptor().hash(),
+            context_limit: TokenCount::new(8),
         }
     }
     #[rustfmt::skip]
@@ -464,6 +502,7 @@ mod tests {
     #[rustfmt::skip]
     fn description_error<const R: usize, const A: usize, const D: usize>(r: &Reg<R, A, D>, intent: RegistrationIntent, error: RegistryError, witness: [u64; 5]) { let mut work = full_work(); assert_eq!(r.prepare_description(r.generation(), intent, &mut work).unwrap_err(), error); assert_eq!(work.witness(), crate::HotPathWorkWitness::new(witness)); }
     #[test]
+    #[rustfmt::skip]
     fn registry_contract() {
         let mut r = ModelRegistry::<2, 2>::try_new(RegistryGeneration(1)).unwrap();
         let sealed = descriptor();
@@ -476,7 +515,16 @@ mod tests {
             .unwrap();
         r.validate(&change).unwrap();
         r.commit(change).unwrap();
-        assert_eq!(r.revisions[0].unwrap().manifest, man(2));
+        assert_eq!((r.revisions[0].unwrap().manifest, r.revisions[0].unwrap().context_limit), (man(2), TokenCount::new(8)));
+        let fact = r
+            .request_revision_fact(
+                r.generation(),
+                RevisionSelection::Direct(rev(2)),
+                &mut full_work(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((fact.selection(), fact.revision(), fact.lifecycle(), fact.vocabulary(), fact.context_limit()), (RevisionSelection::Direct(rev(2)), rev(2), Available, 7, TokenCount::new(8)));
         let mut read_work = full_work();
         let retained = r.descriptor(rev(2), &mut read_work).unwrap().unwrap();
         exact(&read_work, [1, 88, 0, 0, 0]);
@@ -490,9 +538,9 @@ mod tests {
             model: ModelId::new(9).unwrap(),
             ..registration(2)
         };
-        description_error(&r, duplicate, RevisionExists, [1, 0, 0, 0, 4]);
+        description_error(&r, duplicate, RevisionExists, [1, 0, 0, 0, 5]);
         apply_registration(&mut r, registration(1));
-        description_error(&r, registration(3), RegistryLimit, [2, 0, 0, 0, 4]);
+        description_error(&r, registration(3), RegistryLimit, [2, 0, 0, 0, 5]);
         apply(&mut r, BindAlias(name(2), rev(1)));
         for target in [rev(1), rev(2)] {
             assert_eq!(bad(&r, BindAlias(name(2), target)), AliasFrozen);
@@ -521,9 +569,11 @@ mod tests {
     fn failures_preserve_state() {
         assert_eq!(RegistryGeneration::new(0), Err(RegistryError::InvalidInput));
         let mut r = ModelRegistry::<2, 2>::try_new(RegistryGeneration(1)).unwrap(); let descriptor = descriptor(); let first = prep_registration(&r, registration(1), &descriptor).unwrap(); let stale = prep_registration(&r, registration(2), &descriptor).unwrap(); r.commit(first).unwrap();
+        let fact = r.request_revision_fact(r.generation(), RevisionSelection::Direct(rev(1)), &mut full_work()).unwrap().unwrap(); apply(&mut r, BindAlias(name(1), rev(1))); assert_eq!(r.validate_request_revision(fact), Err(Generation));
+        let mut invalid = registration(2); invalid.context_limit = TokenCount::new(0); description_error(&r, invalid, InvalidInput, [0, 0, 0, 0, 5]);
         let retained = r.descriptor(rev(1), &mut full_work()).unwrap().unwrap(); let mut equality_work = full_work(); equality_work.record(VisitedEntities, 1_000_000).unwrap(); assert_eq!(retained.exactly_matches(&descriptor, &mut equality_work).unwrap_err(), Work(WorkBudgetError::BudgetExceeded(VisitedEntities, 1_000_000, 1_000_013))); exact(&equality_work, [1_000_000, 0, 0, 0, 0]);
         let before = (r.generation(), r.counts());
-        let mut generation_work = full_work(); assert_eq!(r.prepare_description(RegistryGeneration(1), registration(2), &mut generation_work).unwrap_err(), Generation); assert_eq!(generation_work.witness(), crate::HotPathWorkWitness::new([0, 0, 0, 0, 4]));
+        let mut generation_work = full_work(); assert_eq!(r.prepare_description(RegistryGeneration(1), registration(2), &mut generation_work).unwrap_err(), Generation); assert_eq!(generation_work.witness(), crate::HotPathWorkWitness::new([0, 0, 0, 0, 5]));
         assert_eq!(r.validate(&stale), Err(PreparedChangeStale)); assert_eq!(r.commit(stale), Err(PreparedChangeStale));
         let plan = r.prepare_description(r.generation(), registration(2), &mut full_work()).unwrap(); let mut work = full_work(); work.record(CopiedBytes, 2_097_152).unwrap(); assert_eq!(r.prepare_registration(plan, &descriptor, &mut work).unwrap_err(), Work(WorkBudgetError::BudgetExceeded(CopiedBytes, 2_097_152, 2_097_677))); assert_eq!(work.witness(), crate::HotPathWorkWitness::new([0, 2_097_152, 0, 0, 6]));
         assert_eq!((r.generation(), r.counts()), before);
@@ -540,7 +590,7 @@ mod tests {
         let plan = r
             .prepare_description(r.generation(), registration(8), &mut plan_work)
             .unwrap();
-        exact(&plan_work, [3, 160, 0, 0, 4]);
+        exact(&plan_work, [3, 160, 0, 0, 5]);
         let mut registration_work = full_work();
         let descriptor = descriptor();
         let change = r

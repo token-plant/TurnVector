@@ -519,7 +519,7 @@ mod tests {
     use crate::{
         BackendGeneration, Duration, FixedStartCountBound, ModelId, MonotonicTime,
         PhysicalStartCreditId, RuntimeOverheadGeneration, SafetyGeneration, SchedulerGeneration,
-        SupportLedgerGeneration, SupportOperationObligationId,
+        SupportLedgerGeneration, SupportOperationObligationId, TokenCount,
     };
     const FRAME: [u8; 13] = [0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 1, b'x'];
     #[rustfmt::skip]
@@ -532,7 +532,7 @@ mod tests {
         generations_with(1, 1, 1, 1)
     }
     #[rustfmt::skip]
-    fn registration(hash: [u8; 32]) -> RegistrationIntent { RegistrationIntent { model: ModelId::new(1).unwrap(), revision: ModelRevisionId::new([2; 32]).unwrap(), manifest: ModelManifestId::new([3; 32]).unwrap(), expected_descriptor_hash: ModelDescriptorHash::from_manifest(1, hash).unwrap() } }
+    fn registration(hash: [u8; 32]) -> RegistrationIntent { RegistrationIntent { model: ModelId::new(1).unwrap(), revision: ModelRevisionId::new([2; 32]).unwrap(), manifest: ModelManifestId::new([3; 32]).unwrap(), expected_descriptor_hash: ModelDescriptorHash::from_manifest(1, hash).unwrap(), context_limit: TokenCount::new(8) } }
     #[rustfmt::skip]
     fn ordinary(n: u8) -> OrdinarySupportSpec { OrdinarySupportSpec { id: SupportOperationObligationId([n; 32]), operation: SupportOperation::DescribeModel, physical_credit: PhysicalStartCreditId([n + 1; 32]), scope: SupportCallScopeId([n + 2; 32]), claim: SupportFundingClaim::OrdinaryReservation([n + 3; 32]) } }
     #[rustfmt::skip]
@@ -577,12 +577,13 @@ mod tests {
         let registration = registration(HASH); let mut core = registration_core(2); let transition = core.handle(CoreEvent::describe_model(EventSequence::new(1).unwrap(), OperationId::new(1).unwrap(), registration, ordinary(5), MonotonicTime::from_micros(1)));
         assert_eq!(transition.outcome(), &CoreOutcome::Accepted);
         assert_eq!((transition.effects().len(), transition.effects().get(0).unwrap().registration()), (1, Some(registration)));
-        assert_eq!(transition.work(), HotPathWorkWitness::new([3, 448, 0, 1, 30]));
+        assert_eq!(transition.work(), HotPathWorkWitness::new([3, 448, 0, 1, 31]));
         let result = core.handle(CoreEvent::model_descriptor_result(EventSequence::new(2).unwrap(), OperationId::new(1).unwrap(), generations(), raw(&FRAME, ID, HASH, 7)));
         assert_eq!((result.outcome(), result.effects().is_empty()), (&CoreOutcome::Accepted, true));
         assert_eq!(result.work(), HotPathWorkWitness::new([833, 823, 0, 2, 29]));
         let state = core.registration.as_ref().unwrap();
         assert_eq!((state.pending.is_none(), state.registry.counts().registered, state.support.generation()), (true, 1, SupportLedgerGeneration::new(3).unwrap()));
+        assert_eq!(state.registry.request_revision_fact(state.registry.generation(), crate::model_registry::RevisionSelection::Direct(ModelRevisionId::new([2; 32]).unwrap()), &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap().unwrap().context_limit(), TokenCount::new(8));
         let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
         let descriptor = state.registry.descriptor(ModelRevisionId::new([2; 32]).unwrap(), &mut work).unwrap().unwrap();
         let sealed = verify(raw(&FRAME, ID, HASH, 7), ModelDescriptorHash::from_manifest(1, HASH).unwrap(), &mut work).unwrap();
@@ -594,7 +595,7 @@ mod tests {
         let snapshot = |core: &Core<4>| { let state = core.registration.as_ref().unwrap(); (state.support.generation(), state.registry.counts(), state.pending.map(|pending| pending.operation), core.state.generations, core.state.operation_count()) };
         let assert_rejected = |transition: CoreTransition, rejection, witness| { assert_eq!(transition.outcome(), &CoreOutcome::Rejected(rejection)); assert!(transition.effects().is_empty()); assert_eq!(transition.work(), HotPathWorkWitness::new(witness)); };
         let mut unavailable = Core::<4>::bootstrap(EventSequence::new(1).unwrap(), generations()); assert_rejected(start(&mut unavailable, 1, 1, registration(HASH), 5), DomainRejection::ModelRegistrationUnavailable, [1, 0, 0, 0, 0]); assert_eq!(unavailable.state.operation_count(), 0);
-        let mut exhausted = registration_core(0); let before = snapshot(&exhausted); assert_rejected(start(&mut exhausted, 1, 1, registration(HASH), 5), DomainRejection::ModelRegistrationSupport, [1, 160, 0, 1, 15]); assert_eq!(snapshot(&exhausted), before);
+        let mut exhausted = registration_core(0); let before = snapshot(&exhausted); assert_rejected(start(&mut exhausted, 1, 1, registration(HASH), 5), DomainRejection::ModelRegistrationSupport, [1, 160, 0, 1, 16]); assert_eq!(snapshot(&exhausted), before);
         let mut wrong = registration_core(2); let before = snapshot(&wrong); let mut support = ordinary(5); support.operation = SupportOperation::DescribeRequest; assert_rejected(wrong.handle(CoreEvent::describe_model(EventSequence::new(1).unwrap(), OperationId::new(1).unwrap(), registration(HASH), support, MonotonicTime::from_micros(1))), DomainRejection::ModelRegistrationSupport, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&wrong), before);
         let mut core = registration_core(2); assert_eq!(start(&mut core, 1, 1, registration(HASH), 5).outcome(), &CoreOutcome::Accepted); let pending = snapshot(&core);
         assert_rejected(start(&mut core, 2, 2, registration(HASH), 9), DomainRejection::ModelRegistrationPending, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&core), pending);
@@ -602,7 +603,7 @@ mod tests {
         for current in [generations_with(2, 1, 1, 1), generations_with(1, 2, 1, 1), generations_with(1, 1, 2, 1), generations_with(1, 1, 1, 2)] { let mut shifted = registration_core(2); assert_eq!(start(&mut shifted, 1, 1, registration(HASH), 5).outcome(), &CoreOutcome::Accepted); shifted.state.generations = current; let before = snapshot(&shifted); assert_rejected(result(&mut shifted, 2, 1, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationResultMismatch, [1, 0, 0, 0, 0]); assert_eq!(snapshot(&shifted), before); }
         let oversize = [0; MAX_FRAME_BYTES + 2];
         for (sequence, descriptor, witness) in [(4, raw(&FRAME[..12], ID, HASH, 7), [2, 0, 0, 0, 6]), (5, raw(&FRAME, [0; 32], HASH, 7), [4, 108, 0, 2, 10]), (6, raw(&FRAME, ID, HASH, 8), [4, 108, 0, 2, 10]), (7, raw(&FRAME, ID, [0; 32], 7), [4, 108, 0, 2, 10]), (8, raw(&oversize, ID, HASH, 7), [2, 0, 0, 0, 1])] { assert_rejected(result(&mut core, sequence, 1, descriptor), DomainRejection::ModelRegistrationDescriptor, witness); assert_eq!(snapshot(&core), pending); }
-        assert_eq!(result(&mut core, 9, 1, raw(&FRAME, ID, HASH, 7)).outcome(), &CoreOutcome::Accepted); let committed = snapshot(&core); assert_rejected(start(&mut core, 10, 2, registration(HASH), 9), DomainRejection::ModelRegistrationRegistry, [3, 0, 0, 1, 8]); assert_eq!(snapshot(&core), committed);
+        assert_eq!(result(&mut core, 9, 1, raw(&FRAME, ID, HASH, 7)).outcome(), &CoreOutcome::Accepted); let committed = snapshot(&core); assert_rejected(start(&mut core, 10, 2, registration(HASH), 9), DomainRejection::ModelRegistrationRegistry, [3, 0, 0, 1, 9]); assert_eq!(snapshot(&core), committed);
         let mut manifest = registration_core(2); assert_eq!(start(&mut manifest, 1, 1, registration([0; 32]), 5).outcome(), &CoreOutcome::Accepted); let before = snapshot(&manifest); assert_rejected(result(&mut manifest, 2, 1, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationDescriptor, [4, 108, 0, 2, 10]); assert_eq!(snapshot(&manifest), before);
         let mut stale = registration_core(2); assert_eq!(start(&mut stale, 1, 1, registration(HASH), 5).outcome(), &CoreOutcome::Accepted); { let state = stale.registration.as_mut().unwrap(); let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum()); let sealed = verify(raw(&FRAME, ID, HASH, 7), ModelDescriptorHash::from_manifest(1, HASH).unwrap(), &mut work).unwrap(); let mut other = registration(HASH); other.revision = ModelRevisionId::new([9; 32]).unwrap(); let plan = state.registry.prepare_description(state.registry.generation(), other, &mut work).unwrap(); let change = state.registry.prepare_registration(plan, &sealed, &mut work).unwrap(); state.registry.commit(change).unwrap(); } let before = snapshot(&stale); assert_rejected(result(&mut stale, 2, 1, raw(&FRAME, ID, HASH, 7)), DomainRejection::ModelRegistrationRegistry, [4, 121, 0, 2, 16]); assert_eq!(snapshot(&stale), before);
     }
