@@ -349,28 +349,290 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         self.generation = next;
         Ok(self.generation)
     }
-    #[rustfmt::skip]
-    pub(crate) fn prepare_description(&self, expected: RequestBookGeneration, id: RequestId, target: BackendGeneration, at: MonotonicTime, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'static>> { require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?; let request = &self.requests[index]; require(work, at < request.deadline, RequestError::PreparationTimeout)?; require(work, request.lifecycle == RequestLifecycle::Preparing && request.description == DescriptionState::Missing, RequestError::DescriptionState)?; self.description_change(expected, index, request.lifecycle, DescriptionState::InFlight(target), None, work) }
-    #[rustfmt::skip]
-    pub(crate) fn prepare_warming(&self, expected: RequestBookGeneration, id: RequestId, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'static>> { require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?; let request = &self.requests[index]; require(work, request.lifecycle == RequestLifecycle::Preparing && request.description == DescriptionState::Missing, RequestError::DescriptionState)?; self.description_change(expected, index, RequestLifecycle::Warming, DescriptionState::Missing, None, work) }
-    #[rustfmt::skip]
-    pub(crate) fn prepare_description_result<'a>(&self, expected: RequestBookGeneration, id: RequestId, target: BackendGeneration, facts: &'a RequestDescriptionFacts, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'a>> { require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?; let request = &self.requests[index]; require(work, request.description == DescriptionState::InFlight(target), RequestError::DescriptionState)?; self.description_change(expected, index, RequestLifecycle::Preparing, DescriptionState::Ready(target), Some(facts), work) }
-    #[rustfmt::skip]
-    pub(crate) fn refresh_count(&self, scope: DescriptionRefreshScope, work: &mut WorkMeter) -> RequestResult<usize> { let warming = match scope { DescriptionRefreshScope::Observation => 0, DescriptionRefreshScope::Loaded(revision) => { let mut count = 0; for entry in &self.warming { work.record(VisitedEntities, 1)?; if let Some((candidate, value)) = entry && *candidate == revision { count = usize::from(*value); break; } } count } }; Ok(usize::from(self.described) + warming) }
-    #[rustfmt::skip]
-    pub(crate) fn prepare_refresh(&self, expected: RequestBookGeneration, scope: DescriptionRefreshScope, target: BackendGeneration, after: Option<RequestId>, at: MonotonicTime, work: &mut WorkMeter) -> RequestResult<(RequestId, Option<DescriptionChange<'static>>)> {
-        require(work, expected == self.generation, RequestError::PreparedChangeStale)?; expected.next()?; let mut selected = None; for (index, request) in self.requests.iter().enumerate() { work.record(VisitedEntities, 1)?; if description_candidate(request, scope, target) && after.is_none_or(|cursor| request.id > cursor) && selected.is_none_or(|prior: usize| request.id < self.requests[prior].id) { selected = Some(index); } } let index = selected.ok_or(RequestError::DescriptionState)?; let request = &self.requests[index]; work.record(InvariantChecks, 1)?; if at >= request.deadline { return Ok((request.id, None)); } Ok((request.id, Some(self.description_change(expected, index, RequestLifecycle::Preparing, DescriptionState::InFlight(target), None, work)?)))
+    pub(crate) fn prepare_description(
+        &self,
+        expected: RequestBookGeneration,
+        id: RequestId,
+        target: BackendGeneration,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> RequestResult<DescriptionChange<'static>> {
+        require(
+            work,
+            expected == self.generation,
+            RequestError::PreparedChangeStale,
+        )?;
+        let _next_generation = expected.next()?;
+        let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?;
+        let request = &self.requests[index];
+        require(
+            work,
+            at < request.deadline,
+            RequestError::PreparationTimeout,
+        )?;
+        require(
+            work,
+            request.lifecycle == RequestLifecycle::Preparing
+                && request.description == DescriptionState::Missing,
+            RequestError::DescriptionState,
+        )?;
+        self.description_change(
+            expected,
+            index,
+            request.lifecycle,
+            DescriptionState::InFlight(target),
+            None,
+            work,
+        )
     }
-    #[rustfmt::skip]
-    pub(crate) fn validate_description(&self, change: &DescriptionChange<'_>) -> RequestResult<()> { let warming = change.warming.is_none_or(|(slot, before, _)| self.warming.get(slot) == Some(&before)); (self.generation == change.expected && self.described == change.described_before && warming && self.description_facts.get(change.index).is_some_and(|facts| facts.is_some() == change.before_facts) && self.requests.get(change.index).is_some_and(|request| request.lifecycle == change.before_lifecycle && request.description == change.before)).then_some(()).ok_or(RequestError::PreparedChangeStale) }
-    #[rustfmt::skip]
-    pub(crate) fn description_request(&self, change: &DescriptionChange<'_>) -> RequestResult<&AcceptedRequest<I, S, T>> { self.validate_description(change)?; Ok(&self.requests[change.index]) }
-    #[rustfmt::skip]
-    pub(crate) fn description_facts(&self, id: RequestId, work: &mut WorkMeter) -> RequestResult<Option<&RequestDescriptionFacts>> { Ok(match self.find(id, work)? { Some(index) => self.description_facts[index].as_ref(), None => None }) }
-    #[rustfmt::skip]
-    pub(crate) fn commit_description(&mut self, change: DescriptionChange<'_>) -> RequestResult<RequestBookGeneration> { self.validate_description(&change)?; self.requests[change.index].lifecycle = change.after_lifecycle; self.requests[change.index].description = change.after; self.description_facts[change.index] = change.after_facts.copied(); self.described = change.described_after; if let Some((slot, _, after)) = change.warming { self.warming[slot] = after; } self.generation = change.expected.next()?; Ok(self.generation) }
-    #[rustfmt::skip]
-    fn description_change<'a>(&self, expected: RequestBookGeneration, index: usize, after_lifecycle: RequestLifecycle, after: DescriptionState, after_facts: Option<&'a RequestDescriptionFacts>, work: &mut WorkMeter) -> RequestResult<DescriptionChange<'a>> { let request = &self.requests[index]; let was_described = request.lifecycle == RequestLifecycle::Preparing && request.description != DescriptionState::Missing; let is_described = after_lifecycle == RequestLifecycle::Preparing && after != DescriptionState::Missing; let described_after = match (was_described, is_described) { (false, true) => self.described.checked_add(1), (true, false) => self.described.checked_sub(1), _ => Some(self.described) }.ok_or(RequestError::DescriptionState)?; let entering = request.lifecycle != RequestLifecycle::Warming && after_lifecycle == RequestLifecycle::Warming; let leaving = request.lifecycle == RequestLifecycle::Warming && after_lifecycle != RequestLifecycle::Warming; let warming = if entering || leaving { let revision = request.revision.revision(); let mut slot = None; for (index, entry) in self.warming.iter().enumerate() { work.record(VisitedEntities, 1)?; if entry.is_some_and(|(candidate, _)| candidate == revision) || entering && entry.is_none() && slot.is_none() { slot = Some(index); if entry.is_some() { break; } } } let slot = slot.ok_or(RequestError::DescriptionState)?; let before = self.warming[slot]; let count = before.map_or(0, |(_, count)| count); let after_count = if entering { count.checked_add(1) } else { count.checked_sub(1) }.ok_or(RequestError::DescriptionState)?; Some((slot, before, (after_count != 0).then_some((revision, after_count)))) } else { None }; let copied = size_of::<DescriptionChange<'_>>() as u64 + after_facts.map_or(0, |_| size_of::<RequestDescriptionFacts>() as u64); work.ensure(crate::HotPathWorkWitness::new([0, copied, 0, 0, 1]))?; work.record(CopiedBytes, copied)?; work.record(InvariantChecks, 1)?; Ok(DescriptionChange { expected, index, before_lifecycle: request.lifecycle, before: request.description, after_lifecycle, after, before_facts: self.description_facts[index].is_some(), after_facts, described_before: self.described, described_after, warming }) }
+    pub(crate) fn prepare_warming(
+        &self,
+        expected: RequestBookGeneration,
+        id: RequestId,
+        work: &mut WorkMeter,
+    ) -> RequestResult<DescriptionChange<'static>> {
+        require(
+            work,
+            expected == self.generation,
+            RequestError::PreparedChangeStale,
+        )?;
+        let _next_generation = expected.next()?;
+        let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?;
+        let request = &self.requests[index];
+        require(
+            work,
+            request.lifecycle == RequestLifecycle::Preparing
+                && request.description == DescriptionState::Missing,
+            RequestError::DescriptionState,
+        )?;
+        self.description_change(
+            expected,
+            index,
+            RequestLifecycle::Warming,
+            DescriptionState::Missing,
+            None,
+            work,
+        )
+    }
+    pub(crate) fn prepare_description_result<'a>(
+        &self,
+        expected: RequestBookGeneration,
+        id: RequestId,
+        target: BackendGeneration,
+        facts: &'a RequestDescriptionFacts,
+        work: &mut WorkMeter,
+    ) -> RequestResult<DescriptionChange<'a>> {
+        require(
+            work,
+            expected == self.generation,
+            RequestError::PreparedChangeStale,
+        )?;
+        let _next_generation = expected.next()?;
+        let index = self.find(id, work)?.ok_or(RequestError::UnknownRequest)?;
+        let request = &self.requests[index];
+        require(
+            work,
+            request.description == DescriptionState::InFlight(target),
+            RequestError::DescriptionState,
+        )?;
+        self.description_change(
+            expected,
+            index,
+            RequestLifecycle::Preparing,
+            DescriptionState::Ready(target),
+            Some(facts),
+            work,
+        )
+    }
+    pub(crate) fn refresh_count(
+        &self,
+        scope: DescriptionRefreshScope,
+        work: &mut WorkMeter,
+    ) -> RequestResult<usize> {
+        let warming = match scope {
+            DescriptionRefreshScope::Observation => 0,
+            DescriptionRefreshScope::Loaded(revision) => {
+                let mut count = 0;
+                for entry in &self.warming {
+                    work.record(VisitedEntities, 1)?;
+                    if let Some((candidate, value)) = entry
+                        && *candidate == revision
+                    {
+                        count = usize::from(*value);
+                        break;
+                    }
+                }
+                count
+            }
+        };
+        Ok(usize::from(self.described) + warming)
+    }
+    pub(crate) fn prepare_refresh(
+        &self,
+        expected: RequestBookGeneration,
+        scope: DescriptionRefreshScope,
+        target: BackendGeneration,
+        after: Option<RequestId>,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> RequestResult<(RequestId, Option<DescriptionChange<'static>>)> {
+        require(
+            work,
+            expected == self.generation,
+            RequestError::PreparedChangeStale,
+        )?;
+        let _next_generation = expected.next()?;
+        let mut selected = None;
+        for (index, request) in self.requests.iter().enumerate() {
+            work.record(VisitedEntities, 1)?;
+            if description_candidate(request, scope, target)
+                && after.is_none_or(|cursor| request.id > cursor)
+                && selected.is_none_or(|prior: usize| request.id < self.requests[prior].id)
+            {
+                selected = Some(index);
+            }
+        }
+        let index = selected.ok_or(RequestError::DescriptionState)?;
+        let request = &self.requests[index];
+        work.record(InvariantChecks, 1)?;
+        if at >= request.deadline {
+            return Ok((request.id, None));
+        }
+        Ok((
+            request.id,
+            Some(self.description_change(
+                expected,
+                index,
+                RequestLifecycle::Preparing,
+                DescriptionState::InFlight(target),
+                None,
+                work,
+            )?),
+        ))
+    }
+    pub(crate) fn validate_description(&self, change: &DescriptionChange<'_>) -> RequestResult<()> {
+        let warming = change
+            .warming
+            .is_none_or(|(slot, before, _)| self.warming.get(slot) == Some(&before));
+        (self.generation == change.expected
+            && self.described == change.described_before
+            && warming
+            && self
+                .description_facts
+                .get(change.index)
+                .is_some_and(|facts| facts.is_some() == change.before_facts)
+            && self.requests.get(change.index).is_some_and(|request| {
+                request.lifecycle == change.before_lifecycle && request.description == change.before
+            }))
+        .then_some(())
+        .ok_or(RequestError::PreparedChangeStale)
+    }
+    pub(crate) fn description_request(
+        &self,
+        change: &DescriptionChange<'_>,
+    ) -> RequestResult<&AcceptedRequest<I, S, T>> {
+        self.validate_description(change)?;
+        Ok(&self.requests[change.index])
+    }
+    pub(crate) fn description_facts(
+        &self,
+        id: RequestId,
+        work: &mut WorkMeter,
+    ) -> RequestResult<Option<&RequestDescriptionFacts>> {
+        Ok(match self.find(id, work)? {
+            Some(index) => self.description_facts[index].as_ref(),
+            None => None,
+        })
+    }
+    pub(crate) fn commit_description(
+        &mut self,
+        change: DescriptionChange<'_>,
+    ) -> RequestResult<RequestBookGeneration> {
+        self.validate_description(&change)?;
+        self.requests[change.index].lifecycle = change.after_lifecycle;
+        self.requests[change.index].description = change.after;
+        self.description_facts[change.index] = change.after_facts.copied();
+        self.described = change.described_after;
+        if let Some((slot, _, after)) = change.warming {
+            self.warming[slot] = after;
+        }
+        self.generation = change.expected.next()?;
+        Ok(self.generation)
+    }
+    fn description_change<'a>(
+        &self,
+        expected: RequestBookGeneration,
+        index: usize,
+        after_lifecycle: RequestLifecycle,
+        after: DescriptionState,
+        after_facts: Option<&'a RequestDescriptionFacts>,
+        work: &mut WorkMeter,
+    ) -> RequestResult<DescriptionChange<'a>> {
+        let request = &self.requests[index];
+        let was_described = request.lifecycle == RequestLifecycle::Preparing
+            && request.description != DescriptionState::Missing;
+        let is_described =
+            after_lifecycle == RequestLifecycle::Preparing && after != DescriptionState::Missing;
+        let described_after = match (was_described, is_described) {
+            (false, true) => self.described.checked_add(1),
+            (true, false) => self.described.checked_sub(1),
+            _ => Some(self.described),
+        }
+        .ok_or(RequestError::DescriptionState)?;
+        let entering = request.lifecycle != RequestLifecycle::Warming
+            && after_lifecycle == RequestLifecycle::Warming;
+        let leaving = request.lifecycle == RequestLifecycle::Warming
+            && after_lifecycle != RequestLifecycle::Warming;
+        let warming = if entering || leaving {
+            let revision = request.revision.revision();
+            let mut slot = None;
+            for (index, entry) in self.warming.iter().enumerate() {
+                work.record(VisitedEntities, 1)?;
+                if entry.is_some_and(|(candidate, _)| candidate == revision)
+                    || entering && entry.is_none() && slot.is_none()
+                {
+                    slot = Some(index);
+                    if entry.is_some() {
+                        break;
+                    }
+                }
+            }
+            let slot = slot.ok_or(RequestError::DescriptionState)?;
+            let before = self.warming[slot];
+            let count = before.map_or(0, |(_, count)| count);
+            let after_count = if entering {
+                count.checked_add(1)
+            } else {
+                count.checked_sub(1)
+            }
+            .ok_or(RequestError::DescriptionState)?;
+            Some((
+                slot,
+                before,
+                (after_count != 0).then_some((revision, after_count)),
+            ))
+        } else {
+            None
+        };
+        let copied = size_of::<DescriptionChange<'_>>() as u64
+            + after_facts.map_or(0, |_| size_of::<RequestDescriptionFacts>() as u64);
+        work.ensure(crate::HotPathWorkWitness::new([0, copied, 0, 0, 1]))?;
+        work.record(CopiedBytes, copied)?;
+        work.record(InvariantChecks, 1)?;
+        Ok(DescriptionChange {
+            expected,
+            index,
+            before_lifecycle: request.lifecycle,
+            before: request.description,
+            after_lifecycle,
+            after,
+            before_facts: self.description_facts[index].is_some(),
+            after_facts,
+            described_before: self.described,
+            described_after,
+            warming,
+        })
+    }
     fn prepare_cursor(
         &self,
         connection: ConnectionId,
