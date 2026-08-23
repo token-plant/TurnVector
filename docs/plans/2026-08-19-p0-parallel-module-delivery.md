@@ -22,16 +22,35 @@ private Core modules public.
 
 ## Non-Goals
 
-This plan does not:
+Except for the item-free Architecture Contract Baseline authorized by ADR 0048,
+this plan does not:
 
-- add placeholder crates, public traits, or production source before its ledger
-  row;
+- add behavior-bearing placeholder crates, public traits, or implemented
+  production behavior before its ledger row;
 - expose a Support, Resource, Request, Certification, or Scheduler interface to
   the Event Loop;
 - let module agents commit parts of one Core transition independently;
 - move Benchmark-owned schemas, suites, runners, or oracles into TurnVector;
 - fold the Compatibility Gateway into the daemon; or
 - make full TurnVector-owned native graphs and operators a P0 readiness gate.
+
+## Architecture Contract Baseline
+
+Before the remaining module rows are delegated, the canonical
+`schemas/p0-runtime-architecture-v1.jsonl` freezes the final Module paths,
+primary and contributing ledger ownership, Interface operation vocabulary,
+schema-family owners, two Backend adapters, visibility, compile roles, and
+declared dependency graphs. This structural manifest does not define Rust
+representations, fields, error variants, algorithms, capacities, or runtime
+behavior.
+
+Contract-only paths contain one Module-level documentation line and no Rust
+item. Production and test-only paths are declared privately; the release
+identity path remains unlinked until L01. The item-free Protocol crate reserves
+its final workspace identity without activating its P04 dependency edges. Each
+scheduled owner row replaces its exact shell, updates its status to
+`implemented`, and supplies behavior and tests without gaining another module's
+authority.
 
 ## Fixed Architecture
 
@@ -461,7 +480,7 @@ This module split is ready to drive implementation only when:
   owner;
 - private interface laws preserve atomic Core transitions and Hot-Path Work
   accounting;
-- no public interface or production placeholder precedes its ledger row;
+- no public interface or behavior-bearing placeholder precedes its ledger row;
 - worktree, PR, review, signing, and generated-identity custody are explicit;
 - Benchmark ownership and the separate delivery tracks remain unambiguous; and
 - the documentation-only PR is merged before implementation agents begin their

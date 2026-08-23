@@ -509,6 +509,16 @@ and serialized landing are defined in the
 That delivery split does not change the ledger order or create independent Core
 commit authorities.
 
+ADR 0048 establishes a one-time Architecture Contract Baseline before the
+remaining implementation rows. Its canonical manifest freezes final Module
+paths, ownership, Interface vocabulary, schema-family authority, adapter
+composition, visibility, compile roles, and declared dependencies. The source
+shells and Protocol crate contain no Rust items or behavior; exact Rust types,
+fields, failure variants, and implementation remain owned by their scheduled
+rows. This preparation does not add or reorder a ledger row, and every later
+owner must replace its exact shell and update the manifest status in the same
+independently green row.
+
 The stable external Runtime Core Interface is deliberately deep:
 
 ```text
