@@ -30,14 +30,24 @@ use std::error::Error;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroU128};
 
+mod admission;
 mod bounded;
 mod certification;
+mod closure_control;
 mod core;
 mod model_descriptor;
 mod model_registry;
 mod request_book;
+mod resource_ledger;
+mod scheduler;
 mod scheduling;
-pub mod support;
+#[expect(
+    dead_code,
+    reason = "later P0 rows have not linked every private Support path"
+)]
+mod support;
+mod transition_coordinator;
+mod turn_plans;
 mod turns;
 mod work;
 

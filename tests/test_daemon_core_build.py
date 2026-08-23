@@ -6,6 +6,8 @@ INPUTS += ("crates/turnvector-core/src/model_registry.rs",)
 INPUTS += ("crates/turnvector-core/src/model_descriptor.rs", "crates/turnvector-core/src/model_descriptor/sha256.rs")
 INPUTS += ("crates/turnvector-core/src/request_book.rs",)
 INPUTS += ("crates/turnvector-core/src/certification.rs",)
+INPUTS += ("crates/turnvector-core/src/admission.rs", "crates/turnvector-core/src/closure_control.rs", "crates/turnvector-core/src/resource_ledger.rs", "crates/turnvector-core/src/scheduler.rs", "crates/turnvector-core/src/transition_coordinator.rs", "crates/turnvector-core/src/turn_plans.rs", "crates/turnvector-daemon/src/audit_journal.rs", "crates/turnvector-daemon/src/backend_contract.rs", "crates/turnvector-daemon/src/certification_tooling.rs", "crates/turnvector-daemon/src/control_plane.rs", "crates/turnvector-daemon/src/control_store.rs", "crates/turnvector-daemon/src/daemon_custody.rs", "crates/turnvector-daemon/src/data_plane.rs", "crates/turnvector-daemon/src/device_executor.rs", "crates/turnvector-daemon/src/event_loop.rs", "crates/turnvector-daemon/src/fake_backend.rs", "crates/turnvector-daemon/src/native_build.rs", "crates/turnvector-daemon/src/native_runtime.rs", "crates/turnvector-daemon/src/native_turns.rs", "crates/turnvector-daemon/src/protocol_authority.rs", "crates/turnvector-daemon/src/residency_coordinator.rs", "crates/turnvector-daemon/src/resource_evidence.rs", "crates/turnvector-daemon/src/resource_governor.rs", "crates/turnvector-daemon/src/runtime_carry.rs", "crates/turnvector-daemon/src/runtime_measurement.rs", "crates/turnvector-daemon/src/runtime_qualification.rs", "crates/turnvector-daemon/src/volume_qualification.rs")
+FIXTURE_ONLY_INPUTS = ("crates/turnvector-protocol/Cargo.toml", "crates/turnvector-protocol/src/lib.rs", "crates/turnvector-daemon/src/release_identity.rs")
 def canonical(value): return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 def evidence(payload, domain="turnvector:evidence:daemon-core-build", version=1): return hashlib.sha256(domain.encode() + b"\0" + version.to_bytes(4, "big") + payload).hexdigest()
 def macho_fixture(catalog_sections=1, data_command_padding=0, rebase=b"", bind=b"", weak=b"", lazy=b"", export=b"", chained=False, reordered_loader=False):
@@ -43,7 +45,7 @@ class DaemonCoreBuildTests(unittest.TestCase):
         result = self.inspect_macho(path, architecture); self.assertEqual(result.returncode, 0, result.stderr); return json.loads(result.stdout)
     def fixture(self, directory):
         root = Path(directory) / "repo"
-        for relative in INPUTS: target = root / relative; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / relative, target)
+        for relative in (*INPUTS, *FIXTURE_ONLY_INPUTS): target = root / relative; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / relative, target)
         return root
     def generate(self, root, output): result = self.run_generator(root, "--output", str(output)); self.assertEqual(result.returncode, 0, result.stderr); return json.loads((output / DESCRIPTOR).read_bytes())
     def rejects(self, root, output, message): result = self.run_generator(root, "--output", str(output)); self.assertNotEqual(result.returncode, 0); self.assertIn(message, result.stderr)

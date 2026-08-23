@@ -829,6 +829,10 @@ _Avoid_: Execution Backend, Resource Governor, request router
 The private Scheduler Module that selects exactly one Turn Plan from complete bounded Candidate Formation results using global safety, urgency, fairness, and optimization policy. It cannot alter candidate Batch membership or infer backend feasibility, and it may grant only a presented Work Candidate; every absent eligible request remains visible through its Candidate Exclusion.
 _Avoid_: Model Planner, Device Executor, Backend priority
 
+**Architecture Contract Baseline**:
+The accepted versioned structural declaration of P0 Module identities, ledger ownership, Interface vocabulary, schema-family authority, adapter composition, visibility, compile roles, dependencies, and implementation status. It makes delegation and structural validation deterministic without implementing behavior or defining representation, fields, algorithms, capacities, failure semantics, or evidence applicability. Contract-only status is never a readiness or conformance claim.
+_Avoid_: Implementation plan, generated runtime code, capability claim
+
 **Runtime Core**:
 The deterministic, synchronous Rust state machine that jointly contains Scheduler-owned Request State, Resource Governor state, generations, ledgers, Reservations, and in-flight operation records while preserving each domain authority's rules. Its only external state-changing Interface handles one sequenced Core Event and returns one Core Transition. Its Implementation is composed of private pure Modules for Request Lifecycle, Scheduling and Arbitration, Resource Policy, Operation Ledger, and one atomic Transition Coordinator; those Modules expose no independently committing authority. The Runtime Core performs no I/O, async execution, clock reads, serialization, MLX calls, or callbacks.
 _Avoid_: Runtime Event Loop, daemon service, collection of communicating actors
