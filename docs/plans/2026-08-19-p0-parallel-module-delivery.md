@@ -167,66 +167,145 @@ prepared change through `Core::handle` to expose successful Request Acceptance.
 
 C15 and C16 have one canonical delivery refinement under Design Lineage
 `TV-C15-C16-CANONICAL-DELIVERY-20260824`, Proposal Revision
-`b000e4990d8e8c6b83fbcc85eafc34d36692efb5a46aa7b76dc5cfb88a22b1f1`.
-It changes delivery bounds and verification obligations without moving either
-owner or creating a public seam. C15 remains wholly `resource_ledger`-owned;
-C16 remains wholly `support_ledger`-owned.
+`a3ffe9908a51bded502fae0592cdf7ef8d84efd3376581a8b8db6e323a4992e4`,
+and unanimous Review Round
+`TV-C15-C16-CANONICAL-DELIVERY-20260824-C15-REFINEMENT-R5-20260824T103037Z`.
+The Launch Record SHA-256 is
+`c2b836de8e219334892181835f357ee2bb9fe37e886e2dd7f1d54816d0611472`;
+the passing round-record SHA-256 is
+`3c8278d3d1a8b5b6dc49579b615f70518c73fde8d80a5a06c702b17c5e457da0`.
 
-The repository-policy count includes every non-documentation addition and
-deletion, including the fixed generated identity cascade. Current accepted Git
-objects measure that cascade as 18 lines. C15 reserves 650 lines for behavior,
-source, and focused tests plus 50 for architecture, wiring, and generated output,
-giving per-commit and PR-cumulative hard limits of 700. C16 reserves 450 plus 50,
-giving exact per-commit and cumulative hard limits of 500. With the measured
-cascade, each structural reserve has 32 lines remaining. If actual generated
-and other structural work exceeds 50, the row stops; unused C15 capacity never
-belongs to C16.
+The corrected complete C15 proof measures `858 + 8 + 18 = 884` counted
+non-documentation lines, 184 above the cumulative 700-line row cap. The accepted
+delivery therefore refines C15 into consecutive C15a and C15b rows while keeping
+one private `resource_ledger`, storage authority, generation, Interface, and
+commit path. C15a closes reserve and pre-materialization withdrawal; C15b
+extends that same owner with terminal settlement, Backend partition, Pending
+Reclaim, and convergence. This is row refinement, not Module or authority split.
 
-C15 is one atomic row because reserve, every typed terminal settlement,
-Pending Reclaim, Resource Capacity Ledger Generation, reusable bounded storage,
-and their conservation law establish one sole capacity authority. An actual
-C15 commit over 500 and at most 700 uses `commit-size-exception` and the exact
-PR disclosure required by repository policy. C16 never uses an exception. Its
-500-line boundary requires deepening the existing Support owner and prohibits a
-second entitlement ledger or broad Support refactor.
+C15a retains the 700-line per-commit and PR-cumulative maximum. Its measured
+prototype is `606 + 14 + 18 = 638`, leaving 62 lines; an actual commit from 501
+through 700 requires `commit-size-exception` and exact PR disclosure. C15b has
+an independent 500-line maximum, uses no exception, and measures
+`(305 + 53) + 18 = 376`, leaving 124 lines. C16 independently retains its
+500-line per-commit and cumulative maximum and never uses an exception. Every
+additional counted line consumes the applicable row margin one-for-one.
 
-For these rows, preparation remains read-only; every validation invocation is
-Hot-Path Work-metered and returns a non-forgeable generation- and before-image-
-bound validated change; commit consumes that value without another fallible
-operation. C15 must replace symbolic Work and memory relations with exact
-constructor-specific witnesses. C16 atomically preflights both logical and
-physical storage, keeps request claim ownership through the tombstone, rejects
-same operation/pool/horizon axes with a different vector value, and uses storage
-compatible with later C18-owned expiry without taking expiry authority.
+C15a changes the architecture ledger series from `C12-C45` to `C12-C14`,
+`C15a-C15b`, `C16-C45`, changes the primary row count from 193 to 194, assigns
+`resource_ledger` to `C15a-C15b, C29`, and marks the source `implemented` only
+after the complete closed foundation is present. C15b changes no architecture
+status or dependency edge. The intermediate status means a real implemented
+foundation, not settlement completion or permission for Admission consumers.
 
-After construction, both paths report zero `Allocations` and zero
-`CandidateWork`; every branch meters `VisitedEntities`, `CopiedBytes`,
-`Allocations`, `CandidateWork`, and `InvariantChecks` before mutation. C15 binds
-constructor-fixed record capacity `R`, record size `s`, per-variant identity
-lookup count `k`, finite lookup depth `b`, and resource-dimension count `|D|` to
-`VisitedEntities <= k * b + O(|D|)` and
-`CopiedBytes <= (R - 1) * s + O(s)`. It substitutes concrete values into the
-binary Hot-Path budget and maintains conservation aggregates incrementally;
-full-ledger transition scans are forbidden. C16 validates and preflights its
-fixed three-item bundle plus vector in `O(3 + v)` with one canonical bounded
-pass. Pairwise `O(v^2)` duplicate detection is forbidden, and logical capacity,
-physical capacity, and every Work dimension are checked before the first write.
+C15a owns unique reservation and Backend-budget identities, fixed reusable
+storage, typed three-dimensional capacity, read-only prepare, metered validate,
+an instance-bound non-forgeable, non-`Copy`, non-`Clone` validated capability,
+infallible commit, snapshot, reserve, and withdrawal. The capability exclusively
+borrows its exact ledger, so two validated changes for one ledger cannot coexist;
+commit consumes it once, while drop without commit preserves state. C15b adds
+the four daemon terminal facts (partial materialization,
+queued-after-invalidation, in-flight-after-Receipt, and ordinary-after-Receipt),
+zero-materialization and ownership-consuming Backend partitions, and Pending
+Reclaim convergence bound to key, opened generation, cursor/evidence floor, and
+fresh observed cursor/evidence. Equal/lower cursors reject, skipped higher
+cursors are allowed, evidence replay/rebind rejects, and unrelated ledger
+generations do not invalidate the exact anchor. Record removal and active-budget
+identity reuse occur only after daemon ownership and Backend/Pending Reclaim
+ownership both close. C16 remains wholly `support_ledger`-owned and atomically
+preflights its logical and physical request-entitlement bundle.
 
-The two rows use separate worktrees, commits, PRs, manifests, reviews, and line
-budgets. C15 lands first. C16 begins from a fresh current `origin/main` only
-after C15 merges; no earlier C16 source or generated output is carried across
-that boundary. C17 and every later row remain blocked from implementation work,
-local row branches, and draft PRs until C16 merges; this row-specific block
-overrides Worktree And Pull Request Protocol item 4. Any count overflow, owner
-expansion, missing exact witness, or pressure to remove tests, add
-`rustfmt::skip`, or hide transition control flow is a stop condition requiring a
-new user decision and Design Proposal Gate.
+After construction, every branch meters all five Work dimensions before
+mutation and reports zero `Allocations` and zero `CandidateWork`. For C15a/C15b,
+the exact Rust 1.97.1 lookup bound is `q(0) = 0` and
+`q(n) = ceil(log2(n)) + 1` for positive `n`. With constructor-fixed capacity
+`R`, concrete record size `s_r`, Backend-budget identity size `s_b = 32`,
+variant lookup count `k_v <= 4`, and `|D| = 3`:
 
-The accepted implementation order contains 193 rows after C07.
+```text
+VisitedEntities_v <= k_v * q(R) + 2 * |D|
+CopiedBytes_v <= max((R + 1) * (s_r + s_b),
+                     2 * (s_r + s_b) + s_r)
+                 + size_of(ResourceChange)
+                 + size_of(ValidatedResourceChange)
+Allocations_v = 0
+CandidateWork_v = 0
+InvariantChecks_v <= exact compiler- and branch-derived maximum
+StorageBytes = size_of(ResourceCapacityLedger<R>) + R * (s_r + s_b)
+```
+
+All arithmetic is checked before allocation, `R = 0` is invalid, and full-ledger
+conservation scans are forbidden. The corrected final proof freezes the
+implementation witnesses `[10,1296,0,0,15]` at `R = 1`, `q(3) = 3` with
+VisitedEntities `18`, `[50,197552,0,0,15]` at `R = 1024`, and
+`[66,2097008,0,0,15]` with StorageBytes `2096296` at `R = 10917`; it rejects
+`R = 10918`, with VisitedEntities `66`, before allocation because copied work
+`2097200` exceeds `2097152`.
+For `R > 0`, the implementation expression is
+`usize::BITS - (R - 1).leading_zeros() + 1`, verified against found and
+not-found targets by an exact Rust 1.97.1 comparator probe. These values are not
+production-capacity claims. C15a and C15b each recompute their exact landing
+witness. C16 remains `O(3 + v)` with no `O(v^2)` duplicate scan and preflights
+every logical, physical, and Work dimension.
+
+The authority update, C15a, C15b, and C16 use separate worktrees, commits, PRs,
+manifests, generated cascades, reviews, and budgets. Each begins from fresh
+post-predecessor `origin/main`; no source, generated output, review, or approval
+carries across the boundary. C17, C19, C20, and every Resource Capacity consumer
+remain blocked through C15b; C17 and every later Core row remain blocked until
+C16 merges. Any count overflow, owner expansion, missing exact witness, test or
+validation removal, `rustfmt::skip`, or hidden transition control flow stops for
+a new user decision and Design Proposal Gate. For this explicitly authorized
+sequence, the coordinator squash-merges each ready, green PR without another
+prompt, verifies the remote merge and branch cleanup, and only then begins the
+next row from fresh `origin/main`.
+
+C15 path custody is exact. The authority PR changes only the two canonical plans.
+C15a may change only `crates/turnvector-core/src/resource_ledger.rs`,
+`schemas/p0-runtime-architecture-v1.jsonl`,
+`tests/test_p0_runtime_architecture.py`, and the nine B03-B05/fixture paths below.
+C15b may change only `crates/turnvector-core/src/resource_ledger.rs` and those
+same nine regenerated paths:
+
+```text
+schemas/daemon-core-build-v1.json
+schemas/daemon-core-build-v1.lock.json
+tests/fixtures/runtime-overhead-catalog-v1/lifecycle-operations.json
+tests/fixtures/runtime-overhead-catalog-v1/local-stale.json
+tests/fixtures/runtime-overhead-catalog-v1/sequenced-events.json
+schemas/runtime-overhead-catalog-v1.json
+schemas/runtime-overhead-catalog-v1.lock.json
+schemas/daemon-build-v1.json
+schemas/daemon-build-v1.lock.json
+```
+
+C15a must prove every dimension exact/one-past/overflow; both duplicate identity
+axes; full/reuse/churn; wrong authority and every before-image axis; stale
+prepare; validated-capability exact-instance, single-use, exclusivity, and drop
+behavior; generation overflow; `R = 0`; exact `R = 3`; derived maximum/first
+invalid `R`; an attainable five-axis witness and one-under failure for every
+nonzero Work dimension; exact rollback; and exact-capacity, equal-length, sorted
+unique indices with zero post-construction Allocation/CandidateWork. It runs the
+exact Rust 1.97.1 fmt, clippy `-D warnings`, focused/Core/workspace debug and
+release, `RUSTFLAGS=-Dwarnings`, pinned comparator, architecture, independent
+B03/B04/B05 reproduction/check, full Python discovery, auditor-at-700,
+diff-check, candidate/Benchmark authentication, and three fresh review gates.
+
+C15b must prove all four daemon facts and all terminal orders; zero/nonzero
+Backend partitions and both daemon/Backend orders; exact Pending Reclaim
+conservation; wrong key/budget/opened generation/floor cursor/floor evidence;
+equal/lower cursor rejection, skipped higher cursor success, same-evidence
+rejection, new-evidence success, unrelated-generation success, replay rejection,
+and reuse only after complete closure; capacity/overflow/stale/Work rollback;
+and final maximum/one-past/five-axis witnesses. It independently repeats the same
+frozen-source Rust, generation, Python, auditor-at-500, repository, Benchmark,
+and three-reviewer gates; no C15a artifact or approval carries forward.
+
+The accepted implementation order contains 194 rows after C07.
 
 | Area | Rows | Count | Delivery result |
 |---|---:|---:|---|
-| Core foundations | C08a-C08b, C09, C10a-C10e, C11a-C11c, C12-C18 | 18 | Support, descriptor integrity, registry, request, Certification, and resource foundations |
+| Core foundations | C08a-C08b, C09, C10a-C10e, C11a-C11c, C12-C14, C15a-C15b, C16-C18 | 19 | Support, descriptor integrity, registry, request, Certification, and resource foundations |
 | Core lifecycle | C19-C31 | 13 | Admission, materialization, invalidation, carry, cancellation, output, and release |
 | Scheduling and Plan lifecycle | C32-C45 | 14 | Exclusive, scheduling, Turn results, replay, and performance |
 | Backend runtime | E01-E24 | 24 | Backend Interface, Fake Adapter, Device Executor, Event Loop, and qualification |
@@ -236,7 +315,7 @@ The accepted implementation order contains 193 rows after C07.
 | Volume and durable authority | U01-U03, S01-S31 | 34 | Volume qualification, Control Store, Audit, recovery, readiness, and shutdown |
 | Aggregate gate | K01-K05 | 5 | Integrated Core properties, sequences, faults, and work bounds |
 | Release and qualification | L01-L02, Q00-Q15 | 18 | Closure freeze, subject adapters, qualification, and finding resolution |
-| **Total** |  | **193** |  |
+| **Total** |  | **194** |  |
 
 Rows remain ordered exactly as written in the base plan. A row may depend on
 several modules, but it has one primary implementation owner and one integrated
@@ -253,7 +332,7 @@ commit result.
 | `model_registry` | C09, C10d | Immutable Model Revision, Alias freeze, lifecycle, Description Plan, sealed Model Descriptor retention/arena accounting, and incremental registry counts | Descriptor parsing/hashing, request state, Backend handles, Residency, Effect emission, or scheduling policy |
 | `request_book` | C11a-C12, C21, C30-C31 | Bounded Token Request values, prepared acceptance, Preparing and later request states, description freshness, ownership identity, release lifecycle, and bounded terminal history | Support or Resource capacity, Certification applicability, Backend execution, or visible transition coordination |
 | `certification` | C13-C14, C23-C24 | Exact Authorization Index access, Environment Fingerprint, finite Applicability Selection, invalidation, and quarantine decisions | Online widening, lifecycle evidence selection, Resource Evidence policy, or ledger mutation |
-| `resource_ledger` | C15, C29 | Request Backend Allocation Budgets, daemon output capacity, transient headroom, Pending Reclaim, checked generation, and atomic reserve or settlement | Support charges, Governor policy, Backend mutation, or request lifecycle authority |
+| `resource_ledger` | C15a-C15b, C29 | Request Backend Allocation Budgets, daemon output capacity, transient headroom, Pending Reclaim, checked generation, and atomic reserve or settlement | Support charges, Governor policy, Resource Evidence interpretation, Backend mutation, or request lifecycle authority |
 | `admission` | C19 | Pure bound construction and complete accepted or rejected Admission decision | Allocation, Effect emission, evidence selection, or state mutation |
 | `turn_plans` | C38; private contribution to C39-C42 | Frozen candidate and Batch membership, Plan provenance and lifecycle, Local Stale and Result progression, and cost-profile update staging | Support credits, output publication, cross-module commit, Backend execution, or scheduler policy |
 | `scheduler` | C32-C37, C43-C45 | Exclusive feasibility, bounded candidate filtering, service accounting, deadline closure, deterministic selection, replay, and scheduler measurement | Request lifecycle, candidate execution, ledger mutation, Plan result progression, or native state |
@@ -294,7 +373,10 @@ Every private interface follows the same laws:
    generation needed for validation.
 2. Validation and Hot-Path Work accounting occur before mutation.
 3. A prepared change is crate-private, non-forgeable by callers, and applicable
-   only to the exact state generation from which it was derived.
+   only to the exact owner instance, generation, and before-image from which it
+   was derived. A validated capability is non-`Copy`, non-`Clone`, exclusively
+   binds its exact owner so two for that owner cannot coexist, consumes its
+   commit once, and leaves state unchanged if dropped without commit.
 4. No mutable ledger reference, unchecked generic delta, callback, I/O handle,
    wall clock, or Backend object crosses a private interface.
 5. The Transition Coordinator checks aggregate capacity and cross-module
@@ -316,16 +398,18 @@ Coordinator, row ordering, cross-module tests, and generated identity output.
 | Owner | Source ownership | Primary rows and private contributions |
 |---|---|---|
 | Agent A: Support | `support_ledger`, including C10a's crate-private `FixedWindowCounter` preparation helper | C08a-C08b, C10a, C16-C18, C26 |
-| Agent B: Descriptor, Registry, and Request Capacity | `model_descriptor`, `model_registry`, `request_book`, `resource_ledger` | C09, C10b-C10d, C11a-C11b, C12, C15, C21, C29-C31 |
+| Agent B: Descriptor, Registry, and Request Capacity | `model_descriptor`, `model_registry`, `request_book`, `resource_ledger` | C09, C10b-C10d, C11a-C11b, C12, C15a-C15b, C21, C29-C31 |
 | Agent C: Certification and Scheduling | `certification`, `admission`, `scheduler`, `turn_plans`, `closure_control` | C13-C14, C19, C23-C25, C32-C38, C43-C45; private Plan changes for C39-C42 |
 | Integration owner | `transition_coordinator`, `core.rs`, cross-module fixtures, generated identity cascade | C10e, C11b registration-path contribution, C11c, C20, C22, C27-C28, C39-C42 |
 
 This is parallel authoring, not parallel authority. The merge order is now
-C08a, C08b, C09, C10a, C10b, C10c, C10d, C10e, C11a, C11b, C11c, and onward through C45. An agent may
-prepare a later row
-locally, but that row cannot become ready or retain generated artifacts until
-every predecessor has landed and the branch is synchronized with the exact
-current `main`.
+C08a, C08b, C09, C10a, C10b, C10c, C10d, C10e, C11a, C11b, C11c,
+C12-C14, C15a, C15b, C16, and onward through C45. An agent may generally prepare
+a later row locally, but that row cannot become ready or retain generated
+artifacts until every predecessor has landed and the branch is synchronized with
+the exact current `main`. The authority -> C15a -> C15b -> C16 chain is stricter:
+no implementation work for its next row begins before the predecessor is
+squash-merged and fresh `origin/main` is authenticated.
 
 For C39-C42, Agent C remains the sole editor of `turn_plans`, while the
 integration owner is the sole editor of the Transition Coordinator and shared
@@ -468,8 +552,10 @@ that Core-only authority.
 3. Every implementation PR remains row-scoped and independently green. A
    module branch is not merged wholesale merely because several future rows
    were prepared there.
-4. Only one row PR is merge-ready at a time. Other work may remain local or in
-   draft PRs while its ledger predecessors are unresolved.
+4. Only one row PR is merge-ready at a time. Other work may generally remain
+   local or in draft PRs while its ledger predecessors are unresolved. The
+   authority -> C15a -> C15b -> C16 chain is excluded: its next-row
+   implementation may not start until the predecessor is squash-merged.
 5. Before a row becomes ready, its branch incorporates current `main`. Before
    first push this may be a local rebase. After first push it uses an explicit
    clean base-synchronization merge; shared history is never rewritten or
@@ -482,10 +568,10 @@ that Core-only authority.
    a second mutable implementation of another module's invariant.
 8. Every content change invalidates review approvals. Review, staging, signed
    commit, push, and ready-PR confirmation follow the base plan unchanged.
-9. C15 uses the accepted-object auditor at limit 700 and accumulates every
-   non-merge payload commit against the same 700-line PR cap. C16 uses limit 500
-   and the same cumulative rule. All other rows retain the base plan's ordinary
-   420-line plan ceiling and 500-line policy limit.
+9. C15a uses the accepted-object auditor at limit 700 and accumulates every
+   non-merge payload commit against the same 700-line PR cap. C15b and C16 each
+   use limit 500 and each has its own cumulative PR cap. All other rows retain
+   the base plan's ordinary 420-line plan ceiling and 500-line policy limit.
 
 ## Generated Identity Single-Writer Protocol
 
@@ -543,8 +629,8 @@ This module split is ready to drive implementation only when:
   accounting;
 - no public interface or behavior-bearing placeholder precedes its ledger row;
 - worktree, PR, review, signing, and generated-identity custody are explicit;
-- C15 and C16 obey their separate 700/500 per-commit and cumulative bounds and
-  ordered fresh-main boundary;
+- C15a, C15b, and C16 obey their independent 700/500/500 per-commit and
+  cumulative bounds and ordered fresh-main boundaries;
 - Benchmark ownership and the separate delivery tracks remain unambiguous; and
 - the documentation-only PR is merged before implementation agents begin their
   first row branches.
