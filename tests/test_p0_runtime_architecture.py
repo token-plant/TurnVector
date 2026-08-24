@@ -7,13 +7,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "schemas/p0-runtime-architecture-v1.jsonl"
-MANIFEST_SHA256 = "5d72f57bd0ba58fcd197508d06142ee4b3b2fbbbe54edb5d4d8227beef3ba5c2"
+MANIFEST_SHA256 = "fe7448d9d878c1eb407fea76a1bc0f3c08f0a6868f48024220c622c772fb789f"
 ROW = re.compile(r"([A-Z]+)(\d+)([a-z]?)\Z")
 KIND_COUNTS = {"meta": 1, "crate": 3, "seam": 2, "adapter": 2, "schema": 9, "module": 41}
 MODULE_ORDER = """admission audit_journal backend_contract closure_control core_gate control_store control_plane certification_tooling certification daemon_custody data_plane device_executor event_loop fault_gate fake_backend lifecycle_gate model_descriptor model_registry native_build native_runtime native_turns protocol_authority qualification_core_adapters qualification_lifecycle_adapters qualification_integration qualification_system_adapters release_identity request_book resource_ledger resource_evidence resource_governor residency_coordinator runtime_carry runtime_measurement runtime_qualification scheduling_gate scheduler support_ledger transition_coordinator turn_plans volume_qualification""".split()
 MODULE_IDS = set(MODULE_ORDER)
-IMPLEMENTED = {"certification", "model_descriptor", "model_registry", "request_book", "support_ledger"}
-IMPLEMENTED_DEPENDENCIES = {"certification": ["model_registry", "request_book"], "model_descriptor": [], "model_registry": ["model_descriptor"], "request_book": ["model_registry"], "support_ledger": []}
+IMPLEMENTED = {"certification", "model_descriptor", "model_registry", "request_book", "resource_ledger", "support_ledger"}
+IMPLEMENTED_DEPENDENCIES = {"certification": ["model_registry", "request_book"], "model_descriptor": [], "model_registry": ["model_descriptor"], "request_book": ["model_registry"], "resource_ledger": [], "support_ledger": []}
 SCHEMAS = {
     "audit_journal_v1": ("S10", "module", "audit_journal"),
     "backend_owned_values_v1": ("E01", "module", "backend_contract"),
@@ -191,7 +191,7 @@ def validate(records, overrides=None):
     if len(identifiers) != len(set(identifiers)):
         raise ValueError("duplicate record id")
     meta = grouped["meta"][0]
-    if (meta["format_version"], meta["module_count"], meta["primary_ledger_row_count"], meta["schema_family_count"], meta["module_visibility_default"], meta["status_scope"]) != (2, 41, 193, 9, "private", "declared_source_path_only"):
+    if (meta["format_version"], meta["module_count"], meta["primary_ledger_row_count"], meta["schema_family_count"], meta["module_visibility_default"], meta["status_scope"]) != (2, 41, 194, 9, "private", "declared_source_path_only"):
         raise ValueError("wrong architecture metadata")
 
     crates = {record["id"]: record for record in grouped["crate"]}
@@ -228,7 +228,7 @@ def validate(records, overrides=None):
         raise ValueError("module graph drift")
 
     ledger = expand_all(meta["ledger_series"])
-    if len(ledger) != 193 or len(set(ledger)) != 193:
+    if len(ledger) != 194 or len(set(ledger)) != 194:
         raise ValueError("ledger cardinality drift")
     owners = Counter(row for module in modules.values() for row in expand_all(module["primary_rows"]))
     dynamic = meta["dynamic_primary_rows"]
