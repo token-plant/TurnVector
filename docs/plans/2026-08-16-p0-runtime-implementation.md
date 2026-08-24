@@ -997,9 +997,12 @@ Every pull-request commit follows all of these rules:
    authored Markdown is exempt. A measured slice above 420 is split before
    review; approaching 500 is not an acceptable plan. The only current
    delivery-specific exceptions are C15a, C15b, and C16 under Design Lineage
-   `TV-C15-C16-CANONICAL-DELIVERY-20260824`, Proposal Revision
-   `a3ffe9908a51bded502fae0592cdf7ef8d84efd3376581a8b8db6e323a4992e4`:
-   C15a has per-commit and pull-request-cumulative hard limits of 700 counted
+   `TV-C15-C16-CANONICAL-DELIVERY-20260824`. The C15a numeric boundary uses
+   Proposal Revision
+   `591f0f1f80fd9f37b1c97a2662f3383edefe855d0e261ea7debc175ae91d608f`;
+   every non-numeric decision remains under the prior accepted revision
+   `a3ffe9908a51bded502fae0592cdf7ef8d84efd3376581a8b8db6e323a4992e4`.
+   C15a has per-commit and pull-request-cumulative hard limits of 821 counted
    lines, while C15b and C16 each have independent per-commit and cumulative
    hard limits of 500. C15a uses `commit-size-exception` only when its actual
    commit exceeds 500; C15b and C16 never use an exception. These bounds do not
@@ -1046,7 +1049,7 @@ Every pull-request commit follows all of these rules:
    manifest, and prints its SHA-256. Earlier documentation-only commits use an
    explicit path/blob table from `git hash-object`, plus `git diff --binary`
    for tracked files or `git diff --no-index` for an untracked file.
-   C15a invokes the accepted auditor with `--limit 700`; C15b and C16 use
+   C15a invokes the accepted auditor with `--limit 821`; C15b and C16 use
    `--limit 500`. All commands still execute the accepted `HEAD` object, and the
    resulting count is also accumulated over every non-merge payload commit in
    the row PR.
@@ -1238,6 +1241,28 @@ Its Mathematical Gate and one fresh three-reviewer unanimous round passed under:
 - passing round-record SHA-256
   `3c8278d3d1a8b5b6dc49579b615f70518c73fde8d80a5a06c702b17c5e457da0`.
 
+After fresh implementation and adversarial proof exhausted the prior C15a
+margin, only its numeric delivery boundary was recalibrated on
+`origin/main@192b57a2802d2e0fcc5bd1558bc498d0fcb0b046`. The same Design
+Lineage passed a new Mathematical Gate and fresh unanimous round under:
+
+- Proposal Revision
+  `591f0f1f80fd9f37b1c97a2662f3383edefe855d0e261ea7debc175ae91d608f`;
+- Review Round
+  `TV-C15-C16-CANONICAL-DELIVERY-20260824-C15A-CAP-R1-20260824T171650Z`;
+- Launch Record SHA-256
+  `309b40546d791f3b7282f4911b26fc91d8f274d54c117e2d1c460d11740e351f`;
+- Mathematical Gate Record SHA-256
+  `568511f6dffe9679348133e7959c2b20a1b58ef9bd9a1a80dff0955b974a44a4`;
+  and
+- passing round-record SHA-256
+  `7574aff639bec952bc538eb3c804a67780fce0f784e4ab1dc7842b09013d2587`.
+
+The user explicitly approved the 821-line C15a per-commit and PR-cumulative
+maximum, its required `commit-size-exception`, and squash merge of this docs
+authority revision on 2026-08-25. The new limit becomes active only after this
+docs-only authority revision is squash-merged.
+
 For a non-merge payload commit `c`, let `L(c)` be the repository-policy count
 of additions plus deletions over non-documentation paths. Generated references,
 fixtures, embedded production source, data, migrations, snapshots, and lockfiles
@@ -1255,20 +1280,28 @@ independently green rows without splitting its Module or mutation authority:
 - C15b extends that same owner and Interface with typed terminal settlement,
   Backend partition, Pending Reclaim, and convergence.
 
-C15a has one 700-line per-commit and PR-cumulative hard stop. Its measured
-prototype is `606 + 14 + 18 = 638`, leaving 62 landing lines. A count from 501
-through 700 requires `commit-size-exception` and a PR entry naming the full
-commit SHA, exact count, the accepted 700-line authorization, and the atomic
+C15a has one 821-line per-commit and PR-cumulative hard stop. Its current
+projection is `727 + 14 + 18 = 759`, preserving the prior 62-line contingency.
+The 727-line behavior input is measured; the 14-line architecture transition
+is specified and proof-reconstructed; and the 18-line cascade is specified and
+historically corroborated but remains unverified against final C15a bytes until
+generation. A count from 501 through 821 requires `commit-size-exception` and a
+PR entry naming the full commit SHA, exact per-commit and cumulative counts, the
+accepted 821-line authorization, and the atomic
 sole-ledger-foundation reason. A count at or below 500 must not use that label.
-If fresh implementation or required adversarial proof consumes more than the
-62-line margin, C15a stops for a new user decision and Design Proposal Gate.
+Every source, architecture, generated, or follow-up line consumes the 62-line
+contingency one-for-one. One post-push runtime repair also requires a fresh
+18-line cascade, leaving at most 44 source lines when no other drift occurred.
+Any cumulative count above 821, removed proof, unreadable compression, or
+changed owner, Interface, invariant, bound, or path stops for a new user
+decision and Design Proposal Gate.
 
 C15b has an independent 500-line per-commit and PR-cumulative hard stop. Its
 measured delta is `(305 + 53) + 0 + 18 = 376`, leaving 124 landing lines. C15b
-never uses a size exception. The `638 + 376 = 1014` prototype chain is a
-feasibility baseline, not a frozen landing count: each row must independently
-freeze its actual bytes and remain within its own margin. Combining C15a and
-C15b into one PR is forbidden.
+never uses a size exception. The prior C15b measurement remains a feasibility
+baseline, not a frozen landing count: each row must independently freeze its
+actual bytes and remain within its own margin. C15a headroom cannot be borrowed
+by C15b, and combining C15a and C15b into one PR is forbidden.
 
 C15a changes the architecture ledger series from `C12-C45` to `C12-C14`,
 `C15a-C15b`, `C16-C45`, changes the primary row count from 193 to 194, changes
@@ -1454,7 +1487,7 @@ uniqueness, zero post-construction Allocation, and zero CandidateWork. It also
 requires exact Rust 1.97.1 fmt, clippy with `-D warnings`, focused/Core/workspace
 debug and release tests, `RUSTFLAGS=-Dwarnings`, the pinned lookup-comparison
 probe, architecture validation, independent B03/B04/B05 reproduction and check,
-full Python discovery, the accepted auditor at 700, diff-check, and candidate and
+full Python discovery, the accepted auditor at 821, diff-check, and candidate and
 Benchmark terminal authentication.
 
 C15b readiness requires all four daemon terminal facts; pre-materialization,
@@ -1492,7 +1525,7 @@ three-reviewer gates; no C15a artifact or approval carries forward.
 | C12 | `feat(core): drive and refresh request descriptions` | Sole initial/post-load/post-observation/stale-generation description owner with O(1) invalidation, stable resident reissue, and deferred Warming refresh; initial description emits an Effect only after C08a atomically creates its typed optional ordinary claim/obligation/credit/active charge, while post-load/post-observation refresh consumes only exact pending lifecycle obligations from the C08b set reserved before the causal load or observation starts and never creates support capacity | Initial optional exhaustion/no-Effect, cross-model advance/counts, C10c verification plus C10d sealed post-load equality, bounded model/request set, failure/cancel/impossible close, no stale rejection/Admission, no unreserved refresh, original timeout, registry, handle, or Resource Reservation | <= 400 |
 | C13 | `feat(core): authorize exact certification keys` | Current-generation finite requirement-to-Key closure over immutable records and the read-only exact-key Authorization Index; every Key includes one exact Execution Route Identity and resolves to one Certified Execution Profile entry | Stale routes to C12 without lookup; omitted/overflowed/missing/drifted/quarantined Route or other Key member fails closed | <= 400 |
 | C14 | `feat(core): derive certification applicability` | Fresh Environment Fingerprint including exact daemon/Capability/Generation Semantics/Resource Signal/Operation Bound identities, fixed recency cache, and complete finite immutable Applicability Selection over exact Profile entries | Every hit and complete selection recheck freshness/evidence; build/schema/algorithm/Route/other drift and selection-race invalidate; miss/eviction; Resource Evidence never creates applicability | <= 400 |
-| C15a | `feat(core): establish resource capacity ledger` | Install the sole fixed reusable Resource Capacity Ledger, independent reservation and Backend-budget identity indices, typed Backend/output/transient capacity, checked generation, read-only prepare, metered validation, non-forgeable instance-bound exclusive commit capability, infallible commit, snapshot, reserve, and pre-materialization withdrawal | The complete C15a readiness matrix and exact path allowlist above, including `R = 3`, attainable five-axis and per-dimension one-under Work, validated-capability drop/exclusivity, equal-length sorted indices, pinned comparator probe, full Python discovery, and exact rollback; no full-ledger scan, support entry, public seam, or Backend/Governor mutation authority | <= 700 |
+| C15a | `feat(core): establish resource capacity ledger` | Install the sole fixed reusable Resource Capacity Ledger, independent reservation and Backend-budget identity indices, typed Backend/output/transient capacity, checked generation, read-only prepare, metered validation, non-forgeable instance-bound exclusive commit capability, infallible commit, snapshot, reserve, and pre-materialization withdrawal | The complete C15a readiness matrix and exact path allowlist above, including `R = 3`, attainable five-axis and per-dimension one-under Work, validated-capability drop/exclusivity, equal-length sorted indices, pinned comparator probe, full Python discovery, and exact rollback; no full-ledger scan, support entry, public seam, or Backend/Governor mutation authority | <= 821 |
 | C15b | `feat(core): settle resource capacity lifecycle` | Extend the same `resource_ledger` owner, storage, generation, and Interface with four daemon terminal facts, zero-materialization and ownership-consuming Backend partitions, Pending Reclaim, and generation/floor/cursor/evidence-bound convergence; only canonical C22/C28/C30/C41 facts may drive daemon-terminal and Backend-partition transitions, while convergence consumes a typed fresh Resource Evidence fact without interpreting it | The complete C15b readiness matrix and exact path allowlist above, including terminal polarity, cursor-gap success, evidence-rebind/replay rejection, complete-closure identity reuse, final exact Work/storage witnesses, full Python discovery, and independent frozen-source gates; no new owner or Resource Evidence interpretation | <= 500 |
 | C16 | `feat(core): reserve request support entitlements` | Extend the sole ledger with checked actual initial-Materialization/initial-Candidate-Formation/release obligation requirements, reusable request-lifetime Future Turn Support Entitlements, finite Support Outstanding Credit Vectors, terminal tombstones, and one atomic reserve/withdraw primitive over a fully supplied request-support requirement bundle; this slice neither constructs Admission nor creates a Turn Plan | Capacity/generation/identity edges; three distinct initial/release claims and credits; finite per-Turn and terminal branch requirements; vector exact-window/one-past, same-axis value drift, and unbatched maxima; exact five-dimensional `O(3 + v)` Work with zero Allocation/Candidate Work and no `O(v^2)` duplicate scan; physical-storage preflight, reserve/withdraw/rollback, expiry-compatible terminal tombstone, mandatory-pool nonborrowability, and no partial state or Admission/Plan authority | <= 500 |
 | C17 | `feat(core): manage plan support obligations` | From only C16-reserved live entitlements, atomically create separate Plan/model-scoped Receipt-observation, conditional-continuation, and rejection/local-stale many-funder obligations, bind C08b's post-observation lifecycle-reserve set, and create terminal membership-change formation only when required; create/fund/rebind/split/merge/typed-impossible-close conserves one global credit and one claim per affected request | Consecutive-Turn and sequential churn; B1/B4 one call/credit versus unbatched demand; initial/entitlement mixed Candidate Formation; newly eligible-member join, split/merge/member cancel, active no-rebind, conditional credit/vector/horizon retention and conditional-to-pending-or-close only on observation Result, post-observation reserve binding, membership removal, terminal branch and tombstone conservation | <= 400 |
@@ -1952,7 +1985,7 @@ Envelope identity.
 Each phase closes only when:
 
 - every ledger commit for the phase is signed, policy-compliant, and at or below
-  its measured row ceiling: 700 for C15a, 500 for C15b and C16 independently,
+  its measured row ceiling: 821 for C15a, 500 for C15b and C16 independently,
   and 420 otherwise;
 - focused, workspace, Release, operation-count, and applicable native/protocol
   tests are green;
