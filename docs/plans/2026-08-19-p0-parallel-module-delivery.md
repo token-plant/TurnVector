@@ -165,6 +165,63 @@ context limit through the existing registration path but exposes no Request
 Acceptance. C11c alone resolves the request's selector and integrates the
 prepared change through `Core::handle` to expose successful Request Acceptance.
 
+C15 and C16 have one canonical delivery refinement under Design Lineage
+`TV-C15-C16-CANONICAL-DELIVERY-20260824`, Proposal Revision
+`b000e4990d8e8c6b83fbcc85eafc34d36692efb5a46aa7b76dc5cfb88a22b1f1`.
+It changes delivery bounds and verification obligations without moving either
+owner or creating a public seam. C15 remains wholly `resource_ledger`-owned;
+C16 remains wholly `support_ledger`-owned.
+
+The repository-policy count includes every non-documentation addition and
+deletion, including the fixed generated identity cascade. Current accepted Git
+objects measure that cascade as 18 lines. C15 reserves 650 lines for behavior,
+source, and focused tests plus 50 for architecture, wiring, and generated output,
+giving per-commit and PR-cumulative hard limits of 700. C16 reserves 450 plus 50,
+giving exact per-commit and cumulative hard limits of 500. With the measured
+cascade, each structural reserve has 32 lines remaining. If actual generated
+and other structural work exceeds 50, the row stops; unused C15 capacity never
+belongs to C16.
+
+C15 is one atomic row because reserve, every typed terminal settlement,
+Pending Reclaim, Resource Capacity Ledger Generation, reusable bounded storage,
+and their conservation law establish one sole capacity authority. An actual
+C15 commit over 500 and at most 700 uses `commit-size-exception` and the exact
+PR disclosure required by repository policy. C16 never uses an exception. Its
+500-line boundary requires deepening the existing Support owner and prohibits a
+second entitlement ledger or broad Support refactor.
+
+For these rows, preparation remains read-only; every validation invocation is
+Hot-Path Work-metered and returns a non-forgeable generation- and before-image-
+bound validated change; commit consumes that value without another fallible
+operation. C15 must replace symbolic Work and memory relations with exact
+constructor-specific witnesses. C16 atomically preflights both logical and
+physical storage, keeps request claim ownership through the tombstone, rejects
+same operation/pool/horizon axes with a different vector value, and uses storage
+compatible with later C18-owned expiry without taking expiry authority.
+
+After construction, both paths report zero `Allocations` and zero
+`CandidateWork`; every branch meters `VisitedEntities`, `CopiedBytes`,
+`Allocations`, `CandidateWork`, and `InvariantChecks` before mutation. C15 binds
+constructor-fixed record capacity `R`, record size `s`, per-variant identity
+lookup count `k`, finite lookup depth `b`, and resource-dimension count `|D|` to
+`VisitedEntities <= k * b + O(|D|)` and
+`CopiedBytes <= (R - 1) * s + O(s)`. It substitutes concrete values into the
+binary Hot-Path budget and maintains conservation aggregates incrementally;
+full-ledger transition scans are forbidden. C16 validates and preflights its
+fixed three-item bundle plus vector in `O(3 + v)` with one canonical bounded
+pass. Pairwise `O(v^2)` duplicate detection is forbidden, and logical capacity,
+physical capacity, and every Work dimension are checked before the first write.
+
+The two rows use separate worktrees, commits, PRs, manifests, reviews, and line
+budgets. C15 lands first. C16 begins from a fresh current `origin/main` only
+after C15 merges; no earlier C16 source or generated output is carried across
+that boundary. C17 and every later row remain blocked from implementation work,
+local row branches, and draft PRs until C16 merges; this row-specific block
+overrides Worktree And Pull Request Protocol item 4. Any count overflow, owner
+expansion, missing exact witness, or pressure to remove tests, add
+`rustfmt::skip`, or hide transition control flow is a stop condition requiring a
+new user decision and Design Proposal Gate.
+
 The accepted implementation order contains 193 rows after C07.
 
 | Area | Rows | Count | Delivery result |
@@ -425,6 +482,10 @@ that Core-only authority.
    a second mutable implementation of another module's invariant.
 8. Every content change invalidates review approvals. Review, staging, signed
    commit, push, and ready-PR confirmation follow the base plan unchanged.
+9. C15 uses the accepted-object auditor at limit 700 and accumulates every
+   non-merge payload commit against the same 700-line PR cap. C16 uses limit 500
+   and the same cumulative rule. All other rows retain the base plan's ordinary
+   420-line plan ceiling and 500-line policy limit.
 
 ## Generated Identity Single-Writer Protocol
 
@@ -482,6 +543,8 @@ This module split is ready to drive implementation only when:
   accounting;
 - no public interface or behavior-bearing placeholder precedes its ledger row;
 - worktree, PR, review, signing, and generated-identity custody are explicit;
+- C15 and C16 obey their separate 700/500 per-commit and cumulative bounds and
+  ordered fresh-main boundary;
 - Benchmark ownership and the separate delivery tracks remain unambiguous; and
 - the documentation-only PR is merged before implementation agents begin their
   first row branches.
