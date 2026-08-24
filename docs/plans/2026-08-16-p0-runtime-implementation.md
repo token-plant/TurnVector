@@ -995,7 +995,15 @@ Every pull-request commit follows all of these rules:
    documentation lines. The planned ceiling is 420 lines, including production
    source, tests, fixtures, generated source, migrations, and lockfiles. Human-
    authored Markdown is exempt. A measured slice above 420 is split before
-   review; approaching 500 is not an acceptable plan.
+   review; approaching 500 is not an acceptable plan. The only current
+   delivery-specific exceptions are C15 and C16 under Design Lineage
+   `TV-C15-C16-CANONICAL-DELIVERY-20260824`, Proposal Revision
+   `b000e4990d8e8c6b83fbcc85eafc34d36692efb5a46aa7b76dc5cfb88a22b1f1`:
+   C15 has per-commit and pull-request-cumulative hard limits of 700 counted
+   lines, while C16 has per-commit and cumulative hard limits of 500. C15 uses
+   `commit-size-exception` only when an actual commit exceeds 500; C16 never
+   uses an exception. These bounds do not amend any other row's 420-line plan
+   ceiling or 500-line policy limit.
 2. Behavior is developed red, then green. A commit is reviewed only after its
    focused test and all applicable prior tests pass.
 3. Every intended path is unstaged during review. Unrelated changes and any
@@ -1038,6 +1046,9 @@ Every pull-request commit follows all of these rules:
    manifest, and prints its SHA-256. Earlier documentation-only commits use an
    explicit path/blob table from `git hash-object`, plus `git diff --binary`
    for tracked files or `git diff --no-index` for an untracked file.
+   C15 invokes the accepted auditor with `--limit 700`; C16 uses `--limit 500`.
+   Both commands still execute the accepted `HEAD` object, and the resulting
+   count is also accumulated over every non-merge payload commit in the row PR.
 4. Three independent reviewers inspect the same complete unstaged manifest and
    diff. Each rereads repository-required internal references, checks the whole
    specification and architecture, runs or requests relevant tests, checks
@@ -1207,6 +1218,140 @@ any structural savings. The projected combined human maximum is 920, leaving
 implementation stops for a new delivery decision instead of weakening an
 invariant or test.
 
+### C15 And C16 Canonical Delivery Refinement
+
+The C15/C16 delivery boundary was independently rebuilt from
+`origin/main@15bc62a23725ec9d350604d8ad9734338c472099` without using any
+unaccepted predecessor design. Its Mathematical Gate and one three-reviewer
+unanimous round passed as Proposal Revision
+`b000e4990d8e8c6b83fbcc85eafc34d36692efb5a46aa7b76dc5cfb88a22b1f1`.
+
+For a non-merge payload commit `c`, let `L(c)` be the repository-policy count
+of additions plus deletions over non-documentation paths. Generated references,
+fixtures, embedded production source, data, migrations, snapshots, and lockfiles
+remain counted. For a row PR, `L_PR = sum L(c_i)` over all non-merge payload
+commits. The fixed current Runtime Core identity cascade is nine paths at one
+addition plus one deletion each, or 18 counted lines.
+
+C15 has one atomic row budget:
+
+```text
+650 behavior, source, and focused-test lines
++ 50 architecture, wiring, and generated lines
+= 700 per-commit and PR-cumulative hard stop
+```
+
+The measured 18-line cascade leaves 32 structural lines. The 650-line behavior
+allowance is 201 lines, or 44.77%, above the canonical 449-line combined C08
+comparator. This is a conservative planning allowance, not an implementation
+measurement or lower bound. C15 plans one signed payload commit. A count from
+501 through 700 requires the existing `commit-size-exception` label and a PR
+entry with the full SHA, exact count, explicit approval, and the atomic sole-
+ledger reason. A count at or below 500 must not use that label.
+
+C16 has one exact row budget:
+
+```text
+450 existing-support-owner behavior, source, and focused-test lines
++ 50 architecture, wiring, and generated lines
+= 500 per-commit and PR-cumulative hard stop
+```
+
+The same measured cascade leaves 32 structural lines. The behavior allowance
+is deliberately only one line above the combined C08 comparator: C16 must deepen
+the existing `support_ledger` and reuse its generation, pools, records, claims,
+credits, and prepared-change machinery. It cannot create a second ledger, make
+a broad Support refactor, borrow C15 capacity, or use a size exception.
+
+For actual generated count `g` and other structural count `x`, the behavior
+allowances become `700 - g - x` for C15 and `500 - g - x` for C16. Each extra
+structural or generated line reduces the behavior allowance by one; neither
+total expands. If `g + x > 50`, either cumulative bound is exceeded, or a
+required invariant/test would need to be removed, hidden behind
+`rustfmt::skip`, or compressed into unreadable control flow, implementation
+stops for a new user decision and Design Proposal Gate.
+
+C15 completes only the private `resource_ledger`. It owns Request Backend
+Allocation Budgets, daemon output capacity, finite typed transient headroom,
+Pending Reclaim, Resource Capacity Ledger Generation, bounded reusable record
+storage, and conservation. Its closed typed inputs distinguish reserve,
+pre-materialization withdrawal, each daemon-component settlement, exact Backend
+partition settlement, and reclaim convergence. For every resource dimension
+`d`, checked `u64` arithmetic preserves `0 <= U_d <= K_d`, reserve requires
+`r_d <= K_d - U_d`, and dimensions never borrow. A Backend partition must
+satisfy checked `allocated + never_allocated = held_budget`; only
+`never_allocated` is immediately released, while `allocated` remains charged
+as Pending Reclaim until a fresh, generation- and cursor-bound convergence fact.
+
+C16 extends only the private `support_ledger`. One atomic request bundle binds
+exactly three operation-specific initial/release obligations, three physical
+credits, three distinct request-owned `AdmissionInitial` claims, one Future Turn
+Support Entitlement, a complete canonical Outstanding Credit Vector, and every
+finite branch requirement. Vector cells are unique by operation, pool, and
+horizon; `max_outstanding` is the cell value, so a duplicate axis with a
+different value is drift rather than a second cell. All logical and physical
+record, claim, credit, vector, entitlement, and tombstone capacities are
+preflighted before the first write. Claim ownership survives the tombstone, and
+storage must remain compatible with C18-owned retention expiry without granting
+C16 expiry authority. Generic reserve paths cannot construct Admission Initial
+or Entitlement Vector state outside the complete bundle path.
+
+Both owners expose only crate-private interface shapes:
+
+```text
+prepare(input, work) -> Change
+validate(change, work) -> ValidatedChange
+commit(validated_change) -> infallible generation advance
+snapshot(work) -> immutable capacity facts
+```
+
+Validation is metered every time. Prepared and validated values are non-
+forgeable, generation-bound, single-use, and bind every target before-image.
+Commit performs no new fallible lookup, check, or allocation. C20 alone later
+validates both owners and commits both once or neither. Every routine rejection
+preserves the exact prior ledger, generation, and Effects. Hot paths allocate
+zero; concrete type sizes and constructor capacities must replace every
+symbolic complexity term with exact Work and memory witnesses before readiness.
+
+After construction, both transition paths report zero `Allocations` and zero
+`CandidateWork`. Every success and rejection branch meters all five Work
+dimensions, `VisitedEntities`, `CopiedBytes`, `Allocations`, `CandidateWork`,
+and `InvariantChecks`, before the first mutation. For C15, let `R` be the
+constructor-fixed record capacity, `s` the record size in bytes, `k` the fixed
+number of identity lookups for the input variant, `b` the finite lookup depth,
+and `|D|` the finite resource-dimension count. Its conservative bounds are:
+
+```text
+VisitedEntities <= k * b + O(|D|)
+CopiedBytes <= (R - 1) * s + O(s)
+Allocations = 0
+CandidateWork = 0
+```
+
+The C15 constructor substitutes concrete `R`, `s`, `k`, `b`, and `|D|` and
+proves the worst success path fits `HotPathWorkBudget::binary_maximum()`; a
+failure leaves bootstrap nonready. Transitions never perform a full-ledger
+conservation scan: aggregates are maintained incrementally and checked by
+focused proofs. For C16, with fixed bundle width `q = 3` and validated vector
+length `v`, validation and preflight are `O(q + v) = O(3 + v)` in one bounded
+pass. Pairwise `O(v^2)` duplicate detection is forbidden; canonical vector
+order supplies uniqueness, and physical capacity, logical capacity, and all
+five Work dimensions are preflighted before any write.
+
+Current Catalog capacity values, including six required vector dimensions and
+the 168-dimension schema capacity, are `test_fixture_nonproduction` inputs.
+They are required exact and one-past test cases, not production-capacity claims.
+C15 and C16 construction fails closed without complete validated production
+capacity facts.
+
+C15 and C16 are separate ordered PRs. C15 starts after this authority change is
+merged. C16 starts from a freshly fetched `origin/main` only after C15 is merged;
+no C16 candidate or generated output survives that predecessor boundary. C17
+and every later row remain blocked from implementation work, local row branches,
+and draft PRs until C16 is merged. Each row receives three independent reviews
+of one exact unstaged manifest before staging. Later fixes consume the same
+cumulative row budget. Neither row is merged without a separate user instruction.
+
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
 | C01 | `feat(core): add checked domain identities` | Distinct IDs, units, sequences, durations, and Monotonic Time | Overflow, zero, and cross-type rejection | <= 360 |
@@ -1230,8 +1375,8 @@ invariant or test.
 | C12 | `feat(core): drive and refresh request descriptions` | Sole initial/post-load/post-observation/stale-generation description owner with O(1) invalidation, stable resident reissue, and deferred Warming refresh; initial description emits an Effect only after C08a atomically creates its typed optional ordinary claim/obligation/credit/active charge, while post-load/post-observation refresh consumes only exact pending lifecycle obligations from the C08b set reserved before the causal load or observation starts and never creates support capacity | Initial optional exhaustion/no-Effect, cross-model advance/counts, C10c verification plus C10d sealed post-load equality, bounded model/request set, failure/cancel/impossible close, no stale rejection/Admission, no unreserved refresh, original timeout, registry, handle, or Resource Reservation | <= 400 |
 | C13 | `feat(core): authorize exact certification keys` | Current-generation finite requirement-to-Key closure over immutable records and the read-only exact-key Authorization Index; every Key includes one exact Execution Route Identity and resolves to one Certified Execution Profile entry | Stale routes to C12 without lookup; omitted/overflowed/missing/drifted/quarantined Route or other Key member fails closed | <= 400 |
 | C14 | `feat(core): derive certification applicability` | Fresh Environment Fingerprint including exact daemon/Capability/Generation Semantics/Resource Signal/Operation Bound identities, fixed recency cache, and complete finite immutable Applicability Selection over exact Profile entries | Every hit and complete selection recheck freshness/evidence; build/schema/algorithm/Route/other drift and selection-race invalidate; miss/eviction; Resource Evidence never creates applicability | <= 400 |
-| C15 | `feat(core): own admitted resource capacity` | Sole fixed-capacity Resource Capacity Ledger for Request Backend Allocation Budgets, daemon output capacity, typed transient headroom, checked generation, atomic reserve/withdraw, and all-or-nothing rollback; only C22 zero/partial materialization, C28 cancellation, and C41 post-output Turn-terminal facts may settle daemon components, while C22's zero-ownership Materialization Result and C30's ownership-consuming Release Result are the only Backend Budget partition facts; Resource Governor supplies limits and mode but owns no ledger mutation | Cross-component and multi-request conservation, generation TOCTOU, capacity edge/overflow, pre-materialization/zero/partial/queued/in-flight-Turn/normal-Turn-terminal settlement, output-occupancy transfer, reserve/withdraw/rollback, no support entry, and no Backend or Governor mutation authority | <= 400 |
-| C16 | `feat(core): reserve request support entitlements` | Extend the sole ledger with checked actual initial-Materialization/initial-Candidate-Formation/release obligation requirements, reusable request-lifetime Future Turn Support Entitlements, finite Support Outstanding Credit Vectors, terminal tombstones, and one atomic reserve/withdraw primitive over a fully supplied request-support requirement bundle; this slice neither constructs Admission nor creates a Turn Plan | Capacity/generation/identity edges; three distinct initial/release claims and credits; finite per-Turn and terminal branch requirements; vector exact-window/one-past and unbatched maxima; reserve/withdraw/rollback, terminal tombstone, mandatory-pool nonborrowability, and no partial state or Admission/Plan authority | <= 360 |
+| C15 | `feat(core): own admitted resource capacity` | Sole fixed-capacity Resource Capacity Ledger for Request Backend Allocation Budgets, daemon output capacity, typed transient headroom, checked generation, atomic reserve/withdraw, and all-or-nothing rollback; only C22 zero/partial materialization, C28 cancellation, and C41 post-output Turn-terminal facts may settle daemon components, while C22's zero-ownership Materialization Result and C30's ownership-consuming Release Result are the only Backend Budget partition facts; Resource Governor supplies limits and mode but owns no ledger mutation | Cross-component and multi-request conservation, generation TOCTOU, capacity edge/overflow, pre-materialization/zero/partial/queued/in-flight-Turn/normal-Turn-terminal settlement, output-occupancy transfer, reserve/withdraw/rollback, exact concrete `R`/`s`/`k`/`b`/`|D|` Work and memory maxima, zero Allocation/Candidate Work, no full-ledger scan, no support entry, and no Backend or Governor mutation authority | <= 700 |
+| C16 | `feat(core): reserve request support entitlements` | Extend the sole ledger with checked actual initial-Materialization/initial-Candidate-Formation/release obligation requirements, reusable request-lifetime Future Turn Support Entitlements, finite Support Outstanding Credit Vectors, terminal tombstones, and one atomic reserve/withdraw primitive over a fully supplied request-support requirement bundle; this slice neither constructs Admission nor creates a Turn Plan | Capacity/generation/identity edges; three distinct initial/release claims and credits; finite per-Turn and terminal branch requirements; vector exact-window/one-past, same-axis value drift, and unbatched maxima; exact five-dimensional `O(3 + v)` Work with zero Allocation/Candidate Work and no `O(v^2)` duplicate scan; physical-storage preflight, reserve/withdraw/rollback, expiry-compatible terminal tombstone, mandatory-pool nonborrowability, and no partial state or Admission/Plan authority | <= 500 |
 | C17 | `feat(core): manage plan support obligations` | From only C16-reserved live entitlements, atomically create separate Plan/model-scoped Receipt-observation, conditional-continuation, and rejection/local-stale many-funder obligations, bind C08b's post-observation lifecycle-reserve set, and create terminal membership-change formation only when required; create/fund/rebind/split/merge/typed-impossible-close conserves one global credit and one claim per affected request | Consecutive-Turn and sequential churn; B1/B4 one call/credit versus unbatched demand; initial/entitlement mixed Candidate Formation; newly eligible-member join, split/merge/member cancel, active no-rebind, conditional credit/vector/horizon retention and conditional-to-pending-or-close only on observation Result, post-observation reserve binding, membership removal, terminal branch and tombstone conservation | <= 400 |
 | C18 | `feat(core): retain and snapshot support history` | Complete the sole ledger with Catalog Retention Horizon expiry, retained active records/credits/linked claims, one dedicated Prepared Carry slot, and an immutable bounded carry input over every conditional/pending obligation, entitlement vector/tombstone, ordinary claim, lifecycle reserve, pool and generation; expose the complete capacity/interference snapshot consumed by Admission and later C26/C27 integration without selecting a lifecycle witness or owning a Control outcome | Carry-in/out accounting, adjacent windows, deferred expiry, short-to-long Budget history, full ordinary capacity plus dedicated slot, dual-Budget mandatory/safety suballocation, conditional-obligation snapshot, stable generation, no reset/refund/borrow, witness selector, Control owner, or second ledger | <= 380 |
 | C19 | `feat(core): construct bounds and decide admission` | From exact current C15 resource-capacity and C18-complete support-ledger snapshot, purely construct one Runtime Overhead Bound Set from C14 selection, complete Configuration Snapshot, and one active immutable daemon-produced Lifecycle Overhead Qualification witness; prove `B + support + sequenced-event` closure, Support Start Count Bounds, finite request closure and complete Support Outstanding Credit Vector, initial operation obligations, and one conserved Future Turn Support Entitlement funding separate Plan-scoped observation and conditional-continuation obligations versus rejection/local-stale plus terminal membership-change formation, then return one complete accepted Admission decision after checking current description/Revision, Authorized Capability Set, worst-case timing, Resource Mode, and both capacities | Core verifies but never selects lifecycle witness; no Event Loop/Backend applicability or Set authority; stale/missing/drifted Catalog/qualification/evidence, missing horizon/start-credit/vector/event/support/resource/obligation/entitlement/membership-change/Key, either ledger race, or failed condition returns rejection without allocation | <= 400 |
@@ -1685,7 +1830,7 @@ Envelope identity.
 Each phase closes only when:
 
 - every ledger commit for the phase is signed, policy-compliant, and at or below
-  its measured 420-line plan ceiling;
+  its measured row ceiling: 700 for C15, 500 for C16, and 420 otherwise;
 - focused, workspace, Release, operation-count, and applicable native/protocol
   tests are green;
 - all applicable earlier-phase tests remain green;
