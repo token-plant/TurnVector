@@ -192,6 +192,19 @@ The user explicitly approved the 821-line maximum, its required
 `commit-size-exception`, and squash merge of the docs authority revision on
 2026-08-25; the new boundary activates only after that revision merges.
 
+Only C16's delivery-count rule was subsequently corrected from
+`origin/main@57ef6f4ccfe4f220f71394b9448c25e70d47aaea` under the same Design
+Lineage. Proposal Revision
+`cff10fc10ce8845de2c981ddb9570affbfc57f4a165744350cdcf1c1e0dc87ff`,
+Review Round
+`TV-C15-C16-CANONICAL-DELIVERY-20260824-C16-MULTICOMMIT-R8-20260825T183842Z`,
+Launch Record SHA-256
+`698973e453a9e03baf9d242cd2e09a4548c24dbfa89dc17c07ef29007c5c634f`,
+and passing round-record SHA-256
+`e8b1d1ff44bc741ef458e06b0af042b1b3a7cb2f4f1c9712074bc60792efb38d`
+bind that correction. Every C15 decision and every non-delivery C16 decision
+remains unchanged.
+
 The corrected complete C15 proof measures `858 + 8 + 18 = 884` counted
 non-documentation lines, 184 above the cumulative 700-line row cap. The accepted
 delivery therefore refines C15 into consecutive C15a and C15b rows while keeping
@@ -209,12 +222,14 @@ requires `commit-size-exception` plus exact full-SHA, per-commit, cumulative,
 approval, and atomic-reason PR disclosure. Every additional source,
 architecture, generated, or follow-up line consumes the margin one-for-one; one
 post-push runtime repair also spends another 18-line cascade and therefore
-leaves at most 44 source lines when no other drift occurred. C15b has
-an independent 500-line maximum, uses no exception, and measures
-`(305 + 53) + 18 = 376`, leaving 124 lines. C16 independently retains its
-500-line per-commit and cumulative maximum and never uses an exception. C15a
-headroom cannot be borrowed by either later row. A C15a count above 821 or any
-non-numeric design drift stops for a new user decision and Gate.
+leaves at most 44 source lines when no other drift occurred. C15b has an
+independent 500-line per-commit and PR-cumulative maximum, uses no exception,
+and measures `(305 + 53) + 18 = 376`, leaving 124 lines. C16 retains a 500-line
+maximum for each non-merge payload commit and never uses an exception. Its
+cumulative PR payload count is recorded and disclosed but is not an LOC
+pass/fail threshold. C15a headroom cannot be borrowed by either later row. A
+C15a count above 821 or any non-numeric design drift stops for a new user
+decision and Gate.
 
 C15a changes the architecture ledger series from `C12-C45` to `C12-C14`,
 `C15a-C15b`, `C16-C45`, changes the primary row count from 193 to 194, assigns
@@ -273,17 +288,43 @@ production-capacity claims. C15a and C15b each recompute their exact landing
 witness. C16 remains `O(3 + v)` with no `O(v^2)` duplicate scan and preflights
 every logical, physical, and Work dimension.
 
-The authority update, C15a, C15b, and C16 use separate worktrees, commits, PRs,
-manifests, generated cascades, reviews, and budgets. Each begins from fresh
-post-predecessor `origin/main`; no source, generated output, review, or approval
-carries across the boundary. C17, C19, C20, and every Resource Capacity consumer
-remain blocked through C15b; C17 and every later Core row remain blocked until
-C16 merges. Any count overflow, owner expansion, missing exact witness, test or
+The authority update, C15a, C15b, and C16 use separate worktrees and PRs. C15a
+and C15b retain their existing commit rules; C16 uses multiple signed payload
+commits in one row-scoped PR. Each row begins from fresh post-predecessor
+`origin/main`; no source, generated output, review, or approval carries across
+the boundary. C17, C19, C20, and every Resource Capacity consumer remain blocked
+through C15b; C17 and every later Core row remain blocked until C16 merges. Any
+per-commit count overflow, owner expansion, missing exact witness, test or
 validation removal, `rustfmt::skip`, or hidden transition control flow stops for
-a new user decision and Design Proposal Gate. For this explicitly authorized
-sequence, the coordinator squash-merges each ready, green PR without another
-prompt, verifies the remote merge and branch cleanup, and only then begins the
-next row from fresh `origin/main`.
+a new user decision and Design Proposal Gate.
+
+Before C16 reconstruction, main freezes a new DeepSeek V4 Flash task prompt that
+explicitly supersedes both historical prompt components: their C16
+PR-cumulative 500 rule, immediate per-commit push or PR update, cumulative-main-
+base candidate review, and any instruction that DeepSeek marks the PR ready.
+DeepSeek must acknowledge the exact replacement-prompt identity before editing.
+
+Each C16 commit covers one coherent independently green aspect and is based on
+its immediate parent. DeepSeek V4 Flash freezes each exact unstaged candidate;
+the accepted immediate-parent checker and one local round of one
+`gpt-5.6-sol/max` plus two `gpt-5.6-terra/max` reviewers must unanimously pass
+before DeepSeek stages and signs that commit. Findings return directly to
+DeepSeek, and changed bytes require a fresh freeze and fresh round. Each
+runtime-source commit includes and counts its own complete B03 -> B04 -> B05
+cascade. No exact commit grouping is pre-approved, and stale pre-authority C16
+source, generated output, reviews, and approvals are not landing inputs. Every
+intermediate tree must compile, pass applicable prior and focused tests, retain
+a usable private `support_ledger` Interface, and state its partial responsibility
+truthfully; only the final C16 commit may claim the complete row.
+
+After the reviewed local series is complete, DeepSeek pushes it, opens one draft
+C16 PR, and waits. Main verifies the sequence, signatures, per-commit manifests
+and counts, final diff, base, checks, and Benchmark cleanliness; main alone marks
+the PR ready and squash-merges it. A content repair repeats the unstaged
+immediate-parent checker and local three-review process before a signed
+non-force-push follow-up; the PR remains draft until the repair and available
+required checks are green. The coordinator verifies the remote merge and branch
+cleanup before the next row begins from fresh `origin/main`.
 
 C15 path custody is exact. The authority PR changes only the two canonical plans.
 C15a may change only `crates/turnvector-core/src/resource_ledger.rs`,
@@ -592,11 +633,14 @@ that Core-only authority.
    facts, expected prepared changes, and focused tests. It is not handed off as
    a second mutable implementation of another module's invariant.
 8. Every content change invalidates review approvals. Review, staging, signed
-   commit, push, and ready-PR confirmation follow the base plan unchanged.
+   commit, push, and ready-PR confirmation follow the base plan unchanged except
+   for C16's per-commit local DeepSeek/reviewer flow above.
 9. C15a uses the accepted-object auditor at limit 821 and accumulates every
-   non-merge payload commit against the same 821-line PR cap. C15b and C16 each
-   use limit 500 and each has its own cumulative PR cap. All other rows retain
-   the base plan's ordinary 420-line plan ceiling and 500-line policy limit.
+   non-merge payload commit against the same 821-line PR cap. C15b uses limit
+   500 and retains its cumulative PR cap. Each C16 payload candidate uses the
+   accepted immediate-parent auditor at limit 500; its PR cumulative count is
+   disclosed but is not an LOC pass/fail threshold. All other rows retain the
+   base plan's ordinary 420-line plan ceiling and 500-line policy limit.
 
 ## Generated Identity Single-Writer Protocol
 
@@ -619,8 +663,9 @@ Before a runtime-source row becomes ready, the integration owner:
 1. synchronizes the row branch to the exact current predecessor;
 2. discards stale generated output from older bases;
 3. regenerates B03, then B04, then B05 in that order;
-4. includes the complete required cascade in the same independently green row
-   commit and its LOC accounting;
+4. includes the complete required cascade in the same independently green
+   payload commit and its LOC accounting; C16 repeats this for every
+   runtime-source commit;
 5. runs every applicable canonical check and records the exact identities; and
 6. verifies TurnVectorBenchmark status before and after any authorized paired
    verification.
@@ -654,8 +699,10 @@ This module split is ready to drive implementation only when:
   accounting;
 - no public interface or behavior-bearing placeholder precedes its ledger row;
 - worktree, PR, review, signing, and generated-identity custody are explicit;
-- C15a, C15b, and C16 obey their independent 821/500/500 per-commit and
-  cumulative bounds and ordered fresh-main boundaries;
+- C15a and C15b obey their independent 821/500 per-commit and cumulative bounds;
+  every C16 non-merge payload commit obeys 500 while its PR cumulative count is
+  disclosed without becoming a threshold; all preserve ordered fresh-main
+  boundaries;
 - Benchmark ownership and the separate delivery tracks remain unambiguous; and
 - the documentation-only PR is merged before implementation agents begin their
   first row branches.
