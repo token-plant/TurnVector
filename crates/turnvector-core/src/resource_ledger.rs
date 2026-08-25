@@ -31,6 +31,11 @@ pub(crate) enum ResourceLedgerError {
     Full,
     MissingReservation,
     BeforeImageMismatch,
+    InvalidSettlement,
+    InvalidBackendPartition,
+    WrongPendingReclaimAnchor,
+    ResourceEvidenceNotNewer,
+    ResourceEvidenceReplay,
     WrongLedger,
     ExclusiveCapability,
     Work(WorkBudgetError),
@@ -64,6 +69,7 @@ macro_rules! identity {
 identity!(ResourceAuthorityId);
 identity!(ResourceReservationId);
 identity!(BackendBudgetId);
+identity!(ResourceEvidenceId);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackendAllocationCapacity(pub(crate) u64);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -82,6 +88,44 @@ impl ResourceCapacityLedgerGeneration {
     fn next(self) -> LedgerResult<Self> {
         Self::new(self.get().checked_add(1).ok_or(GenerationOverflow)?)
     }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceEvidenceCursor(pub(crate) u64);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceEvidencePoint {
+    pub(crate) cursor: ResourceEvidenceCursor,
+    pub(crate) evidence: ResourceEvidenceId,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DaemonTerminalFact {
+    PartialMaterialization,
+    QueuedAfterInvalidation,
+    InFlightAfterReceipt,
+    OrdinaryAfterReceipt,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BackendPartitionSource {
+    ZeroMaterialization,
+    OwnershipConsumed,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackendPartitionFact {
+    pub(crate) source: BackendPartitionSource,
+    pub(crate) allocated: BackendAllocationCapacity,
+    pub(crate) never_allocated: BackendAllocationCapacity,
+    pub(crate) floor: ResourceEvidencePoint,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingReclaimAnchor {
+    pub(crate) reservation: ResourceReservationId,
+    pub(crate) backend_budget: BackendBudgetId,
+    pub(crate) opened_generation: ResourceCapacityLedgerGeneration,
+    pub(crate) floor: ResourceEvidencePoint,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PendingReclaimConvergence {
+    pub(crate) anchor: PendingReclaimAnchor,
+    pub(crate) observed: ResourceEvidencePoint,
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ResourceCapacity {
@@ -149,10 +193,45 @@ impl ResourceReservation {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingReclaimState {
+    opened_generation: ResourceCapacityLedgerGeneration,
+    amount: BackendAllocationCapacity,
+    floor: ResourceEvidencePoint,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendSettlement {
+    Held,
+    Pending(PendingReclaimState),
+    Closed,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResourceSettlement {
+    daemon_open: bool,
+    backend: BackendSettlement,
+}
+impl ResourceSettlement {
+    const HELD: Self = Self {
+        daemon_open: true,
+        backend: BackendSettlement::Held,
+    };
+    fn mutation(self) -> RecordMutation {
+        match (self.daemon_open, self.backend) {
+            (false, BackendSettlement::Closed) => RecordMutation::Remove,
+            _ => RecordMutation::Replace(self),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResourceRecord {
+    reservation: ResourceReservation,
+    settlement: ResourceSettlement,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceSnapshot {
     generation: ResourceCapacityLedgerGeneration,
     limit: ResourceCapacity,
     used: ResourceCapacity,
+    pending_reclaim: BackendAllocationCapacity,
     reservations: usize,
     backend_budgets: usize,
 }
@@ -165,6 +244,9 @@ impl ResourceSnapshot {
     }
     pub(crate) const fn used(self) -> ResourceCapacity {
         self.used
+    }
+    pub(crate) const fn pending_reclaim(self) -> BackendAllocationCapacity {
+        self.pending_reclaim
     }
     pub(crate) const fn reservations(self) -> usize {
         self.reservations
@@ -180,8 +262,14 @@ impl ResourceSnapshot {
 pub(crate) enum ResourceAction {
     Reserve,
     WithdrawBeforeMaterialization,
+    SettleDaemon(DaemonTerminalFact),
+    ApplyBackendPartition(BackendPartitionFact),
+    ConvergePendingReclaim(PendingReclaimConvergence),
 }
-use ResourceAction::{Reserve, WithdrawBeforeMaterialization as Withdraw};
+use ResourceAction::{
+    ApplyBackendPartition, ConvergePendingReclaim, Reserve, SettleDaemon,
+    WithdrawBeforeMaterialization as Withdraw,
+};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ResourceInput {
     pub(crate) action: ResourceAction,
@@ -191,7 +279,7 @@ pub(crate) struct ResourceInput {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResourceIndices {
-    records: Vec<ResourceReservation>,
+    records: Vec<ResourceRecord>,
     budgets: Vec<BackendBudgetId>,
 }
 type IndexPositions = (Result<usize, usize>, Result<usize, usize>);
@@ -220,7 +308,7 @@ impl ResourceIndices {
     fn positions(&self, reservation: ResourceReservation) -> IndexPositions {
         let record = self
             .records
-            .binary_search_by_key(&reservation.id, |value| value.id);
+            .binary_search_by_key(&reservation.id, |value| value.reservation.id);
         let budget = self.budgets.binary_search(&reservation.backend_budget);
         (record, budget)
     }
@@ -228,42 +316,62 @@ impl ResourceIndices {
         &self,
         action: ResourceAction,
         reservation: ResourceReservation,
-    ) -> LedgerResult<(usize, usize)> {
+    ) -> LedgerResult<((usize, usize), Option<ResourceSettlement>)> {
         self.invariant()?;
         let (record, budget) = self.positions(reservation);
         match action {
             Reserve => {
                 require(self.records.len() < R, Full)?;
                 Ok((
-                    record.map_or_else(Ok, |_| Err(DuplicateReservation))?,
-                    budget.map_or_else(Ok, |_| Err(DuplicateBackendBudget))?,
+                    (
+                        record.map_or_else(Ok, |_| Err(DuplicateReservation))?,
+                        budget.map_or_else(Ok, |_| Err(DuplicateBackendBudget))?,
+                    ),
+                    None,
                 ))
             }
-            Withdraw => {
+            Withdraw | SettleDaemon(_) | ApplyBackendPartition(_) | ConvergePendingReclaim(_) => {
                 let record = record.map_err(|_| MissingReservation)?;
-                require(self.records[record] == reservation, BeforeImageMismatch)?;
-                Ok((record, budget.map_err(|_| BeforeImageMismatch)?))
+                let stored = self.records[record];
+                require(stored.reservation == reservation, BeforeImageMismatch)?;
+                Ok((
+                    (record, budget.map_err(|_| BeforeImageMismatch)?),
+                    Some(stored.settlement),
+                ))
             }
         }
     }
     fn target_matches(&self, action: &PreparedAction) -> bool {
         let positions = self.positions(action.reservation);
-        match action.action {
-            Reserve => positions == (Err(action.positions.0), Err(action.positions.1)),
-            Withdraw => {
+        match action.before_settlement {
+            None => positions == (Err(action.positions.0), Err(action.positions.1)),
+            Some(settlement) => {
                 positions == (Ok(action.positions.0), Ok(action.positions.1))
-                    && self.records[action.positions.0] == action.reservation
+                    && self.records[action.positions.0]
+                        == ResourceRecord {
+                            reservation: action.reservation,
+                            settlement,
+                        }
             }
         }
     }
     fn apply(&mut self, action: &PreparedAction) {
-        match action.action {
-            Reserve => {
-                self.records.insert(action.positions.0, action.reservation);
+        match action.mutation {
+            RecordMutation::Insert => {
+                self.records.insert(
+                    action.positions.0,
+                    ResourceRecord {
+                        reservation: action.reservation,
+                        settlement: ResourceSettlement::HELD,
+                    },
+                );
                 self.budgets
                     .insert(action.positions.1, action.reservation.backend_budget);
             }
-            Withdraw => {
+            RecordMutation::Replace(settlement) => {
+                self.records[action.positions.0].settlement = settlement;
+            }
+            RecordMutation::Remove => {
                 self.records.remove(action.positions.0);
                 self.budgets.remove(action.positions.1);
             }
@@ -274,6 +382,7 @@ impl ResourceIndices {
 struct ResourceState {
     generation: ResourceCapacityLedgerGeneration,
     used: ResourceCapacity,
+    pending_reclaim: BackendAllocationCapacity,
     indices: ResourceIndices,
 }
 pub(crate) struct ResourceCapacityLedger<const R: usize> {
@@ -287,11 +396,19 @@ pub(crate) struct ResourceChange<'a, const R: usize> {
     action: PreparedAction,
 }
 struct PreparedAction {
-    action: ResourceAction,
     reservation: ResourceReservation,
     positions: (usize, usize),
+    before_settlement: Option<ResourceSettlement>,
+    mutation: RecordMutation,
     next_used: ResourceCapacity,
+    next_pending_reclaim: BackendAllocationCapacity,
     generation: ResourceCapacityLedgerGeneration,
+}
+#[derive(Clone, Copy)]
+enum RecordMutation {
+    Insert,
+    Replace(ResourceSettlement),
+    Remove,
 }
 pub(crate) struct ValidatedResourceChange<'a, const R: usize> {
     state: RefMut<'a, ResourceState>,
@@ -313,6 +430,7 @@ impl<const R: usize> ResourceCapacityLedger<R> {
             state: RefCell::new(ResourceState {
                 generation,
                 used: ResourceCapacity::default(),
+                pending_reclaim: BackendAllocationCapacity(0),
                 indices: ResourceIndices::try_new::<R>()?,
             }),
         })
@@ -329,18 +447,126 @@ impl<const R: usize> ResourceCapacityLedger<R> {
         let before = self.snapshot_from(&state);
         let reservation = input.reservation;
         let generation = state.generation.next()?;
-        let positions = state.indices.prepare::<R>(input.action, reservation)?;
-        let next_used = match input.action {
-            Reserve => state
-                .used
-                .checked_reserve(reservation.capacity, self.limit)?,
-            Withdraw => state.used.checked_release(reservation.capacity)?,
+        let (positions, before_settlement) =
+            state.indices.prepare::<R>(input.action, reservation)?;
+        let (mutation, next_used, next_pending_reclaim) = match input.action {
+            Reserve => (
+                RecordMutation::Insert,
+                state
+                    .used
+                    .checked_reserve(reservation.capacity, self.limit)?,
+                state.pending_reclaim,
+            ),
+            Withdraw => {
+                require(
+                    before_settlement == Some(ResourceSettlement::HELD),
+                    InvalidSettlement,
+                )?;
+                (
+                    RecordMutation::Remove,
+                    state.used.checked_release(reservation.capacity)?,
+                    state.pending_reclaim,
+                )
+            }
+            SettleDaemon(_) => {
+                let mut settlement = before_settlement.ok_or(BeforeImageMismatch)?;
+                require(settlement.daemon_open, InvalidSettlement)?;
+                settlement.daemon_open = false;
+                let daemon = ResourceCapacity::new(
+                    0,
+                    reservation.capacity.output.0,
+                    reservation.capacity.transient.0,
+                );
+                (
+                    settlement.mutation(),
+                    state.used.checked_release(daemon)?,
+                    state.pending_reclaim,
+                )
+            }
+            ApplyBackendPartition(partition) => {
+                let mut settlement = before_settlement.ok_or(BeforeImageMismatch)?;
+                require(
+                    settlement.backend == BackendSettlement::Held,
+                    InvalidSettlement,
+                )?;
+                let total = arithmetic(
+                    partition
+                        .allocated
+                        .0
+                        .checked_add(partition.never_allocated.0),
+                )?;
+                require(
+                    total == reservation.capacity.backend.0,
+                    InvalidBackendPartition,
+                )?;
+                let closes_daemon = partition.source == BackendPartitionSource::ZeroMaterialization;
+                require(!closes_daemon || settlement.daemon_open, InvalidSettlement)?;
+                settlement.daemon_open &= !closes_daemon;
+                settlement.backend = if partition.allocated.0 == 0 {
+                    BackendSettlement::Closed
+                } else {
+                    BackendSettlement::Pending(PendingReclaimState {
+                        opened_generation: generation,
+                        amount: partition.allocated,
+                        floor: partition.floor,
+                    })
+                };
+                let released = ResourceCapacity::new(
+                    partition.never_allocated.0,
+                    u64::from(closes_daemon) * reservation.capacity.output.0,
+                    u64::from(closes_daemon) * reservation.capacity.transient.0,
+                );
+                let pending =
+                    arithmetic(state.pending_reclaim.0.checked_add(partition.allocated.0))?;
+                (
+                    settlement.mutation(),
+                    state.used.checked_release(released)?,
+                    BackendAllocationCapacity(pending),
+                )
+            }
+            ConvergePendingReclaim(convergence) => {
+                let mut settlement = before_settlement.ok_or(BeforeImageMismatch)?;
+                let pending = match settlement.backend {
+                    BackendSettlement::Pending(pending) => pending,
+                    BackendSettlement::Held | BackendSettlement::Closed => {
+                        return Err(InvalidSettlement);
+                    }
+                };
+                require(
+                    convergence.anchor
+                        == PendingReclaimAnchor {
+                            reservation: reservation.id,
+                            backend_budget: reservation.backend_budget,
+                            opened_generation: pending.opened_generation,
+                            floor: pending.floor,
+                        },
+                    WrongPendingReclaimAnchor,
+                )?;
+                require(
+                    convergence.observed.cursor.0 > pending.floor.cursor.0,
+                    ResourceEvidenceNotNewer,
+                )?;
+                require(
+                    convergence.observed.evidence != pending.floor.evidence,
+                    ResourceEvidenceReplay,
+                )?;
+                settlement.backend = BackendSettlement::Closed;
+                let next_pending = release_one(state.pending_reclaim.0, pending.amount.0)?;
+                let released = ResourceCapacity::new(pending.amount.0, 0, 0);
+                (
+                    settlement.mutation(),
+                    state.used.checked_release(released)?,
+                    BackendAllocationCapacity(next_pending),
+                )
+            }
         };
         let action = PreparedAction {
-            action: input.action,
             reservation,
             positions,
+            before_settlement,
+            mutation,
             next_used,
+            next_pending_reclaim,
             generation,
         };
         Ok(ResourceChange {
@@ -386,6 +612,7 @@ impl<const R: usize> ResourceCapacityLedger<R> {
         let state = &mut *change.state;
         state.indices.apply(&action);
         state.used = action.next_used;
+        state.pending_reclaim = action.next_pending_reclaim;
         state.generation = action.generation;
         action.generation
     }
@@ -400,6 +627,7 @@ impl<const R: usize> ResourceCapacityLedger<R> {
             generation: state.generation,
             limit: self.limit,
             used: state.used,
+            pending_reclaim: state.pending_reclaim,
             reservations: state.indices.records.len(),
             backend_budgets: state.indices.budgets.len(),
         }
@@ -428,7 +656,7 @@ impl<const R: usize> ResourceCapacityLedger<R> {
         let item = Self::item_bytes()?;
         let shifted = arithmetic(R.checked_add(1).and_then(|value| value.checked_mul(item)))?;
         let replaced = arithmetic(item.checked_mul(2))?;
-        let replaced = arithmetic(replaced.checked_add(size_of::<ResourceReservation>()))?;
+        let replaced = arithmetic(replaced.checked_add(size_of::<ResourceRecord>()))?;
         let copied = shifted.max(replaced);
         let copied =
             arithmetic(copied.checked_add(size_of::<ValidatedResourceChange<'static, R>>()))?;
@@ -455,7 +683,7 @@ impl<const R: usize> ResourceCapacityLedger<R> {
         arithmetic(records.checked_add(size_of::<Self>()))
     }
     fn item_bytes() -> LedgerResult<usize> {
-        arithmetic(size_of::<ResourceReservation>().checked_add(size_of::<BackendBudgetId>()))
+        arithmetic(size_of::<ResourceRecord>().checked_add(size_of::<BackendBudgetId>()))
     }
 }
 
@@ -463,13 +691,17 @@ impl<const R: usize> ResourceCapacityLedger<R> {
 mod tests {
     use super::*;
     use WorkDimension::*;
+    use {BackendPartitionSource::*, DaemonTerminalFact::*};
     type Capacity = ResourceCapacity;
     type Change<'a, const R: usize> = ResourceChange<'a, R>;
     type Error = ResourceLedgerError;
+    type Evidence = ResourceEvidencePoint;
     type Input = ResourceInput;
     type Ledger<const R: usize> = ResourceCapacityLedger<R>;
     type Generation = ResourceCapacityLedgerGeneration;
+    type ReclaimAnchor = PendingReclaimAnchor;
     type Reservation = ResourceReservation;
+    type Source = BackendPartitionSource;
     type Validated<'a, const R: usize> = ValidatedResourceChange<'a, R>;
     type Command = (ResourceAction, Generation, Reservation);
     const AUTHORITY: ResourceAuthorityId = ResourceAuthorityId([1; 32]);
@@ -496,6 +728,31 @@ mod tests {
     fn unit(id: u8, budget: u8) -> Reservation {
         reservation(id, budget, amounts(1, 1, 1))
     }
+    fn evidence(cursor: u64, id: u8) -> Evidence {
+        ResourceEvidencePoint {
+            cursor: ResourceEvidenceCursor(cursor),
+            evidence: ResourceEvidenceId::new([id; 32]).unwrap(),
+        }
+    }
+    fn partition(kind: Source, used: u64, free: u64, floor: Evidence) -> ResourceAction {
+        ApplyBackendPartition(BackendPartitionFact {
+            source: kind,
+            allocated: BackendAllocationCapacity(used),
+            never_allocated: BackendAllocationCapacity(free),
+            floor,
+        })
+    }
+    fn anchor(value: Reservation, opened: Generation, floor: Evidence) -> ReclaimAnchor {
+        ReclaimAnchor {
+            reservation: value.id,
+            backend_budget: value.backend_budget,
+            opened_generation: opened,
+            floor,
+        }
+    }
+    fn reclaim(anchor: ReclaimAnchor, observed: Evidence) -> ResourceAction {
+        ConvergePendingReclaim(PendingReclaimConvergence { anchor, observed })
+    }
     fn input(action: ResourceAction, expected: Generation, reservation: Reservation) -> Input {
         Input {
             action,
@@ -515,6 +772,10 @@ mod tests {
         let generation = Ledger::commit(ledger.validate(change, &mut work).unwrap());
         assert_eq!(work.witness(), Ledger::<R>::maximum_work().unwrap());
         generation
+    }
+    fn step<const R: usize>(ledger: &Ledger<R>, command: Command) -> Generation {
+        let (action, generation, value) = command;
+        transact(ledger, input(action, generation, value))
     }
     fn reject_input<const R: usize>(ledger: &Ledger<R>, command: Input, error: Error) {
         let before = ledger.state.borrow().clone();
@@ -541,13 +802,14 @@ mod tests {
             Transient => amounts(other, other, selected),
         }
     }
-    type IndexPointers = (*const Reservation, *const BackendBudgetId);
+    type IndexPointers = (*const ResourceRecord, *const BackendBudgetId);
     fn assert_index<const R: usize>(ledger: &Ledger<R>, length: usize, pointers: IndexPointers) {
         let state = ledger.state.borrow();
         let (r, b) = (&state.indices.records, &state.indices.budgets);
         assert_eq!((r.capacity(), r.len(), r.as_ptr()), (R, length, pointers.0));
         assert_eq!((b.capacity(), b.len(), b.as_ptr()), (R, length, pointers.1));
-        assert!(r.windows(2).all(|pair| pair[0].id < pair[1].id));
+        let id = |value: &ResourceRecord| value.reservation.id;
+        assert!(r.windows(2).all(|pair| id(&pair[0]) < id(&pair[1])));
         assert!(b.windows(2).all(|pair| pair[0] < pair[1]));
     }
     fn assert_maximum<const R: usize>(expected: [u64; 5]) {
@@ -555,6 +817,17 @@ mod tests {
             Ledger::<R>::maximum_work().unwrap(),
             HotPathWorkWitness::new(expected)
         );
+    }
+    fn totals<const R: usize>(ledger: &Ledger<R>) -> (Capacity, u64, usize) {
+        let s = ledger.snapshot(&mut meter()).unwrap();
+        assert_eq!(s.reservations(), s.backend_budgets());
+        (s.used(), s.pending_reclaim().0, s.reservations())
+    }
+    fn pending_state(value: &mut ResourceSettlement) -> Option<&mut PendingReclaimState> {
+        match &mut value.backend {
+            BackendSettlement::Pending(pending) => Some(pending),
+            _ => None,
+        }
     }
 
     #[test]
@@ -595,6 +868,7 @@ mod tests {
         let reservation_zero = ResourceReservationId::new([0; 32]).unwrap_err();
         assert_eq!(reservation_zero, ZeroIdentity);
         assert_eq!(BackendBudgetId::new([0; 32]).unwrap_err(), ZeroIdentity);
+        assert_eq!(ResourceEvidenceId::new([0; 32]).unwrap_err(), ZeroIdentity);
         assert_eq!(Generation::new(0).unwrap_err(), ZeroGeneration);
         for (id, dimension) in [2, 6, 10].into_iter().zip([Backend, Output, Transient]) {
             let error = CapacityExceeded(dimension);
@@ -677,13 +951,14 @@ mod tests {
         validate_fails(&first, stale, StaleGeneration);
         let held = unit(2, 3);
         let generation = transact(&second, input(Reserve, INITIAL, held));
-        let mutations: [fn(&mut Change<'_, 3>); 11] = [
+        let mutations: [fn(&mut Change<'_, 3>); 12] = [
             |value| value.before.limit.backend.0 += 1,
             |value| value.before.limit.output.0 += 1,
             |value| value.before.limit.transient.0 += 1,
             |value| value.before.used.backend.0 += 1,
             |value| value.before.used.output.0 += 1,
             |value| value.before.used.transient.0 += 1,
+            |value| value.before.pending_reclaim.0 += 1,
             |value| value.before.reservations += 1,
             |value| value.before.backend_budgets += 1,
             |value| value.action.positions.0 += 1,
@@ -720,18 +995,19 @@ mod tests {
         full.used.backend.0 += 1;
         assert_eq!(full.available(), Err(BeforeImageMismatch));
         assert_eq!(size_of::<Reservation>(), 88);
+        assert_eq!(size_of::<ResourceRecord>(), 160);
         assert_eq!(size_of::<BackendBudgetId>(), 32);
         let capability_bytes = size_of::<Change<'static, 1>>() + size_of::<Validated<'static, 1>>();
-        assert_eq!(capability_bytes, 384);
-        assert_maximum::<1>([10, 712, 0, 0, 18]);
-        assert_maximum::<3>([18, 864, 0, 0, 18]);
-        assert_maximum::<1_024>([50, 123_384, 0, 0, 18]);
-        assert_maximum::<17_472>([70, 2_097_144, 0, 0, 18]);
-        assert_eq!(Ledger::<17_472>::storage_bytes().unwrap(), 2_096_784);
-        drop(self::ledger::<17_472>(amounts(0, 0, 0)));
-        let exceeded = WorkBudgetError::BudgetExceeded(CopiedBytes, 2_097_152, 2_097_264);
+        assert_eq!(capability_bytes, 680);
+        assert_maximum::<1>([10, 1_224, 0, 0, 18]);
+        assert_maximum::<3>([18, 1_448, 0, 0, 18]);
+        assert_maximum::<1_024>([50, 197_480, 0, 0, 18]);
+        assert_maximum::<10_918>([66, 2_097_128, 0, 0, 18]);
+        assert_eq!(Ledger::<10_918>::storage_bytes().unwrap(), 2_096_408);
+        drop(self::ledger::<10_918>(amounts(0, 0, 0)));
+        let exceeded = WorkBudgetError::BudgetExceeded(CopiedBytes, 2_097_152, 2_097_320);
         let oversized = Work(exceeded);
-        assert_eq!(construction_error::<17_473>(), Some(oversized));
+        assert_eq!(construction_error::<10_919>(), Some(oversized));
         assert_eq!(construction_error::<0>(), Some(InvalidCapacity));
         let arithmetic = construction_error::<{ usize::MAX }>();
         assert_eq!(arithmetic, Some(ArithmeticOverflow));
@@ -773,7 +1049,7 @@ mod tests {
             });
             count
         }
-        for length in (1_usize..=64).chain([1_024, 10_917, 10_918, 17_472, 17_473]) {
+        for length in (1_usize..=64).chain([1_024, 10_917, 10_918, 10_919]) {
             let values = (0..length).map(|value| value * 2).collect::<Vec<_>>();
             let expected = u64::from(usize::BITS - (length - 1).leading_zeros() + 1);
             let mut found = 0;
@@ -783,6 +1059,132 @@ mod tests {
                 missing = missing.max(comparisons(&values, target * 2 + 1));
             }
             assert_eq!((found, missing), (expected, expected));
+        }
+    }
+    #[test]
+    fn settlement_contract_is_exact() {
+        let held = reservation(2, 3, amounts(9, 7, 5));
+        let floor = evidence(4, 5);
+        for (source, allocated, never_allocated) in [
+            (ZeroMaterialization, 6, 3),
+            (ZeroMaterialization, 0, 9),
+            (OwnershipConsumed, 0, 9),
+        ] {
+            let ledger = ledger::<1>(amounts(9, 7, 5));
+            let mut generation = transact(&ledger, input(Reserve, INITIAL, held));
+            let action = partition(source, allocated, never_allocated, floor);
+            generation = step(&ledger, (action, generation, held));
+            let daemon = u64::from(source == OwnershipConsumed);
+            let count = usize::from(allocated != 0 || daemon != 0);
+            let expected = (amounts(allocated, 7 * daemon, 5 * daemon), allocated, count);
+            assert_eq!(totals(&ledger), expected);
+            if allocated != 0 {
+                let action = reclaim(anchor(held, generation, floor), evidence(9, 6));
+                generation = step(&ledger, (action, generation, held));
+            }
+            if daemon != 0 {
+                reject(&ledger, (Withdraw, generation, held), InvalidSettlement);
+                reject(&ledger, (action, generation, held), InvalidSettlement);
+                let action = SettleDaemon(PartialMaterialization);
+                generation = step(&ledger, (action, generation, held));
+            }
+            assert_eq!(totals(&ledger), (Capacity::default(), 0, 0));
+            transact(&ledger, input(Reserve, generation, held));
+        }
+        let facts = [
+            PartialMaterialization,
+            QueuedAfterInvalidation,
+            InFlightAfterReceipt,
+            OrdinaryAfterReceipt,
+        ];
+        for (index, fact) in facts.into_iter().enumerate() {
+            let ledger = ledger::<2>(amounts(18, 14, 10));
+            let mut generation = transact(&ledger, input(Reserve, INITIAL, held));
+            let backend = partition(OwnershipConsumed, 6, 3, floor);
+            let daemon = SettleDaemon(fact);
+            let actions = [[backend, daemon], [daemon, backend]][index % 2];
+            let mut opened = generation;
+            for action in actions {
+                generation = step(&ledger, (action, generation, held));
+                if action == backend {
+                    opened = generation;
+                }
+                if index == 1 && action == daemon {
+                    reject(&ledger, (Withdraw, generation, held), InvalidSettlement);
+                    reject(&ledger, (daemon, generation, held), InvalidSettlement);
+                }
+            }
+            assert_eq!(totals(&ledger), (amounts(6, 0, 0), 6, 1));
+            reject(&ledger, (Withdraw, generation, held), InvalidSettlement);
+            let duplicate = (Reserve, generation, reservation(8, 3, Capacity::default()));
+            reject(&ledger, duplicate, DuplicateBackendBudget);
+            if index == 0 {
+                let other = reservation(8, 9, amounts(9, 7, 5));
+                generation = step(&ledger, (Reserve, generation, other));
+                generation = step(&ledger, (backend, generation, other));
+                let other_opened = generation;
+                assert_eq!(totals(&ledger), (amounts(12, 7, 5), 12, 2));
+                let action = reclaim(anchor(held, opened, floor), evidence(9, 6));
+                generation = step(&ledger, (action, generation, held));
+                assert_eq!(totals(&ledger), (amounts(6, 7, 5), 6, 1));
+                let action = reclaim(anchor(other, other_opened, floor), evidence(9, 6));
+                generation = step(&ledger, (action, generation, other));
+                generation = step(&ledger, (SettleDaemon(fact), generation, other));
+                assert_eq!(totals(&ledger), (Capacity::default(), 0, 0));
+            } else {
+                let action = reclaim(anchor(held, opened, floor), evidence(9, 6));
+                generation = step(&ledger, (action, generation, held));
+            }
+            transact(&ledger, input(Reserve, generation, held));
+        }
+        let ledger = ledger::<2>(amounts(9, 7, 5));
+        let at = transact(&ledger, input(Reserve, INITIAL, held));
+        let invalid = partition(OwnershipConsumed, 7, 3, floor);
+        reject(&ledger, (invalid, at, held), InvalidBackendPartition);
+        let overflow = partition(OwnershipConsumed, u64::MAX, 1, floor);
+        reject(&ledger, (overflow, at, held), ArithmeticOverflow);
+        let action = partition(OwnershipConsumed, 6, 3, floor);
+        let opened = step(&ledger, (action, at, held));
+        let daemon = SettleDaemon(OrdinaryAfterReceipt);
+        reject(&ledger, (daemon, at, held), StaleGeneration);
+        let pending = anchor(held, opened, floor);
+        let mut wrong = [pending; 5];
+        wrong[0].reservation = unit(8, 9).id;
+        wrong[1].backend_budget = unit(8, 9).backend_budget;
+        wrong[2].opened_generation = at;
+        wrong[3].floor = evidence(3, 5);
+        wrong[4].floor = evidence(4, 6);
+        for anchor in wrong {
+            let action = reclaim(anchor, evidence(9, 6));
+            reject(&ledger, (action, opened, held), WrongPendingReclaimAnchor);
+        }
+        for observed in [evidence(4, 6), evidence(3, 6)] {
+            let action = reclaim(pending, observed);
+            reject(&ledger, (action, opened, held), ResourceEvidenceNotNewer);
+        }
+        let replay = reclaim(pending, evidence(9, 5));
+        reject(&ledger, (replay, opened, held), ResourceEvidenceReplay);
+        let converge = reclaim(pending, evidence(9, 6));
+        let generation = step(&ledger, (converge, opened, held));
+        reject(&ledger, (converge, generation, held), InvalidSettlement);
+        let generation = step(&ledger, (daemon, generation, held));
+        let generation = transact(&ledger, input(Reserve, generation, held));
+        let opened = step(&ledger, (action, generation, held));
+        let command = (SettleDaemon(PartialMaterialization), opened, held);
+        let before = ledger.state.borrow().indices.records[0].settlement;
+        let mutations: [fn(&mut ResourceSettlement); 6] = [
+            |value| value.daemon_open = false,
+            |value| value.backend = BackendSettlement::Closed,
+            |value| pending_state(value).unwrap().amount.0 += 1,
+            |value| pending_state(value).unwrap().opened_generation = INITIAL,
+            |value| pending_state(value).unwrap().floor.cursor.0 += 1,
+            |value| pending_state(value).unwrap().floor.evidence = evidence(9, 9).evidence,
+        ];
+        for mutation in mutations {
+            let change = prepared(&ledger, command);
+            mutation(&mut ledger.state.borrow_mut().indices.records[0].settlement);
+            validate_fails(&ledger, change, BeforeImageMismatch);
+            ledger.state.borrow_mut().indices.records[0].settlement = before;
         }
     }
 }
