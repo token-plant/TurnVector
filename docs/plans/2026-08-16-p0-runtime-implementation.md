@@ -1003,10 +1003,13 @@ Every pull-request commit follows all of these rules:
    every non-numeric decision remains under the prior accepted revision
    `a3ffe9908a51bded502fae0592cdf7ef8d84efd3376581a8b8db6e323a4992e4`.
    C15a has per-commit and pull-request-cumulative hard limits of 821 counted
-   lines, while C15b and C16 each have independent per-commit and cumulative
-   hard limits of 500. C15a uses `commit-size-exception` only when its actual
-   commit exceeds 500; C15b and C16 never use an exception. These bounds do not
-   amend any other row's 420-line plan ceiling or 500-line policy limit.
+   lines, while C15b has independent per-commit and pull-request-cumulative hard
+   limits of 500. C16 has a 500-line hard limit for each non-merge payload
+   commit, but no pull-request-cumulative LOC threshold; its cumulative payload
+   count is recorded and disclosed. C15a uses `commit-size-exception` only when
+   its actual commit exceeds 500; C15b and C16 never use an exception. These
+   bounds do not amend any other row's 420-line plan ceiling or 500-line policy
+   limit.
 2. Behavior is developed red, then green. A commit is reviewed only after its
    focused test and all applicable prior tests pass.
 3. Every intended path is unstaged during review. Unrelated changes and any
@@ -1049,10 +1052,12 @@ Every pull-request commit follows all of these rules:
    manifest, and prints its SHA-256. Earlier documentation-only commits use an
    explicit path/blob table from `git hash-object`, plus `git diff --binary`
    for tracked files or `git diff --no-index` for an untracked file.
-   C15a invokes the accepted auditor with `--limit 821`; C15b and C16 use
-   `--limit 500`. All commands still execute the accepted `HEAD` object, and the
-   resulting count is also accumulated over every non-merge payload commit in
-   the row PR.
+   C15a invokes the accepted auditor with `--limit 821`; C15b uses `--limit 500`.
+   Each C16 payload candidate invokes the accepted immediate-parent
+   `HEAD` object with `--base <immediate-parent-SHA> --limit 500`. C15a and C15b
+   accumulate the resulting count over every non-merge payload commit against
+   their row-PR limits. C16 records and discloses the same cumulative sum but
+   does not use it as a pass/fail LOC threshold.
 4. Three independent reviewers inspect the same complete unstaged manifest and
    diff. Each rereads repository-required internal references, checks the whole
    specification and architecture, runs or requests relevant tests, checks
@@ -1258,6 +1263,22 @@ Lineage passed a new Mathematical Gate and fresh unanimous round under:
 - passing round-record SHA-256
   `7574aff639bec952bc538eb3c804a67780fce0f784e4ab1dc7842b09013d2587`.
 
+Only C16's delivery-count rule was subsequently corrected from
+`origin/main@57ef6f4ccfe4f220f71394b9448c25e70d47aaea` under the same Design
+Lineage. Every C15 decision and every non-delivery C16 decision remains
+unchanged. The correction passed a new Mathematical Gate and fresh unanimous
+round under:
+
+- Proposal Revision
+  `cff10fc10ce8845de2c981ddb9570affbfc57f4a165744350cdcf1c1e0dc87ff`;
+- Review Round
+  `TV-C15-C16-CANONICAL-DELIVERY-20260824-C16-MULTICOMMIT-R8-20260825T183842Z`;
+- Launch Record SHA-256
+  `698973e453a9e03baf9d242cd2e09a4548c24dbfa89dc17c07ef29007c5c634f`;
+  and
+- passing round-record SHA-256
+  `e8b1d1ff44bc741ef458e06b0af042b1b3a7cb2f4f1c9712074bc60792efb38d`.
+
 The user explicitly approved the 821-line C15a per-commit and PR-cumulative
 maximum, its required `commit-size-exception`, and squash merge of this docs
 authority revision on 2026-08-25. The new limit becomes active only after this
@@ -1267,8 +1288,11 @@ For a non-merge payload commit `c`, let `L(c)` be the repository-policy count
 of additions plus deletions over non-documentation paths. Generated references,
 fixtures, embedded production source, data, migrations, snapshots, and lockfiles
 remain counted. For a row PR, `L_PR = sum L(c_i)` over all non-merge payload
-commits. The fixed current Runtime Core identity cascade is nine paths at one
-addition plus one deletion each, or 18 counted lines.
+commits. C15a and C15b compare that sum to their accepted cumulative limits.
+C16 records and discloses it without treating it as an LOC pass/fail threshold.
+A Runtime Core identity cascade has nine paths; every landing commit measures
+its actual generated delta rather than inheriting an earlier 18-line
+observation.
 
 The corrected complete one-row proof measures `858 + 8 + 18 = 884` counted
 lines, exceeding 700 by 184. Multiple commits cannot repair that deficit because
@@ -1311,24 +1335,27 @@ present. That status names a real implemented Module source, not completion of
 C15b or readiness for Admission. C15b changes no architecture status or
 dependency edge.
 
-C16 retains its exact row budget:
+C16 retains its exact per-commit budget:
 
 ```text
 450 existing-support-owner behavior, source, and focused-test lines
 + 50 architecture, wiring, and generated lines
-= 500 per-commit and PR-cumulative hard stop
+= 500 per non-merge payload commit hard stop
 ```
 
-The measured 18-line cascade leaves C16 32 structural lines. C16 must deepen
-the existing `support_ledger` and reuse its generation, pools, records, claims,
-credits, and prepared-change machinery. It cannot create a second ledger, make
-a broad Support refactor, borrow C15 capacity, or use a size exception.
+The historically observed 18-line cascade would leave 32 structural lines in a
+commit, but it is not a landing witness. Every runtime-source commit regenerates
+the complete ordered cascade, includes its actual changed lines in that commit's
+500-line count, and cannot defer stale generated identity to a later commit.
+C16 must deepen the existing `support_ledger` and reuse its generation, pools,
+records, claims, credits, and prepared-change machinery. It cannot create a
+second ledger, make a broad Support refactor, borrow C15 capacity, or use a size
+exception.
 
-Every extra structural or generated line reduces the applicable row margin by
-one; no total expands. If a cumulative bound is exceeded, or a required
-invariant/test would need to be removed, hidden behind `rustfmt::skip`, or
-compressed into unreadable control flow, implementation stops for a new user
-decision and Design Proposal Gate.
+Every extra structural or generated line reduces the applicable commit margin
+by one. If any commit exceeds 500, or a required invariant or test would need to
+be removed, hidden behind `rustfmt::skip`, or compressed into unreadable control
+flow, implementation stops for a new user decision and Design Proposal Gate.
 
 C15a and C15b remain one private `resource_ledger`, one fixed reusable record
 store, one independent active Backend-budget identity index, one Resource
@@ -1449,11 +1476,38 @@ from fresh post-C15a `origin/main`; C16 starts from fresh post-C15b
 `origin/main`. No source, generated output, review, or approval survives a
 predecessor boundary. C17, C19, C20, and every Resource Capacity consumer remain
 blocked through C15b; C17 and every later Core row remain blocked until C16
-merges. Each row receives three independent reviews of one exact unstaged
-manifest before staging. Later fixes consume the same cumulative row budget.
-For this explicitly authorized authority -> C15a -> C15b -> C16 sequence, the
-coordinator squash-merges each ready, green PR without another prompt, verifies
-the remote merge and branch cleanup, and then starts the next row from fresh
+merges.
+
+Before C16 reconstruction, main freezes a new DeepSeek V4 Flash task prompt that
+explicitly supersedes both historical prompt components: their C16
+PR-cumulative 500 rule, immediate per-commit push or PR update, cumulative-main-
+base candidate review, and any instruction that DeepSeek marks the PR ready.
+DeepSeek must acknowledge the exact replacement-prompt identity before editing.
+
+C16 is one row-scoped PR containing multiple signed payload commits. Each commit
+covers one coherent, independently green aspect and is based on its immediate
+parent. Before staging each commit, DeepSeek V4 Flash freezes its exact unstaged
+candidate. The accepted immediate-parent checker and one local round of one
+`gpt-5.6-sol/max` plus two `gpt-5.6-terra/max` reviewers inspect those exact
+bytes. Findings return directly to DeepSeek; any content change requires a fresh
+freeze and three fresh reviews. Only after unanimous approval may DeepSeek stage
+the approved paths and create the signed local commit. No exact commit grouping
+is pre-approved, and the stale pre-authority C16 candidate and generated output
+are evidence only, not landing inputs. Every intermediate tree must compile,
+pass applicable prior and focused tests, retain a usable private
+`support_ledger` Interface, and state its partial responsibility truthfully;
+only the final C16 commit may claim the complete row.
+
+After every initially planned commit and local check passes, DeepSeek pushes the
+reviewed series, opens one draft C16 PR, and waits. PR-only checks run on the
+draft. Main verifies the commit sequence, signatures, per-commit manifests and
+counts, final diff, base, checks, and Benchmark cleanliness; main alone marks the
+PR ready and squash-merges it. Any content repair returns to DeepSeek as a new
+unstaged follow-up candidate and repeats the immediate-parent checker and local
+three-review round before signed non-force-push delivery; the PR remains draft
+until the repair and available required checks are green. For this explicitly
+authorized authority -> C15a -> C15b -> C16 sequence, the coordinator verifies
+each remote merge and branch cleanup before the next row starts from fresh
 `origin/main`.
 
 Path custody is exact. The authority PR may change only these two human-authored
