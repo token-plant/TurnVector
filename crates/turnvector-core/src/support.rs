@@ -872,7 +872,7 @@ fn seal_exact_capacity(
 }
 /// One-byte canonical type tag followed by a 32-byte identity. Equal raw
 /// identity bytes in distinct namespaces are distinct tagged keys.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct TaggedKey {
     tag: u8,
     identity: [u8; 32],
@@ -1158,6 +1158,76 @@ impl TaggedIdentityIndex {
             *[&mut parent.zero, &mut parent.one]
                 [identity_bit(key.tag, &key.identity, parent.bit)] = branch_node;
         }
+    }
+    /// Metered prevalidated removal of one tagged identity: meters the bounded
+    /// leaf-locating traversal with grandparent/parent/sibling tracking and
+    /// splices the sibling over the parent only after the complete before-image
+    /// is established. An absent key returns `None` without mutation; every
+    /// removed leaf and, when present, parent branch returns to its free stack.
+    fn remove(
+        &mut self,
+        tag: u8,
+        identity: &[u8; 32],
+        work: &mut WorkMeter,
+    ) -> Result<Option<u32>, FixedStorageError> {
+        let mut grandparent = NO_NODE;
+        let mut parent = NO_NODE;
+        let mut sibling = NO_NODE;
+        let mut node = self.root;
+        while node != NO_NODE && is_branch(node) {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let branch = self.branch_slots[branch_index(node)]
+                .as_ref()
+                .expect("validated occupied branch slot");
+            let children = [branch.zero, branch.one];
+            let bit = identity_bit(tag, identity, branch.bit);
+            sibling = children[1 - bit];
+            grandparent = parent;
+            parent = node;
+            node = children[bit];
+        }
+        if node == NO_NODE {
+            return Ok(None);
+        }
+        work.record(WorkDimension::VisitedEntities, 1)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let leaf = self.leaf_slots[node as usize]
+            .as_ref()
+            .expect("validated occupied leaf slot");
+        if leaf.key.tag != tag || leaf.key.identity != *identity {
+            return Ok(None);
+        }
+        let record = leaf.record;
+        self.splice(grandparent, parent, sibling, node);
+        Ok(Some(record))
+    }
+    /// Infallible splice: removes `leaf` by splicing `sibling` over its parent
+    /// branch, returning the leaf and, when present, the parent branch to the
+    /// free stacks. The last tree leaf needs no branch.
+    fn splice(&mut self, grandparent: u32, parent: u32, sibling: u32, leaf: u32) {
+        if parent == NO_NODE {
+            self.root = NO_NODE;
+        } else if grandparent == NO_NODE {
+            self.root = sibling;
+            let branch = branch_index(parent);
+            self.branch_slots[branch] = None;
+            self.free_branches.push(branch as u32);
+        } else {
+            let grandparent = self.branch_slots[branch_index(grandparent)]
+                .as_mut()
+                .expect("validated occupied grandparent branch");
+            if grandparent.zero == parent {
+                grandparent.zero = sibling;
+            } else {
+                grandparent.one = sibling;
+            }
+            let branch = branch_index(parent);
+            self.branch_slots[branch] = None;
+            self.free_branches.push(branch as u32);
+        }
+        self.leaf_slots[leaf as usize] = None;
+        self.free_leaves.push(leaf);
     }
 }
 fn is_branch(node: u32) -> bool {
@@ -2084,6 +2154,99 @@ mod tests {
     /// increasing along every route, every occupied node reachable exactly once,
     /// and every leaf key unique. Scans `Theta(I + J)` slots and is never called
     /// or charged by a production transition.
+    fn trie_oracle(index: &TaggedIdentityIndex) {
+        use std::collections::HashSet;
+        let mut free_leaves = HashSet::new();
+        for &leaf in &index.free_leaves {
+            assert!(leaf < index.leaf_capacity as u32, "free leaf in range");
+            assert!(free_leaves.insert(leaf), "free leaf indices unique");
+            assert_eq!(index.leaf_slots[leaf as usize], None, "free leaf vacant");
+        }
+        let mut free_branches = HashSet::new();
+        for &branch in &index.free_branches {
+            assert!(
+                branch < index.branch_capacity as u32,
+                "free branch in range"
+            );
+            assert!(free_branches.insert(branch), "free branch indices unique");
+            assert_eq!(
+                index.branch_slots[branch as usize], None,
+                "free branch vacant"
+            );
+        }
+        let occupied_leaves = index
+            .leaf_slots
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count();
+        let occupied_branches = index
+            .branch_slots
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count();
+        assert_eq!(
+            free_leaves.len() + occupied_leaves,
+            index.leaf_capacity,
+            "leaf partition"
+        );
+        assert_eq!(
+            free_branches.len() + occupied_branches,
+            index.branch_capacity,
+            "branch partition"
+        );
+        assert_eq!(
+            occupied_branches,
+            occupied_leaves.saturating_sub(1),
+            "branch cardinality"
+        );
+        if occupied_leaves == 0 {
+            assert_eq!(index.root, NO_NODE, "empty tree root");
+            return;
+        }
+        assert_ne!(index.root, NO_NODE, "nonempty tree root");
+        let mut seen_leaves = HashSet::new();
+        let mut seen_branches = HashSet::new();
+        let mut keys = HashSet::new();
+        let mut stack = vec![(index.root, None)];
+        while let Some((node, parent_bit)) = stack.pop() {
+            if is_branch(node) {
+                let slot = branch_index(node);
+                assert!(seen_branches.insert(slot), "branch reachable exactly once");
+                let branch = index.branch_slots[slot]
+                    .as_ref()
+                    .expect("reachable occupied branch");
+                assert!(branch.bit < IDENTITY_BITS, "branch bit in range");
+                if let Some(parent) = parent_bit {
+                    assert!(parent < branch.bit, "branch bits strictly increase");
+                }
+                assert_ne!(branch.zero, branch.one, "branch children distinct");
+                stack.push((branch.zero, Some(branch.bit)));
+                stack.push((branch.one, Some(branch.bit)));
+            } else {
+                let slot = node as usize;
+                assert!(slot < index.leaf_capacity, "leaf reference in range");
+                let leaf = index.leaf_slots[slot]
+                    .as_ref()
+                    .expect("reachable occupied leaf");
+                assert!(seen_leaves.insert(slot), "leaf reachable exactly once");
+                assert!(keys.insert(leaf.key), "leaf keys unique");
+                assert!(
+                    !free_leaves.contains(&(slot as u32)),
+                    "reachable leaf not free"
+                );
+            }
+        }
+        assert_eq!(
+            seen_leaves.len(),
+            occupied_leaves,
+            "every occupied leaf reachable"
+        );
+        assert_eq!(
+            seen_branches.len(),
+            occupied_branches,
+            "every occupied branch reachable"
+        );
+    }
     #[test]
     fn c16_identity_index_constructor() {
         for (capacity, error) in [
@@ -2361,6 +2524,170 @@ mod tests {
         });
         one_under(WorkDimension::InvariantChecks, 3, 28_708, |meter| {
             index.insert(tagged(0, 0x80), 2, meter)
+        });
+    }
+    #[test]
+    fn c16_identity_index_remove_leaf_and_root() {
+        // Single-leaf tree: removing the root leaf empties the tree.
+        let mut index = TaggedIdentityIndex::try_new(4).unwrap();
+        index.insert(tagged(0, 0), 1, &mut work()).unwrap();
+        let mut meter = work();
+        assert_eq!(index.remove(0, &[0; 32], &mut meter), Ok(Some(1)));
+        assert_eq!(meter.witness(), witness([1, 0, 0, 0, 1]));
+        assert!(index.is_empty());
+        assert_eq!((index.free_leaf_len(), index.free_branch_len()), (4, 3));
+        trie_oracle(&index);
+        // Two-leaf tree: splicing the sibling over the parent makes it the root.
+        let mut index = TaggedIdentityIndex::try_new(4).unwrap();
+        index.insert(tagged(0, 0x00), 1, &mut work()).unwrap();
+        index.insert(tagged(0, 0x80), 2, &mut work()).unwrap();
+        let mut meter = work();
+        assert_eq!(index.remove(0, &[0x00; 32], &mut meter), Ok(Some(1)));
+        assert_eq!(meter.witness(), witness([2, 0, 0, 0, 2]));
+        assert_eq!(index.root, 1);
+        assert_eq!(index.find(0, &[0x80; 32], &mut work()), Ok(Some(2)));
+        assert_eq!(index.branch_slots[0], None);
+        trie_oracle(&index);
+    }
+    #[test]
+    fn c16_identity_index_remove_splices_parent_and_root() {
+        // Remove the middle leaf: its sibling splices over the parent branch.
+        let mut index = three_leaf_tree();
+        let mut meter = work();
+        assert_eq!(index.remove(0, &[0x80; 32], &mut meter), Ok(Some(11)));
+        assert_eq!(meter.witness(), witness([3, 0, 0, 0, 3]));
+        assert_eq!(index.root, BRANCH_TAG | 1);
+        assert_eq!(
+            index.branch_slots[1],
+            Some(IdentityBranch {
+                bit: 7,
+                zero: 0,
+                one: 2
+            })
+        );
+        assert_eq!(index.branch_slots[0], None);
+        assert_eq!(index.find(0, &[0; 32], &mut work()), Ok(Some(10)));
+        assert_eq!(index.find(1, &[0; 32], &mut work()), Ok(Some(12)));
+        trie_oracle(&index);
+        // Remove the one-side leaf: the sibling branch becomes the root.
+        let mut index = three_leaf_tree();
+        let mut meter = work();
+        assert_eq!(index.remove(1, &[0; 32], &mut meter), Ok(Some(12)));
+        assert_eq!(meter.witness(), witness([2, 0, 0, 0, 2]));
+        assert_eq!(index.root, BRANCH_TAG);
+        assert_eq!(
+            index.branch_slots[0],
+            Some(IdentityBranch {
+                bit: 8,
+                zero: 0,
+                one: 1
+            })
+        );
+        assert_eq!(index.branch_slots[1], None);
+        assert_eq!(index.find(0, &[0; 32], &mut work()), Ok(Some(10)));
+        assert_eq!(index.find(0, &[0x80; 32], &mut work()), Ok(Some(11)));
+        trie_oracle(&index);
+        // Remove the deep zero-side leaf: the sibling splices under the root.
+        let mut index = three_leaf_tree();
+        let mut meter = work();
+        assert_eq!(index.remove(0, &[0; 32], &mut meter), Ok(Some(10)));
+        assert_eq!(meter.witness(), witness([3, 0, 0, 0, 3]));
+        assert_eq!(index.root, BRANCH_TAG | 1);
+        assert_eq!(
+            index.branch_slots[1],
+            Some(IdentityBranch {
+                bit: 7,
+                zero: 1,
+                one: 2
+            })
+        );
+        assert_eq!(index.branch_slots[0], None);
+        assert_eq!(index.find(0, &[0x80; 32], &mut work()), Ok(Some(11)));
+        assert_eq!(index.find(1, &[0; 32], &mut work()), Ok(Some(12)));
+        trie_oracle(&index);
+    }
+    #[test]
+    fn c16_identity_index_remove_absent_preserves_state() {
+        let mut index = TaggedIdentityIndex::try_new(4).unwrap();
+        let mut meter = work();
+        assert_eq!(index.remove(0, &[1; 32], &mut meter), Ok(None));
+        assert_eq!(meter.witness(), witness([0, 0, 0, 0, 0]));
+        index.insert(tagged(0, 0), 1, &mut work()).unwrap();
+        let before = index.clone();
+        let mut meter = work();
+        assert_eq!(index.remove(0, &[1; 32], &mut meter), Ok(None));
+        assert_eq!(meter.witness(), witness([1, 0, 0, 0, 1]));
+        assert_eq!(index, before);
+        let mut index = three_leaf_tree();
+        let before = index.clone();
+        let mut meter = work();
+        assert_eq!(index.remove(2, &[0; 32], &mut meter), Ok(None));
+        assert_eq!(meter.witness(), witness([3, 0, 0, 0, 3]));
+        assert_eq!(index, before);
+    }
+    #[test]
+    fn c16_identity_index_remove_churn_and_deterministic_reuse() {
+        let mut index = TaggedIdentityIndex::try_new(4).unwrap();
+        let mut inserted = 0u64;
+        for cycle in 0..6 {
+            for offset in 0..2 {
+                let tag = (cycle * 2 + offset) as u8;
+                index
+                    .insert(tagged(tag, 0), u32::from(tag) + 1, &mut work())
+                    .unwrap();
+                inserted += 1;
+            }
+            for offset in 0..2 {
+                let tag = (cycle * 2 + offset) as u8;
+                let mut meter = work();
+                let removed = index.remove(tag, &[0; 32], &mut meter);
+                assert_eq!(removed, Ok(Some(u32::from(tag) + 1)));
+            }
+            trie_oracle(&index);
+        }
+        assert!(inserted > 4, "churn exceeds leaf capacity");
+        assert_eq!(index.free_leaf_len(), 4);
+        assert_eq!(index.free_branch_len(), 3);
+        assert!(index.is_empty());
+        // Deterministic LIFO reuse: after removing tags 0 and 1, the next insert
+        // reuses leaf slot 1 (the most recently freed leaf).
+        let mut index = TaggedIdentityIndex::try_new(4).unwrap();
+        for tag in [0u8, 1] {
+            index
+                .insert(tagged(tag, 0), u32::from(tag) + 1, &mut work())
+                .unwrap();
+        }
+        index.remove(0, &[0; 32], &mut work()).unwrap();
+        index.remove(1, &[0; 32], &mut work()).unwrap();
+        index.insert(tagged(2, 0), 3, &mut work()).unwrap();
+        assert_eq!(
+            index.leaf_slots[1],
+            Some(IdentityLeaf {
+                key: tagged(2, 0),
+                record: 3
+            }),
+            "freed leaf slot deterministically reused"
+        );
+        trie_oracle(&index);
+    }
+    #[test]
+    fn c16_identity_index_remove_work_one_under() {
+        let index = three_leaf_tree();
+        one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |meter| {
+            let mut index = index.clone();
+            index.remove(0, &[0x80; 32], meter).map(|_| ())
+        });
+        one_under(WorkDimension::InvariantChecks, 3, 28_708, |meter| {
+            let mut index = index.clone();
+            index.remove(0, &[0x80; 32], meter).map(|_| ())
+        });
+        one_under(WorkDimension::VisitedEntities, 2, 1_704_575, |meter| {
+            let mut index = index.clone();
+            index.remove(1, &[0; 32], meter).map(|_| ())
+        });
+        one_under(WorkDimension::InvariantChecks, 2, 28_708, |meter| {
+            let mut index = index.clone();
+            index.remove(1, &[0; 32], meter).map(|_| ())
         });
     }
 }
