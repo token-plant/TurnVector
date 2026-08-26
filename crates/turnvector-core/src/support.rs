@@ -3419,6 +3419,49 @@ mod tests {
     }
     /// Test-only helper: reserve one complete C16 bundle with `n`-derived
     /// identities and `v` cells, returning the first obligation handle.
+    #[test]
+    fn c16_reciprocal_work_witnesses() {
+        // Generic reserve with one OrdinaryReservation claim: the reciprocal
+        // C16 absence preflight adds exactly two InvariantChecks on an empty
+        // store, and the complete witness is frozen.
+        let mut ledger = generic_ledger();
+        let mut measured = work();
+        let valid = spec(7, 7, Ordinary, &[Reserved([7; 32])]);
+        ledger
+            .reserve(ledger.generation(), valid, &mut measured)
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([3, 346, 0, 0, 18])
+        );
+        // Lifecycle reserve m = 1 with the reciprocal preflight frozen.
+        let mut ledger = new_ledger();
+        for capacity in &mut ledger.capacities {
+            capacity[1] = 4;
+        }
+        let lifecycle = LifecycleReserveSpec {
+            id: SupportOperationObligationId::new([1; 32]).unwrap(),
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            physical_credit: PhysicalStartCreditId::new([2; 32]).unwrap(),
+            predecessor: SupportCausalPredecessorId([90; 32]),
+            scope: SupportCallScopeId([91; 32]),
+            claim: SupportFundingClaim::LifecycleReserve([92; 32]),
+            expires_at: None,
+        };
+        let mut measured = work();
+        ledger
+            .reserve_lifecycle(
+                ledger.generation(),
+                MonotonicTime::from_micros(1),
+                &[lifecycle],
+                &mut measured,
+            )
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([3, 280, 0, 0, 29])
+        );
+    }
     fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
         let cells = axis_cells(v, 1);
         let input = bundle_input::<8>(n, &cells);
