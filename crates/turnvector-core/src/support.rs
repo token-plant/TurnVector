@@ -243,6 +243,17 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         if worst_visits > 1_704_575 || worst_copied > 2_097_152 || worst_checks > 28_708 {
             return Err(SupportLedgerError::InvalidInput);
         }
+        // Checked worst-case C16 bundle reserve Work before construction: the
+        // physical cell capacity `C` is the largest vector one bundle could
+        // hold, so the complete reserve envelope must fit every binary Work
+        // maximum. Rejects before any allocation or nonce issuance.
+        let worst = bundle_reserve_work(bundle_cells);
+        if worst.value(WorkDimension::VisitedEntities) > 1_704_575
+            || worst.value(WorkDimension::CopiedBytes) > 2_097_152
+            || worst.value(WorkDimension::InvariantChecks) > 28_708
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
         // After all other fallible construction, the process-global dispenser
         // issues one nonzero instance nonce; checked exhaustion is a
         // constructor error and no nonce is reused.
@@ -781,6 +792,125 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             vector: input.cells,
         })
     }
+    /// Metered exclusive validation of one prepared C16 bundle change. Consumes
+    /// the `BundleChange`, verifies the exact non-reused instance nonce, and
+    /// takes the ordinary exclusive borrow of the sole ledger. Every fixed
+    /// semantic before-image and metered tagged-identity lookup is rechecked,
+    /// and the current top `v` free cell indices plus the exact record slot it
+    /// will use are selected after exclusivity. Returns the non-forgeable
+    /// exclusive `ValidatedBundleChange`; a rejection or a drop changes no
+    /// state.
+    pub(crate) fn validate_bundle<'a, const V: usize>(
+        &mut self,
+        change: BundleChange<'a, V>,
+        work: &mut WorkMeter,
+    ) -> Result<ValidatedBundleChange<'_, 'a, R, F, H, V>, SupportLedgerError> {
+        let stale = SupportLedgerError::Generation;
+        check!(work, change.nonce == self.instance_nonce, stale)?;
+        check!(work, change.expected == self.generation, stale)?;
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                check!(
+                    work,
+                    self.capacities[class][pool] == change.capacities[class][pool],
+                    stale
+                )?;
+                check!(
+                    work,
+                    self.usage[class][pool] == change.usage[class][pool],
+                    stale
+                )?;
+            }
+        }
+        for class in 0..3 {
+            for pool in 0..POOLS {
+                check!(
+                    work,
+                    self.reserved[class][pool] == change.reserved[class][pool],
+                    stale
+                )?;
+            }
+        }
+        check!(
+            work,
+            self.bundles.free_record_len() as u32 == change.free_records,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_cell_len() == change.free_cells,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_leaf_len() == change.free_leaves,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_branch_len() == change.free_branches,
+            stale
+        )?;
+        for (slot, key) in change.record.tagged_keys().into_iter().enumerate() {
+            let found = self.bundles.find(key.tag, &key.identity, work)?;
+            check!(work, found == change.identities[slot], stale)?;
+        }
+        for identity in change
+            .record
+            .obligations
+            .iter()
+            .map(|id| key(0, id.get()))
+            .chain(change.record.credits.iter().map(|id| key(1, id.get())))
+        {
+            let absent = self.records.find(identity, work)?.is_none();
+            check!(work, absent, stale)?;
+        }
+        self.bundles.validate_record_slot(work)?;
+        self.bundles
+            .validate_cell_selection(change.record.vector_len, work)?;
+        Ok(ValidatedBundleChange {
+            ledger: self,
+            change,
+        })
+    }
+    /// Immutable metered capacity-facts snapshot of the sole ledger and its
+    /// C16 request-bundle store.
+    pub(crate) fn snapshot(
+        &self,
+        work: &mut WorkMeter,
+    ) -> Result<SupportCapacitySnapshot, SupportLedgerError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        Ok(SupportCapacitySnapshot {
+            capacities: self.capacities,
+            usage: self.usage,
+            reserved: self.reserved,
+            free_records: self.bundles.free_record_len() as u32,
+            free_cells: self.bundles.free_cell_len(),
+            free_leaves: self.bundles.free_leaf_len(),
+            free_branches: self.bundles.free_branch_len(),
+        })
+    }
+}
+impl<'ledger, 'input, const R: usize, const F: usize, const H: usize, const V: usize>
+    ValidatedBundleChange<'ledger, 'input, R, F, H, V>
+{
+    /// Consuming infallible commit of the validated C16 bundle: performs no
+    /// new fallible lookup, check, allocation, Work call, or legal rejection
+    /// branch, installs the fixed record, all `K` tagged identities, and the
+    /// validated cells as one owned chain, and advances the Support Ledger
+    /// Generation exactly once. Internal `expect` calls are fail-stop
+    /// defenses for impossible owner corruption after validate proved
+    /// capacity, absence, and local-slot selection.
+    pub(crate) fn commit_bundle(self) -> SupportLedgerGeneration {
+        let change = self.change;
+        let ledger = self.ledger;
+        ledger
+            .bundles
+            .commit_bundle(&change.record, change.vector.cells);
+        let next = change.expected.next().expect("prepared bundle generation");
+        ledger.generation = next;
+        next
+    }
 }
 #[allow(dead_code, reason = "used by the C08 adapter constructor")]
 fn total(values: impl IntoIterator<Item = u32>) -> u64 {
@@ -821,13 +951,13 @@ fn insertion_work(count: usize) -> HotPathWorkWitness {
 /// 2, identity validation 18, entitlement/vector/nonempty 3, absence
 /// comparisons 17, free capacity 4) and the validate preflight (nonce 1,
 /// generation 1, capacities 15, usage 15, reserved 9, free counts 4, identity
-/// comparison 11, legacy comparison 6, record slot 2, cell selection 1).
+/// comparison 11, legacy comparison 6, record slot 3, cell selection 4).
 fn bundle_reserve_work(cells: usize) -> HotPathWorkWitness {
     let v = cells as u64;
     let bits = u64::from(IDENTITY_BITS) + 1;
     let fixed = K as u64;
     let visits = fixed * (4 * bits + 33) + 12 * bits + 1 + 5 * v;
-    let checks = fixed * (4 * bits) + 109 + 5 * v;
+    let checks = fixed * (4 * bits) + 113 + 5 * v;
     let copied = (std::mem::size_of::<BundleRecord>() as u64 + std::mem::size_of::<u32>() as u64)
         + fixed
             * (2 * std::mem::size_of::<Option<IdentityLeaf>>() as u64
@@ -948,6 +1078,36 @@ pub(crate) struct BundleChange<'a, const V: usize> {
     identities: [Option<u32>; K],
     record: BundleRecord,
     vector: SupportOutstandingCreditVector<'a, V>,
+}
+/// Exclusive non-forgeable validated C16 bundle capability: holds the sole
+/// `&mut` ledger borrow, the immutable validated change, and no variable
+/// destination snapshot. Not Clone or Copy; `commit_bundle` consumes it once
+/// and performs no new fallible lookup, check, allocation, or Work call;
+/// dropping it releases the borrow without changing any state.
+#[derive(Debug)]
+pub(crate) struct ValidatedBundleChange<
+    'ledger,
+    'input,
+    const R: usize,
+    const F: usize,
+    const H: usize,
+    const V: usize,
+> {
+    ledger: &'ledger mut SupportChargeLedger<R, F, H>,
+    change: BundleChange<'input, V>,
+}
+/// Immutable capacity-facts snapshot: constructor-fixed capacities plus the
+/// current usage/reserved aggregates and C16 free record/cell/index-node
+/// counts. Read-only; never an authority or mutation seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupportCapacitySnapshot {
+    pub(crate) capacities: [[u32; POOLS]; 5],
+    pub(crate) usage: [[u32; POOLS]; 5],
+    pub(crate) reserved: [[u32; POOLS]; 3],
+    pub(crate) free_records: u32,
+    pub(crate) free_cells: usize,
+    pub(crate) free_leaves: usize,
+    pub(crate) free_branches: usize,
 }
 /// Private fixed entitlement-cell arena owned conceptually by the Support Charge
 /// Ledger. Constructor-preallocated exact-capacity `slots` and LIFO `free` stores,
@@ -1436,6 +1596,48 @@ impl TaggedIdentityIndex {
         self.install_branch(key, record, bit, parent, child);
         Ok(())
     }
+    /// Infallible installation used only by the consuming C16 bundle commit
+    /// under the validated trie invariant and preflighted leaf/branch
+    /// capacity: locates the peer, finds the first differing bit, and splices
+    /// one leaf plus one branch over the exact path with no Work call, no
+    /// fallible branch, and no allocation. Internal `expect` and
+    /// `unreachable!` are fail-stop defenses for impossible owner corruption.
+    fn install(&mut self, key: TaggedKey, record: u32) {
+        let peer = self.locate_unmetered(key.tag, &key.identity);
+        if peer == NO_NODE {
+            self.install_root(key, record);
+            return;
+        }
+        let peer_key = self.leaf_slots[peer as usize]
+            .as_ref()
+            .expect("validated occupied leaf slot")
+            .key;
+        debug_assert_ne!(peer_key, key, "validated absent bundle identity");
+        let (bit, _) = first_difference(&key, &peer_key);
+        let (mut parent, mut child) = (NO_NODE, self.root);
+        while is_branch(child) {
+            let branch = self.branch_slots[branch_index(child)]
+                .as_ref()
+                .expect("validated occupied branch slot");
+            if branch.bit >= bit {
+                break;
+            }
+            parent = child;
+            child = [branch.zero, branch.one][identity_bit(key.tag, &key.identity, branch.bit)];
+        }
+        self.install_branch(key, record, bit, parent, child);
+    }
+    /// Unmetered leaf-locating traversal for the infallible commit install.
+    fn locate_unmetered(&self, tag: u8, identity: &[u8; 32]) -> u32 {
+        let mut node = self.root;
+        while node != NO_NODE && is_branch(node) {
+            let branch = self.branch_slots[branch_index(node)]
+                .as_ref()
+                .expect("validated occupied branch slot");
+            node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
+        }
+        node
+    }
     /// Infallible installation of the first leaf into an empty tree.
     fn install_root(&mut self, key: TaggedKey, record: u32) {
         let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
@@ -1848,6 +2050,51 @@ impl RequestBundleStore {
         self.records[record as usize] = None;
         self.free_records.push(record);
         Ok(())
+    }
+    /// Metered validation of the exact record slot the consuming commit will
+    /// pop: the top free record index names a Vacant slot.
+    fn validate_record_slot(&self, work: &mut WorkMeter) -> Result<(), FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let index = self
+            .free_records
+            .last()
+            .copied()
+            .ok_or(FixedStorageError::Capacity)?;
+        work.record(WorkDimension::VisitedEntities, 1)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        check!(
+            work,
+            self.records[index as usize].is_none(),
+            FixedStorageError::NonCanonical
+        )
+    }
+    /// Metered validation that the current top `count` free cell indices name
+    /// Vacant slots, the exact destinations the consuming commit will pop.
+    fn validate_cell_selection(
+        &self,
+        count: usize,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        self.cells.validate_selection(count, work)
+    }
+    /// Infallible consuming installation under the validated selection: pops
+    /// one record slot, `K` leaf slots, the required branches, and exactly `v`
+    /// cell slots, installs every tagged identity, and links the validated
+    /// cells as one owned chain. No Work calls, no fallible branch, no
+    /// allocation; internal `expect` is a fail-stop defense for impossible
+    /// owner corruption after validate proved capacity, absence, and
+    /// local-slot selection.
+    fn commit_bundle(&mut self, record: &BundleRecord, cells: &[OutstandingCreditCell]) {
+        let record_index = self.free_records.pop().expect("validated record capacity");
+        for key in record.tagged_keys() {
+            self.identities.install(key, record_index);
+        }
+        let (head, len) = self.cells.install(record_index as usize, cells);
+        self.records[record_index as usize] = Some(BundleRecord {
+            vector_head: Some(head),
+            vector_len: len,
+            ..*record
+        });
     }
     /// Metered transition to the retained-tombstone state: the record, its
     /// identities, cells, and claims all remain occupied.
@@ -2733,6 +2980,182 @@ mod tests {
             28_708
         );
         assert_eq!(bundle_snapshot(&ledger), before);
+    }
+    #[test]
+    fn c16_bundle_transaction_commits_exactly_once() {
+        let mut ledger = new_ledger();
+        let cells = axis_cells(3, 1);
+        let input = bundle_input::<8>(1, &cells);
+        let before = ledger.generation();
+        let mut measured = work();
+        let change = ledger
+            .prepare_bundle(before, &input, &mut measured)
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([0, 0, 0, 0, 44])
+        );
+        let validated = ledger
+            .validate_bundle(change, &mut measured)
+            .expect("same-instance same-state validation");
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([4, 0, 0, 0, 113])
+        );
+        let next = validated.commit_bundle();
+        assert_eq!(next, before.next().unwrap());
+        assert_eq!(ledger.generation(), next);
+        // Every K identity now resolves to the committed record.
+        let owner = ledger
+            .bundles
+            .find(
+                TAG_OBLIGATION,
+                &[
+                    1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0,
+                ],
+                &mut work(),
+            )
+            .unwrap();
+        assert!(owner.is_some());
+        let record = ledger
+            .bundles
+            .get_record(owner.expect("committed bundle"))
+            .expect("occupied bundle record");
+        assert_eq!(record.state, BundleRecordState::Live);
+        assert_eq!(record.vector_len, 3);
+        assert!(record.vector_head.is_some());
+        assert_eq!(
+            (
+                ledger.bundles.free_record_len(),
+                ledger.bundles.free_cell_len()
+            ),
+            (3, 5)
+        );
+        assert_eq!(
+            (
+                ledger.bundles.free_leaf_len(),
+                ledger.bundles.free_branch_len()
+            ),
+            (33, 33)
+        );
+        bundle_store_oracle(&ledger.bundles);
+        // The committed bundle now blocks a second prepare of the same facts.
+        let mut measured = work();
+        let second = ledger.prepare_bundle(ledger.generation(), &input, &mut measured);
+        assert_eq!(
+            second.unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::Duplicate)
+        );
+        // And blocks a later legacy generic reserve on the same obligation.
+        let mut legacy = spec(1, 9, Mandatory, &[Initial([9; 32])]);
+        legacy.id = SupportOperationObligationId::new([
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ])
+        .unwrap();
+        assert_eq!(
+            ledger.reserve(ledger.generation(), legacy, &mut work()),
+            Err(SupportLedgerError::Storage(FixedStorageError::Duplicate))
+        );
+    }
+    #[test]
+    fn c16_bundle_transaction_drift_drops_and_moves() {
+        let cells = axis_cells(3, 1);
+        // Dropping the validated capability changes no state.
+        let mut ledger = new_ledger();
+        let before = bundle_snapshot(&ledger);
+        let input = bundle_input::<8>(1, &cells);
+        let change = ledger
+            .prepare_bundle(ledger.generation(), &input, &mut work())
+            .unwrap();
+        // The exclusive validated capability drops at the statement end
+        // without committing; the ledger and store remain unchanged.
+        ledger.validate_bundle(change, &mut work()).unwrap();
+        assert_eq!(bundle_snapshot(&ledger), before);
+        // An intervening legal mutation makes the prepared change stale.
+        let mut ledger = new_ledger();
+        let input = bundle_input::<8>(1, &cells);
+        let change = ledger
+            .prepare_bundle(ledger.generation(), &input, &mut work())
+            .unwrap();
+        add(&mut ledger, 9, 9).unwrap();
+        assert_eq!(
+            ledger.validate_bundle(change, &mut work()).unwrap_err(),
+            SupportLedgerError::Generation
+        );
+        assert_eq!(
+            bundle_snapshot(&ledger),
+            (SupportLedgerGeneration::new(2).unwrap(), 4, 8, 44, 43)
+        );
+        // Moving the ledger preserves the instance nonce: validation succeeds.
+        let ledger = new_ledger();
+        let input = bundle_input::<8>(1, &cells);
+        let change = ledger
+            .prepare_bundle(ledger.generation(), &input, &mut work())
+            .unwrap();
+        let mut moved = ledger;
+        let validated = moved.validate_bundle(change, &mut work()).unwrap();
+        validated.commit_bundle();
+        assert_eq!(moved.bundles.free_record_len(), 3);
+        // A same-state different-instance ledger rejects the change.
+        let first = new_ledger();
+        let input = bundle_input::<8>(1, &cells);
+        let change = first
+            .prepare_bundle(first.generation(), &input, &mut work())
+            .unwrap();
+        let mut second = new_ledger();
+        assert_eq!(
+            second.validate_bundle(change, &mut work()).unwrap_err(),
+            SupportLedgerError::Generation
+        );
+    }
+    #[test]
+    fn c16_bundle_constructor_rejects_unbounded_reserve_work() {
+        let generation = SupportLedgerGeneration::new(1).unwrap();
+        let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
+        let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
+        let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
+        assert_eq!(
+            Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 4_000).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+    }
+    #[test]
+    fn c16_bundle_snapshot_reports_capacity_facts() {
+        let mut ledger = new_ledger();
+        let mut measured = work();
+        let snapshot = ledger.snapshot(&mut measured).unwrap();
+        assert_eq!(measured.witness(), HotPathWorkWitness::new([0, 0, 0, 0, 1]));
+        assert_eq!(snapshot.capacities, ledger.capacities);
+        assert_eq!(snapshot.usage, ledger.usage);
+        assert_eq!(snapshot.reserved, ledger.reserved);
+        assert_eq!(
+            (
+                snapshot.free_records,
+                snapshot.free_cells,
+                snapshot.free_leaves,
+                snapshot.free_branches
+            ),
+            (4, 8, 44, 43)
+        );
+        let cells = axis_cells(2, 1);
+        let input = bundle_input::<8>(1, &cells);
+        let change = ledger
+            .prepare_bundle(ledger.generation(), &input, &mut work())
+            .unwrap();
+        let validated = ledger.validate_bundle(change, &mut work()).unwrap();
+        validated.commit_bundle();
+        let snapshot = ledger.snapshot(&mut work()).unwrap();
+        assert_eq!(
+            (
+                snapshot.free_records,
+                snapshot.free_cells,
+                snapshot.free_leaves,
+                snapshot.free_branches
+            ),
+            (3, 6, 33, 33)
+        );
     }
 
     /// Test-only oracle scanning every slot to prove the full arena partition.
