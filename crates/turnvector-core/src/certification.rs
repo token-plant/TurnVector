@@ -93,7 +93,7 @@ impl ExactCapabilityKey {
         requirement: CapabilityRequirement,
         envelope: CertificationEnvelopeId,
     ) -> CertificationResult<Self> {
-        let valid = identity.0 != [0; 32]
+        let valid = identity.get() != [0; 32]
             && requirement.batch.0 != 0
             && requirement.shape != 0
             && requirement.route != [0; 32]
@@ -616,10 +616,10 @@ mod tests {
     fn requirement(route: u8) -> CapabilityRequirement { CapabilityRequirement { phase: ExecutionPhase::Prefill, batch: BatchBucket(1), shape: 64, route: id(route), adapter_build: id(11), mlx_build: id(12), backend_interface: 1 } }
     fn facts(requirements: &[CapabilityRequirement]) -> RequestDescriptionFacts { RequestDescriptionFacts { requirements: bounded::<_, REQUEST_REQUIREMENT_LIMIT>(requirements.iter().copied()), backend_capabilities: id(13), ordinary_estimate: Duration::from_micros(1), conservative_time: Duration::from_micros(2), resource_bytes: ByteCount::new(3), output_bytes: ByteCount::new(4), residency_bytes: ByteCount::new(5) } }
     fn record(envelope: u8) -> CertificationRecord { CertificationRecord { identity: CertificationRecordId::try_new(id(20)).unwrap(), envelope: CertificationEnvelopeId::try_new(id(envelope)).unwrap(), environment: EnvironmentQualificationId::try_new(id(40)).unwrap() } }
-    fn profile(tag: u8, route: u8) -> CertifiedExecutionProfile { CertifiedExecutionProfile { key: ExactCapabilityKey::try_new(CapabilityKey(id(tag)), ModelRevisionId::new(id(1)).unwrap(), requirement(route), CertificationEnvelopeId::try_new(id(30)).unwrap()).unwrap(), record: CertificationRecordId::try_new(id(20)).unwrap(), case_bounds: CaseBoundTableId::try_new(id(tag + 40)).unwrap() } }
+    fn profile(tag: u8, route: u8) -> CertifiedExecutionProfile { CertifiedExecutionProfile { key: ExactCapabilityKey::try_new(CapabilityKey::new(id(tag)).unwrap(), ModelRevisionId::new(id(1)).unwrap(), requirement(route), CertificationEnvelopeId::try_new(id(30)).unwrap()).unwrap(), record: CertificationRecordId::try_new(id(20)).unwrap(), case_bounds: CaseBoundTableId::try_new(id(tag + 40)).unwrap() } }
     fn maximum_requirement(index: usize) -> CapabilityRequirement { let mut value = requirement(2); value.shape = u16::try_from(index).unwrap() + 1; value }
     fn maximum_record(index: usize) -> CertificationRecord { CertificationRecord { identity: CertificationRecordId::try_new(wide_id(u16::try_from(index).unwrap() + 1)).unwrap(), envelope: CertificationEnvelopeId::try_new(id(30)).unwrap(), environment: EnvironmentQualificationId::try_new(id(40)).unwrap() } }
-    fn maximum_profile(index: usize) -> CertifiedExecutionProfile { let index = u16::try_from(index).unwrap(); CertifiedExecutionProfile { key: ExactCapabilityKey::try_new(CapabilityKey(wide_id(index + 257)), ModelRevisionId::new(id(1)).unwrap(), maximum_requirement(index.into()), CertificationEnvelopeId::try_new(id(30)).unwrap()).unwrap(), record: CertificationRecordId::try_new(wide_id(index + 1)).unwrap(), case_bounds: CaseBoundTableId::try_new(wide_id(index + 513)).unwrap() } }
+    fn maximum_profile(index: usize) -> CertifiedExecutionProfile { let index = u16::try_from(index).unwrap(); CertifiedExecutionProfile { key: ExactCapabilityKey::try_new(CapabilityKey::new(wide_id(index + 257)).unwrap(), ModelRevisionId::new(id(1)).unwrap(), maximum_requirement(index.into()), CertificationEnvelopeId::try_new(id(30)).unwrap()).unwrap(), record: CertificationRecordId::try_new(wide_id(index + 1)).unwrap(), case_bounds: CaseBoundTableId::try_new(wide_id(index + 513)).unwrap() } }
     fn environment() -> EnvironmentQualification { EnvironmentQualification { identity: EnvironmentQualificationId::try_new(id(40)).unwrap(), environment: EnvironmentIdentity { device: id(1), gpu: id(2), unified_memory_bytes: 256, os_build: id(3), daemon_build: id(4), adapter_build: id(11), mlx_build: id(12), backend_interface: 1, bootstrap_manifest: id(5), backend_capabilities: id(13), generation_semantics: id(6), resource_signal: id(7), operation_bounds: id(8) } } }
     fn evidence(fresh: bool) -> ApplicabilityEvidence { ApplicabilityEvidence { generation: GenerationHash::try_new(id(60)).unwrap(), index: CertificationAuthorizationIndexId::try_new(id(61)).unwrap(), environment: EnvironmentFingerprint { identity: environment().environment, fresh } } }
     fn index() -> CertificationAuthorizationIndex<1, 3> { CertificationAuthorizationIndex::try_new(evidence(true).generation, evidence(true).index, bounded([environment()]), bounded([record(30)]), bounded([profile(50, 2), profile(51, 2), profile(52, 3)])).unwrap() }
@@ -631,7 +631,7 @@ mod tests {
         let index = index(); let input = facts(&[requirement(2), requirement(3)]); let mut meter = work();
         let CertificationResolution::Current(closure) = current::<3>(&input, &index, &mut meter).unwrap() else { panic!("current description must resolve"); };
         assert_eq!((closure.requirement_count, closure.entries.len()), (2, 3));
-        assert_eq!((closure.entries.get(1).unwrap().profile.key.identity, closure.entries.get(2).unwrap().profile.key.identity), (CapabilityKey(id(51)), CapabilityKey(id(52))));
+        assert_eq!((closure.entries.get(1).unwrap().profile.key.identity, closure.entries.get(2).unwrap().profile.key.identity), (CapabilityKey::new(id(51)).unwrap(), CapabilityKey::new(id(52)).unwrap()));
         assert_eq!(meter.witness(), HotPathWorkWitness::new([14, 1_104, 0, 0, 35]));
         let mut meter = work(); assert_eq!(current::<2>(&input, &index, &mut meter), Err(CertificationError::ClosureCapacity));
         let mut meter = work(); assert_eq!(current::<3>(&facts(&[requirement(9)]), &index, &mut meter), Err(CertificationError::MissingRequirement));
@@ -682,7 +682,7 @@ mod tests {
     fn cache_misses_and_eviction_never_replace_complete_selection() {
         let index = index(); let snapshot = evidence(true); let mut cache = ApplicabilityCache::new();
         for route in [2, 3, 2] { let mut meter = work(); let CertificationResolution::Current(closure) = current::<2>(&facts(&[requirement(route)]), &index, &mut meter).unwrap() else { panic!("current description must resolve"); }; let mut meter = work(); let selection = select_applicable(&closure, &index, &mut cache, snapshot, snapshot, &mut meter).unwrap(); assert_eq!((selection.requirement_count, selection.entries.len()), (1, if route == 2 { 2 } else { 1 })); }
-        assert_eq!(cache.entries[0].unwrap().key.profile.key.identity, CapabilityKey(id(51)));
+        assert_eq!(cache.entries[0].unwrap().key.profile.key.identity, CapabilityKey::new(id(51)).unwrap());
     }
     #[test]
     fn maximum_applicability_selection_fits_binary_work_budget() {

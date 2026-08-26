@@ -53,6 +53,33 @@ fn units_use_checked_arithmetic() {
 }
 
 #[test]
+fn duration_uses_checked_subtraction_with_typed_underflow() {
+    let max = Duration::from_micros(u64::MAX);
+    assert_eq!(
+        Duration::from_micros(5).checked_sub(Duration::from_micros(2)),
+        Ok(Duration::from_micros(3))
+    );
+    assert_eq!(
+        Duration::from_micros(0).checked_sub(Duration::from_micros(0)),
+        Ok(Duration::from_micros(0))
+    );
+    assert_eq!(max.checked_sub(Duration::from_micros(0)), Ok(max));
+    assert_eq!(max.checked_sub(max), Ok(Duration::from_micros(0)));
+    assert_eq!(
+        Duration::from_micros(0).checked_sub(Duration::from_micros(1)),
+        Err(DomainValueError::Underflow)
+    );
+    assert_eq!(
+        Duration::from_micros(1).checked_sub(Duration::from_micros(2)),
+        Err(DomainValueError::Underflow)
+    );
+    assert_eq!(
+        max.checked_add(Duration::from_micros(1)),
+        Err(DomainValueError::Overflow)
+    );
+}
+
+#[test]
 fn monotonic_time_uses_typed_checked_durations() {
     let start = MonotonicTime::from_micros(10);
     let elapsed = Duration::from_micros(5);
