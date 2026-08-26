@@ -93,6 +93,8 @@ impl ExactCapabilityKey {
         requirement: CapabilityRequirement,
         envelope: CertificationEnvelopeId,
     ) -> CertificationResult<Self> {
+        // CapabilityKey::new already excludes zero; the identity term is retained so the
+        // complete ExactCapabilityKey invariant stays locally visible.
         let valid = identity.get() != [0; 32]
             && requirement.batch.0 != 0
             && requirement.shape != 0

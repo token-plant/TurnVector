@@ -204,6 +204,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let count = spec.claims.len();
         let pool = spec.pool as usize;
         let invalid = SupportLedgerError::InvalidInput;
+        // id and physical_credit are constructor-validated to reject zero; this
+        // comparison/accounting shape is intentionally retained so fixed HotPath
+        // Work witnesses remain stable.
         for identity in [
             spec.id.get(),
             spec.physical_credit.get(),
@@ -283,6 +286,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     ) -> Result<SupportChange, SupportLedgerError> {
         self.next(expected, work)?;
         work.record(WorkDimension::InvariantChecks, 3)?;
+        // id and physical_credit are constructor-validated to reject zero; this
+        // comparison/accounting shape is intentionally retained so fixed HotPath
+        // Work witnesses remain stable.
         let valid = [spec.id.get(), spec.physical_credit.get(), spec.scope.0]
             .into_iter()
             .all(|id| id != [0; 32])
@@ -397,6 +403,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             work.record(WorkDimension::VisitedEntities, 1)?;
             let candidate = lifecycle_shape(spec.kind);
             maxima[spec.kind as usize] += 1;
+            // id and physical_credit are constructor-validated to reject zero; this
+            // comparison/accounting shape is intentionally retained so fixed HotPath
+            // Work witnesses remain stable.
             let identities = [
                 spec.id.get(),
                 spec.physical_credit.get(),

@@ -878,6 +878,8 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         let copied = (refresh.obligations.len()
             * std::mem::size_of::<SupportOperationObligationId>()) as u64;
         work.ensure(HotPathWorkWitness::new([0, copied, 0, 0, 0]))?;
+        // Only ids[..len] is read; the repeated valid value initializes the unused tail.
+        // BoundedVec does not expose first(), so iter().next() is retained.
         let mut ids = [*refresh
             .obligations
             .iter()
