@@ -42,10 +42,17 @@ def source_records(identity: list, names: list) -> list:
     return records
 def frozen(snapshot: Path, identity: list, stage: str) -> None:
     if tree_identity(snapshot) != identity: raise ValueError(f"source snapshot changed {stage}")
-def resolve_tools() -> dict:
+def rust_tool(name: str, value: str, rustup, root: Path) -> Path:
+    invocation, target = Path(os.path.abspath(value)), Path(value).resolve(); manager = Path(os.path.abspath(rustup)).resolve() if rustup is not None else None
+    if target.name != "rustup" and (manager is None or not os.path.samefile(invocation, manager)): return invocation
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", **{key: os.environ[key] for key in ("HOME", "RUSTUP_HOME") if key in os.environ}}
+    selected = Path(run([manager or target, "which", name], root, env).strip()).resolve()
+    if not selected.is_file() or not os.access(selected, os.X_OK): raise ValueError(f"rustup did not select an executable {name}")
+    return selected
+def resolve_tools(root: Path) -> dict:
     values = {"python": sys.executable, "cargo": shutil.which("cargo"), "rustc": shutil.which("rustc")}
     if any(value is None for value in values.values()): raise ValueError("required build tool not found")
-    paths = {name: Path(value).resolve() for name, value in values.items()}; paths["xcrun"] = Path("/usr/bin/xcrun")
+    rustup = shutil.which("rustup"); paths = {"python": Path(values["python"]).resolve(), **{name: rust_tool(name, values[name], rustup, root) for name in ("cargo", "rustc")}}; paths["xcrun"] = Path("/usr/bin/xcrun")
     for name in ("clang", "ld"):
         paths[name] = Path(subprocess.run([str(paths["xcrun"]), "--find", name], check=True, capture_output=True, text=True).stdout.rstrip("\n")).resolve()
     paths["developer"] = paths["clang"].parents[4]; selector_env = {"PATH": "/usr/bin:/bin", "DEVELOPER_DIR": str(paths["developer"])}
@@ -78,11 +85,12 @@ def freeze_sdk(sdk: Path, linked: list, destination: Path) -> list:
     frozen = [destination / source.relative_to(sdk) for source in linked]
     if tree_artifact(sdk, "sdk-link-inputs", linked) != tree_artifact(destination, "sdk-link-inputs", frozen): raise ValueError("frozen SDK linker inputs do not match discovery")
     return frozen
-def toolchain(paths: dict) -> dict:
-    env, root = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}, Path("/")
-    sysroot = Path(run([paths["rustc"], "--print", "sysroot"], root, env).strip()).resolve(); target = Path(run([paths["rustc"], "--print", "target-libdir"], root, env).strip()).resolve()
+def rust_sysroot(paths: dict, root: Path) -> Path: return Path(run([paths["rustc"], "--print", "sysroot"], root, {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}).strip()).resolve()
+def toolchain(paths: dict, root: Path) -> dict:
+    sysroot, command_root = rust_sysroot(paths, root), Path("/"); env = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "RUSTUP_TOOLCHAIN": str(sysroot)}
+    target = Path(run([paths["rustc"], "--print", "target-libdir"], command_root, env).strip()).resolve()
     files = sorted([*sysroot.glob("lib/librustc_driver*.dylib"), *(path for path in target.rglob("*") if path.is_file())])
-    def identity(name, args): return {"version": run([paths[name], *args], root, env).strip(), "binary_sha256": sha256(paths[name].read_bytes())}
+    def identity(name, args): return {"version": run([paths[name], *args], command_root, env).strip(), "binary_sha256": sha256(paths[name].read_bytes())}
     rustc = identity("rustc", ["-vV"]); rustc["host"] = next(line.split(": ", 1)[1] for line in rustc["version"].splitlines() if line.startswith("host: ")); rustc["driver_and_target_files"] = [artifact(path, path.relative_to(sysroot).as_posix()) for path in files]
     python = identity("python", ["--version"]); python_files = [path for path in paths["python_runtime"].rglob("*") if path.is_file() and "__pycache__" not in path.parts and "site-packages" not in path.parts and path.suffix != ".pyc"]
     python.update({"flags": {"dont_write_bytecode": True, "isolated": True, "no_site": True}, "runtime_files": tree_artifact(paths["python_runtime"], "python-runtime", python_files)})
@@ -335,7 +343,7 @@ def validated_descriptor(payload: bytes) -> dict:
 def build_descriptor(root: Path) -> tuple:
     root = root.resolve(); source, launcher = root / "scripts/generate_daemon_core_build.py", root / LAUNCHER
     if Path(__file__).resolve() != source: raise ValueError("executing generator is not the generator declared by --root")
-    paths, before = resolve_tools(), tree_identity(root)
+    paths, before = resolve_tools(root), tree_identity(root)
     if source.read_bytes() != _EXECUTED_SOURCE or launcher.read_bytes() != _EXECUTED_LAUNCHER_SOURCE: raise ValueError("executing generator or launcher bytes do not match the declared build input")
     with tempfile.TemporaryDirectory() as directory:
         temporary, snapshot = Path(directory).resolve(), Path(directory).resolve() / "source"; shutil.copytree(root, snapshot, symlinks=True, ignore=lambda _path, names: sorted(set(names) & IGNORED))
@@ -344,8 +352,8 @@ def build_descriptor(root: Path) -> tuple:
         if b'\nsource = "' in (snapshot / "Cargo.lock").read_bytes(): raise ValueError("only repository vendored path dependencies are allowed")
         placeholder = temporary / "catalog-placeholder.bin"
         with placeholder.open("wb") as handle: handle.truncate(CATALOG_SECTION["byte_length"])
-        selected = toolchain(paths); flags = lambda sdk: [f'-Clinker={paths["clang"]}', "-Clink-arg=-isysroot", f'-Clink-arg={sdk}', "-Clink-arg=-t", f"-Clink-arg=-Wl,-sectcreate,__DATA_CONST,__tvcatalog,{placeholder}"]
-        env = {"PATH": ":".join(dict.fromkeys(str(paths[name].parent) for name in ("cargo", "rustc", "clang", "ld"))) + ":/usr/bin:/bin", "HOME": str(temporary / "home"), "CARGO_HOME": str(temporary / "cargo-home"), "CARGO_TARGET_DIR": str(temporary / "discovery-target"), "CARGO_INCREMENTAL": "0", "RUSTC": str(paths["rustc"]), "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags(paths["sdk"])), "DEVELOPER_DIR": str(paths["developer"]), "SDKROOT": str(paths["sdk"]), "MACOSX_DEPLOYMENT_TARGET": "11.0", "LANG": "C", "LC_ALL": "C"}
+        selected = toolchain(paths, root); flags = lambda sdk: [f'-Clinker={paths["clang"]}', "-Clink-arg=-isysroot", f'-Clink-arg={sdk}', "-Clink-arg=-t", f"-Clink-arg=-Wl,-sectcreate,__DATA_CONST,__tvcatalog,{placeholder}"]
+        env = {"PATH": ":".join(dict.fromkeys(str(paths[name].parent) for name in ("cargo", "rustc", "clang", "ld"))) + ":/usr/bin:/bin", "HOME": str(temporary / "home"), "CARGO_HOME": str(temporary / "cargo-home"), "CARGO_TARGET_DIR": str(temporary / "discovery-target"), "CARGO_INCREMENTAL": "0", "RUSTC": str(paths["rustc"]), "RUSTUP_TOOLCHAIN": str(rust_sysroot(paths, snapshot)), "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags(paths["sdk"])), "DEVELOPER_DIR": str(paths["developer"]), "SDKROOT": str(paths["sdk"]), "MACOSX_DEPLOYMENT_TARGET": "11.0", "LANG": "C", "LC_ALL": "C"}
         registry, cargo = generation_registry(snapshot, env), str(paths["cargo"]); common = ["--offline", "--locked", "--manifest-path", str(snapshot / "Cargo.toml")]
         if tree_identity(snapshot) != before: raise ValueError("source snapshot changed during Generation Semantics verification")
         metadata = read_json(run([cargo, "metadata", *common, "--format-version", "1", "--filter-platform", selected["rustc"]["host"]], Path("/"), env).encode()); graph, package_roots = dependency_graph(snapshot, metadata)
@@ -353,19 +361,19 @@ def build_descriptor(root: Path) -> tuple:
             run([cargo, "check", *common, "--package", "turnvector-daemon", "--bin", "turnvector-daemon", *profile], Path("/"), env); frozen(snapshot, before, "during daemon check")
         trace = run([cargo, "build", *common, "--release", "--package", "turnvector-daemon", "--bin", "turnvector-daemon"], Path("/"), env, True)
         if tree_identity(snapshot) != before: raise ValueError("source snapshot changed during daemon build")
-        linked, current_tools = sdk_link_inputs(trace, paths["sdk"]), toolchain(paths)
+        linked, current_tools = sdk_link_inputs(trace, paths["sdk"]), toolchain(paths, root)
         if current_tools != selected: raise ValueError("toolchain changed after discovery")
         selected["native_link"]["link_inputs"] = tree_artifact(paths["sdk"], "sdk-link-inputs", linked); frozen_sdk = temporary / "frozen-sdk"; frozen_linked = freeze_sdk(paths["sdk"], linked, frozen_sdk); final_paths = {**paths, "sdk": frozen_sdk}
         env.update({"CARGO_TARGET_DIR": str(temporary / "target"), "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags(frozen_sdk)), "SDKROOT": str(frozen_sdk)}); final_trace = run([cargo, "build", *common, "--release", "--package", "turnvector-daemon", "--bin", "turnvector-daemon"], Path("/"), env, True)
         if sdk_link_inputs(final_trace, frozen_sdk) != frozen_linked or sdk_link_inputs(final_trace, paths["sdk"], False): raise ValueError("linker input set changed after discovery")
-        frozen(snapshot, before, "during final daemon build"); current_tools = toolchain(final_paths); current_tools["native_link"]["link_inputs"] = tree_artifact(frozen_sdk, "sdk-link-inputs", frozen_linked)
+        frozen(snapshot, before, "during final daemon build"); current_tools = toolchain(final_paths, root); current_tools["native_link"]["link_inputs"] = tree_artifact(frozen_sdk, "sdk-link-inputs", frozen_linked)
         if current_tools != selected: raise ValueError("toolchain or linker input changed during final daemon build")
         dev_traced, dev_environment = traced_inputs(snapshot, temporary / "discovery-target", package_roots); release_traced, release_environment = traced_inputs(snapshot, temporary / "target", package_roots); traced, environment = sorted({*dev_traced, *release_traced}), sorted({*dev_environment, *release_environment}); names = source_names(snapshot, graph, traced); executable, records = macho_text(temporary / "target/release/turnvector-daemon", selected["rustc"]["host"]), source_records(before, names)
         if tree_identity(snapshot) != before: raise ValueError("source snapshot changed before descriptor publication")
         descriptor = {"descriptor_schema_version": 1, "source_closure": {"algorithm": "isolated_snapshot_plus_dev_and_release_daemon_dep_info_v1", "dependency_policy": "reachable_normal_repository_path_dependencies_without_build_code_v1", "runtime_inputs": traced, "environment_inputs": environment, "files": records}, "toolchain": selected, "dependency_graph": graph, "registries": {"protocol": [], "domain": [registry]}, "section_identities": {"executable_text": executable, "native_text": {"artifacts": [], "byte_length": 0, "present": False, "sha256": EMPTY_SHA}, "catalog_payload": CATALOG_SECTION}, **CONTRACT}
     return descriptor, (before, paths, selected, linked)
 def stable(root: Path, guard: tuple) -> None:
-    before, paths, selected, linked = guard; current = toolchain(paths); current["native_link"]["link_inputs"] = tree_artifact(paths["sdk"], "sdk-link-inputs", linked)
+    before, paths, selected, linked = guard; current = toolchain(paths, root); current["native_link"]["link_inputs"] = tree_artifact(paths["sdk"], "sdk-link-inputs", linked)
     if tree_identity(root.resolve()) != before or current != selected: raise ValueError("source or toolchain changed before descriptor publication")
 def output_pair(directory: int) -> tuple:
     result = []; identity = lambda item: (item.st_dev, item.st_ino, item.st_mode, item.st_size, item.st_mtime_ns, item.st_ctime_ns)

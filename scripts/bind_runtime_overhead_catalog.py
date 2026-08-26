@@ -126,7 +126,7 @@ def codesign(path: Path):
     if captured(tool, 0o755) != before: raise ValueError("codesign tool changed during binding")
     return signing_metadata(captured(path))
 def build_artifact(root: Path, inputs: dict, destination: Path):
-    core = load_core(root, inputs); core.check(root, root / "schemas"); before = core.tree_identity(root); paths = core.resolve_tools()
+    core = load_core(root, inputs); core.check(root, root / "schemas"); before = core.tree_identity(root); paths = core.resolve_tools(root)
     with tempfile.TemporaryDirectory() as directory:
         temporary, snapshot = Path(directory).resolve(), Path(directory).resolve() / "source"; shutil.copytree(root, snapshot, symlinks=True, ignore=lambda _path, names: sorted(set(names) & core.IGNORED))
         if core.tree_identity(root) != before or core.tree_identity(snapshot) != before: raise ValueError("source tree changed while freezing binding inputs")
@@ -136,7 +136,7 @@ def build_artifact(root: Path, inputs: dict, destination: Path):
         if core.tree_artifact(paths["sdk"], "sdk-link-inputs", linked) != expected: raise ValueError("binding linker inputs differ from the Core descriptor")
         frozen_sdk = temporary / "frozen-sdk"; frozen = core.freeze_sdk(paths["sdk"], linked, frozen_sdk); env.update({"CARGO_TARGET_DIR": str(temporary / "target"), "CARGO_ENCODED_RUSTFLAGS": "\x1f".join(flags(frozen_sdk)), "SDKROOT": str(frozen_sdk)}); final_trace = core.run([cargo, "build", *common], Path("/"), env, True)
         if core.sdk_link_inputs(final_trace, frozen_sdk) != frozen or core.tree_identity(snapshot) != before or core.tree_identity(root) != before: raise ValueError("binding build inputs changed")
-        current_tools = core.toolchain(paths); current_tools["native_link"]["link_inputs"] = core.tree_artifact(paths["sdk"], "sdk-link-inputs", linked)
+        current_tools = core.toolchain(paths, root); current_tools["native_link"]["link_inputs"] = core.tree_artifact(paths["sdk"], "sdk-link-inputs", linked)
         if current_tools != inputs["core"]["toolchain"]: raise ValueError("binding toolchain changed")
         artifact = temporary / "target/release/turnvector-daemon"; original = artifact.read_bytes(); baseline = core.macho_text(artifact, inputs["core"]["toolchain"]["rustc"]["host"])
         if baseline != inputs["core"]["section_identities"]["executable_text"]: raise ValueError("binding artifact does not match the Core executable identity")
