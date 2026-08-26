@@ -1,8 +1,9 @@
 use crate::bounded::FixedWindowStart;
 use crate::{
     Duration, FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
-    HotPathWorkWitness, MonotonicTime, PhysicalStartCreditId, SupportLedgerGeneration,
-    SupportOperationObligationId, WorkBudgetError, WorkDimension, WorkMeter,
+    FutureTurnSupportEntitlementId, HotPathWorkWitness, MonotonicTime, PhysicalStartCreditId,
+    SupportLedgerGeneration, SupportOperationObligationId, SupportOutstandingCreditVectorId,
+    WorkBudgetError, WorkDimension, WorkMeter,
 };
 const POOLS: usize = 3;
 const CONDITIONAL: usize = 0;
@@ -704,7 +705,7 @@ impl<'a, const V: usize> SupportOutstandingCreditVector<'a, V> {
 /// Private fixed entitlement-cell arena owned conceptually by the Support Charge
 /// Ledger. Constructor-preallocated exact-capacity `slots` and LIFO `free` stores,
 /// no later growth, no hot-path allocation, no public seam.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct EntitlementCellArena {
     capacity: usize,
     slots: Vec<CellSlot>,
@@ -720,6 +721,16 @@ enum CellSlot {
     },
 }
 impl EntitlementCellArena {
+    /// Checked physical storage bytes for `capacity` cell slots plus their
+    /// LIFO free stack, against the binary Storage/CopiedBytes maximum.
+    fn storage_bytes(capacity: u64) -> Option<u64> {
+        let slot_bytes = std::mem::size_of::<CellSlot>() as u64;
+        let index_bytes = std::mem::size_of::<usize>() as u64;
+        let total = capacity
+            .checked_mul(slot_bytes)?
+            .checked_add(capacity.checked_mul(index_bytes)?)?;
+        (total <= 2_097_152).then_some(total)
+    }
     fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
         if capacity == 0 {
             return Err(FixedStorageError::Capacity);
@@ -843,6 +854,46 @@ impl EntitlementCellArena {
         }
         Ok(())
     }
+    /// Metered owner-chain traversal without expected cell values: verifies
+    /// every slot of the exact `count`-length chain is occupied by `owner` with
+    /// a valid next link. Used by pristine withdrawal, which releases the chain
+    /// after the full before-image is established.
+    fn validate_owner_chain(
+        &self,
+        head: usize,
+        count: usize,
+        owner: usize,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let mut slot = Some(head);
+        for i in 0..count {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            let index = slot.ok_or(FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                index < self.slots.len(),
+                FixedStorageError::NonCanonical
+            )?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let CellSlot::Occupied {
+                owner_record,
+                next_owned,
+                ..
+            } = self.slots[index]
+            else {
+                return Err(FixedStorageError::NonCanonical);
+            };
+            check!(work, owner_record == owner, FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                next_owned.is_some() == (i + 1 != count),
+                FixedStorageError::NonCanonical
+            )?;
+            slot = next_owned;
+        }
+        Ok(())
+    }
     fn release(&mut self, head: usize, count: usize) {
         let mut slot = Some(head);
         for _ in 0..count {
@@ -921,6 +972,21 @@ struct TaggedIdentityIndex {
     root: u32,
 }
 impl TaggedIdentityIndex {
+    /// Checked physical storage bytes for `leaf_capacity` leaf slots and
+    /// branch slots plus their LIFO free stacks, against the binary
+    /// Storage/CopiedBytes maximum.
+    fn storage_bytes(leaf_capacity: u64) -> Option<u64> {
+        let leaf_slot_bytes = std::mem::size_of::<Option<IdentityLeaf>>() as u64;
+        let branch_slot_bytes = std::mem::size_of::<Option<IdentityBranch>>() as u64;
+        let index_bytes = std::mem::size_of::<u32>() as u64;
+        let branches = leaf_capacity.checked_sub(1)?;
+        let total = leaf_capacity
+            .checked_mul(leaf_slot_bytes)?
+            .checked_add(leaf_capacity.checked_mul(index_bytes)?)?
+            .checked_add(branches.checked_mul(branch_slot_bytes)?)?
+            .checked_add(branches.checked_mul(index_bytes)?)?;
+        (total <= 2_097_152).then_some(total)
+    }
     /// Creates exact-capacity storage for `I` identity leaves and `I - 1`
     /// Patricia branches. Checked storage arithmetic rejects any capacity whose
     /// physical slots and free stacks exceed the binary Storage/CopiedBytes
@@ -1260,6 +1326,165 @@ fn first_difference(left: &TaggedKey, right: &TaggedKey) -> (u16, u64) {
         }
     }
     unreachable!("distinct tagged identities have distinct bytes")
+}
+/// Fixed tagged-identity count `K = 11` per complete C16 request bundle: three
+/// operation obligations, three physical credits, three request-owned
+/// `AdmissionInitial` claims, one Future Turn Support Entitlement, and one
+/// Support Outstanding Credit Vector.
+const K: usize = 11;
+/// Canonical one-byte type tags for the C16 tagged identity namespaces. Tags 0
+/// and 1 match the legacy obligation and physical-credit tags so reciprocal
+/// collision checks share one encoding.
+const TAG_OBLIGATION: u8 = 0;
+const TAG_CREDIT: u8 = 1;
+const TAG_ADMISSION_CLAIM: u8 = 2;
+const TAG_ENTITLEMENT: u8 = 4;
+const TAG_VECTOR: u8 = 5;
+/// Live or retained-tombstone state of one request-bundle record. A retained
+/// tombstone keeps its record, identities, cells, and claims.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BundleRecordState {
+    Live,
+    RetainedTombstone,
+}
+/// One fixed request-bundle record: three operation-specific initial/release
+/// obligations, three physical credits, three distinct request-owned
+/// `AdmissionInitial` claims, one Future Turn Support Entitlement, one
+/// Support Outstanding Credit Vector with its occupied cell-chain head and
+/// validated length, and the live/tombstone state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BundleRecord {
+    obligations: [SupportOperationObligationId; 3],
+    credits: [PhysicalStartCreditId; 3],
+    claims: [[u8; 32]; 3],
+    entitlement: FutureTurnSupportEntitlementId,
+    vector: SupportOutstandingCreditVectorId,
+    vector_head: Option<usize>,
+    vector_len: usize,
+    state: BundleRecordState,
+}
+impl BundleRecord {
+    fn tagged_keys(&self) -> [TaggedKey; K] {
+        [
+            TaggedKey::new(TAG_OBLIGATION, self.obligations[0].get()),
+            TaggedKey::new(TAG_OBLIGATION, self.obligations[1].get()),
+            TaggedKey::new(TAG_OBLIGATION, self.obligations[2].get()),
+            TaggedKey::new(TAG_CREDIT, self.credits[0].get()),
+            TaggedKey::new(TAG_CREDIT, self.credits[1].get()),
+            TaggedKey::new(TAG_CREDIT, self.credits[2].get()),
+            TaggedKey::new(TAG_ADMISSION_CLAIM, self.claims[0]),
+            TaggedKey::new(TAG_ADMISSION_CLAIM, self.claims[1]),
+            TaggedKey::new(TAG_ADMISSION_CLAIM, self.claims[2]),
+            TaggedKey::new(TAG_ENTITLEMENT, self.entitlement.get()),
+            TaggedKey::new(TAG_VECTOR, self.vector.get()),
+        ]
+    }
+}
+/// Private fixed reusable request-bundle store owned conceptually by the
+/// Support Charge Ledger. One fixed record per C16 bundle plus its `K = 11`
+/// tagged identity leaves and its entitlement cells; every slot
+/// constructor-preallocated with exact-capacity free-index stacks, no hot-path
+/// growth, no public seam.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestBundleStore {
+    record_capacity: usize,
+    records: Vec<Option<BundleRecord>>,
+    free_records: Vec<u32>,
+    identities: TaggedIdentityIndex,
+    cells: EntitlementCellArena,
+}
+impl RequestBundleStore {
+    /// Creates exact-capacity storage for `E` request-bundle records, `I = 11E`
+    /// tagged identity leaves, `J = I - 1` Patricia branches, and `C`
+    /// entitlement cells. Every storage product and sum is checked against the
+    /// binary Storage/CopiedBytes maximum and every backing Vec must seal to
+    /// its exact requested capacity. Construction fails closed without complete
+    /// validated production capacity facts.
+    fn try_new(record_capacity: usize, cell_capacity: usize) -> Result<Self, FixedStorageError> {
+        if record_capacity == 0 || cell_capacity == 0 {
+            return Err(FixedStorageError::Capacity);
+        }
+        let leaf_capacity = record_capacity
+            .checked_mul(K)
+            .ok_or(FixedStorageError::Allocation)?;
+        let record_bytes = std::mem::size_of::<Option<BundleRecord>>() as u64;
+        let index_bytes = std::mem::size_of::<u32>() as u64;
+        let record_capacity_u64 =
+            u64::try_from(record_capacity).map_err(|_| FixedStorageError::Allocation)?;
+        let leaf_capacity_u64 =
+            u64::try_from(leaf_capacity).map_err(|_| FixedStorageError::Allocation)?;
+        let cell_capacity_u64 =
+            u64::try_from(cell_capacity).map_err(|_| FixedStorageError::Allocation)?;
+        let record_storage = record_capacity_u64
+            .checked_mul(record_bytes)
+            .and_then(|slots| {
+                record_capacity_u64
+                    .checked_mul(index_bytes)
+                    .and_then(|free| slots.checked_add(free))
+            })
+            .ok_or(FixedStorageError::Allocation)?;
+        let identity_storage = TaggedIdentityIndex::storage_bytes(leaf_capacity_u64)
+            .ok_or(FixedStorageError::Allocation)?;
+        let cell_storage = EntitlementCellArena::storage_bytes(cell_capacity_u64)
+            .ok_or(FixedStorageError::Allocation)?;
+        let storage = record_storage
+            .checked_add(identity_storage)
+            .and_then(|sum| sum.checked_add(cell_storage))
+            .ok_or(FixedStorageError::Allocation)?;
+        // Binary Storage/CopiedBytes maximum from the accepted HotPathWorkBudget.
+        let storage_max = 2_097_152_u64;
+        if storage > storage_max {
+            return Err(FixedStorageError::Capacity);
+        }
+        if record_capacity > isize::MAX as usize {
+            return Err(FixedStorageError::Allocation);
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(record_capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        records.resize(record_capacity, None);
+        let mut free_records = Vec::new();
+        free_records
+            .try_reserve_exact(record_capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        for index in (0..record_capacity).rev() {
+            free_records.push(index as u32);
+        }
+        if records.capacity() != record_capacity || free_records.capacity() != record_capacity {
+            return Err(FixedStorageError::Capacity);
+        }
+        Ok(Self {
+            record_capacity,
+            records,
+            free_records,
+            identities: TaggedIdentityIndex::try_new(leaf_capacity)?,
+            cells: EntitlementCellArena::try_new(cell_capacity)?,
+        })
+    }
+    fn record_capacity(&self) -> usize {
+        self.record_capacity
+    }
+    fn record_len(&self) -> usize {
+        self.records.iter().filter(|slot| slot.is_some()).count()
+    }
+    fn free_record_len(&self) -> usize {
+        self.free_records.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.record_len() == 0
+    }
+    fn find(
+        &self,
+        tag: u8,
+        identity: &[u8; 32],
+        work: &mut WorkMeter,
+    ) -> Result<Option<u32>, FixedStorageError> {
+        self.identities.find(tag, identity, work)
+    }
+    fn get_record(&self, index: u32) -> Option<&BundleRecord> {
+        self.records.get(index as usize).and_then(Option::as_ref)
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -2689,5 +2914,183 @@ mod tests {
             let mut index = index.clone();
             index.remove(1, &[0; 32], meter).map(|_| ())
         });
+    }
+
+    /// Test-only distinct bundle record with canonical same-tag identity groups.
+    fn bundle_record(n: u8) -> BundleRecord {
+        // Two-byte identities: byte 0 is the record, byte 1 the member offset,
+        // so distinct records never share an identity within u8 range.
+        let identity = |offset: u8| {
+            let mut id = [0u8; 32];
+            id[0] = n;
+            id[1] = offset;
+            id
+        };
+        BundleRecord {
+            obligations: [
+                SupportOperationObligationId::new(identity(1)).unwrap(),
+                SupportOperationObligationId::new(identity(2)).unwrap(),
+                SupportOperationObligationId::new(identity(3)).unwrap(),
+            ],
+            credits: [
+                PhysicalStartCreditId::new(identity(11)).unwrap(),
+                PhysicalStartCreditId::new(identity(12)).unwrap(),
+                PhysicalStartCreditId::new(identity(13)).unwrap(),
+            ],
+            claims: [identity(21), identity(22), identity(23)],
+            entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(),
+            vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(),
+            vector_head: None,
+            vector_len: 0,
+            state: BundleRecordState::Live,
+        }
+    }
+    /// Test-only full request-bundle store oracle: record/cell/leaf/branch
+    /// partitions, free-stack validity, trie and arena oracles, and every
+    /// cross-ownership relation plus all four scalar conservation equations.
+    /// Scans `Theta(C + I + J + E)` slots and is never called or charged by a
+    /// production transition.
+    fn bundle_store_oracle(store: &RequestBundleStore) {
+        use std::collections::HashSet;
+        let mut free_records = HashSet::new();
+        for &record in &store.free_records {
+            assert!(
+                record < store.record_capacity as u32,
+                "free record in range"
+            );
+            assert!(free_records.insert(record), "free record indices unique");
+            assert_eq!(store.records[record as usize], None, "free record vacant");
+        }
+        let occupied: Vec<u32> = store
+            .records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.is_some().then_some(index as u32))
+            .collect();
+        assert_eq!(
+            free_records.len() + occupied.len(),
+            store.record_capacity,
+            "record partition"
+        );
+        trie_oracle(&store.identities);
+        arena_oracle(&store.cells);
+        for &record in &occupied {
+            let slot = store.records[record as usize]
+                .as_ref()
+                .expect("occupied record");
+            for key in slot.tagged_keys() {
+                assert_eq!(
+                    store.identities.find(key.tag, &key.identity, &mut work()),
+                    Ok(Some(record)),
+                    "every record identity present and owned"
+                );
+            }
+            let head = slot.vector_head.expect("occupied record has a cell chain");
+            store
+                .cells
+                .validate_owner_chain(head, slot.vector_len, record as usize, &mut work())
+                .unwrap();
+        }
+        for leaf in store.identities.leaf_slots.iter().flatten() {
+            assert!(
+                store.records[leaf.record as usize].is_some(),
+                "every index leaf owner is an occupied record"
+            );
+        }
+        let cells_owned: usize = occupied
+            .iter()
+            .map(|&record| {
+                store.records[record as usize]
+                    .as_ref()
+                    .expect("occupied record")
+                    .vector_len
+            })
+            .sum();
+        assert_eq!(
+            store.cells.free_len() + cells_owned,
+            store.cells.capacity(),
+            "cell scalar conservation"
+        );
+        assert_eq!(
+            store.identities.free_leaf_len() + K * occupied.len(),
+            store.identities.leaf_capacity(),
+            "leaf scalar conservation"
+        );
+        let branches = if occupied.is_empty() {
+            0
+        } else {
+            K * occupied.len() - 1
+        };
+        assert_eq!(
+            store.identities.free_branch_len() + branches,
+            store.identities.branch_capacity(),
+            "branch scalar conservation"
+        );
+    }
+    #[test]
+    fn c16_bundle_store_constructor() {
+        for (records, cells) in [(0usize, 8usize), (4, 0)] {
+            assert_eq!(
+                RequestBundleStore::try_new(records, cells).unwrap_err(),
+                FixedStorageError::Capacity
+            );
+        }
+        assert_eq!(
+            RequestBundleStore::try_new(usize::MAX / K + 1, 8).unwrap_err(),
+            FixedStorageError::Allocation
+        );
+        // First storage-invalid boundary: total record/identity/cell storage
+        // exceeds the binary Storage/CopiedBytes maximum.
+        let record_bytes =
+            std::mem::size_of::<Option<BundleRecord>>() as u64 + std::mem::size_of::<u32>() as u64;
+        let storage = |records: u64| {
+            records * record_bytes
+                + TaggedIdentityIndex::storage_bytes(records * K as u64).unwrap()
+                + EntitlementCellArena::storage_bytes(1).unwrap()
+        };
+        let mut maximum = 1u64;
+        while storage(maximum + 1) <= 2_097_152 {
+            maximum += 1;
+        }
+        assert_eq!(
+            RequestBundleStore::try_new(maximum as usize, 1)
+                .unwrap()
+                .record_capacity(),
+            maximum as usize
+        );
+        assert_eq!(
+            RequestBundleStore::try_new(maximum as usize + 1, 1).unwrap_err(),
+            FixedStorageError::Capacity
+        );
+        // E = 1 boundary and exact-capacity seal.
+        let store = RequestBundleStore::try_new(1, 4).unwrap();
+        assert_eq!(store.record_capacity(), 1);
+        assert_eq!(
+            (store.records.capacity(), store.free_records.capacity()),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                store.identities.leaf_capacity(),
+                store.identities.branch_capacity()
+            ),
+            (K, K - 1)
+        );
+        assert_eq!(store.cells.capacity(), 4);
+        assert_eq!(
+            (store.free_record_len(), store.identities.free_leaf_len()),
+            (1, K)
+        );
+        assert!(store.is_empty());
+        bundle_store_oracle(&store);
+        let store = RequestBundleStore::try_new(4, 8).unwrap();
+        assert_eq!(
+            (
+                store.identities.leaf_capacity(),
+                store.identities.branch_capacity()
+            ),
+            (44, 43)
+        );
+        bundle_store_oracle(&store);
     }
 }
