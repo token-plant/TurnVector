@@ -910,7 +910,7 @@ const NO_NODE: u32 = u32::MAX;
 /// hot-path growth, no public seam. `I` leaf slots and `J = I - 1` branch
 /// slots; every slot starts Vacant and each free stack initially holds its
 /// full index domain.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TaggedIdentityIndex {
     leaf_capacity: usize,
     branch_capacity: usize,
@@ -1034,6 +1034,25 @@ impl TaggedIdentityIndex {
         identity: &[u8; 32],
         work: &mut WorkMeter,
     ) -> Result<Option<u32>, FixedStorageError> {
+        let node = self.locate(tag, identity, work)?;
+        if node == NO_NODE {
+            return Ok(None);
+        }
+        let leaf = self.leaf_slots[node as usize]
+            .as_ref()
+            .expect("validated occupied leaf slot");
+        Ok((leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record))
+    }
+    /// Walks to the terminal node for a borrowed key, charging one
+    /// VisitedEntities and one InvariantChecks per visited branch and one of
+    /// each for the visited leaf. Returns the leaf index, or `NO_NODE` for an
+    /// empty tree.
+    fn locate(
+        &self,
+        tag: u8,
+        identity: &[u8; 32],
+        work: &mut WorkMeter,
+    ) -> Result<u32, FixedStorageError> {
         let mut node = self.root;
         while node != NO_NODE && is_branch(node) {
             work.record(WorkDimension::VisitedEntities, 1)?;
@@ -1044,14 +1063,101 @@ impl TaggedIdentityIndex {
             node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
         }
         if node == NO_NODE {
-            return Ok(None);
+            return Ok(NO_NODE);
         }
         work.record(WorkDimension::VisitedEntities, 1)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
-        let leaf = self.leaf_slots[node as usize]
+        Ok(node)
+    }
+    /// Metered prevalidated insertion: proves leaf and branch capacity and
+    /// key absence, meters the peer traversal, the first-difference byte pass,
+    /// and the insertion-point traversal, and only then installs the leaf and
+    /// branch infallibly. Rejection preserves the exact trie and free stacks.
+    fn insert(
+        &mut self,
+        key: TaggedKey,
+        record: u32,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        let peer = self.locate(key.tag, &key.identity, work)?;
+        if peer == NO_NODE {
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            if self.free_leaves.is_empty() {
+                return Err(FixedStorageError::Capacity);
+            }
+            self.install_root(key, record);
+            return Ok(());
+        }
+        let peer_key = self.leaf_slots[peer as usize]
             .as_ref()
-            .expect("validated occupied leaf slot");
-        Ok((leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record))
+            .expect("validated occupied leaf slot")
+            .key;
+        if peer_key == key {
+            return Err(FixedStorageError::Duplicate);
+        }
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if self.free_leaves.is_empty() {
+            return Err(FixedStorageError::Capacity);
+        }
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if self.free_branches.is_empty() {
+            return Err(FixedStorageError::Capacity);
+        }
+        let (bit, bytes) = first_difference(&key, &peer_key);
+        work.record(WorkDimension::VisitedEntities, bytes)?;
+        let mut visits = 0u64;
+        let (mut parent, mut child) = (NO_NODE, self.root);
+        while is_branch(child) {
+            visits += 1;
+            let branch = self.branch_slots[branch_index(child)]
+                .as_ref()
+                .expect("validated occupied branch slot");
+            if branch.bit >= bit {
+                break;
+            }
+            parent = child;
+            child = [branch.zero, branch.one][identity_bit(key.tag, &key.identity, branch.bit)];
+        }
+        work.record(WorkDimension::VisitedEntities, visits)?;
+        work.record(WorkDimension::InvariantChecks, visits)?;
+        self.install_branch(key, record, bit, parent, child);
+        Ok(())
+    }
+    /// Infallible installation of the first leaf into an empty tree.
+    fn install_root(&mut self, key: TaggedKey, record: u32) {
+        let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
+        self.leaf_slots[leaf as usize] = Some(IdentityLeaf { key, record });
+        self.root = leaf;
+    }
+    /// Infallible installation of one leaf plus one branch above `child`, whose
+    /// first discriminating bit `bit` is strictly larger than every parent bit.
+    fn install_branch(&mut self, key: TaggedKey, record: u32, bit: u16, parent: u32, child: u32) {
+        let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
+        self.leaf_slots[leaf as usize] = Some(IdentityLeaf { key, record });
+        let branch = self
+            .free_branches
+            .pop()
+            .expect("prevalidated branch capacity");
+        let children = if identity_bit(key.tag, &key.identity, bit) == 0 {
+            [leaf, child]
+        } else {
+            [child, leaf]
+        };
+        let branch_node = BRANCH_TAG | branch;
+        self.branch_slots[branch as usize] = Some(IdentityBranch {
+            bit,
+            zero: children[0],
+            one: children[1],
+        });
+        if parent == NO_NODE {
+            self.root = branch_node;
+        } else {
+            let parent = self.branch_slots[branch_index(parent)]
+                .as_mut()
+                .expect("validated occupied parent branch");
+            *[&mut parent.zero, &mut parent.one]
+                [identity_bit(key.tag, &key.identity, parent.bit)] = branch_node;
+        }
     }
 }
 fn is_branch(node: u32) -> bool {
@@ -1067,6 +1173,23 @@ fn identity_bit(tag: u8, identity: &[u8; 32], bit: u16) -> usize {
         identity[(bit / 8 - 1) as usize]
     };
     ((byte >> (7 - bit % 8)) & 1) as usize
+}
+/// First differing bit between two distinct tagged identities, plus the number
+/// of compared key bytes (the tag byte and every equal identity byte through
+/// the first differing one).
+fn first_difference(left: &TaggedKey, right: &TaggedKey) -> (u16, u64) {
+    if left.tag != right.tag {
+        let difference = left.tag ^ right.tag;
+        return (difference.leading_zeros() as u16, 1);
+    }
+    for (index, (left, right)) in left.identity.iter().zip(right.identity).enumerate() {
+        let difference = left ^ right;
+        if difference != 0 {
+            let bit = 8 + index as u16 * 8 + difference.leading_zeros() as u16;
+            return (bit, index as u64 + 2);
+        }
+    }
+    unreachable!("distinct tagged identities have distinct bytes")
 }
 #[cfg(test)]
 mod tests {
@@ -1923,9 +2046,10 @@ mod tests {
     fn tagged(tag: u8, byte: u8) -> TaggedKey {
         TaggedKey::new(tag, [byte; 32])
     }
-    /// Test-only valid compressed tree over three leaves:
+    /// Test-only valid compressed tree over three leaves, built in the same
+    /// physical slot order as three sequential inserts:
     /// `root = branch(7, branch(8, leaf(0,[0;32]), leaf(0,[0x80;32])), leaf(1,[0;32]))`.
-    /// Branch slot 0 discriminates bit 7 (tag parity), branch slot 1 bit 8.
+    /// Branch slot 0 discriminates bit 8, branch slot 1 bit 7 (tag parity).
     fn three_leaf_tree() -> TaggedIdentityIndex {
         let mut index = TaggedIdentityIndex::try_new(16).unwrap();
         index.leaf_slots[0] = Some(IdentityLeaf {
@@ -1942,19 +2066,24 @@ mod tests {
         });
         index.free_leaves = (3..16).rev().map(|index| index as u32).collect();
         index.branch_slots[0] = Some(IdentityBranch {
-            bit: 7,
-            zero: BRANCH_TAG | 1,
-            one: 2,
-        });
-        index.branch_slots[1] = Some(IdentityBranch {
             bit: 8,
             zero: 0,
             one: 1,
         });
+        index.branch_slots[1] = Some(IdentityBranch {
+            bit: 7,
+            zero: BRANCH_TAG,
+            one: 2,
+        });
         index.free_branches = (2..15).rev().map(|index| index as u32).collect();
-        index.root = BRANCH_TAG;
+        index.root = BRANCH_TAG | 1;
         index
     }
+    /// Test-only full trie oracle: every leaf/branch slot in range and covered
+    /// exactly once, free entries unique and Vacant, branch bits strictly
+    /// increasing along every route, every occupied node reachable exactly once,
+    /// and every leaf key unique. Scans `Theta(I + J)` slots and is never called
+    /// or charged by a production transition.
     #[test]
     fn c16_identity_index_constructor() {
         for (capacity, error) in [
@@ -2081,6 +2210,157 @@ mod tests {
         });
         one_under(WorkDimension::InvariantChecks, 2, 28_708, |meter| {
             index.find(1, &[0x00; 32], meter).map(|_| ())
+        });
+    }
+    #[test]
+    fn c16_identity_index_insert_first_then_second() {
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0, 0x00), 10, &mut meter).unwrap();
+        assert_eq!(meter.witness(), witness([0, 0, 0, 0, 1]));
+        assert_eq!(index.root, 0);
+        assert_eq!(
+            index.leaf_slots[0],
+            Some(IdentityLeaf {
+                key: tagged(0, 0x00),
+                record: 10
+            })
+        );
+        assert_eq!((index.free_leaf_len(), index.free_branch_len()), (15, 15));
+        let mut meter = work();
+        index.insert(tagged(0, 0x80), 11, &mut meter).unwrap();
+        assert_eq!(meter.witness(), witness([3, 0, 0, 0, 3]));
+        assert_eq!(index.root, BRANCH_TAG);
+        assert_eq!(
+            index.branch_slots[0],
+            Some(IdentityBranch {
+                bit: 8,
+                zero: 0,
+                one: 1
+            })
+        );
+        assert_eq!(
+            index.leaf_slots[1],
+            Some(IdentityLeaf {
+                key: tagged(0, 0x80),
+                record: 11
+            })
+        );
+        assert_eq!((index.free_leaf_len(), index.free_branch_len()), (14, 14));
+        for (tag, byte, record) in [(0u8, 0x00u8, 10u32), (0, 0x80, 11)] {
+            assert_eq!(index.find(tag, &[byte; 32], &mut work()), Ok(Some(record)));
+        }
+    }
+    #[test]
+    fn c16_identity_index_insert_many_matches_fixture() {
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0, 0x00), 10, &mut meter).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0, 0x80), 11, &mut meter).unwrap();
+        let mut meter = work();
+        index.insert(tagged(1, 0x00), 12, &mut meter).unwrap();
+        assert_eq!(meter.witness(), witness([4, 0, 0, 0, 5]));
+        // Insert-built tree is structurally identical to the hand-built fixture.
+        assert_eq!(index, three_leaf_tree());
+    }
+    #[test]
+    fn c16_identity_index_insert_duplicate_rejects_and_rolls_back() {
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0, 0x00), 10, &mut meter).unwrap();
+        let before = index.clone();
+        let mut meter = work();
+        let result = index.insert(tagged(0, 0x00), 99, &mut meter);
+        assert_eq!(result, Err(FixedStorageError::Duplicate));
+        assert_eq!(meter.witness(), witness([1, 0, 0, 0, 1]));
+        assert_eq!(index, before);
+        let mut index = three_leaf_tree();
+        let before = index.clone();
+        let mut meter = work();
+        let result = index.insert(tagged(0, 0x00), 99, &mut meter);
+        assert_eq!(result, Err(FixedStorageError::Duplicate));
+        assert_eq!(meter.witness(), witness([3, 0, 0, 0, 3]));
+        assert_eq!(index, before);
+    }
+    #[test]
+    fn c16_identity_index_insert_first_difference_edges() {
+        // First differing bit 0: tag 0x00 versus tag 0x80.
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0x00, 0), 1, &mut meter).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0x80, 0), 2, &mut meter).unwrap();
+        assert_eq!(meter.witness(), witness([2, 0, 0, 0, 3]));
+        assert_eq!(index.root, BRANCH_TAG);
+        assert_eq!(
+            index.branch_slots[0],
+            Some(IdentityBranch {
+                bit: 0,
+                zero: 0,
+                one: 1
+            })
+        );
+        assert_eq!(index.find(0x00, &[0; 32], &mut work()), Ok(Some(1)));
+        assert_eq!(index.find(0x80, &[0; 32], &mut work()), Ok(Some(2)));
+        // First differing bit 263: identity byte 31 LSB.
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut meter = work();
+        index.insert(tagged(0, 0x00), 1, &mut meter).unwrap();
+        let mut identity = [0u8; 32];
+        identity[31] = 1;
+        let mut meter = work();
+        index
+            .insert(TaggedKey::new(0, identity), 2, &mut meter)
+            .unwrap();
+        assert_eq!(meter.witness(), witness([34, 0, 0, 0, 3]));
+        assert_eq!(index.root, BRANCH_TAG);
+        assert_eq!(
+            index.branch_slots[0],
+            Some(IdentityBranch {
+                bit: 263,
+                zero: 0,
+                one: 1
+            })
+        );
+        assert_eq!(index.find(0, &[0; 32], &mut work()), Ok(Some(1)));
+        assert_eq!(index.find(0, &identity, &mut work()), Ok(Some(2)));
+    }
+    #[test]
+    fn c16_identity_index_insert_capacity_and_work() {
+        // I = 4 leaves, J = 3 branches: exactly four inserts fit.
+        let mut index = TaggedIdentityIndex::try_new(4).unwrap();
+        for tag in [0u8, 1, 2, 3] {
+            index
+                .insert(tagged(tag, 0), u32::from(tag) + 1, &mut work())
+                .unwrap();
+        }
+        assert_eq!(index.free_leaf_len(), 0);
+        assert_eq!(index.free_branch_len(), 0);
+        for tag in [0u8, 1, 2, 3] {
+            assert_eq!(
+                index.find(tag, &[0; 32], &mut work()),
+                Ok(Some(u32::from(tag) + 1))
+            );
+        }
+        let before = index.clone();
+        let mut meter = work();
+        let result = index.insert(tagged(4, 0), 99, &mut meter);
+        assert_eq!(result, Err(FixedStorageError::Capacity));
+        assert_eq!(meter.witness(), witness([3, 0, 0, 0, 4]));
+        assert_eq!(index, before);
+        one_under(WorkDimension::InvariantChecks, 1, 28_708, |meter| {
+            TaggedIdentityIndex::try_new(16)
+                .unwrap()
+                .insert(tagged(0, 0), 1, meter)
+        });
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        index.insert(tagged(0, 0x00), 1, &mut work()).unwrap();
+        one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |meter| {
+            index.insert(tagged(0, 0x80), 2, meter)
+        });
+        one_under(WorkDimension::InvariantChecks, 3, 28_708, |meter| {
+            index.insert(tagged(0, 0x80), 2, meter)
         });
     }
 }
