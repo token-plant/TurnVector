@@ -870,6 +870,204 @@ fn seal_exact_capacity(
         .then_some(())
         .ok_or(FixedStorageError::Capacity)
 }
+/// One-byte canonical type tag followed by a 32-byte identity. Equal raw
+/// identity bytes in distinct namespaces are distinct tagged keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TaggedKey {
+    tag: u8,
+    identity: [u8; 32],
+}
+impl TaggedKey {
+    fn new(tag: u8, identity: [u8; 32]) -> Self {
+        Self { tag, identity }
+    }
+}
+/// An occupied Patricia leaf: one tagged identity and its owner record index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IdentityLeaf {
+    key: TaggedKey,
+    record: u32,
+}
+/// An occupied compressed Patricia branch: one strictly increasing
+/// discriminating bit and two child node references. A child is a leaf index
+/// or `BRANCH_TAG | branch index`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IdentityBranch {
+    bit: u16,
+    zero: u32,
+    one: u32,
+}
+/// Tagged-identity compressed Patricia trie over `33 * 8 = 264` key bits:
+/// one tag byte plus 32 identity bytes.
+const IDENTITY_BITS: u16 = 33 * 8;
+/// Node-reference tag bit distinguishing a branch reference from a leaf index.
+const BRANCH_TAG: u32 = 1 << 31;
+/// Empty-tree root sentinel.
+const NO_NODE: u32 = u32::MAX;
+/// Private fixed reusable tagged-identity Patricia index owned conceptually by
+/// the Support Charge Ledger's request-bundle store. Constructor-preallocated
+/// exact-capacity leaf/branch slot Vecs with LIFO free-index stacks, no
+/// hot-path growth, no public seam. `I` leaf slots and `J = I - 1` branch
+/// slots; every slot starts Vacant and each free stack initially holds its
+/// full index domain.
+#[derive(Debug, Eq, PartialEq)]
+struct TaggedIdentityIndex {
+    leaf_capacity: usize,
+    branch_capacity: usize,
+    leaf_slots: Vec<Option<IdentityLeaf>>,
+    branch_slots: Vec<Option<IdentityBranch>>,
+    free_leaves: Vec<u32>,
+    free_branches: Vec<u32>,
+    root: u32,
+}
+impl TaggedIdentityIndex {
+    /// Creates exact-capacity storage for `I` identity leaves and `I - 1`
+    /// Patricia branches. Checked storage arithmetic rejects any capacity whose
+    /// physical slots and free stacks exceed the binary Storage/CopiedBytes
+    /// maximum; every backing Vec must seal to its exact requested capacity.
+    fn try_new(leaf_capacity: usize) -> Result<Self, FixedStorageError> {
+        let branch_capacity = leaf_capacity
+            .checked_sub(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let leaf_capacity_u64 =
+            u64::try_from(leaf_capacity).map_err(|_| FixedStorageError::Allocation)?;
+        let branch_capacity_u64 =
+            u64::try_from(branch_capacity).map_err(|_| FixedStorageError::Allocation)?;
+        let leaf_slot_bytes = std::mem::size_of::<Option<IdentityLeaf>>() as u64;
+        let branch_slot_bytes = std::mem::size_of::<Option<IdentityBranch>>() as u64;
+        let index_bytes = std::mem::size_of::<u32>() as u64;
+        let leaf_storage = leaf_capacity_u64
+            .checked_mul(leaf_slot_bytes)
+            .and_then(|slots| {
+                leaf_capacity_u64
+                    .checked_mul(index_bytes)
+                    .and_then(|free| slots.checked_add(free))
+            })
+            .ok_or(FixedStorageError::Allocation)?;
+        let branch_storage = branch_capacity_u64
+            .checked_mul(branch_slot_bytes)
+            .and_then(|slots| {
+                branch_capacity_u64
+                    .checked_mul(index_bytes)
+                    .and_then(|free| slots.checked_add(free))
+            })
+            .ok_or(FixedStorageError::Allocation)?;
+        let storage = leaf_storage
+            .checked_add(branch_storage)
+            .ok_or(FixedStorageError::Allocation)?;
+        // Binary Storage/CopiedBytes maximum from the accepted HotPathWorkBudget.
+        let storage_max = 2_097_152_u64;
+        if storage > storage_max {
+            return Err(FixedStorageError::Capacity);
+        }
+        // Node references encode branch nodes with a tag bit, so every leaf and
+        // branch index must stay below the tagged reference domain.
+        if leaf_capacity >= BRANCH_TAG as usize || branch_capacity >= BRANCH_TAG as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        if leaf_capacity > isize::MAX as usize || branch_capacity > isize::MAX as usize {
+            return Err(FixedStorageError::Allocation);
+        }
+        let mut leaf_slots = Vec::new();
+        leaf_slots
+            .try_reserve_exact(leaf_capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        leaf_slots.resize(leaf_capacity, None);
+        let mut branch_slots = Vec::new();
+        branch_slots
+            .try_reserve_exact(branch_capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        branch_slots.resize(branch_capacity, None);
+        let mut free_leaves = Vec::new();
+        free_leaves
+            .try_reserve_exact(leaf_capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        for index in (0..leaf_capacity).rev() {
+            free_leaves.push(index as u32);
+        }
+        let mut free_branches = Vec::new();
+        free_branches
+            .try_reserve_exact(branch_capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        for index in (0..branch_capacity).rev() {
+            free_branches.push(index as u32);
+        }
+        if leaf_slots.capacity() != leaf_capacity
+            || branch_slots.capacity() != branch_capacity
+            || free_leaves.capacity() != leaf_capacity
+            || free_branches.capacity() != branch_capacity
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        Ok(Self {
+            leaf_capacity,
+            branch_capacity,
+            leaf_slots,
+            branch_slots,
+            free_leaves,
+            free_branches,
+            root: NO_NODE,
+        })
+    }
+    fn leaf_capacity(&self) -> usize {
+        self.leaf_capacity
+    }
+    fn branch_capacity(&self) -> usize {
+        self.branch_capacity
+    }
+    fn free_leaf_len(&self) -> usize {
+        self.free_leaves.len()
+    }
+    fn free_branch_len(&self) -> usize {
+        self.free_branches.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.root == NO_NODE
+    }
+    /// Borrowed bounded lookup: follows at most `B = 264` branches plus one
+    /// leaf, independent of `E`. No key copy and no allocation; each visited
+    /// branch and the visited leaf charge one VisitedEntities and one
+    /// InvariantChecks.
+    fn find(
+        &self,
+        tag: u8,
+        identity: &[u8; 32],
+        work: &mut WorkMeter,
+    ) -> Result<Option<u32>, FixedStorageError> {
+        let mut node = self.root;
+        while node != NO_NODE && is_branch(node) {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let branch = self.branch_slots[branch_index(node)]
+                .as_ref()
+                .expect("validated occupied branch slot");
+            node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
+        }
+        if node == NO_NODE {
+            return Ok(None);
+        }
+        work.record(WorkDimension::VisitedEntities, 1)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let leaf = self.leaf_slots[node as usize]
+            .as_ref()
+            .expect("validated occupied leaf slot");
+        Ok((leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record))
+    }
+}
+fn is_branch(node: u32) -> bool {
+    node & BRANCH_TAG != 0
+}
+fn branch_index(node: u32) -> usize {
+    (node & !BRANCH_TAG) as usize
+}
+fn identity_bit(tag: u8, identity: &[u8; 32], bit: u16) -> usize {
+    let byte = if bit < 8 {
+        tag
+    } else {
+        identity[(bit / 8 - 1) as usize]
+    };
+    ((byte >> (7 - bit % 8)) & 1) as usize
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1718,6 +1916,171 @@ mod tests {
         });
         one_under(WorkDimension::InvariantChecks, 16, 28_708, |m| {
             arena.validate_chain(head, len, 7, &cells, m)
+        });
+    }
+
+    /// Test-only tagged key over one tag byte and one repeated identity byte.
+    fn tagged(tag: u8, byte: u8) -> TaggedKey {
+        TaggedKey::new(tag, [byte; 32])
+    }
+    /// Test-only valid compressed tree over three leaves:
+    /// `root = branch(7, branch(8, leaf(0,[0;32]), leaf(0,[0x80;32])), leaf(1,[0;32]))`.
+    /// Branch slot 0 discriminates bit 7 (tag parity), branch slot 1 bit 8.
+    fn three_leaf_tree() -> TaggedIdentityIndex {
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        index.leaf_slots[0] = Some(IdentityLeaf {
+            key: tagged(0, 0x00),
+            record: 10,
+        });
+        index.leaf_slots[1] = Some(IdentityLeaf {
+            key: tagged(0, 0x80),
+            record: 11,
+        });
+        index.leaf_slots[2] = Some(IdentityLeaf {
+            key: tagged(1, 0x00),
+            record: 12,
+        });
+        index.free_leaves = (3..16).rev().map(|index| index as u32).collect();
+        index.branch_slots[0] = Some(IdentityBranch {
+            bit: 7,
+            zero: BRANCH_TAG | 1,
+            one: 2,
+        });
+        index.branch_slots[1] = Some(IdentityBranch {
+            bit: 8,
+            zero: 0,
+            one: 1,
+        });
+        index.free_branches = (2..15).rev().map(|index| index as u32).collect();
+        index.root = BRANCH_TAG;
+        index
+    }
+    #[test]
+    fn c16_identity_index_constructor() {
+        for (capacity, error) in [
+            (0, FixedStorageError::Capacity),
+            (usize::MAX, FixedStorageError::Allocation),
+            (BRANCH_TAG as usize, FixedStorageError::Capacity),
+        ] {
+            assert_eq!(TaggedIdentityIndex::try_new(capacity).unwrap_err(), error);
+        }
+        // First storage-invalid boundary: leaf+branch slots and free stacks
+        // exceed the binary Storage/CopiedBytes maximum.
+        let leaf_slot_bytes = std::mem::size_of::<Option<IdentityLeaf>>() as u64;
+        let branch_slot_bytes = std::mem::size_of::<Option<IdentityBranch>>() as u64;
+        let index_bytes = std::mem::size_of::<u32>() as u64;
+        let storage = |leaves: u64| {
+            leaves * (leaf_slot_bytes + index_bytes)
+                + (leaves - 1) * (branch_slot_bytes + index_bytes)
+        };
+        let mut maximum = 1usize;
+        while storage(maximum as u64 + 1) <= 2_097_152 {
+            maximum += 1;
+        }
+        assert_eq!(
+            TaggedIdentityIndex::try_new(maximum)
+                .unwrap()
+                .leaf_capacity(),
+            maximum
+        );
+        assert_eq!(
+            TaggedIdentityIndex::try_new(maximum + 1).unwrap_err(),
+            FixedStorageError::Capacity
+        );
+        let index = TaggedIdentityIndex::try_new(16).unwrap();
+        assert_eq!((index.leaf_capacity(), index.branch_capacity()), (16, 15));
+        assert_eq!((index.free_leaf_len(), index.free_branch_len()), (16, 15));
+        assert!(index.is_empty());
+        assert_eq!(index.root, NO_NODE);
+    }
+    #[test]
+    fn c16_identity_index_empty_lookup() {
+        let index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut meter = work();
+        assert_eq!(index.find(0, &[7; 32], &mut meter), Ok(None));
+        assert_eq!(meter.witness(), witness([0, 0, 0, 0, 0]));
+        let mut meter = work();
+        assert_eq!(index.find(5, &[0; 32], &mut meter), Ok(None));
+        assert_eq!(meter.witness(), witness([0, 0, 0, 0, 0]));
+        assert_eq!(index.free_leaf_len(), 16);
+        assert_eq!(index.free_branch_len(), 15);
+    }
+    #[test]
+    fn c16_identity_index_single_leaf_lookup() {
+        let mut index = TaggedIdentityIndex::try_new(16).unwrap();
+        index.leaf_slots[0] = Some(IdentityLeaf {
+            key: tagged(0, 0xAB),
+            record: 7,
+        });
+        index.root = 0;
+        index.free_leaves = (1..16).rev().map(|index| index as u32).collect();
+        let present = |tag: u8, identity: [u8; 32]| {
+            let mut meter = work();
+            let found = index.find(tag, &identity, &mut meter);
+            (found, meter.witness())
+        };
+        assert_eq!(
+            present(0, [0xAB; 32]),
+            (Ok(Some(7)), witness([1, 0, 0, 0, 1]))
+        );
+        // Same tag, different identity: same bounded path, absent.
+        assert_eq!(present(0, [0xAC; 32]), (Ok(None), witness([1, 0, 0, 0, 1])));
+        // Different tag, same identity bytes: a distinct key, absent.
+        assert_eq!(present(1, [0xAB; 32]), (Ok(None), witness([1, 0, 0, 0, 1])));
+        assert_eq!(index.free_leaf_len(), 15);
+        assert_eq!(index.free_branch_len(), 15);
+    }
+    #[test]
+    fn c16_identity_index_many_route_lookup() {
+        let index = three_leaf_tree();
+        let lookup = |tag: u8, identity: [u8; 32]| {
+            let mut meter = work();
+            let found = index.find(tag, &identity, &mut meter);
+            (found, meter.witness())
+        };
+        // Present keys follow the two-branch path or the one-branch path.
+        assert_eq!(
+            lookup(0, [0x00; 32]),
+            (Ok(Some(10)), witness([3, 0, 0, 0, 3]))
+        );
+        assert_eq!(
+            lookup(0, [0x80; 32]),
+            (Ok(Some(11)), witness([3, 0, 0, 0, 3]))
+        );
+        assert_eq!(
+            lookup(1, [0x00; 32]),
+            (Ok(Some(12)), witness([2, 0, 0, 0, 2]))
+        );
+        // Same raw identity bytes across distinct tags are distinct keys.
+        assert_eq!(
+            lookup(0, [0x00; 32]),
+            (Ok(Some(10)), witness([3, 0, 0, 0, 3]))
+        );
+        assert_eq!(
+            lookup(1, [0x00; 32]),
+            (Ok(Some(12)), witness([2, 0, 0, 0, 2]))
+        );
+        // Absent key routed to leaf2 (bit 7 = 1): tag 1, identity byte 0x01.
+        assert_eq!(lookup(1, [0x01; 32]), (Ok(None), witness([2, 0, 0, 0, 2])));
+        // Absent key routed to leaf0 (deeper path): tag 0, identity byte 0x40.
+        assert_eq!(lookup(0, [0x40; 32]), (Ok(None), witness([3, 0, 0, 0, 3])));
+        // Absent key with a third tag (tag 2) is a distinct namespace.
+        assert_eq!(lookup(2, [0x00; 32]), (Ok(None), witness([3, 0, 0, 0, 3])));
+    }
+    #[test]
+    fn c16_identity_index_lookup_work_one_under() {
+        let index = three_leaf_tree();
+        one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |meter| {
+            index.find(0, &[0x00; 32], meter).map(|_| ())
+        });
+        one_under(WorkDimension::InvariantChecks, 3, 28_708, |meter| {
+            index.find(0, &[0x00; 32], meter).map(|_| ())
+        });
+        one_under(WorkDimension::VisitedEntities, 2, 1_704_575, |meter| {
+            index.find(1, &[0x00; 32], meter).map(|_| ())
+        });
+        one_under(WorkDimension::InvariantChecks, 2, 28_708, |meter| {
+            index.find(1, &[0x00; 32], meter).map(|_| ())
         });
     }
 }
