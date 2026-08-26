@@ -701,6 +701,175 @@ impl<'a, const V: usize> SupportOutstandingCreditVector<'a, V> {
         self.cells.iter()
     }
 }
+/// Private fixed entitlement-cell arena owned conceptually by the Support Charge
+/// Ledger. Constructor-preallocated exact-capacity `slots` and LIFO `free` stores,
+/// no later growth, no hot-path allocation, no public seam.
+#[derive(Debug, Eq, PartialEq)]
+struct EntitlementCellArena {
+    capacity: usize,
+    slots: Vec<CellSlot>,
+    free: Vec<usize>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CellSlot {
+    Vacant,
+    Occupied {
+        owner_record: usize,
+        cell: OutstandingCreditCell,
+        next_owned: Option<usize>,
+    },
+}
+impl EntitlementCellArena {
+    fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
+        if capacity == 0 {
+            return Err(FixedStorageError::Capacity);
+        }
+        // Checked storage arithmetic before allocation.
+        let slot_bytes = std::mem::size_of::<CellSlot>() as u64;
+        let index_bytes = std::mem::size_of::<usize>() as u64;
+        let capacity_u64 = u64::try_from(capacity).map_err(|_| FixedStorageError::Allocation)?;
+        let slots_bytes = capacity_u64
+            .checked_mul(slot_bytes)
+            .ok_or(FixedStorageError::Allocation)?;
+        let free_bytes = capacity_u64
+            .checked_mul(index_bytes)
+            .ok_or(FixedStorageError::Allocation)?;
+        if slots_bytes > isize::MAX as u64 || free_bytes > isize::MAX as u64 {
+            return Err(FixedStorageError::Allocation);
+        }
+        // Binary Storage/CopiedBytes maximum from the accepted HotPathWorkBudget.
+        let storage_max = 2_097_152_u64;
+        if slots_bytes
+            .checked_add(free_bytes)
+            .is_none_or(|total| total > storage_max)
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        slots.resize(capacity, CellSlot::Vacant);
+        let mut free = Vec::new();
+        free.try_reserve_exact(capacity)
+            .map_err(|_| FixedStorageError::Allocation)?;
+        for index in (0..capacity).rev() {
+            free.push(index);
+        }
+        seal_exact_capacity(&slots, &free, capacity)?;
+        Ok(Self {
+            capacity,
+            slots,
+            free,
+        })
+    }
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+    fn free_len(&self) -> usize {
+        self.free.len()
+    }
+    fn validate_selection(
+        &self,
+        count: usize,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if count > self.free.len() {
+            return Err(FixedStorageError::Capacity);
+        }
+        for index in self.free.iter().rev().take(count) {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            if !matches!(self.slots[*index], CellSlot::Vacant) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        Ok(())
+    }
+    fn install(&mut self, owner: usize, cells: &[OutstandingCreditCell]) -> (usize, usize) {
+        let count = cells.len();
+        let mut head = None;
+        for cell in cells.iter().rev() {
+            let index = self.free.pop().expect("prevalidated free capacity");
+            let next = head;
+            self.slots[index] = CellSlot::Occupied {
+                owner_record: owner,
+                cell: *cell,
+                next_owned: next,
+            };
+            head = Some(index);
+        }
+        (head.expect("nonempty chain"), count)
+    }
+    fn validate_chain(
+        &self,
+        head: usize,
+        count: usize,
+        owner: usize,
+        cells: &[OutstandingCreditCell],
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if count != cells.len() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let mut slot = Some(head);
+        for (i, expected) in cells.iter().enumerate() {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            let index = slot.ok_or(FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                index < self.slots.len(),
+                FixedStorageError::NonCanonical
+            )?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let CellSlot::Occupied {
+                owner_record,
+                cell,
+                next_owned,
+            } = self.slots[index]
+            else {
+                return Err(FixedStorageError::NonCanonical);
+            };
+            check!(work, owner_record == owner, FixedStorageError::NonCanonical)?;
+            check!(work, cell == *expected, FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                next_owned.is_some() == (i + 1 != count),
+                FixedStorageError::NonCanonical
+            )?;
+            slot = next_owned;
+        }
+        Ok(())
+    }
+    fn release(&mut self, head: usize, count: usize) {
+        let mut slot = Some(head);
+        for _ in 0..count {
+            let index = slot.expect("validated chain length");
+            let next_owned = match self.slots[index] {
+                CellSlot::Occupied { next_owned, .. } => next_owned,
+                CellSlot::Vacant => unreachable!("validated chain slot"),
+            };
+            self.slots[index] = CellSlot::Vacant;
+            self.free.push(index);
+            slot = next_owned;
+        }
+    }
+}
+/// Fail-closed exact-capacity seal: both backing Vecs must hold exactly
+/// `capacity` slots, never more. `try_reserve_exact` only guarantees at least
+/// the requested capacity, so a successful arena must be exactly `C`; anything
+/// over-capacity is rejected deterministically, independent of allocator policy.
+fn seal_exact_capacity(
+    slots: &Vec<CellSlot>,
+    free: &Vec<usize>,
+    capacity: usize,
+) -> Result<(), FixedStorageError> {
+    (slots.capacity() == capacity && free.capacity() == capacity)
+        .then_some(())
+        .ok_or(FixedStorageError::Capacity)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,5 +1428,296 @@ mod tests {
             ),
             HotPathWorkWitness::new([2, 0, 0, 0, 6])
         );
+    }
+
+    /// Test-only oracle scanning every slot to prove the full arena partition.
+    fn arena_oracle(arena: &EntitlementCellArena) {
+        use std::collections::HashSet;
+        let capacity = arena.capacity();
+        assert!(capacity > 0);
+        assert_eq!(arena.slots.len(), capacity, "slots length exact");
+        assert_eq!(arena.slots.capacity(), capacity, "slots capacity sealed");
+        assert_eq!(arena.free.capacity(), capacity, "free capacity sealed");
+        assert!(arena.free.len() <= capacity);
+        let mut free_set = HashSet::new();
+        for &index in arena.free.iter() {
+            assert!(index < capacity, "free index in range");
+            assert!(free_set.insert(index), "free indices unique");
+            assert_eq!(arena.slots[index], CellSlot::Vacant);
+        }
+        let mut pointed = HashSet::new();
+        let mut occupied = 0usize;
+        for index in 0..capacity {
+            if let CellSlot::Occupied {
+                next_owned: Some(next),
+                ..
+            } = arena.slots[index]
+            {
+                assert!(next < capacity, "next index in range");
+                assert!(
+                    pointed.insert(next),
+                    "two slots share one next (not a simple chain)"
+                );
+            }
+            if matches!(arena.slots[index], CellSlot::Occupied { .. }) {
+                occupied += 1;
+            }
+        }
+        assert_eq!(
+            free_set.len() + occupied,
+            capacity,
+            "free disjoint_union occupied = all slots"
+        );
+        let mut visited = HashSet::new();
+        let mut chains = 0usize;
+        for index in 0..capacity {
+            let CellSlot::Occupied { .. } = arena.slots[index] else {
+                continue;
+            };
+            if pointed.contains(&index) {
+                continue;
+            }
+            chains += 1;
+            let mut slot = Some(index);
+            let mut owner = None;
+            let mut chain = HashSet::new();
+            while let Some(current) = slot {
+                assert!(current < capacity);
+                assert!(chain.insert(current), "acyclic chain");
+                assert!(visited.insert(current), "chain disjoint from another");
+                let CellSlot::Occupied {
+                    owner_record,
+                    next_owned,
+                    ..
+                } = arena.slots[current]
+                else {
+                    panic!("chain reaches a Vacant slot");
+                };
+                assert!(
+                    owner.is_none() || owner == Some(owner_record),
+                    "single owner per chain"
+                );
+                owner = Some(owner_record);
+                slot = next_owned;
+            }
+        }
+        if occupied > 0 {
+            assert!(chains >= 1, "at least one chain when occupied");
+        }
+        assert_eq!(
+            visited.len(),
+            occupied,
+            "every occupied slot reachable from a head"
+        );
+    }
+    fn witness(v: [u64; 5]) -> HotPathWorkWitness {
+        HotPathWorkWitness::new(v)
+    }
+    fn select_ok(arena: &EntitlementCellArena, count: usize) -> HotPathWorkWitness {
+        let mut meter = work();
+        arena.validate_selection(count, &mut meter).unwrap();
+        meter.witness()
+    }
+    fn select_err(arena: &EntitlementCellArena, count: usize) -> HotPathWorkWitness {
+        let mut meter = work();
+        let selection = arena.validate_selection(count, &mut meter);
+        assert_eq!(selection, Err(FixedStorageError::Capacity));
+        meter.witness()
+    }
+    fn chain_ok(
+        arena: &EntitlementCellArena,
+        head: usize,
+        len: usize,
+        owner: usize,
+        cells: &[OutstandingCreditCell],
+    ) -> HotPathWorkWitness {
+        let mut meter = work();
+        let chain = arena.validate_chain(head, len, owner, cells, &mut meter);
+        assert_eq!(chain, Ok(()));
+        meter.witness()
+    }
+    fn chain_err(
+        arena: &EntitlementCellArena,
+        head: usize,
+        len: usize,
+        owner: usize,
+        cells: &[OutstandingCreditCell],
+    ) -> HotPathWorkWitness {
+        let mut meter = work();
+        let chain = arena.validate_chain(head, len, owner, cells, &mut meter);
+        assert_eq!(chain, Err(FixedStorageError::NonCanonical));
+        meter.witness()
+    }
+    fn one_under(
+        dim: WorkDimension,
+        exact: u64,
+        max: u64,
+        run: impl FnOnce(&mut WorkMeter) -> std::result::Result<(), FixedStorageError>,
+    ) {
+        let mut meter = work();
+        meter.record(dim, max - exact + 1).unwrap();
+        let fault = run(&mut meter).unwrap_err();
+        let expected = WorkBudgetError::BudgetExceeded(dim, max, max + 1);
+        assert_eq!(fault, FixedStorageError::Work(expected));
+    }
+
+    #[test]
+    fn c16_cell_arena_constructor() {
+        for (capacity, error) in [
+            (0, FixedStorageError::Capacity),
+            (usize::MAX, FixedStorageError::Allocation),
+        ] {
+            assert_eq!(EntitlementCellArena::try_new(capacity).unwrap_err(), error);
+        }
+        // First storage-invalid boundary: slots+free bytes exceed the binary bound.
+        let slot_bytes = std::mem::size_of::<CellSlot>() as u64;
+        let index_bytes = std::mem::size_of::<usize>() as u64;
+        let max_capacity = (2_097_152_u64 / (slot_bytes + index_bytes)) as usize;
+        let boundary = EntitlementCellArena::try_new(max_capacity + 1).unwrap_err();
+        assert_eq!(boundary, FixedStorageError::Capacity);
+        // Deterministic fail-closed seal: an over-capacity stand-in proves
+        // rejection without relying on allocator behavior. `with_capacity(16)`
+        // guarantees at least 16 slots, so both backing Vecs are never exactly 8.
+        let mut slots = Vec::with_capacity(16);
+        slots.resize(8, CellSlot::Vacant);
+        let mut free = Vec::with_capacity(16);
+        free.extend((0..8).rev());
+        let sealed = seal_exact_capacity(&slots, &free, 8).unwrap_err();
+        assert_eq!(sealed, FixedStorageError::Capacity);
+        let arena = EntitlementCellArena::try_new(8).unwrap();
+        assert_eq!(arena.capacity(), 8);
+        assert_eq!(arena.free_len(), 8);
+        arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_selection_and_install() {
+        let mut arena = EntitlementCellArena::try_new(8).unwrap();
+        assert_eq!(select_ok(&arena, 0), witness([0, 0, 0, 0, 1]));
+        assert_eq!(select_ok(&arena, 1), witness([1, 0, 0, 0, 2]));
+        assert_eq!(select_err(&arena, 9), witness([0, 0, 0, 0, 1]));
+        let five = axis_cells(5, 1);
+        assert_eq!(select_ok(&arena, 5), witness([5, 0, 0, 0, 6]));
+        let (head, len) = arena.install(7, &five);
+        assert_eq!((head, len), (4, 5));
+        assert_eq!(arena.free_len(), 3);
+        assert_eq!(select_ok(&arena, 3), witness([3, 0, 0, 0, 4]));
+        assert_eq!(select_err(&arena, 4), witness([0, 0, 0, 0, 1]));
+        for (index, cell, next) in [(0, five[4], None), (4, five[0], Some(3))] {
+            let expected = CellSlot::Occupied {
+                owner_record: 7,
+                cell,
+                next_owned: next,
+            };
+            assert_eq!(arena.slots[index], expected);
+        }
+        let chain = chain_ok(&arena, head, len, 7, &five);
+        assert_eq!(chain, witness([5, 0, 0, 0, 26]));
+        let three = axis_cells(3, 2);
+        let (tail_head, tail_len) = arena.install(8, &three);
+        assert_eq!((tail_head, tail_len), (7, 3));
+        assert_eq!(arena.free_len(), 0);
+        assert_eq!(select_err(&arena, 1), witness([0, 0, 0, 0, 1]));
+        arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_disjoint_owners() {
+        let mut arena = EntitlementCellArena::try_new(8).unwrap();
+        let first = axis_cells(3, 1);
+        let second = axis_cells(2, 2);
+        let (h1, l1) = arena.install(11, &first);
+        let (h2, l2) = arena.install(22, &second);
+        assert_eq!((h1, l1), (2, 3));
+        assert_eq!((h2, l2), (4, 2));
+        chain_ok(&arena, h1, l1, 11, &first);
+        chain_ok(&arena, h2, l2, 22, &second);
+        arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_chain_rejection() {
+        let mut arena = EntitlementCellArena::try_new(8).unwrap();
+        let cells = axis_cells(3, 1);
+        let (head, len) = arena.install(7, &cells);
+        let wrong_owner = chain_err(&arena, head, len, 99, &cells);
+        assert_eq!(wrong_owner, witness([1, 0, 0, 0, 4]));
+        chain_err(&arena, head, 2, 7, &cells[..2]);
+        let reversed = [cells[0], cells[2], cells[1]];
+        chain_err(&arena, head, 3, 7, &reversed);
+        arena.release(head, len);
+        let stale = chain_err(&arena, head, len, 7, &cells);
+        assert_eq!(stale, witness([1, 0, 0, 0, 3]));
+        assert_eq!(arena.free_len(), 8);
+        arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_reuse_and_churn() {
+        let mut arena = EntitlementCellArena::try_new(8).unwrap();
+        let mut total_installed = 0usize;
+        for cycle in 0..5 {
+            let count = 3 + cycle % 2;
+            let cells = axis_cells(count, 1);
+            let (head, len) = arena.install(cycle + 1, &cells);
+            assert_eq!(len, count);
+            assert!(head < 8);
+            arena_oracle(&arena);
+            chain_ok(&arena, head, len, cycle + 1, &cells);
+            arena.release(head, len);
+            arena_oracle(&arena);
+            total_installed += count;
+        }
+        assert!(total_installed > 8, "churn exceeds physical capacity");
+        assert_eq!(arena.free_len(), 8);
+        arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_front_middle_tail_reuse() {
+        let mut arena = EntitlementCellArena::try_new(8).unwrap();
+        let a = axis_cells(3, 1);
+        let b = axis_cells(2, 2);
+        let c = axis_cells(2, 3);
+        assert_eq!(arena.install(1, &a), (2, 3));
+        assert_eq!(arena.install(2, &b), (4, 2));
+        assert_eq!(arena.install(3, &c), (6, 2));
+        arena_oracle(&arena);
+        arena.release(4, 2);
+        let d = axis_cells(2, 4);
+        assert_eq!(arena.install(4, &d), (4, 2), "middle slots reused");
+        arena_oracle(&arena);
+        arena.release(2, 3);
+        let e = axis_cells(3, 5);
+        assert_eq!(arena.install(5, &e), (2, 3), "front slots reused");
+        arena_oracle(&arena);
+        arena.release(6, 2);
+        let f = axis_cells(3, 6);
+        let tail = arena.install(6, &f);
+        assert_eq!(tail, (7, 3), "tail slots and never-used index reused");
+        assert_eq!(arena.free_len(), 0);
+        arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_work_exact_and_one_under() {
+        let mut arena = EntitlementCellArena::try_new(8).unwrap();
+        let cells = axis_cells(3, 1);
+        assert_eq!(select_ok(&arena, 3), witness([3, 0, 0, 0, 4]));
+        one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |m| {
+            arena.validate_selection(3, m)
+        });
+        one_under(WorkDimension::InvariantChecks, 4, 28_708, |m| {
+            arena.validate_selection(3, m)
+        });
+        let (head, len) = arena.install(7, &cells);
+        let chain = chain_ok(&arena, head, len, 7, &cells);
+        assert_eq!(chain, witness([3, 0, 0, 0, 16]));
+        one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |m| {
+            arena.validate_chain(head, len, 7, &cells, m)
+        });
+        one_under(WorkDimension::InvariantChecks, 16, 28_708, |m| {
+            arena.validate_chain(head, len, 7, &cells, m)
+        });
     }
 }
