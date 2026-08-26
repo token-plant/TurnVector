@@ -890,6 +890,103 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             free_branches: self.bundles.free_branch_len(),
         })
     }
+    /// Read-only metered preparation of one pristine C16 bundle withdrawal:
+    /// locates the exact live record by its first obligation, proves the
+    /// record and its complete owned cell chain, and preflights the complete
+    /// removal Work envelope before any mutation. Returns the non-forgeable
+    /// instance-bound `WithdrawChange`; dropping it changes no state. A
+    /// retained terminal tombstone is not pristine and rejects.
+    pub(crate) fn prepare_withdraw(
+        &self,
+        expected: SupportLedgerGeneration,
+        obligation: SupportOperationObligationId,
+        work: &mut WorkMeter,
+    ) -> Result<WithdrawChange, SupportLedgerError> {
+        self.next(expected, work)?;
+        let invalid = SupportLedgerError::InvalidTransition;
+        let record_index = self
+            .bundles
+            .find(TAG_OBLIGATION, &obligation.get(), work)?
+            .ok_or(invalid)?;
+        let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
+        check!(work, record.state == BundleRecordState::Live, invalid)?;
+        check!(work, record.obligations.contains(&obligation), invalid)?;
+        let head = record.vector_head.ok_or(invalid)?;
+        self.bundles
+            .validate_owner_chain(head, record.vector_len, record_index as usize, work)?;
+        work.ensure(HotPathWorkWitness::new([
+            K as u64 * (u64::from(IDENTITY_BITS) + 1),
+            0,
+            0,
+            0,
+            K as u64 * (u64::from(IDENTITY_BITS) + 1),
+        ]))?;
+        Ok(WithdrawChange {
+            nonce: self.instance_nonce,
+            expected,
+            record_index,
+            record,
+        })
+    }
+    /// Metered exclusive validation of one prepared pristine-withdrawal
+    /// change. Consumes the `WithdrawChange`, verifies the exact non-reused
+    /// instance nonce, and rechecks the target record before-image and its
+    /// complete owner cell chain under the ordinary exclusive ledger borrow.
+    /// Returns the exclusive `ValidatedWithdrawChange`; a rejection or a drop
+    /// changes no state.
+    pub(crate) fn validate_withdraw(
+        &mut self,
+        change: WithdrawChange,
+        work: &mut WorkMeter,
+    ) -> Result<ValidatedWithdrawChange<'_, R, F, H>, SupportLedgerError> {
+        let stale = SupportLedgerError::Generation;
+        check!(work, change.nonce == self.instance_nonce, stale)?;
+        check!(work, change.expected == self.generation, stale)?;
+        let found = self
+            .bundles
+            .find(TAG_OBLIGATION, &change.record.obligations[0].get(), work)?
+            .ok_or(stale)?;
+        check!(work, found == change.record_index, stale)?;
+        check!(
+            work,
+            self.bundles.get_record(change.record_index) == Some(&change.record),
+            stale
+        )?;
+        let head = change.record.vector_head.ok_or(stale)?;
+        self.bundles.validate_owner_chain(
+            head,
+            change.record.vector_len,
+            change.record_index as usize,
+            work,
+        )?;
+        Ok(ValidatedWithdrawChange {
+            ledger: self,
+            change,
+        })
+    }
+    /// Metered transition of one live C16 bundle to its retained terminal
+    /// tombstone: the record, all `K` identities, cells, and claims remain
+    /// occupied and keep blocking later legacy reuse until accepted C18
+    /// expiry. C16 exposes no expiry action.
+    pub(crate) fn close_bundle(
+        &mut self,
+        expected: SupportLedgerGeneration,
+        obligation: SupportOperationObligationId,
+        work: &mut WorkMeter,
+    ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        let next = self.next(expected, work)?;
+        let invalid = SupportLedgerError::InvalidTransition;
+        let record_index = self
+            .bundles
+            .find(TAG_OBLIGATION, &obligation.get(), work)?
+            .ok_or(invalid)?;
+        let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
+        check!(work, record.state == BundleRecordState::Live, invalid)?;
+        check!(work, record.obligations.contains(&obligation), invalid)?;
+        self.bundles.retain_bundle(record_index, work)?;
+        self.generation = next;
+        Ok(next)
+    }
 }
 impl<'ledger, 'input, const R: usize, const F: usize, const H: usize, const V: usize>
     ValidatedBundleChange<'ledger, 'input, R, F, H, V>
@@ -908,6 +1005,30 @@ impl<'ledger, 'input, const R: usize, const F: usize, const H: usize, const V: u
             .bundles
             .commit_bundle(&change.record, change.vector.cells);
         let next = change.expected.next().expect("prepared bundle generation");
+        ledger.generation = next;
+        next
+    }
+}
+impl<'ledger, const R: usize, const F: usize, const H: usize>
+    ValidatedWithdrawChange<'ledger, R, F, H>
+{
+    /// Consuming infallible pristine withdrawal of the validated C16 bundle:
+    /// performs no new fallible lookup, check, allocation, Work call, or
+    /// legal rejection branch, removes every tagged identity, releases the
+    /// validated cells, vacates the record, and advances the Support Ledger
+    /// Generation exactly once. Internal `expect` calls are fail-stop
+    /// defenses for impossible owner corruption after validate proved the
+    /// exact record and chain.
+    pub(crate) fn commit_withdraw(self) -> SupportLedgerGeneration {
+        let change = self.change;
+        let ledger = self.ledger;
+        ledger
+            .bundles
+            .withdraw_bundle_unmetered(change.record_index);
+        let next = change
+            .expected
+            .next()
+            .expect("prepared withdrawal generation");
         ledger.generation = next;
         next
     }
@@ -1108,6 +1229,26 @@ pub(crate) struct SupportCapacitySnapshot {
     pub(crate) free_cells: usize,
     pub(crate) free_leaves: usize,
     pub(crate) free_branches: usize,
+}
+/// Non-forgeable prepared pristine-withdrawal change: the exact instance
+/// nonce, expected generation, target record index, and fixed record
+/// before-image. Intentionally not Clone or Copy; dropping it changes no
+/// state.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct WithdrawChange {
+    nonce: u64,
+    expected: SupportLedgerGeneration,
+    record_index: u32,
+    record: BundleRecord,
+}
+/// Exclusive non-forgeable validated pristine-withdrawal capability: holds the
+/// sole `&mut` ledger borrow and the fixed withdrawal facts. Not Clone or
+/// Copy; `commit_withdraw` consumes it once and performs no new fallible
+/// lookup, check, allocation, or Work call; dropping it changes no state.
+#[derive(Debug)]
+pub(crate) struct ValidatedWithdrawChange<'ledger, const R: usize, const F: usize, const H: usize> {
+    ledger: &'ledger mut SupportChargeLedger<R, F, H>,
+    change: WithdrawChange,
 }
 /// Private fixed entitlement-cell arena owned conceptually by the Support Charge
 /// Ledger. Constructor-preallocated exact-capacity `slots` and LIFO `free` stores,
@@ -1717,6 +1858,32 @@ impl TaggedIdentityIndex {
         self.splice(grandparent, parent, sibling, node);
         Ok(Some(record))
     }
+    /// Infallible removal used only by the consuming pristine-withdrawal
+    /// commit: walks to the exact leaf for the tagged identity and splices
+    /// its sibling over its parent, returning every released leaf and branch
+    /// slot to its matching free stack, with no Work call, no fallible
+    /// branch, and no allocation. Internal `expect` is a fail-stop defense
+    /// for impossible owner corruption after validate proved the exact record
+    /// and its cell chain.
+    fn remove_unmetered(&mut self, tag: u8, identity: &[u8; 32]) {
+        let mut grandparent = NO_NODE;
+        let mut parent = NO_NODE;
+        let mut sibling = NO_NODE;
+        let mut node = self.root;
+        while node != NO_NODE && is_branch(node) {
+            let branch = self.branch_slots[branch_index(node)]
+                .as_ref()
+                .expect("validated occupied branch slot");
+            let children = [branch.zero, branch.one];
+            let bit = identity_bit(tag, identity, branch.bit);
+            sibling = children[1 - bit];
+            grandparent = parent;
+            parent = node;
+            node = children[bit];
+        }
+        debug_assert_ne!(node, NO_NODE, "validated present bundle identity");
+        self.splice(grandparent, parent, sibling, node);
+    }
     /// Infallible splice: removes `leaf` by splicing `sibling` over its parent
     /// branch, returning the leaf and, when present, the parent branch to the
     /// free stacks. The last tree leaf needs no branch.
@@ -2068,6 +2235,18 @@ impl RequestBundleStore {
             FixedStorageError::NonCanonical
         )
     }
+    /// Metered validation that the exact `len`-length owner cell chain of one
+    /// record is in range, occupied by that owner, and acyclic, the same
+    /// before-image the consuming withdrawal commit will release.
+    fn validate_owner_chain(
+        &self,
+        head: usize,
+        len: usize,
+        owner: usize,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        self.cells.validate_owner_chain(head, len, owner, work)
+    }
     /// Metered validation that the current top `count` free cell indices name
     /// Vacant slots, the exact destinations the consuming commit will pop.
     fn validate_cell_selection(
@@ -2095,6 +2274,26 @@ impl RequestBundleStore {
             vector_len: len,
             ..*record
         });
+    }
+    /// Infallible consuming pristine withdrawal under the validated selection:
+    /// removes each of the `K` identity leaves by splicing its sibling over
+    /// its parent, releases the validated `v` cells, vacates the record, and
+    /// returns every slot to its matching free stack. No Work calls, no
+    /// fallible branch, no allocation; internal `expect` is a fail-stop
+    /// defense for impossible owner corruption after validate proved the
+    /// exact record and chain.
+    fn withdraw_bundle_unmetered(&mut self, record: u32) {
+        let record_slot = self.records[record as usize]
+            .as_ref()
+            .expect("validated occupied record");
+        let head = record_slot.vector_head.expect("validated vector head");
+        let len = record_slot.vector_len;
+        for key in record_slot.tagged_keys() {
+            self.identities.remove_unmetered(key.tag, &key.identity);
+        }
+        self.cells.release(head, len);
+        self.records[record as usize] = None;
+        self.free_records.push(record);
     }
     /// Metered transition to the retained-tombstone state: the record, its
     /// identities, cells, and claims all remain occupied.
@@ -3155,6 +3354,175 @@ mod tests {
                 snapshot.free_branches
             ),
             (3, 6, 33, 33)
+        );
+    }
+    /// Test-only helper: reserve one complete C16 bundle with `n`-derived
+    /// identities and `v` cells, returning the first obligation handle.
+    fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
+        let cells = axis_cells(v, 1);
+        let input = bundle_input::<8>(n, &cells);
+        let change = ledger
+            .prepare_bundle(ledger.generation(), &input, &mut work())
+            .unwrap();
+        let validated = ledger.validate_bundle(change, &mut work()).unwrap();
+        validated.commit_bundle();
+        input.obligations[0]
+    }
+    #[test]
+    fn c16_bundle_pristine_withdraw_commits_once_and_releases() {
+        let mut ledger = new_ledger();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let before = ledger.generation();
+        let mut measured = work();
+        let change = ledger
+            .prepare_withdraw(before, obligation, &mut measured)
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([8, 0, 0, 0, 22])
+        );
+        let validated = ledger
+            .validate_withdraw(change, &mut measured)
+            .expect("same-instance same-state validation");
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([16, 0, 0, 0, 44])
+        );
+        let next = validated.commit_withdraw();
+        assert_eq!(next, before.next().unwrap());
+        assert_eq!(ledger.generation(), next);
+        // The store is pristine again: every identity is released and the
+        // exact later reuse of the same facts succeeds.
+        assert!(ledger.bundles.is_empty());
+        assert_eq!(
+            (
+                ledger.bundles.free_record_len(),
+                ledger.bundles.free_cell_len(),
+                ledger.bundles.free_leaf_len(),
+                ledger.bundles.free_branch_len()
+            ),
+            (4, 8, 44, 43)
+        );
+        bundle_store_oracle(&ledger.bundles);
+        // The released obligation is again usable by a legacy generic reserve.
+        let mut legacy = spec(1, 9, Mandatory, &[Initial([9; 32])]);
+        legacy.id = obligation;
+        ledger
+            .reserve(ledger.generation(), legacy, &mut work())
+            .unwrap();
+        // Exact later reuse of the same C16 facts succeeds after pristine
+        // withdrawal on a fresh ledger.
+        let mut ledger = new_ledger();
+        let first = reserve_bundle(&mut ledger, 1, 3);
+        let change = ledger
+            .prepare_withdraw(ledger.generation(), first, &mut work())
+            .unwrap();
+        ledger
+            .validate_withdraw(change, &mut work())
+            .unwrap()
+            .commit_withdraw();
+        let reused = reserve_bundle(&mut ledger, 1, 3);
+        assert_eq!(ledger.bundles.free_record_len(), 3);
+        assert_eq!(reused, first);
+    }
+    #[test]
+    fn c16_bundle_withdraw_drift_and_non_pristine_reject() {
+        let cells = axis_cells(3, 1);
+        // An intervening legal mutation makes the prepared withdrawal stale.
+        let mut ledger = new_ledger();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let change = ledger
+            .prepare_withdraw(ledger.generation(), obligation, &mut work())
+            .unwrap();
+        add(&mut ledger, 9, 9).unwrap();
+        assert_eq!(
+            ledger.validate_withdraw(change, &mut work()).unwrap_err(),
+            SupportLedgerError::Generation
+        );
+        // Dropping the validated capability changes no state.
+        let mut ledger = new_ledger();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let before = bundle_snapshot(&ledger);
+        let change = ledger
+            .prepare_withdraw(ledger.generation(), obligation, &mut work())
+            .unwrap();
+        ledger.validate_withdraw(change, &mut work()).unwrap();
+        assert_eq!(bundle_snapshot(&ledger), before);
+        // An unknown obligation rejects during prepare.
+        assert_eq!(
+            ledger
+                .prepare_withdraw(
+                    ledger.generation(),
+                    SupportOperationObligationId::new([200; 32]).unwrap(),
+                    &mut work()
+                )
+                .unwrap_err(),
+            SupportLedgerError::InvalidTransition
+        );
+        // A retained terminal tombstone is not pristine: withdrawal rejects.
+        let mut ledger = new_ledger();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        ledger
+            .close_bundle(ledger.generation(), obligation, &mut work())
+            .unwrap();
+        assert_eq!(
+            ledger
+                .prepare_withdraw(ledger.generation(), obligation, &mut work())
+                .unwrap_err(),
+            SupportLedgerError::InvalidTransition
+        );
+        // Double close rejects.
+        assert_eq!(
+            ledger
+                .close_bundle(ledger.generation(), obligation, &mut work())
+                .unwrap_err(),
+            SupportLedgerError::InvalidTransition
+        );
+        // The tombstone keeps every identity and cell occupied.
+        assert_eq!(ledger.bundles.free_record_len(), 3);
+        assert_eq!(ledger.bundles.free_cell_len(), 5);
+        assert_eq!(ledger.bundles.free_leaf_len(), 33);
+        assert_eq!(ledger.bundles.free_branch_len(), 33);
+        let input = bundle_input::<8>(1, &cells);
+        let second = ledger
+            .prepare_bundle(ledger.generation(), &input, &mut work())
+            .unwrap_err();
+        assert_eq!(
+            second,
+            SupportLedgerError::Storage(FixedStorageError::Duplicate)
+        );
+        // A legacy generic reserve on a tombstoned obligation still rejects.
+        let mut legacy = spec(1, 9, Mandatory, &[Initial([9; 32])]);
+        legacy.id = obligation;
+        assert_eq!(
+            ledger.reserve(ledger.generation(), legacy, &mut work()),
+            Err(SupportLedgerError::Storage(FixedStorageError::Duplicate))
+        );
+        // Post-removal reuse: close then pristine-withdraw is impossible, so
+        // reuse is tested on a fresh Live bundle below.
+        let mut ledger = new_ledger();
+        let first = reserve_bundle(&mut ledger, 1, 3);
+        let change = ledger
+            .prepare_withdraw(ledger.generation(), first, &mut work())
+            .unwrap();
+        ledger
+            .validate_withdraw(change, &mut work())
+            .unwrap()
+            .commit_withdraw();
+        let tombstone = reserve_bundle(&mut ledger, 2, 3);
+        ledger
+            .close_bundle(ledger.generation(), tombstone, &mut work())
+            .unwrap();
+        assert_eq!(ledger.bundles.free_record_len(), 3);
+        // The live bundle's identities were released; the tombstone's remain.
+        let owner = ledger
+            .bundles
+            .find(TAG_OBLIGATION, &tombstone.get(), &mut work())
+            .unwrap()
+            .expect("tombstone identity retained");
+        assert_eq!(
+            ledger.bundles.get_record(owner).unwrap().state,
+            BundleRecordState::RetainedTombstone
         );
     }
 
