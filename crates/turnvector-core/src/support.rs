@@ -1,8 +1,8 @@
 use crate::bounded::FixedWindowStart;
 use crate::{
-    FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
+    Duration, FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
     HotPathWorkWitness, MonotonicTime, PhysicalStartCreditId, SupportLedgerGeneration,
-    SupportOperationObligationId, WorkDimension, WorkMeter,
+    SupportOperationObligationId, WorkBudgetError, WorkDimension, WorkMeter,
 };
 const POOLS: usize = 3;
 const CONDITIONAL: usize = 0;
@@ -629,6 +629,78 @@ fn key(tag: u8, id: [u8; 32]) -> [u8; 33] {
     key[1..].copy_from_slice(&id);
     key
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OutstandingCreditCell {
+    pub(crate) operation: SupportOperation,
+    pub(crate) pool: SupportPool,
+    pub(crate) horizon: Duration,
+    pub(crate) max_outstanding: u64,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SupportOutstandingCreditVectorError {
+    Empty,
+    TooLarge,
+    ZeroOutstanding,
+    ZeroHorizon,
+    DuplicateAxis,
+    ReverseOrder,
+    Work(WorkBudgetError),
+}
+impl From<WorkBudgetError> for SupportOutstandingCreditVectorError {
+    fn from(error: WorkBudgetError) -> Self {
+        Self::Work(error)
+    }
+}
+use SupportOutstandingCreditVectorError::{
+    DuplicateAxis, Empty, ReverseOrder, TooLarge, ZeroHorizon, ZeroOutstanding,
+};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupportOutstandingCreditVector<'a, const V: usize> {
+    cells: &'a [OutstandingCreditCell],
+}
+impl<'a, const V: usize> SupportOutstandingCreditVector<'a, V> {
+    pub(crate) fn try_new(
+        cells: &'a [OutstandingCreditCell],
+        work: &mut WorkMeter,
+    ) -> Result<Self, SupportOutstandingCreditVectorError> {
+        let count = cells.len() as u64;
+        // Preflight the complete work requirement before validation.
+        work.ensure(HotPathWorkWitness::new([count, 0, 0, 0, 2 + 2 * count]))?;
+        check!(work, count > 0, Empty)?;
+        check!(work, count <= V as u64, TooLarge)?;
+        let mut previous = None;
+        for cell in cells {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            check!(
+                work,
+                cell.max_outstanding > 0 && cell.horizon.as_micros() > 0,
+                if cell.max_outstanding == 0 {
+                    ZeroOutstanding
+                } else {
+                    ZeroHorizon
+                }
+            )?;
+            let axis = (cell.operation, cell.pool, cell.horizon.as_micros());
+            check!(
+                work,
+                previous.is_none_or(|prev| prev < axis),
+                if previous.is_some_and(|prev| prev == axis) {
+                    DuplicateAxis
+                } else {
+                    ReverseOrder
+                }
+            )?;
+            previous = Some(axis);
+        }
+        Ok(Self { cells })
+    }
+    pub(crate) const fn len(&self) -> usize {
+        self.cells.len()
+    }
+    pub(crate) fn iter(&self) -> std::slice::Iter<'a, OutstandingCreditCell> {
+        self.cells.iter()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,5 +1082,182 @@ mod tests {
         rejected!(ledger, reserve(&mut ledger, at(2), &[next]), CAPACITY_ERROR);
         trigger(&mut ledger, at(2), &first, QualificationFailed, &mut work()).unwrap();
         reserve(&mut ledger, at(2), &[next]).unwrap();
+    }
+
+    use SupportOutstandingCreditVectorError::{
+        DuplicateAxis as DupAxis, Empty, ReverseOrder as Reversed, TooLarge, Work as WorkFault,
+        ZeroHorizon, ZeroOutstanding,
+    };
+    fn cell(horizon: u64, outstanding: u64) -> OutstandingCreditCell {
+        OutstandingCreditCell {
+            operation: SupportOperation::DescribeModel,
+            pool: SupportPool::Ordinary,
+            horizon: Duration::from_micros(horizon),
+            max_outstanding: outstanding,
+        }
+    }
+    fn axis_cells(count: usize, outstanding: u64) -> Vec<OutstandingCreditCell> {
+        (1..=count)
+            .map(|horizon| cell(horizon as u64, outstanding))
+            .collect()
+    }
+    fn oc(
+        operation: SupportOperation,
+        pool: SupportPool,
+        horizon: u64,
+        outstanding: u64,
+    ) -> OutstandingCreditCell {
+        OutstandingCreditCell {
+            operation,
+            pool,
+            horizon: Duration::from_micros(horizon),
+            max_outstanding: outstanding,
+        }
+    }
+    fn make_view<'a, const V: usize>(
+        cells: &'a [OutstandingCreditCell],
+        work: &mut WorkMeter,
+    ) -> std::result::Result<
+        SupportOutstandingCreditVector<'a, V>,
+        SupportOutstandingCreditVectorError,
+    > {
+        SupportOutstandingCreditVector::<'a, V>::try_new(cells, work)
+    }
+    fn reject<const V: usize>(
+        cells: &[OutstandingCreditCell],
+        expected: SupportOutstandingCreditVectorError,
+    ) -> HotPathWorkWitness {
+        let mut meter = work();
+        let result = make_view::<V>(cells, &mut meter);
+        assert_eq!(result, Err(expected));
+        assert_eq!(meter.witness().value(WorkDimension::CopiedBytes), 0);
+        assert_eq!(meter.witness().value(WorkDimension::Allocations), 0);
+        assert_eq!(meter.witness().value(WorkDimension::CandidateWork), 0);
+        meter.witness()
+    }
+    #[test]
+    fn c16_outstanding_credit_vector_contract() {
+        let cells = axis_cells(1, 1);
+        let mut meter = work();
+        let view = make_view::<168>(&cells, &mut meter).unwrap();
+        assert_eq!(meter.witness(), HotPathWorkWitness::new([1, 0, 0, 0, 4]));
+        assert_eq!(view.len(), 1);
+        let collected: Vec<_> = view.iter().copied().collect();
+        assert_eq!(collected, cells);
+
+        let cells = axis_cells(1, 1);
+        let mut meter = work();
+        meter
+            .record(WorkDimension::VisitedEntities, 1_704_575)
+            .unwrap();
+        let fault = make_view::<168>(&cells, &mut meter);
+        let error =
+            WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_704_575, 1_704_576);
+        assert_eq!(fault, Err(WorkFault(error)));
+        assert_eq!(
+            meter.witness(),
+            HotPathWorkWitness::new([1_704_575, 0, 0, 0, 0])
+        );
+        let mut meter = work();
+        meter
+            .record(WorkDimension::InvariantChecks, 28_705)
+            .unwrap();
+        let fault = make_view::<168>(&cells, &mut meter);
+        let error = WorkBudgetError::BudgetExceeded(WorkDimension::InvariantChecks, 28_708, 28_709);
+        assert_eq!(fault, Err(WorkFault(error)));
+        assert_eq!(
+            meter.witness(),
+            HotPathWorkWitness::new([0, 0, 0, 0, 28_705])
+        );
+
+        let cells = axis_cells(6, 1);
+        let mut meter = work();
+        let view = make_view::<168>(&cells, &mut meter).unwrap();
+        assert_eq!(meter.witness(), HotPathWorkWitness::new([6, 0, 0, 0, 14]));
+        assert_eq!(view.len(), 6);
+
+        let cells = axis_cells(168, 1);
+        let mut meter = work();
+        let view = make_view::<168>(&cells, &mut meter).unwrap();
+        assert_eq!(
+            meter.witness(),
+            HotPathWorkWitness::new([168, 0, 0, 0, 338])
+        );
+        assert_eq!(view.len(), 168);
+
+        let tail = [cell(1, 1), cell(1, 1)];
+        let witness = reject::<168>(&tail, DupAxis);
+        assert_eq!(witness, HotPathWorkWitness::new([2, 0, 0, 0, 6]));
+
+        assert_eq!(
+            reject::<168>(&[cell(1, 1), cell(1, 2)], DupAxis),
+            HotPathWorkWitness::new([2, 0, 0, 0, 6])
+        );
+        assert_eq!(
+            reject::<168>(&[cell(2, 1), cell(1, 1)], Reversed),
+            HotPathWorkWitness::new([2, 0, 0, 0, 6])
+        );
+        assert_eq!(
+            reject::<168>(&[cell(1, 0)], ZeroOutstanding),
+            HotPathWorkWitness::new([1, 0, 0, 0, 3])
+        );
+        assert_eq!(
+            reject::<168>(&[cell(0, 1)], ZeroHorizon),
+            HotPathWorkWitness::new([1, 0, 0, 0, 3])
+        );
+        assert_eq!(
+            reject::<168>(&[], Empty),
+            HotPathWorkWitness::new([0, 0, 0, 0, 1])
+        );
+        assert_eq!(
+            reject::<168>(&axis_cells(169, 1), TooLarge),
+            HotPathWorkWitness::new([0, 0, 0, 0, 2])
+        );
+    }
+    #[test]
+    fn c16_outstanding_credit_vector_axis_ordering() {
+        // Same horizon, increasing SupportOperation succeeds.
+        let cells = [
+            oc(SupportOperation::DescribeModel, Ordinary, 1, 1),
+            oc(SupportOperation::DescribeRequest, Ordinary, 1, 1),
+        ];
+        let mut meter = work();
+        let view = make_view::<168>(&cells, &mut meter).unwrap();
+        assert_eq!(meter.witness(), HotPathWorkWitness::new([2, 0, 0, 0, 6]));
+        assert_eq!(view.len(), 2);
+
+        // Same operation/horizon, increasing SupportPool succeeds.
+        let cells = [
+            oc(SupportOperation::DescribeModel, Ordinary, 1, 1),
+            oc(SupportOperation::DescribeModel, Mandatory, 1, 1),
+        ];
+        let mut meter = work();
+        let view = make_view::<168>(&cells, &mut meter).unwrap();
+        assert_eq!(meter.witness(), HotPathWorkWitness::new([2, 0, 0, 0, 6]));
+        assert_eq!(view.len(), 2);
+
+        // Decreasing SupportOperation rejects ReverseOrder.
+        assert_eq!(
+            reject::<168>(
+                &[
+                    oc(SupportOperation::DescribeRequest, Ordinary, 1, 1),
+                    oc(SupportOperation::DescribeModel, Ordinary, 1, 1),
+                ],
+                Reversed,
+            ),
+            HotPathWorkWitness::new([2, 0, 0, 0, 6])
+        );
+
+        // Decreasing SupportPool rejects ReverseOrder.
+        assert_eq!(
+            reject::<168>(
+                &[
+                    oc(SupportOperation::DescribeModel, Mandatory, 1, 1),
+                    oc(SupportOperation::DescribeModel, Ordinary, 1, 1),
+                ],
+                Reversed,
+            ),
+            HotPathWorkWitness::new([2, 0, 0, 0, 6])
+        );
     }
 }
