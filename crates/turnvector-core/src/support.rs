@@ -204,7 +204,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let count = spec.claims.len();
         let pool = spec.pool as usize;
         let invalid = SupportLedgerError::InvalidInput;
-        for identity in [spec.id.0, spec.physical_credit.0, spec.predecessor.0] {
+        // id and physical_credit are constructor-validated to reject zero; this
+        // comparison/accounting shape is intentionally retained so fixed HotPath
+        // Work witnesses remain stable.
+        for identity in [
+            spec.id.get(),
+            spec.physical_credit.get(),
+            spec.predecessor.0,
+        ] {
             check!(work, identity != [0; 32], invalid)?;
         }
         let valid_count = (1..=self.max_claims as usize).contains(&count);
@@ -226,7 +233,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             check!(work, self.available(class, pool, added), CAPACITY_ERROR)?;
         }
         work.record(WorkDimension::CopiedBytes, 66)?;
-        let keys = [key(0, spec.id.0), key(1, spec.physical_credit.0)];
+        let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
         let record = (
             spec.operation,
             spec.pool,
@@ -279,7 +286,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     ) -> Result<SupportChange, SupportLedgerError> {
         self.next(expected, work)?;
         work.record(WorkDimension::InvariantChecks, 3)?;
-        let valid = [spec.id.0, spec.physical_credit.0, spec.scope.0]
+        // id and physical_credit are constructor-validated to reject zero; this
+        // comparison/accounting shape is intentionally retained so fixed HotPath
+        // Work witnesses remain stable.
+        let valid = [spec.id.get(), spec.physical_credit.get(), spec.scope.0]
             .into_iter()
             .all(|id| id != [0; 32])
             && matches!(spec.claim, SupportFundingClaim::OrdinaryReservation(id) if id != [0; 32]);
@@ -288,7 +298,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         for class in [ACTIVE, CREDITS, CLAIMS] {
             check!(work, self.available(class, pool, 1), CAPACITY_ERROR)?;
         }
-        for identity in [key(0, spec.id.0), key(1, spec.physical_credit.0)] {
+        for identity in [key(0, spec.id.get()), key(1, spec.physical_credit.get())] {
             let absent = self.records.find(identity, work)?.is_none();
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
@@ -352,7 +362,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     spec.scope,
                     None,
                 );
-                let keys = [key(0, spec.id.0), key(1, spec.physical_credit.0)];
+                let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
                 self.records.try_push(keys, record, &[spec.claim], work)?;
                 self.starts.apply_start(start);
                 for class in [ACTIVE, CREDITS, CLAIMS] {
@@ -393,9 +403,12 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             work.record(WorkDimension::VisitedEntities, 1)?;
             let candidate = lifecycle_shape(spec.kind);
             maxima[spec.kind as usize] += 1;
+            // id and physical_credit are constructor-validated to reject zero; this
+            // comparison/accounting shape is intentionally retained so fixed HotPath
+            // Work witnesses remain stable.
             let identities = [
-                spec.id.0,
-                spec.physical_credit.0,
+                spec.id.get(),
+                spec.physical_credit.get(),
                 spec.predecessor.0,
                 spec.scope.0,
             ];
@@ -414,7 +427,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 && maxima[spec.kind as usize] <= self.lifecycle_maxima.0[spec.kind as usize];
             work.record(WorkDimension::InvariantChecks, 10)?;
             valid.then_some(()).ok_or(invalid)?;
-            for identity in [key(0, spec.id.0), key(1, spec.physical_credit.0)] {
+            for identity in [key(0, spec.id.get()), key(1, spec.physical_credit.get())] {
                 let absent = self.records.find(identity, work)?.is_none();
                 check!(work, absent, FixedStorageError::Duplicate)?;
             }
@@ -436,7 +449,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 spec.scope,
                 Some((spec.kind, first.id, count)),
             );
-            let keys = [key(0, spec.id.0), key(1, spec.physical_credit.0)];
+            let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
             self.records
                 .try_push(keys, record, &[spec.claim], work)
                 .expect("lifecycle insertion was fully prevalidated");
@@ -468,7 +481,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let record_bytes = std::mem::size_of::<Record>() as u64;
         let mut first_index = None;
         for (offset, id) in ids.iter().enumerate() {
-            let index = self.records.find(key(0, id.0), work)?.ok_or(invalid)?;
+            let index = self.records.find(key(0, id.get()), work)?.ok_or(invalid)?;
             work.record(WorkDimension::CopiedBytes, record_bytes)?;
             let record = *self.records.get(index).expect("indexed support record");
             let reserve = record.6.ok_or(invalid)?;
@@ -553,7 +566,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         work: &mut WorkMeter,
     ) -> Result<(usize, Record), SupportLedgerError> {
         work.record(WorkDimension::CopiedBytes, 33)?;
-        let found = self.records.find(key(0, id.0), work)?;
+        let found = self.records.find(key(0, id.get()), work)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
         let index = found.ok_or(SupportLedgerError::InvalidTransition)?;
         let record_bytes = std::mem::size_of::<Record>() as u64;
@@ -651,10 +664,10 @@ mod tests {
     }
     fn spec(n: u8, credit: u8, pool: SupportPool, claims: &[Claim]) -> SupportObligationSpec<'_> {
         SupportObligationSpec {
-            id: SupportOperationObligationId([n; 32]),
+            id: SupportOperationObligationId::new([n; 32]).unwrap(),
             operation: SupportOperation::MaterializeRequest,
             pool,
-            physical_credit: PhysicalStartCreditId([credit; 32]),
+            physical_credit: PhysicalStartCreditId::new([credit; 32]).unwrap(),
             predecessor: SupportCausalPredecessorId([n; 32]),
             claims,
         }
@@ -666,7 +679,7 @@ mod tests {
         put(ledger, n, credit, Mandatory, &[Initial([n; 32])])
     }
     fn go(ledger: &mut Ledger, n: u8, transition: SupportTransition) -> Result {
-        let id = SupportOperationObligationId([n; 32]);
+        let id = SupportOperationObligationId::new([n; 32]).unwrap();
         ledger.transition(ledger.generation(), id, transition, &mut work())
     }
     #[test]
@@ -735,7 +748,7 @@ mod tests {
         fail(go(&mut ledger, 3, end(3, 1)), CAPACITY_ERROR);
         fail(put(&mut ledger, 7, 7, Safety, &[]), InvalidInput);
         let stale = SupportLedgerGeneration::new(1).unwrap();
-        let id = SupportOperationObligationId([2; 32]);
+        let id = SupportOperationObligationId::new([2; 32]).unwrap();
         let result = ledger.transition(stale, id, end(2, 1), &mut work());
         fail(result, Stale);
     }
@@ -743,9 +756,9 @@ mod tests {
     fn ordinary(parts: (u8, u8, u8, Claim)) -> OrdinarySupportSpec {
         let (id, credit, scope, claim) = parts;
         OrdinarySupportSpec {
-            id: SupportOperationObligationId([id; 32]),
+            id: SupportOperationObligationId::new([id; 32]).unwrap(),
             operation: SupportOperation::DescribeRequest,
-            physical_credit: PhysicalStartCreditId([credit; 32]),
+            physical_credit: PhysicalStartCreditId::new([credit; 32]).unwrap(),
             scope: SupportCallScopeId([scope; 32]),
             claim,
         }
@@ -779,8 +792,6 @@ mod tests {
         let second = ordinary((2, 22, 42, Reserved([2; 32])));
         let mut ledger = ordinary_ledger();
         for invalid in [
-            ordinary((0, 21, 41, Reserved([1; 32]))),
-            ordinary((1, 0, 41, Reserved([1; 32]))),
             ordinary((1, 21, 0, Reserved([1; 32]))),
             ordinary((1, 21, 41, Reserved([0; 32]))),
             ordinary((1, 21, 41, Initial([1; 32]))),
@@ -886,9 +897,9 @@ mod tests {
         }
         fn life(n: u8, kind: LifecycleReserveKind) -> Life {
             Life {
-                id: SupportOperationObligationId([n; 32]),
+                id: SupportOperationObligationId::new([n; 32]).unwrap(),
                 kind,
-                physical_credit: PhysicalStartCreditId([n + 20; 32]),
+                physical_credit: PhysicalStartCreditId::new([n + 20; 32]).unwrap(),
                 predecessor: SupportCausalPredecessorId([90; 32]),
                 scope: SupportCallScopeId([n + 40; 32]),
                 claim: Lifecycle([n; 32]),

@@ -8,14 +8,39 @@
 //! ```
 
 use crate::{
-    BoundedSet, BoundedVec, CandidateId, GenerationVector, ModelId, MonotonicTime, RequestId,
-    RuntimeOverheadGeneration,
+    BoundedSet, BoundedVec, CandidateId, DomainValueError, GenerationVector, ModelId,
+    MonotonicTime, RequestId, RuntimeOverheadGeneration,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CapabilityKey(pub [u8; 32]);
+pub struct CapabilityKey([u8; 32]);
+
+impl CapabilityKey {
+    pub fn new(bytes: [u8; 32]) -> Result<Self, DomainValueError> {
+        (bytes != [0; 32])
+            .then_some(Self(bytes))
+            .ok_or(DomainValueError::Zero)
+    }
+
+    pub const fn get(self) -> [u8; 32] {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RuntimeOverheadBoundSetId(pub [u8; 32]);
+pub struct RuntimeOverheadBoundSetId([u8; 32]);
+
+impl RuntimeOverheadBoundSetId {
+    pub fn new(bytes: [u8; 32]) -> Result<Self, DomainValueError> {
+        (bytes != [0; 32])
+            .then_some(Self(bytes))
+            .ok_or(DomainValueError::Zero)
+    }
+
+    pub const fn get(self) -> [u8; 32] {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BatchBucket(pub u16);
@@ -229,5 +254,25 @@ impl<const E: usize, const C: usize, const M: usize> SchedulingSnapshot<E, C, M>
             candidates,
             exclusions,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduling_digest_identities_reject_zero_and_round_trip_nonzero() {
+        let zero = [0; 32];
+        let nonzero = [1; 32];
+        assert_eq!(CapabilityKey::new(zero), Err(DomainValueError::Zero));
+        assert_eq!(
+            RuntimeOverheadBoundSetId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        let key = CapabilityKey::new(nonzero).unwrap();
+        assert_eq!(key.get(), nonzero);
+        let bound = RuntimeOverheadBoundSetId::new(nonzero).unwrap();
+        assert_eq!(bound.get(), nonzero);
     }
 }

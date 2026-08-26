@@ -1,12 +1,25 @@
 use crate::{
-    BoundedVec, CandidateCoordinates, CandidateId, CapabilityKey, Duration, GenerationVector,
-    RequestId, RuntimeOverheadBoundSetId, SchedulingSnapshot, TokenCount, TurnPlanId,
+    BoundedVec, CandidateCoordinates, CandidateId, CapabilityKey, DomainValueError, Duration,
+    GenerationVector, RequestId, RuntimeOverheadBoundSetId, SchedulingSnapshot, TokenCount,
+    TurnPlanId,
 };
 
 macro_rules! digest_identity {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub struct $name(pub [u8; 32]);
+        pub struct $name([u8; 32]);
+
+        impl $name {
+            pub fn new(bytes: [u8; 32]) -> Result<Self, DomainValueError> {
+                (bytes != [0; 32])
+                    .then_some(Self(bytes))
+                    .ok_or(DomainValueError::Zero)
+            }
+
+            pub const fn get(self) -> [u8; 32] {
+                self.0
+            }
+        }
     };
 }
 macro_rules! copy_record {
@@ -62,8 +75,12 @@ pub enum PlanValidationError {
     InvalidWorkBudget,
     FundingMismatch,
     ReusedSupportIdentity,
-    ReceiptMemberMismatch,
-    ReceiptProgressMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptValidationError {
+    MemberMismatch,
+    ProgressMismatch,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,21 +217,21 @@ impl<const MEMBERS: usize> TurnReceipt<MEMBERS> {
         resumable: bool,
         yield_reason: YieldReason,
         members: BoundedVec<TurnReceiptMember, MEMBERS>,
-    ) -> Result<Self, PlanValidationError> {
+    ) -> Result<Self, ReceiptValidationError> {
         if members.len() != plan.members.len()
             || members
                 .iter()
                 .zip(plan.members.iter())
                 .any(|(a, b)| a.request_id != b.request_id)
         {
-            return Err(PlanValidationError::ReceiptMemberMismatch);
+            return Err(ReceiptValidationError::MemberMismatch);
         }
         if members
             .iter()
             .filter_map(|m| m.progress)
             .any(|progress| progress.end < progress.start)
         {
-            return Err(PlanValidationError::ReceiptProgressMismatch);
+            return Err(ReceiptValidationError::ProgressMismatch);
         }
         Ok(Self {
             identity: TurnReceiptIdentity {
@@ -232,5 +249,65 @@ impl<const MEMBERS: usize> TurnReceipt<MEMBERS> {
     }
     pub const fn members(&self) -> &BoundedVec<TurnReceiptMember, MEMBERS> {
         &self.members
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digest_identities_reject_zero_and_round_trip_nonzero() {
+        let zero = [0; 32];
+        let nonzero = [1; 32];
+        assert_eq!(
+            FutureTurnSupportEntitlementId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        assert_eq!(
+            SupportOutstandingCreditVectorId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        assert_eq!(
+            SupportOperationObligationId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        assert_eq!(
+            PhysicalStartCreditId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        assert_eq!(
+            StalePlanDispositionBoundId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        assert_eq!(
+            PersistentStateIsolationEvidenceId::new(zero),
+            Err(DomainValueError::Zero)
+        );
+        assert_eq!(
+            FutureTurnSupportEntitlementId::new(nonzero).unwrap().get(),
+            nonzero
+        );
+        assert_eq!(
+            SupportOutstandingCreditVectorId::new(nonzero)
+                .unwrap()
+                .get(),
+            nonzero
+        );
+        assert_eq!(
+            SupportOperationObligationId::new(nonzero).unwrap().get(),
+            nonzero
+        );
+        assert_eq!(PhysicalStartCreditId::new(nonzero).unwrap().get(), nonzero);
+        assert_eq!(
+            StalePlanDispositionBoundId::new(nonzero).unwrap().get(),
+            nonzero
+        );
+        assert_eq!(
+            PersistentStateIsolationEvidenceId::new(nonzero)
+                .unwrap()
+                .get(),
+            nonzero
+        );
     }
 }

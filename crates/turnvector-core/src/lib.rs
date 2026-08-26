@@ -66,9 +66,10 @@ pub use scheduling::{
 pub use turns::{
     FutureTurnSupportEntitlementId, MemberOutcome, PersistentStateIsolationEvidenceId,
     PhysicalStartCreditId, PlanMemberFunding, PlanSupportObligation, PlanSupportObligations,
-    PlanValidationError, StalePlanDispositionBoundId, SupportOperationObligationId,
-    SupportOutstandingCreditVectorId, TurnBudget, TurnPlan, TurnPlanIdentity, TurnProgress,
-    TurnReceipt, TurnReceiptIdentity, TurnReceiptMember, YieldReason,
+    PlanValidationError, ReceiptValidationError, StalePlanDispositionBoundId,
+    SupportOperationObligationId, SupportOutstandingCreditVectorId, TurnBudget, TurnPlan,
+    TurnPlanIdentity, TurnProgress, TurnReceipt, TurnReceiptIdentity, TurnReceiptMember,
+    YieldReason,
 };
 pub use work::{HotPathWorkBudget, HotPathWorkWitness, WorkBudgetError, WorkDimension, WorkMeter};
 
@@ -272,6 +273,13 @@ impl Duration {
             .checked_add(other.0)
             .map(Self)
             .ok_or(DomainValueError::Overflow)
+    }
+
+    pub fn checked_sub(self, other: Self) -> Result<Self, DomainValueError> {
+        self.0
+            .checked_sub(other.0)
+            .map(Self)
+            .ok_or(DomainValueError::Underflow)
     }
 }
 
