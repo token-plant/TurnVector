@@ -3586,6 +3586,164 @@ mod tests {
             BundleRecordState::RetainedTombstone
         );
     }
+    #[test]
+    fn c16_reciprocal_uniqueness_across_legacy_paths() {
+        let cells = axis_cells(3, 1);
+        let at = MonotonicTime::from_micros;
+        let duplicate = SupportLedgerError::Storage(Duplicate);
+        let legacy_blocks = |ledger: &mut Ledger, obligation: [u8; 32], credit: [u8; 32]| {
+            let mut input = bundle_input::<8>(2, &cells);
+            input.obligations[0] = SupportOperationObligationId::new(obligation).unwrap();
+            assert_eq!(
+                ledger
+                    .prepare_bundle(ledger.generation(), &input, &mut work())
+                    .unwrap_err(),
+                duplicate
+            );
+            let mut input = bundle_input::<8>(3, &cells);
+            input.credits[0] = PhysicalStartCreditId::new(credit).unwrap();
+            assert_eq!(
+                ledger
+                    .prepare_bundle(ledger.generation(), &input, &mut work())
+                    .unwrap_err(),
+                duplicate
+            );
+        };
+        // Generic reserve keys block a later C16 bundle in both namespaces.
+        let mut ledger = new_ledger();
+        add(&mut ledger, 1, 1).unwrap();
+        legacy_blocks(&mut ledger, [1; 32], [1; 32]);
+        // Prepared ordinary keys block a later C16 bundle.
+        let mut ledger = ordinary_ledger();
+        begin(&mut ledger, ordinary((1, 1, 3, Reserved([4; 32]))), at(1)).unwrap();
+        legacy_blocks(&mut ledger, [1; 32], [1; 32]);
+        // Lifecycle reserve keys block a later C16 bundle.
+        let mut ledger = new_ledger();
+        for capacity in &mut ledger.capacities {
+            capacity[1] = 4;
+        }
+        let lifecycle = LifecycleReserveSpec {
+            id: SupportOperationObligationId::new([1; 32]).unwrap(),
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            physical_credit: PhysicalStartCreditId::new([2; 32]).unwrap(),
+            predecessor: SupportCausalPredecessorId([90; 32]),
+            scope: SupportCallScopeId([91; 32]),
+            claim: SupportFundingClaim::LifecycleReserve([92; 32]),
+            expires_at: None,
+        };
+        ledger
+            .reserve_lifecycle(ledger.generation(), at(1), &[lifecycle], &mut work())
+            .unwrap();
+        legacy_blocks(&mut ledger, [1; 32], [2; 32]);
+        // A live C16 bundle blocks every earlier-row legacy path in both
+        // shared namespaces.
+        let mut ledger = new_ledger();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let credit = PhysicalStartCreditId::new([
+            1, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ])
+        .unwrap();
+        let mut generic = spec(9, 9, Ordinary, &[Reserved([9; 32])]);
+        generic.id = obligation;
+        assert_eq!(
+            ledger
+                .reserve(ledger.generation(), generic, &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let mut generic = spec(9, 9, Ordinary, &[Reserved([9; 32])]);
+        generic.physical_credit = credit;
+        assert_eq!(
+            ledger
+                .reserve(ledger.generation(), generic, &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let mut ordinary_spec = ordinary((9, 21, 41, Reserved([9; 32])));
+        ordinary_spec.id = obligation;
+        assert_eq!(
+            ledger
+                .begin_ordinary(ledger.generation(), ordinary_spec, at(2), &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let mut ordinary_spec = ordinary((9, 21, 41, Reserved([9; 32])));
+        ordinary_spec.physical_credit = credit;
+        assert_eq!(
+            ledger
+                .begin_ordinary(ledger.generation(), ordinary_spec, at(2), &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let lifecycle = LifecycleReserveSpec {
+            id: obligation,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            physical_credit: PhysicalStartCreditId::new([21; 32]).unwrap(),
+            predecessor: SupportCausalPredecessorId([90; 32]),
+            scope: SupportCallScopeId([91; 32]),
+            claim: SupportFundingClaim::LifecycleReserve([92; 32]),
+            expires_at: None,
+        };
+        assert_eq!(
+            ledger
+                .reserve_lifecycle(ledger.generation(), at(2), &[lifecycle], &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let lifecycle = LifecycleReserveSpec {
+            id: SupportOperationObligationId::new([8; 32]).unwrap(),
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            physical_credit: credit,
+            predecessor: SupportCausalPredecessorId([90; 32]),
+            scope: SupportCallScopeId([91; 32]),
+            claim: SupportFundingClaim::LifecycleReserve([92; 32]),
+            expires_at: None,
+        };
+        assert_eq!(
+            ledger
+                .reserve_lifecycle(ledger.generation(), at(2), &[lifecycle], &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        // A retained terminal tombstone keeps blocking every earlier-row path.
+        let mut ledger = new_ledger();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        ledger
+            .close_bundle(ledger.generation(), obligation, &mut work())
+            .unwrap();
+        let mut generic = spec(9, 9, Ordinary, &[Reserved([9; 32])]);
+        generic.id = obligation;
+        assert_eq!(
+            ledger
+                .reserve(ledger.generation(), generic, &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let mut ordinary_spec = ordinary((9, 21, 41, Reserved([9; 32])));
+        ordinary_spec.id = obligation;
+        assert_eq!(
+            ledger
+                .begin_ordinary(ledger.generation(), ordinary_spec, at(2), &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+        let lifecycle = LifecycleReserveSpec {
+            id: obligation,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            physical_credit: PhysicalStartCreditId::new([21; 32]).unwrap(),
+            predecessor: SupportCausalPredecessorId([90; 32]),
+            scope: SupportCallScopeId([91; 32]),
+            claim: SupportFundingClaim::LifecycleReserve([92; 32]),
+            expires_at: None,
+        };
+        assert_eq!(
+            ledger
+                .reserve_lifecycle(ledger.generation(), at(2), &[lifecycle], &mut work())
+                .unwrap_err(),
+            duplicate
+        );
+    }
 
     /// Test-only oracle scanning every slot to prove the full arena partition.
     fn arena_oracle(arena: &EntitlementCellArena) {
