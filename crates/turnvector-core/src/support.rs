@@ -1485,6 +1485,133 @@ impl RequestBundleStore {
     fn get_record(&self, index: u32) -> Option<&BundleRecord> {
         self.records.get(index as usize).and_then(Option::as_ref)
     }
+    /// Metered prevalidated bundle reserve: proves all `K` tagged identities
+    /// absent, checks record/cell/leaf/branch capacity, and preflights the
+    /// complete insertion Work envelope before any mutation. The infallible
+    /// installation then pops one record slot, `K` leaf slots, and exactly
+    /// `K - 1` branches when the tree was empty or `K` branches otherwise,
+    /// performs standard first-differing-bit insertion, and installs the
+    /// validated cells as one owned chain.
+    fn reserve_bundle(
+        &mut self,
+        record: &BundleRecord,
+        cells: &[OutstandingCreditCell],
+        work: &mut WorkMeter,
+    ) -> Result<u32, FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if self.free_records.is_empty() {
+            return Err(FixedStorageError::Capacity);
+        }
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if cells.len() > self.cells.free_len() {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.cells.validate_selection(cells.len(), work)?;
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if self.identities.free_leaf_len() < K {
+            return Err(FixedStorageError::Capacity);
+        }
+        let branch_need = if self.identities.is_empty() { K - 1 } else { K };
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        if self.identities.free_branch_len() < branch_need {
+            return Err(FixedStorageError::Capacity);
+        }
+        for key in record.tagged_keys() {
+            if self
+                .identities
+                .find(key.tag, &key.identity, work)?
+                .is_some()
+            {
+                return Err(FixedStorageError::Duplicate);
+            }
+        }
+        // Conservative insertion envelope: per identity one peer traversal, one
+        // insertion traversal, and a 33-byte first-difference pass.
+        let bits = u64::from(IDENTITY_BITS);
+        work.ensure(HotPathWorkWitness::new([
+            K as u64 * (2 * bits + 35),
+            0,
+            0,
+            0,
+            K as u64 * (2 * bits + 4),
+        ]))?;
+        let record_index = self
+            .free_records
+            .pop()
+            .expect("prevalidated record capacity");
+        for key in record.tagged_keys() {
+            self.identities
+                .insert(key, record_index, work)
+                .expect("insertion Work fully preflighted");
+        }
+        let (head, len) = self.cells.install(record_index as usize, cells);
+        self.records[record_index as usize] = Some(BundleRecord {
+            vector_head: Some(head),
+            vector_len: len,
+            ..*record
+        });
+        Ok(record_index)
+    }
+    /// Metered prevalidated pristine withdrawal: proves the exact record,
+    /// traverses and checks its owned cell chain, preflights the complete
+    /// removal Work envelope, then removes each of the `K` identity leaves by
+    /// splicing its sibling over its parent, releases the `v` cells, vacates
+    /// the record, and returns every slot to its matching free stack.
+    fn withdraw_bundle(
+        &mut self,
+        record: u32,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        let record_slot = self
+            .records
+            .get(record as usize)
+            .and_then(Option::as_ref)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        let head = record_slot
+            .vector_head
+            .ok_or(FixedStorageError::NonCanonical)?;
+        let len = record_slot.vector_len;
+        self.cells
+            .validate_owner_chain(head, len, record as usize, work)?;
+        let bits = u64::from(IDENTITY_BITS);
+        work.ensure(HotPathWorkWitness::new([
+            K as u64 * (bits + 1),
+            0,
+            0,
+            0,
+            K as u64 * (bits + 1),
+        ]))?;
+        for key in record_slot.tagged_keys() {
+            let removed = self
+                .identities
+                .remove(key.tag, &key.identity, work)
+                .expect("removal Work fully preflighted");
+            debug_assert_eq!(removed, Some(record));
+        }
+        self.cells.release(head, len);
+        self.records[record as usize] = None;
+        self.free_records.push(record);
+        Ok(())
+    }
+    /// Metered transition to the retained-tombstone state: the record, its
+    /// identities, cells, and claims all remain occupied.
+    fn retain_bundle(
+        &mut self,
+        record: u32,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        work.record(WorkDimension::InvariantChecks, 1)?;
+        let slot = self
+            .records
+            .get_mut(record as usize)
+            .and_then(Option::as_mut)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        if slot.state != BundleRecordState::Live {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        slot.state = BundleRecordState::RetainedTombstone;
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -3092,5 +3219,169 @@ mod tests {
             (44, 43)
         );
         bundle_store_oracle(&store);
+    }
+    #[test]
+    fn c16_bundle_store_reserve_and_withdraw() {
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let cells = axis_cells(3, 1);
+        let record = bundle_record(1);
+        let mut meter = work();
+        let index = store.reserve_bundle(&record, &cells, &mut meter).unwrap();
+        assert_eq!(index, 0);
+        assert_eq!((store.record_len(), store.free_record_len()), (1, 3));
+        assert_eq!(store.cells.free_len(), 5);
+        assert_eq!(store.identities.free_leaf_len(), 44 - K);
+        assert_eq!(store.identities.free_branch_len(), 43 - (K - 1));
+        for key in record.tagged_keys() {
+            assert_eq!(store.find(key.tag, &key.identity, &mut work()), Ok(Some(0)));
+        }
+        bundle_store_oracle(&store);
+        let mut meter = work();
+        store.withdraw_bundle(0, &mut meter).unwrap();
+        assert!(store.is_empty());
+        assert_eq!(store.free_record_len(), 4);
+        assert_eq!(store.cells.free_len(), 8);
+        assert_eq!(store.identities.free_leaf_len(), 44);
+        assert_eq!(store.identities.free_branch_len(), 43);
+        for key in record.tagged_keys() {
+            assert_eq!(store.find(key.tag, &key.identity, &mut work()), Ok(None));
+        }
+        bundle_store_oracle(&store);
+    }
+    #[test]
+    fn c16_bundle_store_tombstone_retains_identities_and_cells() {
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let cells = axis_cells(2, 1);
+        let record = bundle_record(1);
+        store.reserve_bundle(&record, &cells, &mut work()).unwrap();
+        let mut meter = work();
+        store.retain_bundle(0, &mut meter).unwrap();
+        assert_eq!(
+            store.get_record(0).unwrap().state,
+            BundleRecordState::RetainedTombstone
+        );
+        // Retained tombstone keeps every identity and cell occupied.
+        for key in record.tagged_keys() {
+            assert_eq!(store.find(key.tag, &key.identity, &mut work()), Ok(Some(0)));
+        }
+        assert_eq!(store.cells.free_len(), 6);
+        assert_eq!(store.free_record_len(), 3);
+        bundle_store_oracle(&store);
+        // A second retain on the tombstone is rejected; the tombstone blocks no
+        // slot reuse until pristine withdrawal.
+        let mut meter = work();
+        assert_eq!(
+            store.retain_bundle(0, &mut meter),
+            Err(FixedStorageError::NonCanonical)
+        );
+        store.withdraw_bundle(0, &mut work()).unwrap();
+        assert!(store.is_empty());
+        assert_eq!(store.cells.free_len(), 8);
+        bundle_store_oracle(&store);
+    }
+    #[test]
+    fn c16_bundle_store_reuse_and_churn_beyond_capacity() {
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let mut reserved = 0usize;
+        for cycle in 0..7 {
+            let record = bundle_record((cycle * 4 + 1) as u8);
+            let cells = axis_cells(1 + cycle % 2, 1);
+            store.reserve_bundle(&record, &cells, &mut work()).unwrap();
+            reserved += 1;
+            bundle_store_oracle(&store);
+            for key in record.tagged_keys() {
+                let owner = store
+                    .find(key.tag, &key.identity, &mut work())
+                    .unwrap()
+                    .expect("reserved identity present");
+                assert!(
+                    store
+                        .get_record(owner)
+                        .unwrap()
+                        .tagged_keys()
+                        .contains(&key),
+                    "owner record contains the reserved identity"
+                );
+            }
+            if cycle % 2 == 1 {
+                for index in 0..2 {
+                    store.withdraw_bundle(index as u32, &mut work()).unwrap();
+                }
+                bundle_store_oracle(&store);
+            }
+        }
+        assert!(reserved > 4, "record churn exceeds record capacity");
+        assert!(store.record_len() > 0);
+        bundle_store_oracle(&store);
+        // Deterministic LIFO record reuse: after withdrawing record 0, the next
+        // reserve reuses record slot 0.
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let first = bundle_record(1);
+        let cells = axis_cells(3, 1);
+        assert_eq!(
+            store.reserve_bundle(&first, &cells, &mut work()).unwrap(),
+            0
+        );
+        store.withdraw_bundle(0, &mut work()).unwrap();
+        let second = bundle_record(50);
+        assert_eq!(
+            store.reserve_bundle(&second, &cells, &mut work()).unwrap(),
+            0
+        );
+        bundle_store_oracle(&store);
+    }
+    #[test]
+    fn c16_bundle_store_rollback_on_rejection() {
+        // Duplicate identity rejects before mutation.
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let cells = axis_cells(2, 1);
+        let first = bundle_record(1);
+        store.reserve_bundle(&first, &cells, &mut work()).unwrap();
+        let before = store.clone();
+        let mut meter = work();
+        let duplicate = store.reserve_bundle(&first, &cells, &mut meter);
+        assert_eq!(duplicate, Err(FixedStorageError::Duplicate));
+        assert_eq!(store, before);
+        // Record exhaustion rejects before mutation.
+        let mut store = RequestBundleStore::try_new(2, 8).unwrap();
+        for n in [1u8, 2] {
+            store
+                .reserve_bundle(&bundle_record(n), &axis_cells(2, 1), &mut work())
+                .unwrap();
+        }
+        let before = store.clone();
+        let mut meter = work();
+        let full = store.reserve_bundle(&bundle_record(3), &axis_cells(2, 1), &mut meter);
+        assert_eq!(full, Err(FixedStorageError::Capacity));
+        assert_eq!(store, before);
+        // Cell exhaustion rejects before mutation.
+        let mut store = RequestBundleStore::try_new(4, 3).unwrap();
+        store
+            .reserve_bundle(&bundle_record(1), &axis_cells(3, 1), &mut work())
+            .unwrap();
+        let before = store.clone();
+        let mut meter = work();
+        let full = store.reserve_bundle(&bundle_record(2), &axis_cells(1, 1), &mut meter);
+        assert_eq!(full, Err(FixedStorageError::Capacity));
+        assert_eq!(store, before);
+        // Work exhaustion during preflight rejects with exact rollback.
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let before = store.clone();
+        let mut meter = work();
+        meter
+            .record(WorkDimension::VisitedEntities, 1_704_575)
+            .unwrap();
+        let fault = store.reserve_bundle(&bundle_record(1), &axis_cells(2, 1), &mut meter);
+        let error =
+            WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_704_575, 1_704_576);
+        assert_eq!(fault, Err(FixedStorageError::Work(error)));
+        assert_eq!(store, before);
+        // Withdrawal of a vacant record rejects.
+        let mut store = RequestBundleStore::try_new(4, 8).unwrap();
+        let mut meter = work();
+        assert_eq!(
+            store.withdraw_bundle(0, &mut meter),
+            Err(FixedStorageError::NonCanonical)
+        );
     }
 }
