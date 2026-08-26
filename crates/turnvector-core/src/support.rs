@@ -39,7 +39,9 @@ impl SupportFundingClaim {
     fn valid_for(self, pool: SupportPool) -> bool {
         let (identity, pools) = match self {
             Self::OrdinaryReservation(id) => (id, 0b001),
-            Self::AdmissionInitial(id) | Self::EntitlementVector(id) => (id, 0b010),
+            // C16-only typed facts: constructible only by the complete
+            // request-bundle path, never by a generic reserve.
+            Self::AdmissionInitial(_) | Self::EntitlementVector(_) => return false,
             Self::LifecycleReserve(id) => (id, 0),
         };
         identity != [0; 32] && pools & (1 << pool as usize) != 0
@@ -300,7 +302,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         check!(work, valid_count, invalid)?;
         let remaining = HotPathWorkWitness::new([count as u64, 66, 0, 0, (2 * count + 3) as u64]);
         work.ensure(remaining)?;
-        check!(work, spec.pool != SupportPool::Ordinary, invalid)?;
+        // The claim-to-pool pairing is the sole authority: generic reserve
+        // funds OrdinaryReservation on the Ordinary pool, and the C16-only
+        // AdmissionInitial/EntitlementVector claims reject above.
         let mut previous = None;
         for claim in spec.claims {
             work.record(WorkDimension::VisitedEntities, 1)?;
@@ -2362,7 +2366,15 @@ mod tests {
         ledger.reserve(ledger.generation(), spec(n, c, pool, claims), &mut work())
     }
     fn add(ledger: &mut Ledger, n: u8, credit: u8) -> Result {
-        put(ledger, n, credit, Mandatory, &[Initial([n; 32])])
+        put(ledger, n, credit, Ordinary, &[Reserved([n; 32])])
+    }
+    /// Generic-reserve fixture with the Ordinary pool carrying the same
+    /// capacities the generic tests previously used on the Mandatory pool:
+    /// the claim-to-pool pairing is now the sole generic authority.
+    fn generic_ledger() -> Ledger {
+        let mut ledger = new_ledger();
+        ledger.capacities = [[2, 1, 1], [1, 0, 1], [2, 1, 1], [4, 1, 1], [4, 1, 1]];
+        ledger
     }
     fn go(ledger: &mut Ledger, n: u8, transition: SupportTransition) -> Result {
         let id = SupportOperationObligationId::new([n; 32]).unwrap();
@@ -2373,7 +2385,7 @@ mod tests {
         let fail = |result: Result, error| assert_eq!(result, Err(error));
         let at = MonotonicTime::from_micros;
         let end = |n: u8, value| PredecessorEnded(SupportCausalPredecessorId([n; 32]), at(value));
-        let mut ledger = new_ledger();
+        let mut ledger = generic_ledger();
         add(&mut ledger, 1, 1).unwrap();
         fail(go(&mut ledger, 1, Begin(at(1))), InvalidTransition);
         fail(go(&mut ledger, 1, end(2, 1)), InvalidTransition);
@@ -2387,21 +2399,36 @@ mod tests {
         add(&mut ledger, 3, 3).unwrap();
         go(&mut ledger, 3, end(3, 15)).unwrap();
         fail(go(&mut ledger, 3, Begin(at(25))), CAPACITY_ERROR);
-        let mut ledger = new_ledger();
+        let mut ledger = generic_ledger();
         let before = ledger.generation();
-        for claims in [[Initial([1; 32]); 2], [Initial([2; 32]), Initial([1; 32])]] {
+        // Duplicate and reversed OrdinaryReservation claims reject with exact
+        // per-claim Work; the C16-only AdmissionInitial claim rejects at its
+        // first validity check.
+        for claims in [
+            [Reserved([1; 32]); 2],
+            [Reserved([2; 32]), Reserved([1; 32])],
+        ] {
             let mut measured = work();
-            let result = ledger.reserve(before, spec(7, 7, Mandatory, &claims), &mut measured);
+            let result = ledger.reserve(before, spec(7, 7, Ordinary, &claims), &mut measured);
             fail(result, InvalidInput);
             assert_eq!(measured.witness().value(WorkDimension::VisitedEntities), 2);
-            assert_eq!(measured.witness().value(WorkDimension::InvariantChecks), 9);
+            assert_eq!(measured.witness().value(WorkDimension::InvariantChecks), 8);
         }
+        let mut measured = work();
+        let result = ledger.reserve(
+            before,
+            spec(7, 7, Mandatory, &[Initial([7; 32])]),
+            &mut measured,
+        );
+        fail(result, InvalidInput);
+        assert_eq!(measured.witness().value(WorkDimension::VisitedEntities), 1);
+        assert_eq!(measured.witness().value(WorkDimension::InvariantChecks), 7);
         assert_eq!((ledger.generation(), ledger.records.len()), (before, 0));
         let mut measured = work();
-        let valid = spec(7, 7, Mandatory, &[Initial([7; 32])]);
+        let valid = spec(7, 7, Ordinary, &[Reserved([7; 32])]);
         ledger.reserve(before, valid, &mut measured).unwrap();
         assert_eq!(measured.witness().value(WorkDimension::VisitedEntities), 3);
-        let mut ledger = new_ledger();
+        let mut ledger = generic_ledger();
         let before = ledger.generation();
         let mut exhausted = work();
         exhausted
@@ -2409,15 +2436,17 @@ mod tests {
             .unwrap();
         let result = ledger.reserve(
             before,
-            spec(7, 7, Mandatory, &[Initial([7; 32])]),
+            spec(7, 7, Ordinary, &[Reserved([7; 32])]),
             &mut exhausted,
         );
         let error =
             WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_704_575, 1_704_576);
         fail(result, error.into());
         assert_eq!((ledger.generation(), ledger.records.len()), (before, 0));
+        // Generic reserve rejects the C16-only AdmissionInitial claim even on
+        // the Ordinary pool.
         fail(
-            put(&mut ledger, 1, 1, Ordinary, &[Reserved([1; 32])]),
+            put(&mut ledger, 1, 1, Ordinary, &[Initial([1; 32])]),
             InvalidInput,
         );
         add(&mut ledger, 1, 1).unwrap();
@@ -2578,7 +2607,9 @@ mod tests {
         use LifecycleTriggerResult::*;
         fn lifecycle_ledger() -> Ledger {
             let mut ledger = new_ledger();
-            ledger.capacities = [[0, 3, 2], [0, 2, 1], [0, 2, 1], [0, 4, 2], [0, 4, 2]];
+            // The Ordinary pool carries the generic capacities so the generic
+            // domain coexists with the Mandatory lifecycle reservations.
+            ledger.capacities = [[2, 3, 2], [1, 2, 1], [2, 2, 1], [4, 4, 2], [4, 4, 2]];
             ledger
         }
         fn life(n: u8, kind: LifecycleReserveKind) -> Life {
@@ -2625,9 +2656,12 @@ mod tests {
         ));
         assert_eq!(snapshot(&ledger), before);
         reserve(&mut ledger, at(1), &specs).unwrap();
+        // The Ordinary generic domain is independent of the Mandatory
+        // lifecycle reservations: the generic record reserves and advances to
+        // Pending without contending for lifecycle capacity.
         add(&mut ledger, 3, 3).unwrap();
         let end = PredecessorEnded(SupportCausalPredecessorId([3; 32]), at(2));
-        rejected!(ledger, go(&mut ledger, 3, end), CAPACITY_ERROR);
+        go(&mut ledger, 3, end).unwrap();
         rejected!(
             ledger,
             trigger(&mut ledger, at(2), &specs, ObservationFailed, &mut work()),
@@ -3093,6 +3127,7 @@ mod tests {
         // A live legacy obligation blocks a matching C16 obligation.
         let mut ledger = new_ledger();
         add(&mut ledger, 1, 1).unwrap();
+        assert_eq!(ledger.records.get(0).unwrap().1, Ordinary);
         let mut legacy = bundle_input::<8>(1, &cells);
         legacy.obligations[0] = SupportOperationObligationId::new([1; 32]).unwrap();
         assert_eq!(
@@ -3247,7 +3282,7 @@ mod tests {
             SupportLedgerError::Storage(FixedStorageError::Duplicate)
         );
         // And blocks a later legacy generic reserve on the same obligation.
-        let mut legacy = spec(1, 9, Mandatory, &[Initial([9; 32])]);
+        let mut legacy = spec(1, 9, Ordinary, &[Reserved([9; 32])]);
         legacy.id = SupportOperationObligationId::new([
             1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0,
@@ -3356,6 +3391,32 @@ mod tests {
             (3, 6, 33, 33)
         );
     }
+    #[test]
+    fn generic_reserve_rejects_c16_only_claims() {
+        let mut ledger = new_ledger();
+        let mut reject = |claims: &[Claim]| {
+            let before = (ledger.generation(), ledger.records.len());
+            let mut measured = work();
+            let result = ledger.reserve(
+                ledger.generation(),
+                spec(7, 7, Mandatory, claims),
+                &mut measured,
+            );
+            assert_eq!(result, Err(InvalidInput));
+            assert_eq!((ledger.generation(), ledger.records.len()), before);
+        };
+        reject(&[Initial([7; 32])]);
+        reject(&[SupportFundingClaim::EntitlementVector([7; 32])]);
+        // C16-only facts remain constructible only by the complete bundle path.
+        let mut ledger = new_ledger();
+        reserve_bundle(&mut ledger, 1, 3);
+        assert_eq!(ledger.bundles.free_record_len(), 3);
+        assert_eq!(
+            ledger.records.len(),
+            0,
+            "C16 bundles insert nothing into the legacy arena"
+        );
+    }
     /// Test-only helper: reserve one complete C16 bundle with `n`-derived
     /// identities and `v` cells, returning the first obligation handle.
     fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
@@ -3405,7 +3466,7 @@ mod tests {
         );
         bundle_store_oracle(&ledger.bundles);
         // The released obligation is again usable by a legacy generic reserve.
-        let mut legacy = spec(1, 9, Mandatory, &[Initial([9; 32])]);
+        let mut legacy = spec(1, 9, Ordinary, &[Reserved([9; 32])]);
         legacy.id = obligation;
         ledger
             .reserve(ledger.generation(), legacy, &mut work())
@@ -3492,7 +3553,7 @@ mod tests {
             SupportLedgerError::Storage(FixedStorageError::Duplicate)
         );
         // A legacy generic reserve on a tombstoned obligation still rejects.
-        let mut legacy = spec(1, 9, Mandatory, &[Initial([9; 32])]);
+        let mut legacy = spec(1, 9, Ordinary, &[Reserved([9; 32])]);
         legacy.id = obligation;
         assert_eq!(
             ledger.reserve(ledger.generation(), legacy, &mut work()),
