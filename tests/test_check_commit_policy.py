@@ -8,7 +8,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "check_commit_policy.py"
-WORKTREE_SCRIPT = ROOT / "scripts" / "check_worktree_policy.py"
 SPEC = importlib.util.spec_from_file_location("check_commit_policy", SCRIPT)
 POLICY = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -36,15 +35,6 @@ class PolicyUnitTests(unittest.TestCase):
         self.assertEqual(rows, [("0", "1", "new.rs", "old.rs")])
         self.assertTrue(POLICY.policy_transition_errors([("D", "scripts/check_commit_policy.py", None, "100755", None)]) and POLICY.policy_transition_errors([("R100", "other.py", "scripts/check_commit_policy.py", "100755", "100755")]))
 
-    def test_retired_worktree_auditor_is_not_policy_owned(self):
-        path = "scripts/check_worktree_policy.py"
-        self.assertNotIn(path, POLICY.POLICY_MODES)
-        self.assertEqual(
-            POLICY.policy_transition_errors([("D", path, None, "100755", None)]),
-            [],
-        )
-
-
 class PolicyIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory(suffix=": trailing \n")
@@ -58,11 +48,10 @@ class PolicyIntegrationTests(unittest.TestCase):
             json.dumps({"counted_documentation_globs": ["docs/generated/**"]}),
         )
         self.write(".gitignore", ".work/\n__pycache__/\n")
-        for source in (SCRIPT, WORKTREE_SCRIPT):
-            target = self.repo / "scripts" / source.name
-            target.parent.mkdir(exist_ok=True)
-            target.write_bytes(source.read_bytes())
-            target.chmod(0o755)
+        target = self.repo / "scripts" / SCRIPT.name
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(SCRIPT.read_bytes())
+        target.chmod(0o755)
         self.git("add", ".")
         self.git("commit", "-m", "chore: initialize fixture")
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -115,20 +104,6 @@ class PolicyIntegrationTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-
-    def test_retired_worktree_auditor_uses_current_policy_api(self):
-        self.write("candidate.py", "candidate\n")
-        for policy_base in ((), ("--policy-base", self.base)):
-            result = subprocess.run(
-                (
-                    "python3", "-I", "-B", str(WORKTREE_SCRIPT), "--base", "HEAD",
-                    *policy_base, "--limit", "400",
-                ),
-                cwd=self.repo,
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_config_history_includes_divergent_base(self):
         self.git("switch", "-c", "stale"); self.write("special/generated.md", "line\n" * 600); stale = self.commit("build: add stale generated output")
