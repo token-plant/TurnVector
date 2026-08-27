@@ -171,9 +171,7 @@ C15 and C16 have one canonical delivery refinement under Design Lineage
 and unanimous Review Round
 `TV-C15-C16-CANONICAL-DELIVERY-20260824-C15-REFINEMENT-R5-20260824T103037Z`.
 The Launch Record SHA-256 is
-`c2b836de8e219334892181835f357ee2bb9fe37e886e2dd7f1d54816d0611472`;
-the passing round-record SHA-256 is
-`3c8278d3d1a8b5b6dc49579b615f70518c73fde8d80a5a06c702b17c5e457da0`.
+`c2b836de8e219334892181835f357ee2bb9fe37e886e2dd7f1d54816d0611472`.
 
 Only the C15a numeric delivery boundary was subsequently recalibrated under the
 same Design Lineage from `origin/main@192b57a2802d2e0fcc5bd1558bc498d0fcb0b046`.
@@ -182,11 +180,7 @@ Proposal Revision
 Review Round
 `TV-C15-C16-CANONICAL-DELIVERY-20260824-C15A-CAP-R1-20260824T171650Z`,
 Launch Record SHA-256
-`309b40546d791f3b7282f4911b26fc91d8f274d54c117e2d1c460d11740e351f`,
-Mathematical Gate Record SHA-256
-`568511f6dffe9679348133e7959c2b20a1b58ef9bd9a1a80dff0955b974a44a4`,
-and passing round-record SHA-256
-`7574aff639bec952bc538eb3c804a67780fce0f784e4ab1dc7842b09013d2587`
+`309b40546d791f3b7282f4911b26fc91d8f274d54c117e2d1c460d11740e351f`
 bind that revision. Every non-numeric C15a/C15b/C16 decision remains unchanged.
 The user explicitly approved the 821-line maximum, its required
 `commit-size-exception`, and squash merge of the docs authority revision on
@@ -199,9 +193,7 @@ Lineage. Proposal Revision
 Review Round
 `TV-C15-C16-CANONICAL-DELIVERY-20260824-C16-MULTICOMMIT-R8-20260825T183842Z`,
 Launch Record SHA-256
-`698973e453a9e03baf9d242cd2e09a4548c24dbfa89dc17c07ef29007c5c634f`,
-and passing round-record SHA-256
-`e8b1d1ff44bc741ef458e06b0af042b1b3a7cb2f4f1c9712074bc60792efb38d`
+`698973e453a9e03baf9d242cd2e09a4548c24dbfa89dc17c07ef29007c5c634f`
 bind that correction. Every C15 decision and every non-delivery C16 decision
 remains unchanged.
 
@@ -298,30 +290,30 @@ per-commit count overflow, owner expansion, missing exact witness, test or
 validation removal, `rustfmt::skip`, or hidden transition control flow stops for
 a new user decision and Design Proposal Gate.
 
-Before C16 reconstruction, main freezes a new DeepSeek V4 Flash task prompt that
-explicitly supersedes both historical prompt components: their C16
+Before C16 reconstruction, main gives DeepSeek V4 Flash one complete accepted
+implementation brief. It supersedes historical slice prompts, the former C16
 PR-cumulative 500 rule, immediate per-commit push or PR update, cumulative-main-
 base candidate review, and any instruction that DeepSeek marks the PR ready.
-DeepSeek must acknowledge the exact replacement-prompt identity before editing.
 
 Each C16 commit covers one coherent independently green aspect and is based on
-its immediate parent. DeepSeek V4 Flash freezes each exact unstaged candidate;
-the accepted immediate-parent checker and one local round of one
-`gpt-5.6-sol/max` plus two `gpt-5.6-terra/max` reviewers must unanimously pass
-before DeepSeek stages and signs that commit. Findings return directly to
-DeepSeek, and changed bytes require a fresh freeze and fresh round. Each
-runtime-source commit includes and counts its own complete B03 -> B04 -> B05
-cascade. No exact commit grouping is pre-approved, and stale pre-authority C16
-source, generated output, reviews, and approvals are not landing inputs. Every
-intermediate tree must compile, pass applicable prior and focused tests, retain
-a usable private `support_ledger` Interface, and state its partial responsibility
-truthfully; only the final C16 commit may claim the complete row.
+its immediate parent. Repository-native targeted checks and ordinary Git line
+counts run for every commit. Each runtime-source commit includes and counts its
+own complete B03 -> B04 -> B05 cascade. No exact commit grouping is pre-approved,
+and stale pre-authority C16 source, generated output, reviews, and approvals are
+not landing inputs. Every intermediate tree must compile, pass applicable prior
+and focused tests, retain a usable private `support_ledger` Interface, and state
+its partial responsibility truthfully; only the final C16 commit may claim the
+complete row. The complete final unstaged candidate runs the full repository
+verification once and receives one local round of one `gpt-5.6-sol/max` plus two
+`gpt-5.6-terra/max` reviews. Findings return directly to DeepSeek; changed bytes
+require a fresh freeze and fresh round. Only unanimous approval permits staging
+and signed local commits.
 
 After the reviewed local series is complete, DeepSeek pushes it, opens one draft
-C16 PR, and waits. Main verifies the sequence, signatures, per-commit manifests
-and counts, final diff, base, checks, and Benchmark cleanliness; main alone marks
+C16 PR, and waits. Main verifies the sequence, signatures, per-commit counts,
+final diff, base, checks, and Benchmark cleanliness; main alone marks
 the PR ready and squash-merges it. A content repair repeats the unstaged
-immediate-parent checker and local three-review process before a signed
+repository-native checks and local three-review process before a signed
 non-force-push follow-up; the PR remains draft until the repair and available
 required checks are green. The coordinator verifies the remote merge and branch
 cleanup before the next row begins from fresh `origin/main`.
@@ -354,8 +346,9 @@ nonzero Work dimension; exact rollback; and exact-capacity, equal-length, sorted
 unique indices with zero post-construction Allocation/CandidateWork. It runs the
 exact Rust 1.97.1 fmt, clippy `-D warnings`, focused/Core/workspace debug and
 release, `RUSTFLAGS=-Dwarnings`, pinned comparator, architecture, independent
-B03/B04/B05 reproduction/check, full Python discovery, auditor-at-821,
-diff-check, candidate/Benchmark authentication, and three fresh review gates.
+B03/B04/B05 reproduction/check, full Python discovery, ordinary Git counting
+against the accepted 821 limit, diff-check, candidate/Benchmark authentication,
+and three fresh review gates.
 
 C15b must prove all four daemon facts and all terminal orders; zero/nonzero
 Backend partitions and both daemon/Backend orders; exact Pending Reclaim
@@ -364,8 +357,9 @@ equal/lower cursor rejection, skipped higher cursor success, same-evidence
 rejection, new-evidence success, unrelated-generation success, replay rejection,
 and reuse only after complete closure; capacity/overflow/stale/Work rollback;
 and final maximum/one-past/five-axis witnesses. It independently repeats the same
-frozen-source Rust, generation, Python, auditor-at-500, repository, Benchmark,
-and three-reviewer gates; no C15a artifact or approval carries forward.
+frozen-source Rust, generation, Python, ordinary Git counting against the
+accepted 500 limit, repository, Benchmark, and three-reviewer gates; no C15a
+artifact or approval carries forward.
 
 The accepted implementation order contains 194 rows after C07.
 
@@ -634,13 +628,13 @@ that Core-only authority.
    a second mutable implementation of another module's invariant.
 8. Every content change invalidates review approvals. Review, staging, signed
    commit, push, and ready-PR confirmation follow the base plan unchanged except
-   for C16's per-commit local DeepSeek/reviewer flow above.
-9. C15a uses the accepted-object auditor at limit 821 and accumulates every
-   non-merge payload commit against the same 821-line PR cap. C15b uses limit
-   500 and retains its cumulative PR cap. Each C16 payload candidate uses the
-   accepted immediate-parent auditor at limit 500; its PR cumulative count is
-   disclosed but is not an LOC pass/fail threshold. All other rows retain the
-   base plan's ordinary 420-line plan ceiling and 500-line policy limit.
+   for C16's local DeepSeek/reviewer flow above.
+9. Ordinary Git additions-plus-deletions accounting applies the accepted 821
+   limit and cumulative PR cap to C15a, and the 500 limit and cumulative PR cap
+   to C15b. Each C16 payload commit uses the repository policy's 500-line limit;
+   its PR cumulative count is disclosed but is not an LOC pass/fail threshold.
+   All other rows retain the base plan's ordinary 420-line plan ceiling and
+   500-line policy limit.
 
 ## Generated Identity Single-Writer Protocol
 

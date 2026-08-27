@@ -6,6 +6,10 @@ TurnVector and TurnVectorBenchmark are independent repositories. TurnVectorBench
 
 Before every TurnVector task, read `.internal/reference/INDEX.md` completely, then read every document it marks `Required: always` completely. Treat these local-only documents as design and evidence context, while revalidating facts that can drift against the current repository, runtime, hardware, and dependency revisions.
 
+Formal Design Proposal Gate reviewers read those required internal references
+directly in addition to their frozen Review Bundle. The Gate document defines
+the remaining review-isolation boundary.
+
 If the index or a required document is missing, report the missing local prerequisite before making architecture, runtime, benchmark, or evidence claims. Keep `.internal/` local and outside Git.
 
 For TurnVector work:
@@ -23,11 +27,11 @@ Before changing evidence policy or creating or revising research, benchmark, exp
 # Design Proposal Gate
 
 Before creating or materially revising a design, read
-`docs/design-proposal-gate.md` completely. Before reporting any substantive
-design content, the same frozen Review Bundle must pass both its Mathematical
-Gate and one three-reviewer Unanimous Review Round. Until then, report only
-scope questions, progress, review findings, or blockers without disclosing the
-proposal itself.
+`docs/design-proposal-gate.md` completely. Drafts and substantive alternatives
+may be discussed while authoring. A design becomes accepted authority only when
+one frozen Review Bundle passes its Mathematical Gate and one three-reviewer
+Unanimous Review Round under that document. The required internal references
+are its only permitted external review context.
 
 # Change Delivery
 

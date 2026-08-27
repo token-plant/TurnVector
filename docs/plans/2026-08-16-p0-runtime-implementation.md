@@ -1012,64 +1012,28 @@ Every pull-request commit follows all of these rules:
    limit.
 2. Behavior is developed red, then green. A commit is reviewed only after its
    focused test and all applicable prior tests pass.
-3. Every intended path is unstaged during review. Unrelated changes and any
-   staged path are forbidden. T01 is the sole bootstrap: its candidate checker
-   output is test evidence, while the review authority remains an explicit
-   path/mode/blob table and full diff. T02 keeps that bootstrap review path
-   while binding executable policy authority; installed authority permanently
-   consumes the bootstrap and rejects restoration of the bootstrap helper before merge. After signed T02 installation,
-   the canonical command is:
-
-   ```sh
-   set -eu
-   head="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git -C . rev-parse --verify HEAD^{commit})"
-   remote="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
-   auditor="$(mktemp "${TMPDIR:-/tmp}/turnvector-policy.XXXXXX")"
-   trap 'unlink "$auditor"' EXIT
-   entry="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git -C . ls-tree "$head" -- scripts/check_worktree_policy.py)"
-   test "${entry%% *}" = 100755
-   entry="${entry#* }"; test "${entry%% *}" = blob
-   env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git -C . \
-     cat-file blob "${head}:scripts/check_worktree_policy.py" >"$auditor"
-   test -s "$auditor"
-   env -i PATH="$PATH" LC_ALL=C \
-     python3 -I -B "$auditor" --base "$head" --limit 420
-   test "$remote" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
-   test "$head" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-     git -C . rev-parse --verify HEAD^{commit})"
-   ```
-
-   It starts isolated from the accepted `HEAD` Git object rather than the
-   candidate worktree, selects the exact remote-base policy revision or the
-   first reviewed T01 installation when the remote base predates T01, preserves
-   the exact remote tip as the separate configuration-lineage endpoint, executes
-   that accepted auditor instead of changed candidate policy code, enumerates every
-   tracked and untracked path, reports counted LOC, writes the ignored review
-   manifest, and prints its SHA-256. Earlier documentation-only commits use an
-   explicit path/blob table from `git hash-object`, plus `git diff --binary`
-   for tracked files or `git diff --no-index` for an untracked file.
-   C15a invokes the accepted auditor with `--limit 821`; C15b uses `--limit 500`.
-   Each C16 payload candidate invokes the accepted immediate-parent
-   `HEAD` object with `--base <immediate-parent-SHA> --limit 500`. C15a and C15b
-   accumulate the resulting count over every non-merge payload commit against
-   their row-PR limits. C16 records and discloses the same cumulative sum but
-   does not use it as a pass/fail LOC threshold.
-4. Three independent reviewers inspect the same complete unstaged manifest and
-   diff. Each rereads repository-required internal references, checks the whole
-   specification and architecture, runs or requests relevant tests, checks
-   failure behavior and measured LOC, and returns `APPROVE` or findings.
+3. Every intended path is unstaged during review. Unrelated changes and staged
+   paths are forbidden. Record the base SHA, inspect `git status --short`, run
+   `git diff --check`, and measure non-documentation additions plus deletions
+   with ordinary Git output. Use only repository-native checks; do not add a
+   separate worktree auditor or review-publication protocol.
+4. Three independent reviewers inspect the same complete frozen candidate.
+   Design Proposal Gate reviewers read the frozen bundle plus
+   `.internal/reference/INDEX.md` and every document it marks `Required:
+   always`; no other bundle-external input is permitted. Each reviewer checks
+   the whole specification and architecture, evaluates the frozen test evidence
+   and any bundle-contained probes, checks failure behavior and measured LOC,
+   and returns `APPROVE` or findings.
 5. Any content change or finding invalidates all approvals. The complete revised
-   diff receives three fresh reviews; a majority is insufficient.
+   candidate receives three fresh reviews after the full finding set is
+   addressed; a majority is insufficient.
 6. Only after three approvals are the exact reviewed paths staged. The staged
-   path/blob manifest must equal the approved manifest, repository-native tests
-   run again, and the commit is signed. `git verify-commit --raw HEAD` must
-   verify that exact commit before the contribution-policy checker validates it.
-7. Review transcripts, manifests, test output, native builds, models, traces,
-   and qualification artifacts remain under ignored `.work/`.
+   bytes are checked against the reviewed candidate, repository-native tests run
+   again, and the commit is signed. `git verify-commit --raw HEAD` must verify
+   that exact commit before the contribution-policy checker validates it.
+7. Optional review notes, test output, native builds, models, traces, and
+   qualification artifacts remain under ignored `.work/`; no protocol-specific
+   publication artifact is required.
 8. After the first push, fixes are new commits. Shared history is never rewritten
    or force-pushed.
 
@@ -1102,8 +1066,8 @@ independently green and at or below its target when measured.
 | D04 | `docs(adr): define p0 audit sequence authority` | Define exact P0 storage-qualification binding, Control Initialization, sole later Control mutation authority, range-only sequence-state authority, build-derived mutation headroom and Audit Safety Reserve, Core-owned Runtime Closure Gate, Event Loop-owned Control Mutation Cancel Gate, bounded noncreating Predecessor Fence interleaving, known-absent closure, two-stage success Results with no post-C27 discretionary work, installation-scoped process lock across every successor, Control Publication Commit Barrier, commit/parent recovery, pending-before-tail, lost suffix, and pre-writer Storage Barrier Failure; align ADRs 0019/0021/0026/0027/0029/0036/0040 plus glossary | No Anchor/Locator/Metadata, implicit latest qualification, same-ID P0 Rebind, second pointer, sequence-owner/headroom overlap or terminal borrowing, closure-liability fanout, delayed or identity-cycling cancel custody, safety-queue starvation, Event Loop publication/result gap, post-C27 discretionary assignment, clean-restart or cross-Runtime lock bypass, fabricated indeterminate Result, or unchanged-state claim after a required barrier failure | docs only |
 | D05 | `docs(adr): bind runtime overhead evidence` | Define the acyclic daemon/Catalog build identity, generated Runtime Overhead Catalog and Lifecycle Evidence Tables, repeatable daemon-selected pre-activation Lifecycle Overhead Qualification witness and readiness gate, Admission-owned applicability selection, separate Core-owned Resource Capacity and Support Charge Ledgers with independently green support-capacity, ordinary/lifecycle, request-entitlement, Plan-obligation, and retention slices, Catalog-bound Support Start Count Bounds, operation-scoped Support Operation Obligations, typed Support Funding Claims including Ordinary Reservation Claim, finite request Support Outstanding Credit Vectors, pre-trigger description/safety lifecycle reserves, reusable Future Turn Support Entitlements, standalone post-predecessor `begin_support`, explicit daemon-component terminal settlement, dedicated prepared carry, Admission-derived daemon Bound Sets, Core-owned Runtime Overhead Generation, Sequenced Event Interference Bound and all-trigger scheduling cut, dedicated intrinsic local-stale transition, disjoint Turn/support/event envelopes, request-quiescent Control publication, complete Configuration binding, and closed Backend lifecycle classification; update ADRs 0005/0008/0015/0016/0018/0020/0021/0022/0024/0025/0027/0030/0031/0034/0036/0040 plus glossary and remove implementation-row coupling | Catalog-wide retention, per-operation/pool half-open start-count enforcement, optional ordinary nonempty claims, consecutive-Turn/sequential churn, B1/B4 one-call-one-credit conservation including separate observation and conditional continuation, conditional-state credit/vector/horizon/carry occupancy, mixed initial+entitlement funding, newly eligible member join, Batch split/merge/cancel rebind, and activation-sequence capacity including lifecycle/carry/suballocation maxima; startup/successor qualification witness, first pre-ready sample through drain, atomic two-ledger Admission, initial obligations, request-lifetime vectors plus three distinct Plan-scoped operation obligations, post-load/post-observation description sets, safety trigger, first-plan/Receipt/rejection/local-stale/support-result/idle scheduling-cut prefix and crossing allowance, intrinsic local stale disposition, complete nonoverlapping envelopes including Output Publication before observation, sole ledger/generation/selector owners and separate Core/Event-Loop gate owners, typed prepublication carry abort, pre-owner carry/generation/headroom revalidation and ordinary-support restoration, stable zero request-liability before Store/Audit pause, exact evidence/build identity, single-count three-term Deadline Cost, pre-dispatch drift rejection, and no online widening | docs only |
 | D06 | `docs(architecture): define exact execution profiles` | Amend ADRs 0007, 0017, and 0031, the glossary, this plan, and the native ownership todo to define Certified Execution Profile and Execution Route Identity, distinguish stable exact identity from dynamic Resource Evidence, and bind every graph, memory, kernel/fusion, KV, speculative, prefix, and command-replay route change to a new exact Capability Key | Exact versus one-field-drift matrix, exact required-member baselines, explicit absent optional plans, no Serving Profile collision, runtime range inference, favorable-resource authorization, raw GPU-address promise, or P-1 status upgrade | docs only |
-| T01 | `build: audit unstaged commit scope` | Freeze a side-effect-free entry path/type/mode/raw-byte identity before filters, then record the stable staging-equivalent tracked/untracked path hashes and documentation-aware LOC | Unit fixtures for add/delete/rename/binary/untracked, self-count, transformed content, and forward-sorted filter mutation | <= 420 |
-| T02 | `build: bind contribution-policy authority` | Fail-closed extraction and execution of the accepted Git-object auditor/helper rather than candidate policy code; authenticate the executing helper against the explicit accepted base rather than checkout HEAD; clear Git selectors/config injection and disable replacement objects before extraction; bind both branch config lineages, checked-out base/fetched PR/event identities, path-specific policy-owner modes, policy-only transitions, one-time bootstrap consumption to irreversible installed-helper history with bootstrap-helper restoration rejection, isolated local/CI post-commit startup, config-invariant capture, secure manifest publication, and post-commit parity including clean base-sync merges | Missing/empty accepted object, wrong accepted source, candidate self-change, successful policy-only helper update, helper relaxation, add/remove and divergent-remote config history, pre-T01 divergent-base post-merge worktree continuity, in-scan remote-ref drift, stale event/ref identity, unsigned commit, installed-authority helper-restoration rejection, squash-installed bootstrap replay, symlink/mode/delete/rename, Git selector/config injection, replace ref, hostile startup for both worktree and post-commit commands, ambient diff configuration, manifest path replacement, workflow mixing, and exact post-commit clean/extra-payload/unrelated-parent merge fixtures | <= 420 |
+| T01 | `build: audit unstaged commit scope` | Historical bootstrap for the now-retired worktree auditor; ordinary Git status, diff, and line counts replace it | The retired helper is absent and no tracked authority requires its output | <= 420 |
+| T02 | `build: bind contribution-policy authority` | Install the repository contribution-policy checker and workflow for signed commit subjects, branch and PR title conventions, documentation-aware per-commit limits, explicit size exceptions, and clean base-sync merge exemptions | Valid and invalid subjects, branches, titles, documentation overrides, size exceptions, policy-only transitions, hostile Git selectors, policy-source authentication, and base-sync merge fixtures | <= 420 |
 | B01 | `build: initialize the Rust workspace` | Rust 1.97.1 toolchain, workspace, core crate, format/lint/test entrypoints | Format, clippy, workspace tests | <= 180 |
 | B02 | `build: lock the generation semantics descriptor` | Canonical descriptor generator and Evidence Hash lock shared by daemon Domain Types, Fake, Manifest, Native, and qualification | Double-generation bytes/hash; incomplete/unknown descriptor rejection; every schema/domain/greedy/categorical/RNG semantic mutation changes identity | <= 300 |
 | B03 | `build(runtime): lock the daemon core build identity` | Canonical payload-independent Core build descriptor/generator binding an exact dependency-traced runtime source-closure manifest, tool/dependency locks, features/profiles, protocol/domain registries, native inputs, the private Model Descriptor V1 frame/schema/domain tags and size/arena maxima, and exact repository-owned SHA-256 derivative source bytes whose in-source provenance header binds the upstream commit, archive digest, and selected license, plus Catalog schema/capacity/lookup/worst-case work, Support Start Count Bound, Support Funding Claim including Ordinary Reservation Claim, and Support Outstanding Credit Vector schemas/binary maxima, conditional/pending-operation-obligation/active-record/ordinary-claim/entitlement-tombstone/lifecycle-reserve maxima and their Ingress Budget Warming/active plus Model Registry cardinality inputs, one dedicated nonborrowable Prepared Carry slot with dual-Budget mandatory/safety suballocation maxima, event-registry maxima, and executable/native text-section identities while excluding generated payload bytes | Double generation, undeclared build-input rejection, every determining-input drift including SHA source bytes or their provenance header, frame/domain/schema, descriptor arena and registry cardinality, unrelated-repository-file invariance including the Markdown provenance notice, payload-byte invariance, schema/capacity/start-count/funding-claim/ordinary-claim/vector/conditional/pending-obligation/carry-slot drift, section mismatch, and final-binary self-hash rejection | <= 360 |
@@ -1241,10 +1205,7 @@ Its Mathematical Gate and one fresh three-reviewer unanimous round passed under:
 - Review Round
   `TV-C15-C16-CANONICAL-DELIVERY-20260824-C15-REFINEMENT-R5-20260824T103037Z`;
 - Launch Record SHA-256
-  `c2b836de8e219334892181835f357ee2bb9fe37e886e2dd7f1d54816d0611472`;
-  and
-- passing round-record SHA-256
-  `3c8278d3d1a8b5b6dc49579b615f70518c73fde8d80a5a06c702b17c5e457da0`.
+  `c2b836de8e219334892181835f357ee2bb9fe37e886e2dd7f1d54816d0611472`.
 
 After fresh implementation and adversarial proof exhausted the prior C15a
 margin, only its numeric delivery boundary was recalibrated on
@@ -1256,12 +1217,7 @@ Lineage passed a new Mathematical Gate and fresh unanimous round under:
 - Review Round
   `TV-C15-C16-CANONICAL-DELIVERY-20260824-C15A-CAP-R1-20260824T171650Z`;
 - Launch Record SHA-256
-  `309b40546d791f3b7282f4911b26fc91d8f274d54c117e2d1c460d11740e351f`;
-- Mathematical Gate Record SHA-256
-  `568511f6dffe9679348133e7959c2b20a1b58ef9bd9a1a80dff0955b974a44a4`;
-  and
-- passing round-record SHA-256
-  `7574aff639bec952bc538eb3c804a67780fce0f784e4ab1dc7842b09013d2587`.
+  `309b40546d791f3b7282f4911b26fc91d8f274d54c117e2d1c460d11740e351f`.
 
 Only C16's delivery-count rule was subsequently corrected from
 `origin/main@57ef6f4ccfe4f220f71394b9448c25e70d47aaea` under the same Design
@@ -1274,10 +1230,7 @@ round under:
 - Review Round
   `TV-C15-C16-CANONICAL-DELIVERY-20260824-C16-MULTICOMMIT-R8-20260825T183842Z`;
 - Launch Record SHA-256
-  `698973e453a9e03baf9d242cd2e09a4548c24dbfa89dc17c07ef29007c5c634f`;
-  and
-- passing round-record SHA-256
-  `e8b1d1ff44bc741ef458e06b0af042b1b3a7cb2f4f1c9712074bc60792efb38d`.
+  `698973e453a9e03baf9d242cd2e09a4548c24dbfa89dc17c07ef29007c5c634f`.
 
 The user explicitly approved the 821-line C15a per-commit and PR-cumulative
 maximum, its required `commit-size-exception`, and squash merge of this docs
@@ -1478,32 +1431,32 @@ predecessor boundary. C17, C19, C20, and every Resource Capacity consumer remain
 blocked through C15b; C17 and every later Core row remain blocked until C16
 merges.
 
-Before C16 reconstruction, main freezes a new DeepSeek V4 Flash task prompt that
-explicitly supersedes both historical prompt components: their C16
+Before C16 reconstruction, main gives DeepSeek V4 Flash one complete accepted
+implementation brief. It supersedes historical slice prompts, the former C16
 PR-cumulative 500 rule, immediate per-commit push or PR update, cumulative-main-
 base candidate review, and any instruction that DeepSeek marks the PR ready.
-DeepSeek must acknowledge the exact replacement-prompt identity before editing.
 
 C16 is one row-scoped PR containing multiple signed payload commits. Each commit
 covers one coherent, independently green aspect and is based on its immediate
 parent. Before staging each commit, DeepSeek V4 Flash freezes its exact unstaged
-candidate. The accepted immediate-parent checker and one local round of one
-`gpt-5.6-sol/max` plus two `gpt-5.6-terra/max` reviewers inspect those exact
-bytes. Findings return directly to DeepSeek; any content change requires a fresh
-freeze and three fresh reviews. Only after unanimous approval may DeepSeek stage
-the approved paths and create the signed local commit. No exact commit grouping
-is pre-approved, and the stale pre-authority C16 candidate and generated output
-are evidence only, not landing inputs. Every intermediate tree must compile,
-pass applicable prior and focused tests, retain a usable private
+candidate. Repository-native targeted checks and ordinary Git line counts run
+for each coherent commit. The stale pre-authority C16 candidate and generated
+output are evidence only, not landing inputs. Every intermediate tree must
+compile, pass applicable prior and focused tests, retain a usable private
 `support_ledger` Interface, and state its partial responsibility truthfully;
-only the final C16 commit may claim the complete row.
+only the final C16 commit may claim the complete row. The complete final
+unstaged candidate runs the full repository verification once and receives one
+local round of one `gpt-5.6-sol/max` plus two `gpt-5.6-terra/max` reviews.
+Findings return directly to DeepSeek; any content change requires a fresh freeze
+and three fresh reviews. Only unanimous approval permits staging and signed
+local commits.
 
 After every initially planned commit and local check passes, DeepSeek pushes the
 reviewed series, opens one draft C16 PR, and waits. PR-only checks run on the
-draft. Main verifies the commit sequence, signatures, per-commit manifests and
-counts, final diff, base, checks, and Benchmark cleanliness; main alone marks the
+draft. Main verifies the commit sequence, signatures, per-commit counts, final
+diff, base, checks, and Benchmark cleanliness; main alone marks the
 PR ready and squash-merges it. Any content repair returns to DeepSeek as a new
-unstaged follow-up candidate and repeats the immediate-parent checker and local
+unstaged follow-up candidate and repeats repository-native checks and the local
 three-review round before signed non-force-push delivery; the PR remains draft
 until the repair and available required checks are green. For this explicitly
 authorized authority -> C15a -> C15b -> C16 sequence, the coordinator verifies
@@ -1541,8 +1494,8 @@ uniqueness, zero post-construction Allocation, and zero CandidateWork. It also
 requires exact Rust 1.97.1 fmt, clippy with `-D warnings`, focused/Core/workspace
 debug and release tests, `RUSTFLAGS=-Dwarnings`, the pinned lookup-comparison
 probe, architecture validation, independent B03/B04/B05 reproduction and check,
-full Python discovery, the accepted auditor at 821, diff-check, and candidate and
-Benchmark terminal authentication.
+full Python discovery, ordinary Git counting against the accepted 821 limit,
+diff-check, and candidate and Benchmark terminal authentication.
 
 C15b readiness requires all four daemon terminal facts; pre-materialization,
 zero, partial, queued, in-flight, and ordinary terminal orderings; zero and
@@ -1553,8 +1506,9 @@ same-evidence rejection, new-evidence success, unrelated-generation success,
 post-success replay rejection, and active-budget reuse only after complete
 closure; capacity, overflow, stale, and Work rollback; and final maximum-R,
 one-past, and exact five-axis witnesses. It independently reruns the same Rust,
-generation, full-Python, auditor-at-500, diff, repository, Benchmark, and
-three-reviewer gates; no C15a artifact or approval carries forward.
+generation, full-Python, ordinary Git counting against the accepted 500 limit,
+diff, repository, Benchmark, and three-reviewer gates; no C15a artifact or
+approval carries forward.
 
 | ID | Commit subject | Behavior slice | Required verification | Target LOC |
 |---|---|---|---|---:|
@@ -1907,8 +1861,8 @@ C15a and C15b additionally run the exact Rust 1.97.1 lookup-comparison probe
 defined by their row-specific readiness matrix; a generic workspace test cannot
 substitute for that compiler-bound comparison proof.
 
-The worktree policy command is the complete accepted-object auditor block in
-Commit Protocol step 3; the candidate path is never executable authority.
+Before staging, use ordinary Git status, diff, and line-count output together
+with the repository-native checks applicable to the candidate.
 
 From N01 onward, native verification is exactly:
 
@@ -1931,90 +1885,10 @@ compatibility matrices. S10 provides `scripts/verify-audit-schema.sh`, which
 independently regenerates the Audit descriptor and registry identity twice,
 checks the lock, and runs record-kind compatibility fixtures.
 
-After a commit is signed, its one-commit policy check is:
-
-```sh
-set -eu
-commit="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . rev-parse --verify HEAD^{commit})"
-parent1="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . rev-parse --verify "${commit}^1")"
-test -z "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . rev-parse --verify "${commit}^3" 2>/dev/null || true)"
-base="$parent1"; remote=
-if parent2="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . rev-parse --verify "${commit}^2" 2>/dev/null)"; then
-  remote="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-    git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
-  env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-    git -C . merge-base --is-ancestor "$parent2" "$remote"
-  base="$remote"
-fi
-env -i PATH="$PATH" HOME="$HOME" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . verify-commit --raw "$commit"
-helper="$(mktemp "${TMPDIR:-/tmp}/turnvector-policy.XXXXXX")"
-trap 'unlink "$helper"' EXIT
-entry="$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . ls-tree "$base" -- scripts/check_commit_policy.py)"
-test "${entry%% *}" = 100755
-entry="${entry#* }"; test "${entry%% *}" = blob
-env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 git -C . \
-  cat-file blob "${base}:scripts/check_commit_policy.py" >"$helper"
-test -s "$helper"
-env -i PATH="$PATH" LC_ALL=C BASE="$base" \
-  COMMIT="$commit" HELPER="$helper" python3 -I -B - <<'PY'
-import os, subprocess, tempfile
-git_env = {"PATH": os.environ["PATH"], "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
-           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_NO_REPLACE_OBJECTS": "1"}
-root = os.fsdecode(subprocess.check_output(
-    ("git", "-C", ".", "rev-parse", "--show-toplevel"), env=git_env
-).removesuffix(b"\n"))
-with tempfile.TemporaryDirectory(prefix="turnvector-policy-repo-") as sandbox:
-    subprocess.run(("git", "init", "--quiet", "--bare", sandbox),
-                   check=True, env=git_env)
-    refs = ((os.environ["BASE"], "refs/turnvector/accepted-base"),
-            (os.environ["COMMIT"], "refs/turnvector/candidate"))
-    subprocess.run(("git", "-C", sandbox, "fetch", "--quiet", "--no-tags",
-                    "--no-write-fetch-head", "--", root,
-                    *(f"{oid}:{ref}" for oid, ref in refs)),
-                   check=True, env=git_env)
-    for expected, ref in refs:
-        actual = subprocess.check_output(
-            ("git", "-C", sandbox, "rev-parse", "--verify", f"{ref}^{{commit}}"),
-            env=git_env, text=True).strip()
-        if actual != expected:
-            raise SystemExit(f"sandbox object mismatch for {ref}")
-    subprocess.run(("git", "-C", sandbox, "update-ref", "--no-deref", "HEAD",
-                    os.environ["BASE"]), check=True, env=git_env)
-    actual = subprocess.check_output(("git", "-C", sandbox, "rev-parse", "HEAD"),
-                                     env=git_env, text=True).strip()
-    if actual != os.environ["BASE"]:
-        raise SystemExit("accepted-base sandbox HEAD mismatch")
-    command = ("python3", "-I", "-B", os.environ["HELPER"],
-               "--base", os.environ["BASE"], "--head", os.environ["COMMIT"],
-               "--branch", "feat/p0-runtime-implementation",
-               "--title", "feat: implement P0 runtime")
-    raise SystemExit(subprocess.run(command, cwd=sandbox,
-                                    env={"PATH": os.environ["PATH"], "LC_ALL": "C"}).returncode)
-PY
-test -z "$remote" || test "$remote" = "$(env -i PATH="$PATH" LC_ALL=C \
-  GIT_NO_REPLACE_OBJECTS=1 git -C . rev-parse --verify refs/remotes/origin/main^{commit})"
-test "$commit" = "$(env -i PATH="$PATH" LC_ALL=C GIT_NO_REPLACE_OBJECTS=1 \
-  git -C . rev-parse --verify HEAD^{commit})"
-```
-
-The helper is always extracted from the already accepted `base` object, never
-from the commit under audit. It runs in an automatically removed bare repository
-that fetches the frozen accepted-base and candidate object closures into private
-refs, verifies both identities, and pins `HEAD` to the accepted base while the
-immutable candidate SHA remains data. This also covers an accepted remote tip
-that is not reachable from candidate `HEAD`. It makes the migration from the
-installed helper's older checkout-`HEAD` self-authentication independently green
-without granting the candidate authority. The successor helper treats `--base`
-as its explicit policy source and authenticates its executing bytes against that
-tree. T02 is therefore checked by its reviewed T01 predecessor; later commits,
-including policy-only helper updates, are checked by the installed predecessor
-authority without executing candidate policy code.
+After a commit is signed, verify it with `git verify-commit --raw HEAD` and run
+the installed repository contribution-policy checker through its checked-in
+workflow or direct CLI. The checker enforces the Change Delivery rules; it does
+not publish a second review identity or replace the frozen-candidate review.
 
 After Q00 and a separately authorized compatible Benchmark contract are both
 present, qualification commands are exact wrappers:
@@ -2044,7 +1918,7 @@ Each phase closes only when:
 - focused, workspace, Release, operation-count, and applicable native/protocol
   tests are green;
 - all applicable earlier-phase tests remain green;
-- three approvals exist for every exact unstaged review manifest;
+- three approvals exist for the exact frozen unstaged candidate;
 - TurnVector has no unintended tracked or untracked files;
 - TurnVectorBenchmark has no new changes; and
 - limitations and unavailable evidence remain explicit rather than passes.
