@@ -47,7 +47,7 @@ FIXTURE_ONLY_PATHS = ("crates/turnvector-protocol/Cargo.toml", "crates/turnvecto
 FROZEN_TOPOLOGY_SHA256 = {
     "Cargo.toml": "d718f6f9dce78fcdebf72931b2d0f03fbfa2cf3772623cc7a544503ccfe9595a",
     "crates/turnvector-core/Cargo.toml": "5a4a358ec3b14544dbfc3a6ee4e8cc1e56674e19d66e210e2249a7c806cd83b6",
-    "crates/turnvector-core/src/lib.rs": "6bfb0028a47c707d56eb0ed6bc39055524f8afb12a8898e0a849f9832ddd52e6",
+    "crates/turnvector-core/src/lib.rs": "ff918ad554a9c919634912d4fb7c36e84d5724e5e7ff9893df9dcc731934326d",
     "crates/turnvector-daemon/Cargo.toml": "1dec90d7c04004eaa25ab4bf3aacea7989a898a24df29629be6c93ad6d203f0a",
     "crates/turnvector-daemon/src/main.rs": "f9e7bb4b97fbe08292028ab4ada11199df3a3629a18899cfb57a46683230622e",
     "tests/test_daemon_core_build.py": "36127c653cd5b43afc21fc6aa6ed1ea012db0b93d18a716466ea512a989a6cdd",
