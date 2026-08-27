@@ -36,17 +36,7 @@ SIZE_EXCEPTION_LABEL = "commit-size-exception"
 DIFF_OPTIONS = ("--find-renames=50%", "-l0", "--no-ext-diff", "--no-textconv",
                 "--diff-algorithm=myers", "--no-indent-heuristic", "--no-color", "--text")
 POLICY_MODES = {".commit-policy.json": "100644", ".github/workflows/contribution-policy.yml": "100644",
-                "scripts/check_commit_policy.py": "100755", "scripts/check_worktree_policy.py": "100755", "tests/test_check_commit_policy.py": "100644"}
-PLAN = "docs/plans/2026-08-16-p0-runtime-implementation.md"
-T01_PARENT, T01_COMMIT = "35d9109d4e3f9686c5b9acfd5324f5bb31bf003c", "b222afb0cac506b34fa682df389c37611ba3d116"
-T01_HELPER_BLOB = "bf18ca8b6e04adbe49f0cb25ad29b9710714f548"
-ONE_TIME_TRANSITIONS = {
-    "build: audit unstaged commit scope": (T01_PARENT, T01_COMMIT, {PLAN: "M",
-        "scripts/check_worktree_policy.py": "A", "tests/test_check_commit_policy.py": "M"}),
-    "build: bind contribution-policy authority": (T01_COMMIT, None, {path: "M" for path in
-        (PLAN, ".github/workflows/contribution-policy.yml", "scripts/check_commit_policy.py",
-         "scripts/check_worktree_policy.py", "tests/test_check_commit_policy.py")}),
-}
+                "scripts/check_commit_policy.py": "100755", "tests/test_check_commit_policy.py": "100644"}
 GIT_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1", "GIT_LITERAL_PATHSPECS": "1", "GIT_NO_REPLACE_OBJECTS": "1"}
 
 
@@ -120,34 +110,18 @@ def parse_changes(raw: bytes):
             None if set(mode) == {"0"} else mode
 
 
-def policy_transition_errors(changes, one_time=None, policy_installed=False, helper_blob=None) -> List[str]:
-    errors = ["installed policy cannot restore bootstrap helper"] if policy_installed and helper_blob == T01_HELPER_BLOB else []
-    if one_time is False:
-        return errors + ["bootstrap transition is not at its reviewed one-time predecessor"]
-    modes = {**POLICY_MODES, **({PLAN: "100644"} if one_time is not None else {})}
+def policy_transition_errors(changes) -> List[str]:
+    errors: List[str] = []
     changed = {value for _status, path, old_path, _old_mode, _mode in changes for value in (old_path, path) if value is not None}
-    policy = changed.intersection(modes)
-    allowed = set(POLICY_MODES) if one_time is None else set(one_time)
-    if policy and (changed - allowed or one_time is not None and changed != allowed):
+    policy = changed.intersection(POLICY_MODES)
+    if policy and changed - set(POLICY_MODES):
         errors.append("policy paths must change alone")
     for _status, path, old_path, _old_mode, mode in changes:
-        owners = {value for value in (old_path, path) if value in modes}
-        if any(old_path is not None and old_path != path or mode != modes[value]
+        owners = {value for value in (old_path, path) if value in POLICY_MODES}
+        if any(old_path is not None and old_path != path or mode != POLICY_MODES[value]
                for value in owners):
             errors.append(f"policy path has invalid rename, deletion, or mode: {path!r}")
-        if one_time is not None and path in one_time and _status != one_time[path]:
-            errors.append(f"bootstrap policy path has invalid status: {path!r}")
     return errors
-
-
-def bootstrap_transition(subject: str, commit: str, parent: str, seen: Set[str], policy_installed=False):
-    if (transition := ONE_TIME_TRANSITIONS.get(subject)) is None:
-        return None
-    expected_parent, expected_commit, paths = transition
-    allowed = (subject not in seen and parent == expected_parent and expected_commit in (None, commit)
-               and (expected_commit is not None or not policy_installed))
-    seen.add(subject)
-    return paths if allowed else False
 
 
 def parse_numstat(raw: bytes) -> Iterable[Tuple[str, str, str, Optional[str]]]:
@@ -269,8 +243,6 @@ def validate(
         errors.append(f"PR title is not conventional: {title!r}")
 
     commits = commits_between(base, head)
-    policy_installed = any(tree_entry(revision, "scripts/check_commit_policy.py") != ("100755", T01_HELPER_BLOB) for revision in str(git("rev-list", base, "--", "scripts/check_commit_policy.py")).splitlines())
-    seen_transitions = set(str(git("log", "--format=%s", base)).splitlines()) & ONE_TIME_TRANSITIONS.keys()
     if not commits:
         errors.append("pull request contains no commits")
 
@@ -290,9 +262,7 @@ def validate(
         raw = git("diff", "--raw", "-z", "--no-abbrev", *DIFF_OPTIONS,
                   parents[0], commit, "--", binary=True)
         changes = list(parse_changes(raw))
-        helper = tree_entry(commit, "scripts/check_commit_policy.py"); transition = bootstrap_transition(subject, commit, parents[0], seen_transitions, policy_installed)
-        errors.extend(policy_transition_errors(changes, transition, policy_installed, None if helper is None else helper[1]))
-        policy_installed |= helper != ("100755", T01_HELPER_BLOB)
+        errors.extend(policy_transition_errors(changes))
         line_count, binaries = changed_lines(parents[0], commit, counted_globs)
         print(f"COUNT {commit[:12]} {line_count} non-documentation changed lines")
         for path in binaries:

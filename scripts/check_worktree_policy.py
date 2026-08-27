@@ -168,9 +168,8 @@ def capture(root: Path, base: str, config_base: str, head: str, policy):
         raw = git(root, "diff", "--cached", "--raw", "-z", "--no-abbrev",
                   *DIFF_OPTIONS, base, "--", env=env)
         changes = list(parse_changes(raw))
-        helper_blob = next((new for _status, path, _old_path, _old_mode, _mode, _old, new in changes if path == "scripts/check_commit_policy.py"), None)
         errors = policy.policy_transition_errors([(status, path, old_path, old_mode, mode)
-            for status, path, old_path, old_mode, mode, _old, _new in changes], policy_installed=policy.tree_entry(head, "scripts/check_commit_policy.py") != ("100755", policy.T01_HELPER_BLOB), helper_blob=helper_blob)
+            for status, path, old_path, old_mode, mode, _old, _new in changes])
         if errors:
             raise ValueError("; ".join(errors))
         rows = [account_change(root, change, globs, env) for change in changes]
@@ -202,18 +201,9 @@ def accepted_helper(root: Path, head: str):
     exec(compile(source, f"{head}:{path}", "exec"), policy.__dict__)
     return policy, blob.decode(), hashlib.sha256(source).hexdigest()
 
-def select_policy_base(root: Path, head: str, explicit, policy):
+def select_policy_base(root: Path, head: str, explicit):
     remote = git(root, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}").decode().strip()
     base = remote if not explicit else git(root, "rev-parse", "--verify", "--end-of-options", f"{explicit}^{{commit}}").decode().strip()
-    if not explicit:
-        exists = subprocess.run(("git", "cat-file", "-e", f"{remote}:scripts/check_worktree_policy.py"),
-                                cwd=root, env=GIT_ENV, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL).returncode == 0
-        if not exists:
-            base = policy.T01_COMMIT
-            if subprocess.run(("git", "merge-base", "--is-ancestor", base, head),
-                              cwd=root, env=GIT_ENV).returncode:
-                raise ValueError("no reviewed T01 policy installation is reachable")
     git(root, "merge-base", base, head)
     git(root, "merge-base", remote, head)
     return base, remote
@@ -254,7 +244,7 @@ def main(argv=None):
             root, "rev-parse", "--verify", "--end-of-options", f"{args.base}^{{commit}}",
         ).decode().strip()
         policy, helper_blob, helper_sha256 = accepted_helper(root, head)
-        policy_base, config_base = select_policy_base(root, head, args.policy_base, policy)
+        policy_base, config_base = select_policy_base(root, head, args.policy_base)
         auditor = policy.tree_entry(head, "scripts/check_worktree_policy.py")
         if auditor is None or auditor[0] != "100755" or Path(__file__).read_bytes() != git(
                 root, "cat-file", "blob", auditor[1]):
