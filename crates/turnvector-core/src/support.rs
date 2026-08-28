@@ -1308,21 +1308,19 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             change,
         })
     }
-    /// Metered transition of one live C16 bundle to its retained terminal
-    /// tombstone: the record, all `K` identities, cells, and claims remain
-    /// occupied and keep blocking later legacy reuse until accepted C18
-    /// expiry. C16 exposes no expiry action.
-    pub(crate) fn close_bundle(
-        &mut self,
-        expected: SupportLedgerGeneration,
-        obligation: SupportOperationObligationId,
-        work: &mut WorkMeter,
-    ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
-        let next = self.next(expected, work)?;
+    /// Read-only preparation of a live C16 bundle's retained terminal
+    /// tombstone by its entitlement. The returned capability owns the complete
+    /// before-image snapshot and the same Work-meter borrow.
+    pub(crate) fn prepare_tombstone<'work>(
+        &self,
+        entitlement: FutureTurnSupportEntitlementId,
+        work: &'work mut WorkMeter,
+    ) -> Result<PreparedTombstone<'work, H>, SupportLedgerError> {
+        self.next(self.generation, work)?;
         let invalid = SupportLedgerError::InvalidTransition;
         let record_index = self
             .bundles
-            .find(TAG_OBLIGATION, &obligation.get(), work)?
+            .find(TAG_ENTITLEMENT, &entitlement.get(), work)?
             .ok_or(invalid)?;
         let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
         check!(
@@ -1333,10 +1331,45 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             ),
             invalid
         )?;
-        check!(work, record.obligations().contains(&obligation), invalid)?;
-        self.bundles.retain_bundle(record_index, work)?;
-        self.generation = next;
-        Ok(next)
+        check!(work, record.entitlement == entitlement, invalid)?;
+        Ok(PreparedTombstone {
+            work,
+            nonce: self.instance_nonce,
+            snapshot: self.capacity_snapshot(),
+            record_index,
+            record,
+        })
+    }
+    pub(crate) fn validate_tombstone<'ledger, 'work>(
+        &'ledger mut self,
+        change: PreparedTombstone<'work, H>,
+    ) -> Result<ValidatedTombstone<'ledger, 'work, R, F, H>, SupportLedgerError> {
+        let work = &mut *change.work;
+        let stale = SupportLedgerError::Generation;
+        check!(work, change.nonce == self.instance_nonce, stale)?;
+        self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
+        for key in change.record.tagged_keys() {
+            let owner = self
+                .bundles
+                .find(key.tag, &key.identity, work)?
+                .ok_or(stale)?;
+            check!(work, owner == change.record_index, stale)?;
+        }
+        check!(
+            work,
+            self.bundles.get_record(change.record_index) == Some(&change.record),
+            stale
+        )?;
+        self.bundles.validate_owner_chain(
+            change.record.vector_head,
+            usize::try_from(change.record.vector_len).map_err(|_| stale)?,
+            change.record_index,
+            work,
+        )?;
+        Ok(ValidatedTombstone {
+            ledger: self,
+            change,
+        })
     }
 }
 impl<'ledger, 'input, 'work, const R: usize, const F: usize, const H: usize>
@@ -1385,6 +1418,22 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
             .generation
             .next()
             .expect("prepared withdrawal generation");
+        ledger.generation = next;
+        next
+    }
+}
+impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
+    ValidatedTombstone<'ledger, 'work, R, F, H>
+{
+    pub(crate) fn commit_tombstone(self) -> SupportLedgerGeneration {
+        let change = self.change;
+        let ledger = self.ledger;
+        ledger.bundles.retain_bundle_unmetered(change.record_index);
+        let next = change
+            .snapshot
+            .generation
+            .next()
+            .expect("prepared tombstone generation");
         ledger.generation = next;
         next
     }
@@ -1818,6 +1867,34 @@ impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ValidatedWithdrawal")
+            .finish_non_exhaustive()
+    }
+}
+pub(crate) struct PreparedTombstone<'work, const H: usize> {
+    work: &'work mut WorkMeter,
+    nonce: u64,
+    snapshot: SupportCapacitySnapshot<H>,
+    record_index: u32,
+    record: BundleRecord,
+}
+impl<const H: usize> std::fmt::Debug for PreparedTombstone<'_, H> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedTombstone")
+            .finish_non_exhaustive()
+    }
+}
+pub(crate) struct ValidatedTombstone<'ledger, 'work, const R: usize, const F: usize, const H: usize>
+{
+    ledger: &'ledger mut SupportChargeLedger<R, F, H>,
+    change: PreparedTombstone<'work, H>,
+}
+impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
+    for ValidatedTombstone<'_, '_, R, F, H>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedTombstone")
             .finish_non_exhaustive()
     }
 }
@@ -3056,6 +3133,13 @@ impl RequestBundleStore {
         self.free_records.push(record);
         self.occupied_records = occupied_records;
     }
+    fn retain_bundle_unmetered(&mut self, record: u32) {
+        let RecordSlot::Occupied(record) = &mut self.records[record as usize] else {
+            unreachable!("validated occupied tombstone record")
+        };
+        debug_assert_ne!(record.state, BundleState::RetainedTombstone);
+        record.state = BundleState::RetainedTombstone;
+    }
     /// Metered transition to the retained-tombstone state: the record, its
     /// identities, cells, and claims all remain occupied.
     fn retain_bundle(
@@ -3904,6 +3988,11 @@ mod tests {
         assert_eq!(change.record.support_budget, input.timing.support_budget);
         assert_eq!(change.record.bound_set, input.timing.bound_set);
         assert_eq!(change.record.linked_claims, 0);
+        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 1>>(), 1_584);
+        assert_eq!(
+            std::mem::size_of::<ValidatedTombstone<'static, 'static, 64, 64, 1>>(),
+            1_600
+        );
         assert_eq!(std::mem::size_of::<BundleRecord>(), 1_008);
         assert_eq!(
             std::mem::size_of::<BundleChange<'static, 'static, 1>>(),
@@ -4384,6 +4473,41 @@ mod tests {
         validated.commit_bundle();
         input.initial.materialize.obligation
     }
+    fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(bundle_entitlement(n), &mut meter)
+            .unwrap();
+        ledger
+            .validate_tombstone(change)
+            .unwrap()
+            .commit_tombstone()
+    }
+    #[test]
+    fn c16_bundle_tombstone_drift_and_drop_are_read_only() {
+        let mut ledger = bundle_ledger(4, 8);
+        reserve_bundle(&mut ledger, 1, 3);
+        let before = bundle_snapshot(&ledger);
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(bundle_entitlement(1), &mut meter)
+            .unwrap();
+        ledger.validate_tombstone(change).unwrap();
+        assert_eq!(bundle_snapshot(&ledger), before);
+
+        let mut ledger = bundle_ledger(4, 8);
+        reserve_bundle(&mut ledger, 1, 3);
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(bundle_entitlement(1), &mut meter)
+            .unwrap();
+        add(&mut ledger, 9, 9).unwrap();
+        assert_eq!(
+            ledger.validate_tombstone(change).unwrap_err(),
+            SupportLedgerError::Generation
+        );
+    }
+
     #[test]
     fn c16_bundle_pristine_withdraw_commits_once_and_releases() {
         let mut ledger = bundle_ledger(4, 8);
@@ -4485,9 +4609,7 @@ mod tests {
         let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
         let retained = (ledger.usage, ledger.reserved, ledger.vector_usage);
-        ledger
-            .close_bundle(ledger.generation(), obligation, &mut work())
-            .unwrap();
+        tombstone_bundle(&mut ledger, 1);
         assert_eq!(
             (ledger.usage, ledger.reserved, ledger.vector_usage),
             retained,
@@ -4500,9 +4622,10 @@ mod tests {
             SupportLedgerError::InvalidTransition
         );
         // Double close rejects.
+        let mut tombstone_meter = work();
         assert_eq!(
             ledger
-                .close_bundle(ledger.generation(), obligation, &mut work())
+                .prepare_tombstone(bundle_entitlement(1), &mut tombstone_meter)
                 .unwrap_err(),
             SupportLedgerError::InvalidTransition
         );
@@ -4534,9 +4657,7 @@ mod tests {
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let tombstone = reserve_bundle(&mut ledger, 2, 3);
-        ledger
-            .close_bundle(ledger.generation(), tombstone, &mut work())
-            .unwrap();
+        tombstone_bundle(&mut ledger, 2);
         assert_eq!(ledger.bundles.free_record_len(), 3);
         // The live bundle's identities were released; the tombstone's remain.
         let owner = ledger
@@ -4669,9 +4790,7 @@ mod tests {
         // A retained terminal tombstone keeps blocking every earlier-row path.
         let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
-        ledger
-            .close_bundle(ledger.generation(), obligation, &mut work())
-            .unwrap();
+        tombstone_bundle(&mut ledger, 1);
         let mut generic = spec(9, 9, Ordinary, &[Reserved([9; 32])]);
         generic.id = obligation;
         assert_eq!(
