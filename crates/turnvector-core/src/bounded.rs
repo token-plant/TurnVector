@@ -954,6 +954,84 @@ mod fixed_index_tests {
     }
 
     #[test]
+    fn avl_layout_height_recurrence_and_structure_are_exact() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!((size_of::<AvlNode>(), align_of::<AvlNode>()), (56, 4));
+        assert_eq!(
+            (
+                offset_of!(AvlNode, key),
+                offset_of!(AvlNode, record),
+                offset_of!(AvlNode, left),
+                offset_of!(AvlNode, right),
+                offset_of!(AvlNode, parent),
+                offset_of!(AvlNode, height),
+            ),
+            (0, 36, 40, 44, 48, 52)
+        );
+        assert_eq!(AvlIndex::height_bound(2_050), Ok(15));
+        assert_eq!(AvlIndex::height_bound(16_130), Ok(19));
+
+        fn key(value: u32) -> [u8; 33] {
+            let mut key = [0; 33];
+            key[29..].copy_from_slice(&value.to_be_bytes());
+            key
+        }
+        fn oracle(index: &AvlIndex, node: u32, parent: u32, seen: &mut usize) -> u8 {
+            if node == NO_NODE {
+                return 0;
+            }
+            let value = &index.nodes[node as usize];
+            assert_eq!(value.parent, parent);
+            if value.left != NO_NODE {
+                assert!(index.nodes[value.left as usize].key < value.key);
+            }
+            if value.right != NO_NODE {
+                assert!(index.nodes[value.right as usize].key > value.key);
+            }
+            let left = oracle(index, value.left, node, seen);
+            let right = oracle(index, value.right, node, seen);
+            assert!((i16::from(left) - i16::from(right)).abs() <= 1);
+            assert_eq!(value.height, 1 + left.max(right));
+            *seen += 1;
+            value.height
+        }
+        let rotations = [
+            vec![3, 2, 1],
+            vec![1, 2, 3],
+            vec![3, 1, 2],
+            vec![1, 3, 2],
+            (0..128).collect(),
+            (0..128).rev().collect(),
+        ];
+        for values in rotations {
+            let mut index = AvlIndex::try_new(values.len()).unwrap();
+            let pointer = index.nodes.as_ptr();
+            let capacity = index.nodes.capacity();
+            for value in values {
+                index.insert_prevalidated(key(value), value);
+            }
+            assert_eq!(
+                (index.nodes.as_ptr(), index.nodes.capacity()),
+                (pointer, capacity)
+            );
+            let mut seen = 0;
+            let height = oracle(&index, index.root, NO_NODE, &mut seen);
+            assert_eq!(seen, index.nodes.len());
+            assert!(height <= AvlIndex::height_bound(index.capacity).unwrap());
+            for node in &index.nodes {
+                assert_eq!(
+                    index.find(
+                        node.key,
+                        &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())
+                    ),
+                    Ok(Some(node.record))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fixed_record_arena_owns_claims_and_rejects_atomically() {
         let mut arena = FixedRecordArena::<u8, u8, 2>::try_new(2, 3).unwrap();
         assert!(arena.is_empty());

@@ -931,6 +931,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             capacities: self.capacities,
             usage: self.usage,
             reserved: self.reserved,
+            occupied_records: self.bundles.occupied_records,
             free_records: self.bundles.free_record_len() as u32,
             free_cells: self.bundles.free_cell_len(),
             free_leaves: self.bundles.free_leaf_len(),
@@ -1256,6 +1257,7 @@ pub(crate) struct SupportCapacitySnapshot {
     pub(crate) capacities: [[u32; POOLS]; 5],
     pub(crate) usage: [[u32; POOLS]; 5],
     pub(crate) reserved: [[u32; POOLS]; 3],
+    pub(crate) occupied_records: u32,
     pub(crate) free_records: u32,
     pub(crate) free_cells: usize,
     pub(crate) free_leaves: usize,
@@ -2037,6 +2039,7 @@ struct RequestBundleStore {
     record_capacity: usize,
     records: Vec<Option<BundleRecord>>,
     free_records: Vec<u32>,
+    occupied_records: u32,
     identities: TaggedIdentityIndex,
     cells: EntitlementCellArena,
 }
@@ -2105,6 +2108,7 @@ impl RequestBundleStore {
             record_capacity,
             records,
             free_records,
+            occupied_records: 0,
             identities: TaggedIdentityIndex::try_new(leaf_capacity)?,
             cells: EntitlementCellArena::try_new(cell_capacity)?,
         })
@@ -2113,7 +2117,7 @@ impl RequestBundleStore {
         self.record_capacity
     }
     fn record_len(&self) -> usize {
-        self.records.iter().filter(|slot| slot.is_some()).count()
+        usize::try_from(self.occupied_records).expect("u32 record count fits usize")
     }
     fn free_record_len(&self) -> usize {
         self.free_records.len()
@@ -2128,7 +2132,7 @@ impl RequestBundleStore {
         self.identities.free_branch_len()
     }
     fn is_empty(&self) -> bool {
-        self.record_len() == 0
+        self.occupied_records == 0
     }
     fn find(
         &self,
@@ -2191,6 +2195,10 @@ impl RequestBundleStore {
             0,
             K as u64 * (2 * bits + 4),
         ]))?;
+        let occupied_records = self
+            .occupied_records
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
         let record_index = self
             .free_records
             .pop()
@@ -2206,6 +2214,7 @@ impl RequestBundleStore {
             vector_len: len,
             ..*record
         });
+        self.occupied_records = occupied_records;
         Ok(record_index)
     }
     /// Metered prevalidated pristine withdrawal: proves the exact record,
@@ -2237,6 +2246,10 @@ impl RequestBundleStore {
             0,
             K as u64 * (bits + 1),
         ]))?;
+        let occupied_records = self
+            .occupied_records
+            .checked_sub(1)
+            .ok_or(FixedStorageError::NonCanonical)?;
         for key in record_slot.tagged_keys() {
             let removed = self
                 .identities
@@ -2247,6 +2260,7 @@ impl RequestBundleStore {
         self.cells.release(head, len);
         self.records[record as usize] = None;
         self.free_records.push(record);
+        self.occupied_records = occupied_records;
         Ok(())
     }
     /// Metered validation of the exact record slot the consuming commit will
@@ -2295,6 +2309,10 @@ impl RequestBundleStore {
     /// owner corruption after validate proved capacity, absence, and
     /// local-slot selection.
     fn commit_bundle(&mut self, record: &BundleRecord, cells: &[OutstandingCreditCell]) {
+        let occupied_records = self
+            .occupied_records
+            .checked_add(1)
+            .expect("validated occupied record count");
         let record_index = self.free_records.pop().expect("validated record capacity");
         for key in record.tagged_keys() {
             self.identities.install(key, record_index);
@@ -2305,6 +2323,7 @@ impl RequestBundleStore {
             vector_len: len,
             ..*record
         });
+        self.occupied_records = occupied_records;
     }
     /// Infallible consuming pristine withdrawal under the validated selection:
     /// removes each of the `K` identity leaves by splicing its sibling over
@@ -2314,6 +2333,10 @@ impl RequestBundleStore {
     /// defense for impossible owner corruption after validate proved the
     /// exact record and chain.
     fn withdraw_bundle_unmetered(&mut self, record: u32) {
+        let occupied_records = self
+            .occupied_records
+            .checked_sub(1)
+            .expect("validated occupied record count");
         let record_slot = self.records[record as usize]
             .as_ref()
             .expect("validated occupied record");
@@ -2325,6 +2348,7 @@ impl RequestBundleStore {
         self.cells.release(head, len);
         self.records[record as usize] = None;
         self.free_records.push(record);
+        self.occupied_records = occupied_records;
     }
     /// Metered transition to the retained-tombstone state: the record, its
     /// identities, cells, and claims all remain occupied.
@@ -3404,12 +3428,13 @@ mod tests {
         assert_eq!(snapshot.reserved, ledger.reserved);
         assert_eq!(
             (
+                snapshot.occupied_records,
                 snapshot.free_records,
                 snapshot.free_cells,
                 snapshot.free_leaves,
                 snapshot.free_branches
             ),
-            (4, 8, 44, 43)
+            (0, 4, 8, 44, 43)
         );
         let cells = axis_cells(2, 1);
         let input = bundle_input::<8>(1, &cells);
@@ -3421,12 +3446,13 @@ mod tests {
         let snapshot = ledger.snapshot(&mut work()).unwrap();
         assert_eq!(
             (
+                snapshot.occupied_records,
                 snapshot.free_records,
                 snapshot.free_cells,
                 snapshot.free_leaves,
                 snapshot.free_branches
             ),
-            (3, 6, 33, 33)
+            (1, 3, 6, 33, 33)
         );
     }
     #[test]
@@ -4747,6 +4773,11 @@ mod tests {
             .enumerate()
             .filter_map(|(index, slot)| slot.is_some().then_some(index as u32))
             .collect();
+        assert_eq!(
+            store.record_len(),
+            occupied.len(),
+            "constant-time occupied record count"
+        );
         assert_eq!(
             free_records.len() + occupied.len(),
             store.record_capacity,
