@@ -924,75 +924,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let work = &mut *change.work;
         let stale = SupportLedgerError::Generation;
         check!(work, change.nonce == self.instance_nonce, stale)?;
-        check!(work, change.snapshot.generation == self.generation, stale)?;
-        check!(
-            work,
-            change.snapshot.bundle_vector_max == self.bundle_vector_max,
-            stale
-        )?;
-        for class in 0..5 {
-            for pool in 0..POOLS {
-                check!(
-                    work,
-                    self.capacities[class][pool] == change.snapshot.capacities[class][pool],
-                    stale
-                )?;
-                check!(
-                    work,
-                    self.usage[class][pool] == change.snapshot.usage[class][pool],
-                    stale
-                )?;
-            }
-        }
-        for class in 0..5 {
-            for pool in 0..POOLS {
-                check!(
-                    work,
-                    self.reserved[class][pool] == change.snapshot.reserved[class][pool],
-                    stale
-                )?;
-            }
-        }
-        for cell in 0..21 {
-            for horizon in 0..H {
-                check!(
-                    work,
-                    self.vector_capacity[cell][horizon]
-                        == change.snapshot.vector_capacity[cell][horizon],
-                    stale
-                )?;
-                check!(
-                    work,
-                    self.vector_usage[cell][horizon] == change.snapshot.vector_usage[cell][horizon],
-                    stale
-                )?;
-            }
-        }
-        check!(
-            work,
-            self.bundles.occupied_records == change.snapshot.occupied_records,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_record_len() as u32 == change.snapshot.free_records,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_cell_len() as u32 == change.snapshot.free_cells,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_leaf_len() as u32 == change.snapshot.free_leaves,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_branch_len() as u32 == change.snapshot.free_branches,
-            stale
-        )?;
+        self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
         for (slot, key) in change.record.tagged_keys().into_iter().enumerate() {
             let found = self.bundles.find(key.tag, &key.identity, work)?;
             check!(
@@ -1062,23 +994,95 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             occupied_records: self.bundles.occupied_records,
         }
     }
-    /// Read-only metered preparation of one pristine C16 bundle withdrawal:
-    /// locates the exact live record by its first obligation, proves the
-    /// record and its complete owned cell chain, and preflights the complete
-    /// removal Work envelope before any mutation. Returns the non-forgeable
-    /// instance-bound `WithdrawChange`; dropping it changes no state. A
-    /// retained terminal tombstone is not pristine and rejects.
-    pub(crate) fn prepare_withdraw(
+    fn validate_capacity_snapshot(
         &self,
-        expected: SupportLedgerGeneration,
-        obligation: SupportOperationObligationId,
+        snapshot: &SupportCapacitySnapshot<H>,
         work: &mut WorkMeter,
-    ) -> Result<WithdrawChange, SupportLedgerError> {
+        stale: SupportLedgerError,
+    ) -> Result<(), SupportLedgerError> {
+        check!(work, snapshot.generation == self.generation, stale)?;
+        check!(
+            work,
+            snapshot.bundle_vector_max == self.bundle_vector_max,
+            stale
+        )?;
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                check!(
+                    work,
+                    self.capacities[class][pool] == snapshot.capacities[class][pool],
+                    stale
+                )?;
+                check!(
+                    work,
+                    self.usage[class][pool] == snapshot.usage[class][pool],
+                    stale
+                )?;
+                check!(
+                    work,
+                    self.reserved[class][pool] == snapshot.reserved[class][pool],
+                    stale
+                )?;
+            }
+        }
+        for cell in 0..21 {
+            for horizon in 0..H {
+                check!(
+                    work,
+                    self.vector_capacity[cell][horizon] == snapshot.vector_capacity[cell][horizon],
+                    stale
+                )?;
+                check!(
+                    work,
+                    self.vector_usage[cell][horizon] == snapshot.vector_usage[cell][horizon],
+                    stale
+                )?;
+            }
+        }
+        check!(
+            work,
+            self.bundles.occupied_records == snapshot.occupied_records,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_record_len() as u32 == snapshot.free_records,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_cell_len() as u32 == snapshot.free_cells,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_leaf_len() as u32 == snapshot.free_leaves,
+            stale
+        )?;
+        check!(
+            work,
+            self.bundles.free_branch_len() as u32 == snapshot.free_branches,
+            stale
+        )?;
+        Ok(())
+    }
+    /// Read-only metered preparation of one pristine C16 bundle withdrawal:
+    /// locates the exact live record by its entitlement, proves the record and
+    /// its complete owned cell chain, and preflights the complete removal Work
+    /// envelope before any mutation. Returns the non-forgeable
+    /// instance-bound `PreparedWithdrawal`; dropping it changes no state. A
+    /// retained terminal tombstone is not pristine and rejects.
+    pub(crate) fn prepare_withdraw<'work>(
+        &self,
+        entitlement: FutureTurnSupportEntitlementId,
+        work: &'work mut WorkMeter,
+    ) -> Result<PreparedWithdrawal<'work, H>, SupportLedgerError> {
+        let expected = self.generation;
         self.next(expected, work)?;
         let invalid = SupportLedgerError::InvalidTransition;
         let record_index = self
             .bundles
-            .find(TAG_OBLIGATION, &obligation.get(), work)?
+            .find(TAG_ENTITLEMENT, &entitlement.get(), work)?
             .ok_or(invalid)?;
         let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
         check!(
@@ -1088,7 +1092,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 && record.initial.iter().all(|item| item.state == Conditional),
             invalid
         )?;
-        check!(work, record.obligations().contains(&obligation), invalid)?;
+        check!(work, record.entitlement == entitlement, invalid)?;
         let head = usize::try_from(record.vector_head).map_err(|_| invalid)?;
         let len = usize::try_from(record.vector_len).map_err(|_| invalid)?;
         self.bundles
@@ -1100,34 +1104,32 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             0,
             K as u64 * (u64::from(IDENTITY_BITS) + 1),
         ]))?;
-        Ok(WithdrawChange {
+        Ok(PreparedWithdrawal {
+            work,
             nonce: self.instance_nonce,
-            expected,
+            snapshot: self.capacity_snapshot(),
             record_index,
+            leaves: [NO_NODE; K],
             record,
         })
     }
     /// Metered exclusive validation of one prepared pristine-withdrawal
-    /// change. Consumes the `WithdrawChange`, verifies the exact non-reused
+    /// change. Consumes the `PreparedWithdrawal`, verifies the exact non-reused
     /// instance nonce, and rechecks the target record before-image and its
     /// complete owner cell chain under the ordinary exclusive ledger borrow.
-    /// Returns the exclusive `ValidatedWithdrawChange`; a rejection or a drop
+    /// Returns the exclusive `ValidatedWithdrawal`; a rejection or a drop
     /// changes no state.
-    pub(crate) fn validate_withdraw(
-        &mut self,
-        change: WithdrawChange,
-        work: &mut WorkMeter,
-    ) -> Result<ValidatedWithdrawChange<'_, R, F, H>, SupportLedgerError> {
+    pub(crate) fn validate_withdraw<'ledger, 'work>(
+        &'ledger mut self,
+        mut change: PreparedWithdrawal<'work, H>,
+    ) -> Result<ValidatedWithdrawal<'ledger, 'work, R, F, H>, SupportLedgerError> {
+        let work = &mut *change.work;
         let stale = SupportLedgerError::Generation;
         check!(work, change.nonce == self.instance_nonce, stale)?;
-        check!(work, change.expected == self.generation, stale)?;
+        self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
         let found = self
             .bundles
-            .find(
-                TAG_OBLIGATION,
-                &change.record.initial[0].obligation.get(),
-                work,
-            )?
+            .find(TAG_ENTITLEMENT, &change.record.entitlement.get(), work)?
             .ok_or(stale)?;
         check!(work, found == change.record_index, stale)?;
         check!(
@@ -1135,6 +1137,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             self.bundles.get_record(change.record_index) == Some(&change.record),
             stale
         )?;
+        for (slot, key) in change.leaves.iter_mut().zip(change.record.tagged_keys()) {
+            let owner = self
+                .bundles
+                .find(key.tag, &key.identity, work)?
+                .ok_or(stale)?;
+            check!(work, owner == change.record_index, stale)?;
+            *slot = owner;
+        }
         let head = usize::try_from(change.record.vector_head).map_err(|_| stale)?;
         self.bundles.validate_owner_chain(
             head,
@@ -1142,7 +1152,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             change.record_index as usize,
             work,
         )?;
-        Ok(ValidatedWithdrawChange {
+        Ok(ValidatedWithdrawal {
             ledger: self,
             change,
         })
@@ -1201,8 +1211,8 @@ impl<'ledger, 'input, 'work, const R: usize, const F: usize, const H: usize>
         next
     }
 }
-impl<'ledger, const R: usize, const F: usize, const H: usize>
-    ValidatedWithdrawChange<'ledger, R, F, H>
+impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
+    ValidatedWithdrawal<'ledger, 'work, R, F, H>
 {
     /// Consuming infallible pristine withdrawal of the validated C16 bundle:
     /// performs no new fallible lookup, check, allocation, Work call, or
@@ -1218,7 +1228,8 @@ impl<'ledger, const R: usize, const F: usize, const H: usize>
             .bundles
             .withdraw_bundle_unmetered(change.record_index);
         let next = change
-            .expected
+            .snapshot
+            .generation
             .next()
             .expect("prepared withdrawal generation");
         ledger.generation = next;
@@ -1612,21 +1623,43 @@ pub(crate) struct SupportCapacitySnapshot<const H: usize> {
 /// nonce, expected generation, target record index, and fixed record
 /// before-image. Intentionally not Clone or Copy; dropping it changes no
 /// state.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct WithdrawChange {
+pub(crate) struct PreparedWithdrawal<'work, const H: usize> {
+    work: &'work mut WorkMeter,
     nonce: u64,
-    expected: SupportLedgerGeneration,
+    snapshot: SupportCapacitySnapshot<H>,
     record_index: u32,
+    leaves: [u32; K],
     record: BundleRecord,
+}
+impl<const H: usize> std::fmt::Debug for PreparedWithdrawal<'_, H> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedWithdrawal")
+            .finish_non_exhaustive()
+    }
 }
 /// Exclusive non-forgeable validated pristine-withdrawal capability: holds the
 /// sole `&mut` ledger borrow and the fixed withdrawal facts. Not Clone or
 /// Copy; `commit_withdraw` consumes it once and performs no new fallible
 /// lookup, check, allocation, or Work call; dropping it changes no state.
-#[derive(Debug)]
-pub(crate) struct ValidatedWithdrawChange<'ledger, const R: usize, const F: usize, const H: usize> {
+pub(crate) struct ValidatedWithdrawal<
+    'ledger,
+    'work,
+    const R: usize,
+    const F: usize,
+    const H: usize,
+> {
     ledger: &'ledger mut SupportChargeLedger<R, F, H>,
-    change: WithdrawChange,
+    change: PreparedWithdrawal<'work, H>,
+}
+impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
+    for ValidatedWithdrawal<'_, '_, R, F, H>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedWithdrawal")
+            .finish_non_exhaustive()
+    }
 }
 /// Private fixed entitlement-cell arena owned conceptually by the Support Charge
 /// Ledger. Constructor-preallocated exact-capacity `slots` and LIFO `free` stores,
@@ -3501,6 +3534,12 @@ mod tests {
             entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(), vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(), cells,
         }
     }
+    fn bundle_entitlement(n: u8) -> FutureTurnSupportEntitlementId {
+        let mut identity = [0; 32];
+        identity[0] = n;
+        identity[1] = 31;
+        FutureTurnSupportEntitlementId::new(identity).unwrap()
+    }
     fn bundle_ledger(records: usize, cells: usize) -> Ledger {
         let generation = SupportLedgerGeneration::new(1).unwrap();
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
@@ -4032,18 +4071,23 @@ mod tests {
         let before = ledger.generation();
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(before, obligation, &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), &mut measured)
             .unwrap();
         assert_eq!(
-            measured.witness(),
-            HotPathWorkWitness::new([8, 0, 0, 0, 22])
+            change.work.witness(),
+            HotPathWorkWitness::new([6, 0, 0, 0, 20])
         );
         let validated = ledger
-            .validate_withdraw(change, &mut measured)
+            .validate_withdraw(change)
             .expect("same-instance same-state validation");
         assert_eq!(
-            measured.witness(),
-            HotPathWorkWitness::new([16, 0, 0, 0, 44])
+            validated.change.work.witness(),
+            HotPathWorkWitness::new([66, 0, 0, 0, 198])
+        );
+        assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_632);
+        assert_eq!(
+            std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 1>>(),
+            1_648
         );
         let next = validated.commit_withdraw();
         assert_eq!(next, before.next().unwrap());
@@ -4071,13 +4115,11 @@ mod tests {
         // withdrawal on a fresh ledger.
         let mut ledger = new_ledger();
         let first = reserve_bundle(&mut ledger, 1, 3);
+        let mut measured = work();
         let change = ledger
-            .prepare_withdraw(ledger.generation(), first, &mut work())
+            .prepare_withdraw(bundle_entitlement(1), &mut measured)
             .unwrap();
-        ledger
-            .validate_withdraw(change, &mut work())
-            .unwrap()
-            .commit_withdraw();
+        ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let reused = reserve_bundle(&mut ledger, 1, 3);
         assert_eq!(ledger.bundles.free_record_len(), 3);
         assert_eq!(reused, first);
@@ -4087,31 +4129,31 @@ mod tests {
         let cells = axis_cells(3, 1);
         // An intervening legal mutation makes the prepared withdrawal stale.
         let mut ledger = new_ledger();
-        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        reserve_bundle(&mut ledger, 1, 3);
+        let mut measured = work();
         let change = ledger
-            .prepare_withdraw(ledger.generation(), obligation, &mut work())
+            .prepare_withdraw(bundle_entitlement(1), &mut measured)
             .unwrap();
         add(&mut ledger, 9, 9).unwrap();
         assert_eq!(
-            ledger.validate_withdraw(change, &mut work()).unwrap_err(),
+            ledger.validate_withdraw(change).unwrap_err(),
             SupportLedgerError::Generation
         );
         // Dropping the validated capability changes no state.
         let mut ledger = new_ledger();
-        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        reserve_bundle(&mut ledger, 1, 3);
         let before = bundle_snapshot(&ledger);
         let change = ledger
-            .prepare_withdraw(ledger.generation(), obligation, &mut work())
+            .prepare_withdraw(bundle_entitlement(1), &mut measured)
             .unwrap();
-        ledger.validate_withdraw(change, &mut work()).unwrap();
+        ledger.validate_withdraw(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
         // An unknown obligation rejects during prepare.
         assert_eq!(
             ledger
                 .prepare_withdraw(
-                    ledger.generation(),
-                    SupportOperationObligationId::new([200; 32]).unwrap(),
-                    &mut work()
+                    FutureTurnSupportEntitlementId::new([200; 32]).unwrap(),
+                    &mut measured,
                 )
                 .unwrap_err(),
             SupportLedgerError::InvalidTransition
@@ -4124,7 +4166,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ledger
-                .prepare_withdraw(ledger.generation(), obligation, &mut work())
+                .prepare_withdraw(bundle_entitlement(1), &mut measured)
                 .unwrap_err(),
             SupportLedgerError::InvalidTransition
         );
@@ -4156,14 +4198,12 @@ mod tests {
         // Post-removal reuse: close then pristine-withdraw is impossible, so
         // reuse is tested on a fresh Live bundle below.
         let mut ledger = new_ledger();
-        let first = reserve_bundle(&mut ledger, 1, 3);
+        reserve_bundle(&mut ledger, 1, 3);
+        let mut measured = work();
         let change = ledger
-            .prepare_withdraw(ledger.generation(), first, &mut work())
+            .prepare_withdraw(bundle_entitlement(1), &mut measured)
             .unwrap();
-        ledger
-            .validate_withdraw(change, &mut work())
-            .unwrap()
-            .commit_withdraw();
+        ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let tombstone = reserve_bundle(&mut ledger, 2, 3);
         ledger
             .close_bundle(ledger.generation(), tombstone, &mut work())
