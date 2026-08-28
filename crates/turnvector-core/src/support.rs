@@ -1093,10 +1093,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             invalid
         )?;
         check!(work, record.entitlement == entitlement, invalid)?;
-        let head = usize::try_from(record.vector_head).map_err(|_| invalid)?;
+        let head = record.vector_head;
         let len = usize::try_from(record.vector_len).map_err(|_| invalid)?;
         self.bundles
-            .validate_owner_chain(head, len, record_index as usize, work)?;
+            .validate_owner_chain(head, len, record_index, work)?;
         work.ensure(HotPathWorkWitness::new([
             K as u64 * (u64::from(IDENTITY_BITS) + 1),
             0,
@@ -1145,11 +1145,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             check!(work, owner == change.record_index, stale)?;
             *slot = owner;
         }
-        let head = usize::try_from(change.record.vector_head).map_err(|_| stale)?;
+        let head = change.record.vector_head;
         self.bundles.validate_owner_chain(
             head,
             usize::try_from(change.record.vector_len).map_err(|_| stale)?,
-            change.record_index as usize,
+            change.record_index,
             work,
         )?;
         Ok(ValidatedWithdrawal {
@@ -1666,52 +1666,40 @@ impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
 /// no later growth, no hot-path allocation, no public seam.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EntitlementCellArena {
-    capacity: usize,
     slots: Vec<CellSlot>,
-    free: Vec<usize>,
+    free: Vec<u32>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CellSlot {
-    Vacant,
+    Vacant {
+        free_position: u32,
+    },
     Occupied {
-        owner_record: usize,
+        owner_record: u32,
         cell: OutstandingCreditCell,
-        next_owned: Option<usize>,
+        next_owned: u32,
     },
 }
 impl EntitlementCellArena {
-    /// Checked physical storage bytes for `capacity` cell slots plus their
-    /// LIFO free stack, against the binary Storage/CopiedBytes maximum.
     fn storage_bytes(capacity: u64) -> Option<u64> {
-        let slot_bytes = std::mem::size_of::<CellSlot>() as u64;
-        let index_bytes = std::mem::size_of::<usize>() as u64;
-        let total = capacity
-            .checked_mul(slot_bytes)?
-            .checked_add(capacity.checked_mul(index_bytes)?)?;
-        (total <= 2_097_152).then_some(total)
+        capacity.checked_mul(44).filter(|&total| total <= 2_097_152)
     }
     fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
-        if capacity == 0 {
+        if capacity == 0 || capacity >= NO_NODE as usize {
             return Err(FixedStorageError::Capacity);
         }
-        // Checked storage arithmetic before allocation.
-        let slot_bytes = std::mem::size_of::<CellSlot>() as u64;
-        let index_bytes = std::mem::size_of::<usize>() as u64;
         let capacity_u64 = u64::try_from(capacity).map_err(|_| FixedStorageError::Allocation)?;
         let slots_bytes = capacity_u64
-            .checked_mul(slot_bytes)
+            .checked_mul(std::mem::size_of::<CellSlot>() as u64)
             .ok_or(FixedStorageError::Allocation)?;
         let free_bytes = capacity_u64
-            .checked_mul(index_bytes)
+            .checked_mul(std::mem::size_of::<u32>() as u64)
             .ok_or(FixedStorageError::Allocation)?;
-        if slots_bytes > isize::MAX as u64 || free_bytes > isize::MAX as u64 {
-            return Err(FixedStorageError::Allocation);
-        }
-        // Binary Storage/CopiedBytes maximum from the accepted HotPathWorkBudget.
-        let storage_max = 2_097_152_u64;
-        if slots_bytes
-            .checked_add(free_bytes)
-            .is_none_or(|total| total > storage_max)
+        if slots_bytes > isize::MAX as u64
+            || free_bytes > isize::MAX as u64
+            || slots_bytes
+                .checked_add(free_bytes)
+                .is_none_or(|total| total > 2_097_152)
         {
             return Err(FixedStorageError::Capacity);
         }
@@ -1719,22 +1707,22 @@ impl EntitlementCellArena {
         slots
             .try_reserve_exact(capacity)
             .map_err(|_| FixedStorageError::Allocation)?;
-        slots.resize(capacity, CellSlot::Vacant);
+        for position in (0..capacity).rev() {
+            slots.push(CellSlot::Vacant {
+                free_position: u32::try_from(position).map_err(|_| FixedStorageError::Capacity)?,
+            });
+        }
         let mut free = Vec::new();
         free.try_reserve_exact(capacity)
             .map_err(|_| FixedStorageError::Allocation)?;
         for index in (0..capacity).rev() {
-            free.push(index);
+            free.push(u32::try_from(index).map_err(|_| FixedStorageError::Capacity)?);
         }
         seal_exact_capacity(&slots, &free, capacity)?;
-        Ok(Self {
-            capacity,
-            slots,
-            free,
-        })
+        Ok(Self { slots, free })
     }
     fn capacity(&self) -> usize {
-        self.capacity
+        self.slots.len()
     }
     fn free_len(&self) -> usize {
         self.free.len()
@@ -1744,61 +1732,72 @@ impl EntitlementCellArena {
         count: usize,
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
-        work.record(WorkDimension::InvariantChecks, 1)?;
-        if count > self.free.len() {
-            return Err(FixedStorageError::Capacity);
-        }
-        for index in self.free.iter().rev().take(count) {
+        check!(work, count <= self.free.len(), FixedStorageError::Capacity)?;
+        let start = self.free.len() - count;
+        for position in start..self.free.len() {
             work.record(WorkDimension::VisitedEntities, 1)?;
-            work.record(WorkDimension::InvariantChecks, 1)?;
-            if !matches!(self.slots[*index], CellSlot::Vacant) {
+            let index = *self
+                .free
+                .get(position)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                (index as usize) < self.slots.len(),
+                FixedStorageError::NonCanonical
+            )?;
+            let slot = &self.slots[index as usize];
+            let CellSlot::Vacant { free_position } = *slot else {
+                work.record(WorkDimension::InvariantChecks, 1)?;
                 return Err(FixedStorageError::NonCanonical);
-            }
+            };
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            check!(
+                work,
+                free_position == position as u32,
+                FixedStorageError::NonCanonical
+            )?;
         }
         Ok(())
     }
-    fn install(&mut self, owner: usize, cells: &[OutstandingCreditCell]) -> (usize, usize) {
-        let count = cells.len();
-        let mut head = None;
+    fn install(&mut self, owner: u32, cells: &[OutstandingCreditCell]) -> (u32, u32) {
+        let mut head = NO_NODE;
         for cell in cells.iter().rev() {
             let index = self.free.pop().expect("prevalidated free capacity");
-            let next = head;
-            self.slots[index] = CellSlot::Occupied {
+            self.slots[index as usize] = CellSlot::Occupied {
                 owner_record: owner,
                 cell: *cell,
-                next_owned: next,
+                next_owned: head,
             };
-            head = Some(index);
+            head = index;
         }
-        (head.expect("nonempty chain"), count)
+        (
+            head,
+            u32::try_from(cells.len()).expect("constructor-bounded cell count"),
+        )
     }
     fn validate_chain(
         &self,
-        head: usize,
+        head: u32,
         count: usize,
-        owner: usize,
+        owner: u32,
         cells: &[OutstandingCreditCell],
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
-        work.record(WorkDimension::InvariantChecks, 1)?;
-        if count != cells.len() {
-            return Err(FixedStorageError::NonCanonical);
-        }
-        let mut slot = Some(head);
-        for (i, expected) in cells.iter().enumerate() {
+        check!(work, count == cells.len(), FixedStorageError::NonCanonical)?;
+        let mut index = head;
+        for (position, expected) in cells.iter().enumerate() {
             work.record(WorkDimension::VisitedEntities, 1)?;
-            let index = slot.ok_or(FixedStorageError::NonCanonical)?;
-            check!(
-                work,
-                index < self.slots.len(),
-                FixedStorageError::NonCanonical
-            )?;
+            check!(work, index != NO_NODE, FixedStorageError::NonCanonical)?;
+            let slot = self
+                .slots
+                .get(index as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
             work.record(WorkDimension::InvariantChecks, 1)?;
             let CellSlot::Occupied {
                 owner_record,
                 cell,
                 next_owned,
-            } = self.slots[index]
+            } = *slot
             else {
                 return Err(FixedStorageError::NonCanonical);
             };
@@ -1806,64 +1805,58 @@ impl EntitlementCellArena {
             check!(work, cell == *expected, FixedStorageError::NonCanonical)?;
             check!(
                 work,
-                next_owned.is_some() == (i + 1 != count),
+                (next_owned == NO_NODE) == (position + 1 == count),
                 FixedStorageError::NonCanonical
             )?;
-            slot = next_owned;
+            index = next_owned;
         }
         Ok(())
     }
-    /// Metered owner-chain traversal without expected cell values: verifies
-    /// every slot of the exact `count`-length chain is occupied by `owner` with
-    /// a valid next link. Used by pristine withdrawal, which releases the chain
-    /// after the full before-image is established.
     fn validate_owner_chain(
         &self,
-        head: usize,
+        head: u32,
         count: usize,
-        owner: usize,
+        owner: u32,
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
-        work.record(WorkDimension::InvariantChecks, 1)?;
-        let mut slot = Some(head);
-        for i in 0..count {
+        let mut index = head;
+        for position in 0..count {
             work.record(WorkDimension::VisitedEntities, 1)?;
-            let index = slot.ok_or(FixedStorageError::NonCanonical)?;
-            check!(
-                work,
-                index < self.slots.len(),
-                FixedStorageError::NonCanonical
-            )?;
+            check!(work, index != NO_NODE, FixedStorageError::NonCanonical)?;
+            let slot = self
+                .slots
+                .get(index as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
             work.record(WorkDimension::InvariantChecks, 1)?;
             let CellSlot::Occupied {
                 owner_record,
                 next_owned,
                 ..
-            } = self.slots[index]
+            } = *slot
             else {
                 return Err(FixedStorageError::NonCanonical);
             };
             check!(work, owner_record == owner, FixedStorageError::NonCanonical)?;
             check!(
                 work,
-                next_owned.is_some() == (i + 1 != count),
+                (next_owned == NO_NODE) == (position + 1 == count),
                 FixedStorageError::NonCanonical
             )?;
-            slot = next_owned;
+            index = next_owned;
         }
         Ok(())
     }
-    fn release(&mut self, head: usize, count: usize) {
-        let mut slot = Some(head);
+    fn release(&mut self, head: u32, count: usize) {
+        let mut index = head;
         for _ in 0..count {
-            let index = slot.expect("validated chain length");
-            let next_owned = match self.slots[index] {
+            let next = match self.slots[index as usize] {
                 CellSlot::Occupied { next_owned, .. } => next_owned,
-                CellSlot::Vacant => unreachable!("validated chain slot"),
+                CellSlot::Vacant { .. } => unreachable!("validated chain slot"),
             };
-            self.slots[index] = CellSlot::Vacant;
+            let free_position = u32::try_from(self.free.len()).expect("bounded free stack");
+            self.slots[index as usize] = CellSlot::Vacant { free_position };
             self.free.push(index);
-            slot = next_owned;
+            index = next;
         }
     }
 }
@@ -1871,9 +1864,9 @@ impl EntitlementCellArena {
 /// `capacity` slots, never more. `try_reserve_exact` only guarantees at least
 /// the requested capacity, so a successful arena must be exactly `C`; anything
 /// over-capacity is rejected deterministically, independent of allocator policy.
-fn seal_exact_capacity(
-    slots: &Vec<CellSlot>,
-    free: &Vec<usize>,
+fn seal_exact_capacity<T, U>(
+    slots: &Vec<T>,
+    free: &Vec<U>,
     capacity: usize,
 ) -> Result<(), FixedStorageError> {
     (slots.capacity() == capacity && free.capacity() == capacity)
@@ -2485,10 +2478,15 @@ impl BundleRecord {
 /// tagged identity leaves and its entitlement cells; every slot
 /// constructor-preallocated with exact-capacity free-index stacks, no hot-path
 /// growth, no public seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+enum RecordSlot {
+    Vacant { free_position: u32 },
+    Occupied(BundleRecord),
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RequestBundleStore {
-    record_capacity: usize,
-    records: Vec<Option<BundleRecord>>,
+    records: Vec<RecordSlot>,
     free_records: Vec<u32>,
     occupied_records: u32,
     identities: TaggedIdentityIndex,
@@ -2508,7 +2506,7 @@ impl RequestBundleStore {
         let leaf_capacity = record_capacity
             .checked_mul(K)
             .ok_or(FixedStorageError::Allocation)?;
-        let record_bytes = std::mem::size_of::<Option<BundleRecord>>() as u64;
+        let record_bytes = std::mem::size_of::<RecordSlot>() as u64;
         let index_bytes = std::mem::size_of::<u32>() as u64;
         let record_capacity_u64 =
             u64::try_from(record_capacity).map_err(|_| FixedStorageError::Allocation)?;
@@ -2544,7 +2542,11 @@ impl RequestBundleStore {
         records
             .try_reserve_exact(record_capacity)
             .map_err(|_| FixedStorageError::Allocation)?;
-        records.resize(record_capacity, None);
+        for position in (0..record_capacity).rev() {
+            records.push(RecordSlot::Vacant {
+                free_position: u32::try_from(position).map_err(|_| FixedStorageError::Capacity)?,
+            });
+        }
         let mut free_records = Vec::new();
         free_records
             .try_reserve_exact(record_capacity)
@@ -2556,7 +2558,6 @@ impl RequestBundleStore {
             return Err(FixedStorageError::Capacity);
         }
         Ok(Self {
-            record_capacity,
             records,
             free_records,
             occupied_records: 0,
@@ -2565,7 +2566,7 @@ impl RequestBundleStore {
         })
     }
     fn record_capacity(&self) -> usize {
-        self.record_capacity
+        self.records.len()
     }
     fn record_len(&self) -> usize {
         usize::try_from(self.occupied_records).expect("u32 record count fits usize")
@@ -2594,7 +2595,10 @@ impl RequestBundleStore {
         self.identities.find(tag, identity, work)
     }
     fn get_record(&self, index: u32) -> Option<&BundleRecord> {
-        self.records.get(index as usize).and_then(Option::as_ref)
+        match self.records.get(index as usize)? {
+            RecordSlot::Occupied(record) => Some(record),
+            RecordSlot::Vacant { .. } => None,
+        }
     }
     /// Metered prevalidated bundle reserve: proves all `K` tagged identities
     /// absent, checks record/cell/leaf/branch capacity, and preflights the
@@ -2659,10 +2663,10 @@ impl RequestBundleStore {
                 .insert(key, record_index, work)
                 .expect("insertion Work fully preflighted");
         }
-        let (head, len) = self.cells.install(record_index as usize, cells);
-        self.records[record_index as usize] = Some(BundleRecord {
-            vector_head: u32::try_from(head).expect("constructor-bounded cell index"),
-            vector_len: u32::try_from(len).expect("constructor-bounded cell count"),
+        let (head, len) = self.cells.install(record_index, cells);
+        self.records[record_index as usize] = RecordSlot::Occupied(BundleRecord {
+            vector_head: head,
+            vector_len: len,
             ..*record
         });
         self.occupied_records = occupied_records;
@@ -2679,16 +2683,12 @@ impl RequestBundleStore {
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
         let record_slot = self
-            .records
-            .get(record as usize)
-            .and_then(Option::as_ref)
+            .get_record(record)
             .ok_or(FixedStorageError::NonCanonical)?;
-        let head = usize::try_from(record_slot.vector_head)
-            .map_err(|_| FixedStorageError::NonCanonical)?;
+        let head = record_slot.vector_head;
         let len =
             usize::try_from(record_slot.vector_len).map_err(|_| FixedStorageError::NonCanonical)?;
-        self.cells
-            .validate_owner_chain(head, len, record as usize, work)?;
+        self.cells.validate_owner_chain(head, len, record, work)?;
         let bits = u64::from(IDENTITY_BITS);
         work.ensure(HotPathWorkWitness::new([
             K as u64 * (bits + 1),
@@ -2709,7 +2709,9 @@ impl RequestBundleStore {
             debug_assert_eq!(removed, Some(record));
         }
         self.cells.release(head, len);
-        self.records[record as usize] = None;
+        let free_position =
+            u32::try_from(self.free_records.len()).expect("constructor-bounded record free stack");
+        self.records[record as usize] = RecordSlot::Vacant { free_position };
         self.free_records.push(record);
         self.occupied_records = occupied_records;
         Ok(())
@@ -2727,7 +2729,11 @@ impl RequestBundleStore {
         work.record(WorkDimension::InvariantChecks, 1)?;
         check!(
             work,
-            self.records[index as usize].is_none(),
+            matches!(
+                self.records.get(index as usize),
+                Some(RecordSlot::Vacant { free_position })
+                    if *free_position == (self.free_records.len() - 1) as u32
+            ),
             FixedStorageError::NonCanonical
         )
     }
@@ -2736,9 +2742,9 @@ impl RequestBundleStore {
     /// before-image the consuming withdrawal commit will release.
     fn validate_owner_chain(
         &self,
-        head: usize,
+        head: u32,
         len: usize,
-        owner: usize,
+        owner: u32,
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
         self.cells.validate_owner_chain(head, len, owner, work)
@@ -2768,10 +2774,10 @@ impl RequestBundleStore {
         for key in record.tagged_keys() {
             self.identities.install(key, record_index);
         }
-        let (head, len) = self.cells.install(record_index as usize, cells);
-        self.records[record_index as usize] = Some(BundleRecord {
-            vector_head: u32::try_from(head).expect("constructor-bounded cell index"),
-            vector_len: u32::try_from(len).expect("constructor-bounded cell count"),
+        let (head, len) = self.cells.install(record_index, cells);
+        self.records[record_index as usize] = RecordSlot::Occupied(BundleRecord {
+            vector_head: head,
+            vector_len: len,
             ..*record
         });
         self.occupied_records = occupied_records;
@@ -2788,16 +2794,16 @@ impl RequestBundleStore {
             .occupied_records
             .checked_sub(1)
             .expect("validated occupied record count");
-        let record_slot = self.records[record as usize]
-            .as_ref()
-            .expect("validated occupied record");
-        let head = usize::try_from(record_slot.vector_head).expect("validated vector head");
+        let record_slot = self.get_record(record).expect("validated occupied record");
+        let head = record_slot.vector_head;
         let len = usize::try_from(record_slot.vector_len).expect("validated vector length");
         for key in record_slot.tagged_keys() {
             self.identities.remove_unmetered(key.tag, &key.identity);
         }
         self.cells.release(head, len);
-        self.records[record as usize] = None;
+        let free_position =
+            u32::try_from(self.free_records.len()).expect("constructor-bounded record free stack");
+        self.records[record as usize] = RecordSlot::Vacant { free_position };
         self.free_records.push(record);
         self.occupied_records = occupied_records;
     }
@@ -2812,12 +2818,14 @@ impl RequestBundleStore {
         let slot = self
             .records
             .get_mut(record as usize)
-            .and_then(Option::as_mut)
             .ok_or(FixedStorageError::NonCanonical)?;
-        if slot.state == BundleState::RetainedTombstone {
+        let RecordSlot::Occupied(record) = slot else {
+            return Err(FixedStorageError::NonCanonical);
+        };
+        if record.state == BundleState::RetainedTombstone {
             return Err(FixedStorageError::NonCanonical);
         }
-        slot.state = BundleState::RetainedTombstone;
+        record.state = BundleState::RetainedTombstone;
         Ok(())
     }
 }
@@ -3810,7 +3818,7 @@ mod tests {
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([7, 0, 0, 0, 187])
+            HotPathWorkWitness::new([7, 0, 0, 0, 193])
         );
         let next = validated.commit_bundle();
         assert_eq!(next, before.next().unwrap());
@@ -4075,14 +4083,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([6, 0, 0, 0, 20])
+            HotPathWorkWitness::new([6, 0, 0, 0, 19])
         );
         let validated = ledger
             .validate_withdraw(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([66, 0, 0, 0, 198])
+            HotPathWorkWitness::new([66, 0, 0, 0, 196])
         );
         assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_632);
         assert_eq!(
@@ -4386,22 +4394,25 @@ mod tests {
         assert_eq!(arena.free.capacity(), capacity, "free capacity sealed");
         assert!(arena.free.len() <= capacity);
         let mut free_set = HashSet::new();
-        for &index in arena.free.iter() {
-            assert!(index < capacity, "free index in range");
+        for (position, &index) in arena.free.iter().enumerate() {
+            assert!((index as usize) < capacity, "free index in range");
             assert!(free_set.insert(index), "free indices unique");
-            assert_eq!(arena.slots[index], CellSlot::Vacant);
+            assert_eq!(
+                arena.slots[index as usize],
+                CellSlot::Vacant {
+                    free_position: position as u32,
+                }
+            );
         }
         let mut pointed = HashSet::new();
         let mut occupied = 0usize;
         for index in 0..capacity {
-            if let CellSlot::Occupied {
-                next_owned: Some(next),
-                ..
-            } = arena.slots[index]
+            if let CellSlot::Occupied { next_owned, .. } = arena.slots[index]
+                && next_owned != NO_NODE
             {
-                assert!(next < capacity, "next index in range");
+                assert!((next_owned as usize) < capacity, "next index in range");
                 assert!(
-                    pointed.insert(next),
+                    pointed.insert(next_owned),
                     "two slots share one next (not a simple chain)"
                 );
             }
@@ -4420,14 +4431,15 @@ mod tests {
             let CellSlot::Occupied { .. } = arena.slots[index] else {
                 continue;
             };
-            if pointed.contains(&index) {
+            if pointed.contains(&(index as u32)) {
                 continue;
             }
             chains += 1;
-            let mut slot = Some(index);
+            let mut slot = index as u32;
             let mut owner = None;
             let mut chain = HashSet::new();
-            while let Some(current) = slot {
+            while slot != NO_NODE {
+                let current = slot as usize;
                 assert!(current < capacity);
                 assert!(chain.insert(current), "acyclic chain");
                 assert!(visited.insert(current), "chain disjoint from another");
@@ -4472,25 +4484,25 @@ mod tests {
     }
     fn chain_ok(
         arena: &EntitlementCellArena,
-        head: usize,
-        len: usize,
-        owner: usize,
+        head: u32,
+        len: u32,
+        owner: u32,
         cells: &[OutstandingCreditCell],
     ) -> HotPathWorkWitness {
         let mut meter = work();
-        let chain = arena.validate_chain(head, len, owner, cells, &mut meter);
+        let chain = arena.validate_chain(head, len as usize, owner, cells, &mut meter);
         assert_eq!(chain, Ok(()));
         meter.witness()
     }
     fn chain_err(
         arena: &EntitlementCellArena,
-        head: usize,
-        len: usize,
-        owner: usize,
+        head: u32,
+        len: u32,
+        owner: u32,
         cells: &[OutstandingCreditCell],
     ) -> HotPathWorkWitness {
         let mut meter = work();
-        let chain = arena.validate_chain(head, len, owner, cells, &mut meter);
+        let chain = arena.validate_chain(head, len as usize, owner, cells, &mut meter);
         assert_eq!(chain, Err(FixedStorageError::NonCanonical));
         meter.witness()
     }
@@ -4511,13 +4523,13 @@ mod tests {
     fn c16_cell_arena_constructor() {
         for (capacity, error) in [
             (0, FixedStorageError::Capacity),
-            (usize::MAX, FixedStorageError::Allocation),
+            (usize::MAX, FixedStorageError::Capacity),
         ] {
             assert_eq!(EntitlementCellArena::try_new(capacity).unwrap_err(), error);
         }
         // First storage-invalid boundary: slots+free bytes exceed the binary bound.
         let slot_bytes = std::mem::size_of::<CellSlot>() as u64;
-        let index_bytes = std::mem::size_of::<usize>() as u64;
+        let index_bytes = std::mem::size_of::<u32>() as u64;
         let max_capacity = (2_097_152_u64 / (slot_bytes + index_bytes)) as usize;
         let boundary = EntitlementCellArena::try_new(max_capacity + 1).unwrap_err();
         assert_eq!(boundary, FixedStorageError::Capacity);
@@ -4525,12 +4537,14 @@ mod tests {
         // rejection without relying on allocator behavior. `with_capacity(16)`
         // guarantees at least 16 slots, so both backing Vecs are never exactly 8.
         let mut slots = Vec::with_capacity(16);
-        slots.resize(8, CellSlot::Vacant);
+        slots.extend((0..8).map(|free_position| CellSlot::Vacant { free_position }));
         let mut free = Vec::with_capacity(16);
-        free.extend((0..8).rev());
+        free.extend((0u32..8).rev());
         let sealed = seal_exact_capacity(&slots, &free, 8).unwrap_err();
         assert_eq!(sealed, FixedStorageError::Capacity);
         let arena = EntitlementCellArena::try_new(8).unwrap();
+        assert_eq!(std::mem::size_of::<CellSlot>(), 40);
+        assert_eq!(std::mem::size_of::<EntitlementCellArena>(), 48);
         assert_eq!(arena.capacity(), 8);
         assert_eq!(arena.free_len(), 8);
         arena_oracle(&arena);
@@ -4540,20 +4554,20 @@ mod tests {
     fn c16_cell_arena_selection_and_install() {
         let mut arena = EntitlementCellArena::try_new(8).unwrap();
         assert_eq!(select_ok(&arena, 0), witness([0, 0, 0, 0, 1]));
-        assert_eq!(select_ok(&arena, 1), witness([1, 0, 0, 0, 2]));
+        assert_eq!(select_ok(&arena, 1), witness([1, 0, 0, 0, 4]));
         assert_eq!(select_err(&arena, 9), witness([0, 0, 0, 0, 1]));
         let five = axis_cells(5, 1);
-        assert_eq!(select_ok(&arena, 5), witness([5, 0, 0, 0, 6]));
+        assert_eq!(select_ok(&arena, 5), witness([5, 0, 0, 0, 16]));
         let (head, len) = arena.install(7, &five);
         assert_eq!((head, len), (4, 5));
         assert_eq!(arena.free_len(), 3);
-        assert_eq!(select_ok(&arena, 3), witness([3, 0, 0, 0, 4]));
+        assert_eq!(select_ok(&arena, 3), witness([3, 0, 0, 0, 10]));
         assert_eq!(select_err(&arena, 4), witness([0, 0, 0, 0, 1]));
         for (index, cell, next) in [(0, five[4], None), (4, five[0], Some(3))] {
             let expected = CellSlot::Occupied {
                 owner_record: 7,
                 cell,
-                next_owned: next,
+                next_owned: next.unwrap_or(NO_NODE),
             };
             assert_eq!(arena.slots[index], expected);
         }
@@ -4565,6 +4579,30 @@ mod tests {
         assert_eq!(arena.free_len(), 0);
         assert_eq!(select_err(&arena, 1), witness([0, 0, 0, 0, 1]));
         arena_oracle(&arena);
+    }
+
+    #[test]
+    fn c16_cell_arena_selected_slot_corruption_rejects_safely() {
+        let arena = EntitlementCellArena::try_new(8).unwrap();
+        let mut out_of_range = arena.clone();
+        *out_of_range.free.last_mut().unwrap() = u32::MAX;
+        assert_eq!(
+            out_of_range.validate_selection(1, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut wrong_position = arena.clone();
+        wrong_position.slots[0] = CellSlot::Vacant { free_position: 0 };
+        assert_eq!(
+            wrong_position.validate_selection(1, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut duplicate = arena;
+        let last = duplicate.free.len() - 1;
+        duplicate.free[last - 1] = duplicate.free[last];
+        assert_eq!(
+            duplicate.validate_selection(2, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
     }
 
     #[test]
@@ -4591,7 +4629,7 @@ mod tests {
         chain_err(&arena, head, 2, 7, &cells[..2]);
         let reversed = [cells[0], cells[2], cells[1]];
         chain_err(&arena, head, 3, 7, &reversed);
-        arena.release(head, len);
+        arena.release(head, len as usize);
         let stale = chain_err(&arena, head, len, 7, &cells);
         assert_eq!(stale, witness([1, 0, 0, 0, 3]));
         assert_eq!(arena.free_len(), 8);
@@ -4605,12 +4643,12 @@ mod tests {
         for cycle in 0..5 {
             let count = 3 + cycle % 2;
             let cells = axis_cells(count, 1);
-            let (head, len) = arena.install(cycle + 1, &cells);
-            assert_eq!(len, count);
+            let (head, len) = arena.install((cycle + 1) as u32, &cells);
+            assert_eq!(len, count as u32);
             assert!(head < 8);
             arena_oracle(&arena);
-            chain_ok(&arena, head, len, cycle + 1, &cells);
-            arena.release(head, len);
+            chain_ok(&arena, head, len, (cycle + 1) as u32, &cells);
+            arena.release(head, len as usize);
             arena_oracle(&arena);
             total_installed += count;
         }
@@ -4649,21 +4687,21 @@ mod tests {
     fn c16_cell_arena_work_exact_and_one_under() {
         let mut arena = EntitlementCellArena::try_new(8).unwrap();
         let cells = axis_cells(3, 1);
-        assert_eq!(select_ok(&arena, 3), witness([3, 0, 0, 0, 4]));
+        assert_eq!(select_ok(&arena, 3), witness([3, 0, 0, 0, 10]));
         one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |m| {
             arena.validate_selection(3, m)
         });
-        one_under(WorkDimension::InvariantChecks, 4, 28_708, |m| {
+        one_under(WorkDimension::InvariantChecks, 10, 28_708, |m| {
             arena.validate_selection(3, m)
         });
         let (head, len) = arena.install(7, &cells);
         let chain = chain_ok(&arena, head, len, 7, &cells);
         assert_eq!(chain, witness([3, 0, 0, 0, 16]));
         one_under(WorkDimension::VisitedEntities, 3, 1_704_575, |m| {
-            arena.validate_chain(head, len, 7, &cells, m)
+            arena.validate_chain(head, len as usize, 7, &cells, m)
         });
         one_under(WorkDimension::InvariantChecks, 16, 28_708, |m| {
-            arena.validate_chain(head, len, 7, &cells, m)
+            arena.validate_chain(head, len as usize, 7, &cells, m)
         });
     }
 
@@ -5258,19 +5296,27 @@ mod tests {
     fn bundle_store_oracle(store: &RequestBundleStore) {
         use std::collections::HashSet;
         let mut free_records = HashSet::new();
-        for &record in &store.free_records {
+        for (position, &record) in store.free_records.iter().enumerate() {
             assert!(
-                record < store.record_capacity as u32,
+                record < store.record_capacity() as u32,
                 "free record in range"
             );
             assert!(free_records.insert(record), "free record indices unique");
-            assert_eq!(store.records[record as usize], None, "free record vacant");
+            assert_eq!(
+                store.records[record as usize],
+                RecordSlot::Vacant {
+                    free_position: position as u32,
+                },
+                "free record vacant"
+            );
         }
         let occupied: Vec<u32> = store
             .records
             .iter()
             .enumerate()
-            .filter_map(|(index, slot)| slot.is_some().then_some(index as u32))
+            .filter_map(|(index, slot)| {
+                matches!(slot, RecordSlot::Occupied(_)).then_some(index as u32)
+            })
             .collect();
         assert_eq!(
             store.record_len(),
@@ -5279,15 +5325,13 @@ mod tests {
         );
         assert_eq!(
             free_records.len() + occupied.len(),
-            store.record_capacity,
+            store.record_capacity(),
             "record partition"
         );
         trie_oracle(&store.identities);
         arena_oracle(&store.cells);
         for &record in &occupied {
-            let slot = store.records[record as usize]
-                .as_ref()
-                .expect("occupied record");
+            let slot = store.get_record(record).expect("occupied record");
             for key in slot.tagged_keys() {
                 assert_eq!(
                     store.identities.find(key.tag, &key.identity, &mut work()),
@@ -5295,20 +5339,20 @@ mod tests {
                     "every record identity present and owned"
                 );
             }
-            let head = usize::try_from(slot.vector_head).expect("occupied record has a cell chain");
+            let head = slot.vector_head;
             store
                 .cells
                 .validate_owner_chain(
                     head,
                     usize::try_from(slot.vector_len).unwrap(),
-                    record as usize,
+                    record,
                     &mut work(),
                 )
                 .unwrap();
         }
         for leaf in store.identities.leaf_slots.iter().flatten() {
             assert!(
-                store.records[leaf.record as usize].is_some(),
+                matches!(store.records[leaf.record as usize], RecordSlot::Occupied(_)),
                 "every index leaf owner is an occupied record"
             );
         }
@@ -5316,8 +5360,8 @@ mod tests {
             .iter()
             .map(|&record| {
                 usize::try_from(
-                    store.records[record as usize]
-                        .as_ref()
+                    store
+                        .get_record(record)
                         .expect("occupied record")
                         .vector_len,
                 )
@@ -5360,7 +5404,7 @@ mod tests {
         // First storage-invalid boundary: total record/identity/cell storage
         // exceeds the binary Storage/CopiedBytes maximum.
         let record_bytes =
-            std::mem::size_of::<Option<BundleRecord>>() as u64 + std::mem::size_of::<u32>() as u64;
+            std::mem::size_of::<RecordSlot>() as u64 + std::mem::size_of::<u32>() as u64;
         let storage = |records: u64| {
             records * record_bytes
                 + TaggedIdentityIndex::storage_bytes(records * K as u64).unwrap()
@@ -5380,6 +5424,7 @@ mod tests {
             RequestBundleStore::try_new(maximum as usize + 1, 1).unwrap_err(),
             FixedStorageError::Capacity
         );
+        assert_eq!(std::mem::size_of::<RecordSlot>(), 1_008);
         // E = 1 boundary and exact-capacity seal.
         let store = RequestBundleStore::try_new(1, 4).unwrap();
         assert_eq!(store.record_capacity(), 1);
@@ -5410,6 +5455,28 @@ mod tests {
             (44, 43)
         );
         bundle_store_oracle(&store);
+    }
+    #[test]
+    fn c16_bundle_record_destination_corruption_rejects_safely() {
+        let store = RequestBundleStore::try_new(4, 8).unwrap();
+        let mut out_of_range = store.clone();
+        *out_of_range.free_records.last_mut().unwrap() = u32::MAX;
+        assert_eq!(
+            out_of_range.validate_record_slot(&mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut wrong_position = store.clone();
+        wrong_position.records[0] = RecordSlot::Vacant { free_position: 0 };
+        assert_eq!(
+            wrong_position.validate_record_slot(&mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut occupied = store;
+        occupied.records[0] = RecordSlot::Occupied(bundle_record(1));
+        assert_eq!(
+            occupied.validate_record_slot(&mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
     }
     #[test]
     fn c16_bundle_store_reserve_and_withdraw() {
