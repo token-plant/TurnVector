@@ -165,6 +165,7 @@ pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     lifecycle_maxima: LifecycleReserveMaxima,
     lifecycle_batch_max: u16,
     bundles: RequestBundleStore,
+    bundle_vector_max: u16,
     instance_nonce: u64,
 }
 /// Process-local one-issuance dispenser for private per-ledger instance
@@ -191,6 +192,10 @@ fn issue_instance_nonce(dispenser: &AtomicU64) -> Option<u64> {
 }
 impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H> {
     #[allow(dead_code, reason = "C08 installs the Catalog adapter")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor binds the complete ledger facts"
+    )]
     pub(crate) fn try_new(
         generation: SupportLedgerGeneration,
         capacities: [[u32; POOLS]; 5],
@@ -199,79 +204,87 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         lifecycle_maxima: LifecycleReserveMaxima,
         bundle_records: usize,
         bundle_cells: usize,
+        bundle_vector_max: usize,
     ) -> Result<Self, SupportLedgerError> {
+        let records = usize::try_from(total(capacities[CREDITS]))
+            .map_err(|_| SupportLedgerError::InvalidInput)?;
+        let claims = usize::try_from(total(capacities[CLAIMS]))
+            .map_err(|_| SupportLedgerError::InvalidInput)?;
+        let capacity_consistent = (0..POOLS).all(|pool| {
+            (0..=ACTIVE).all(|class| {
+                capacities[class][pool] <= capacities[CREDITS][pool]
+                    && capacities[class][pool] <= capacities[CLAIMS][pool]
+            })
+        });
         let valid = (1..=1_024).contains(&max_claims)
             && total(capacities[..3].iter().flatten().copied()) <= R as u64
-            && total(capacities[CREDITS]) <= R as u64
-            && total(capacities[CLAIMS]) <= F as u64
+            && records <= R
+            && claims <= F
+            && capacity_consistent
             && lifecycle_maxima
                 .0
                 .into_iter()
-                .all(|maximum| maximum > 0 && maximum as usize <= R);
+                .all(|maximum| maximum > 0 && maximum as usize <= R)
+            && H > 0
+            && H <= 8
+            && bundle_records > 0
+            && bundle_cells > 0
+            && bundle_vector_max > 0
+            && bundle_vector_max <= bundle_cells
+            && bundle_vector_max <= 21 * H;
         valid
             .then_some(())
             .ok_or(SupportLedgerError::InvalidInput)?;
         let maxima = lifecycle_maxima.0;
-        // Checked constructor derivation of the exact maximum lifecycle batch
-        // length: kinds 0 and 1 share one trigger, every other kind uses its
-        // own trigger, and the batch never exceeds u16::MAX.
-        let shared = u64::from(maxima[0]) + u64::from(maxima[1]);
+        let shared = u32::from(maxima[0])
+            .checked_add(u32::from(maxima[1]))
+            .ok_or(SupportLedgerError::InvalidInput)?;
         let batch = shared
-            .max(u64::from(maxima[2]))
-            .max(u64::from(maxima[3]))
-            .max(u64::from(maxima[4]));
-        let lifecycle_batch_max = u16::try_from(batch).unwrap_or(u16::MAX);
-        // Checked worst-case lifecycle batch Work before construction: the
-        // exact maximum batch `M_L` must fit every binary Work maximum when
-        // every reciprocal legacy and C16 lookup visits its full bounded path
-        // and the complete insertion envelope is charged. Per member this is
-        // one loop visit, two legacy finds and two C16 finds (each at most
-        // B+1 = 265 visits, and each C16 find at most B+1 = 265 checks), the
-        // two per-find absence checks, plus the insertion envelope of 1,662
-        // visits and 16 checks; the fixed checks are next (2), nonempty (1),
-        // batch bound (1), and capacity (5).
+            .max(u32::from(maxima[2]))
+            .max(u32::from(maxima[3]))
+            .max(u32::from(maxima[4]))
+            .min(u32::from(u16::MAX));
+        let lifecycle_batch_max =
+            u16::try_from(batch).map_err(|_| SupportLedgerError::InvalidInput)?;
+        let height = u64::from(crate::bounded::AvlIndex::height_bound(
+            records
+                .checked_mul(2)
+                .ok_or(SupportLedgerError::InvalidInput)?,
+        )?);
         let batch = u64::from(lifecycle_batch_max);
-        let worst_visits = batch
-            .checked_mul(2_723)
+        let worst_visits = (567u64)
+            .checked_add(10 * height)
+            .and_then(|per_member| per_member.checked_mul(batch))
             .ok_or(SupportLedgerError::InvalidInput)?;
-        let copied = std::mem::size_of::<(Record, SupportFundingClaim)>() as u64 + 172;
-        let worst_copied = batch
-            .checked_mul(copied)
+        let worst_copied = 300u64
+            .checked_mul(batch)
             .ok_or(SupportLedgerError::InvalidInput)?;
-        let worst_checks = batch
-            .checked_mul(560)
-            .and_then(|value| value.checked_add(9))
+        let worst_checks = 16u64
+            .checked_mul(batch)
+            .and_then(|value| value.checked_add(13))
             .ok_or(SupportLedgerError::InvalidInput)?;
         if worst_visits > 1_704_575 || worst_copied > 2_097_152 || worst_checks > 28_708 {
             return Err(SupportLedgerError::InvalidInput);
         }
-        // Checked worst-case C16 bundle reserve Work before construction: the
-        // physical cell capacity `C` is the largest vector one bundle could
-        // hold, so the complete reserve envelope must fit every binary Work
-        // maximum. Rejects before any allocation or nonce issuance.
-        let worst = bundle_reserve_work(bundle_cells);
-        if worst.value(WorkDimension::VisitedEntities) > 1_704_575
-            || worst.value(WorkDimension::CopiedBytes) > 2_097_152
-            || worst.value(WorkDimension::InvariantChecks) > 28_708
-        {
-            return Err(SupportLedgerError::InvalidInput);
-        }
-        // After all other fallible construction, the process-global dispenser
-        // issues one nonzero instance nonce; checked exhaustion is a
-        // constructor error and no nonce is reused.
+        let records = FixedRecordArena::try_new(records, claims)?;
+        let starts = FixedWindowCounter::try_new(starts)?;
+        let bundles = RequestBundleStore::try_new(bundle_records, bundle_cells)?;
+        let bundle_vector_max =
+            u16::try_from(bundle_vector_max).map_err(|_| SupportLedgerError::InvalidInput)?;
         let instance_nonce = issue_instance_nonce(&PROCESS_INSTANCE_DISPENSER)
             .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
         Ok(Self {
             generation,
             capacities,
             max_claims,
-            records: FixedRecordArena::try_new(R, F)?,
+            records,
             usage: [[0; POOLS]; 5],
             reserved: [[0; POOLS]; 3],
-            starts: FixedWindowCounter::try_new(starts)?,
+            starts,
             lifecycle_maxima,
             lifecycle_batch_max,
-            bundles: RequestBundleStore::try_new(bundle_records, bundle_cells)?,
+            bundles,
+            bundle_vector_max,
             instance_nonce,
         })
     }
@@ -318,7 +331,24 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         for (class, added) in [(CONDITIONAL, 1), (CREDITS, 1), (CLAIMS, claims)] {
             check!(work, self.available(class, pool, added), CAPACITY_ERROR)?;
         }
+        for identity in [key(0, spec.id.get()), key(1, spec.physical_credit.get())] {
+            let absent = self.records.find(identity, work)?.is_none();
+            check!(work, absent, FixedStorageError::Duplicate)?;
+        }
         self.reciprocal_absent(spec.id.get(), spec.physical_credit.get(), work)?;
+        self.records.validate_capacity(count)?;
+        let height = u64::from(self.records.maximum_identity_height()?);
+        let mutation = HotPathWorkWitness::new([
+            8 * height + 34,
+            (std::mem::size_of::<Record>()
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of_val(spec.claims)
+                + 2 * 56) as u64,
+            0,
+            0,
+            6,
+        ]);
+        work.charge(mutation)?;
         work.record(WorkDimension::CopiedBytes, 66)?;
         let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
         let record = (
@@ -330,7 +360,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             SupportCallScopeId([0; 32]),
             None,
         );
-        self.records.try_push(keys, record, spec.claims, work)?;
+        self.records.push_prevalidated(keys, record, spec.claims);
         self.usage[CONDITIONAL][pool] += 1;
         self.usage[CREDITS][pool] += 1;
         self.usage[CLAIMS][pool] += claims;
@@ -390,7 +420,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
         self.reciprocal_absent(spec.id.get(), spec.physical_credit.get(), work)?;
-        work.ensure(insertion_work(1))?;
+        self.records.validate_capacity(1)?;
+        let height = u64::from(self.records.maximum_identity_height()?);
+        work.charge(HotPathWorkWitness::new([8 * height + 34, 300, 0, 0, 6]))?;
         let start = self
             .starts
             .prepare_start(spec.operation as usize * POOLS + pool, at, work)?;
@@ -436,7 +468,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     pub(crate) fn commit(
         &mut self,
         change: SupportChange,
-        work: &mut WorkMeter,
+        _work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
         self.validate(&change)?;
         match change.delta {
@@ -451,7 +483,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     None,
                 );
                 let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
-                self.records.try_push(keys, record, &[spec.claim], work)?;
+                self.records.push_prevalidated(keys, record, &[spec.claim]);
                 self.starts.apply_start(start);
                 for class in [ACTIVE, CREDITS, CLAIMS] {
                     self.usage[class][SupportPool::Ordinary as usize] += 1;
@@ -527,7 +559,16 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         for class in [CONDITIONAL, PENDING, ACTIVE, CREDITS, CLAIMS] {
             check!(work, self.available(class, pool, added), CAPACITY_ERROR)?;
         }
-        work.ensure(insertion_work(specs.len()))?;
+        self.records.validate_capacity(specs.len())?;
+        let members = u64::try_from(specs.len()).map_err(|_| invalid)?;
+        let height = u64::from(self.records.maximum_identity_height()?);
+        work.charge(HotPathWorkWitness::new([
+            members * (8 * height + 34),
+            members * 300,
+            0,
+            0,
+            4 + 2 * members,
+        ]))?;
         for spec in specs {
             let (operation, pool, _) = lifecycle_shape(spec.kind);
             let record = (
@@ -540,9 +581,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 Some((spec.kind, first.id, count)),
             );
             let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
-            self.records
-                .try_push(keys, record, &[spec.claim], work)
-                .expect("lifecycle insertion was fully prevalidated");
+            self.records.push_prevalidated(keys, record, &[spec.claim]);
         }
         for class in [CONDITIONAL, CREDITS, CLAIMS] {
             self.usage[class][pool] += added;
@@ -736,7 +775,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         check!(work, input.entitlement.get() != [0; 32], invalid)?;
         check!(work, input.vector.get() != [0; 32], invalid)?;
-        check!(work, input.cells.len() > 0, invalid)?;
+        check!(
+            work,
+            input.cells.len() > 0 && input.cells.len() <= usize::from(self.bundle_vector_max),
+            invalid
+        )?;
         let record = BundleRecord {
             obligations,
             credits,
@@ -1061,34 +1104,18 @@ fn lifecycle_result(result: LifecycleTriggerResult) -> (u8, bool) {
     let encoded = LIFECYCLE_RESULTS[result as usize];
     (encoded >> 1, encoded & 1 != 0)
 }
-fn insertion_work(count: usize) -> HotPathWorkWitness {
-    let count = count as u64;
-    let copied = std::mem::size_of::<(Record, SupportFundingClaim)>() as u64 + 172;
-    HotPathWorkWitness::new([1_662 * count, copied * count, 0, 0, 16 * count])
-}
-/// Conservative complete-reserve Work envelope for one C16 bundle with `v`
-/// validated cells, charged before any mutation. Per tagged identity it
-/// budgets two absence traversals in prepare, two in validate, and one peer,
-/// one insertion traversal, and a 33-byte first-difference pass in commit,
-/// each bounded by `B + 1` branches plus one leaf; the six shared
-/// obligation/credit identities add their reciprocal legacy traversals; each
-/// cell adds five passes. The fixed checks cover the prepare preflight (next
-/// 2, identity validation 18, entitlement/vector/nonempty 3, absence
-/// comparisons 17, free capacity 4) and the validate preflight (nonce 1,
-/// generation 1, capacities 15, usage 15, reserved 9, free counts 4, identity
-/// comparison 11, legacy comparison 6, record slot 3, cell selection 4).
 fn bundle_reserve_work(cells: usize) -> HotPathWorkWitness {
     let v = cells as u64;
     let bits = u64::from(IDENTITY_BITS) + 1;
     let fixed = K as u64;
     let visits = fixed * (4 * bits + 33) + 12 * bits + 1 + 5 * v;
     let checks = fixed * (4 * bits) + 113 + 5 * v;
-    let copied = (std::mem::size_of::<BundleRecord>() as u64 + std::mem::size_of::<u32>() as u64)
+    let copied = (std::mem::size_of::<BundleRecord>() as u64 + 4)
         + fixed
             * (2 * std::mem::size_of::<Option<IdentityLeaf>>() as u64
                 + 2 * std::mem::size_of::<Option<IdentityBranch>>() as u64
-                + 4 * std::mem::size_of::<u32>() as u64)
-        + 4 * v * (std::mem::size_of::<CellSlot>() as u64 + std::mem::size_of::<usize>() as u64);
+                + 16)
+        + 4 * v * (std::mem::size_of::<CellSlot>() as u64 + 8);
     HotPathWorkWitness::new([visits, copied, 0, 0, checks])
 }
 fn key(tag: u8, id: [u8; 32]) -> [u8; 33] {
@@ -2340,7 +2367,7 @@ mod tests {
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
-        Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 8).unwrap()
+        Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 8, 6).unwrap()
     }
     fn ordinary_ledger() -> Ledger {
         let mut ledger = new_ledger();
@@ -2427,7 +2454,10 @@ mod tests {
         let mut measured = work();
         let valid = spec(7, 7, Ordinary, &[Reserved([7; 32])]);
         ledger.reserve(before, valid, &mut measured).unwrap();
-        assert_eq!(measured.witness().value(WorkDimension::VisitedEntities), 3);
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([75, 366, 0, 0, 20])
+        );
         let mut ledger = generic_ledger();
         let before = ledger.generation();
         let mut exhausted = work();
@@ -2535,7 +2565,7 @@ mod tests {
         let next = ledger.commit(change, &mut measured).unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([2, 288, 0, 0, 22])
+            HotPathWorkWitness::new([74, 308, 0, 0, 22])
         );
         let mut rejected_work = work();
         rejected!(ledger, ledger.commit(replay, &mut rejected_work), Stale);
@@ -2570,7 +2600,7 @@ mod tests {
         );
         assert_eq!(
             finished.witness(),
-            HotPathWorkWitness::new([2, 177, 0, 0, 4])
+            HotPathWorkWitness::new([1, 177, 0, 0, 4])
         );
         assert_eq!(ledger.records.get(0).unwrap().3, Retained);
 
@@ -2680,8 +2710,8 @@ mod tests {
         assert_eq!(ledger.records.get(0).unwrap().3, Active);
         assert_eq!(ledger.records.get(1).unwrap().3, ClosedPending);
 
-        let resolved_work = HotPathWorkWitness::new([2, 144, 0, 0, 5]);
-        let rejected_work = HotPathWorkWitness::new([2, 144, 0, 0, 4]);
+        let resolved_work = HotPathWorkWitness::new([1, 144, 0, 0, 5]);
+        let rejected_work = HotPathWorkWitness::new([1, 144, 0, 0, 4]);
         let run = |kind, result, state| {
             let mut spec = life(result as u8 + 10, kind);
             spec.expires_at = (kind == Next).then_some(at(3));
@@ -2733,31 +2763,25 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_batch_constructor_rejects_unbounded_work() {
+    fn lifecycle_batch_constructor_accepts_the_immutable_boundary() {
         type Wide = SupportChargeLedger<65_536, 65_536, 3>;
         let generation = SupportLedgerGeneration::new(1).unwrap();
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
-        let starts = std::array::from_fn(|_| {
-            [
-                FixedStartCountBound(Duration::from_micros(10), 1),
-                FixedStartCountBound(Duration::from_micros(20), 1),
-                FixedStartCountBound(Duration::from_micros(30), 1),
-            ]
-        });
-        let build = |maxima| Wide::try_new(generation, capacities, 2, starts, maxima, 4, 8);
-        // Exact envelope boundary: M_L = max(1+50, 50, 1, 1) = 51 fits every
-        // binary Work maximum, so the constructor accepts it.
-        build(LifecycleReserveMaxima([1, 50, 50, 1, 1])).unwrap();
-        // M_L = 52 exceeds the worst-case InvariantChecks envelope: reject.
+        let starts = [[
+            FixedStartCountBound(Duration::from_micros(10), 1),
+            FixedStartCountBound(Duration::from_micros(20), 1),
+            FixedStartCountBound(Duration::from_micros(30), 1),
+        ]; 21];
+        let build = |maxima| Wide::try_new(generation, capacities, 2, starts, maxima, 4, 8, 6);
+        build(LifecycleReserveMaxima([1, 1_024, 1_024, 1, 1])).unwrap();
+        build(LifecycleReserveMaxima([1, 1_792, 1_792, 1, 1])).unwrap();
         assert_eq!(
-            build(LifecycleReserveMaxima([1, 51, 51, 1, 1])).unwrap_err(),
-            SupportLedgerError::InvalidInput
+            build(LifecycleReserveMaxima([1, 1_793, 1_793, 1, 1])).unwrap_err(),
+            InvalidInput
         );
-        // A u16::MAX-clamped batch can never fit a binary maximum: checked
-        // derivation rejects without overflow or reuse.
         assert_eq!(
             build(LifecycleReserveMaxima([u16::MAX; 5])).unwrap_err(),
-            SupportLedgerError::InvalidInput
+            InvalidInput
         );
     }
 
@@ -3007,7 +3031,17 @@ mod tests {
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
-        Ledger::try_new(generation, capacities, 2, starts, maxima, records, cells).unwrap()
+        Ledger::try_new(
+            generation,
+            capacities,
+            2,
+            starts,
+            maxima,
+            records,
+            cells,
+            cells.clamp(1, 6),
+        )
+        .unwrap()
     }
     fn bundle_snapshot(ledger: &Ledger) -> (SupportLedgerGeneration, usize, usize, usize, usize) {
         (
@@ -3169,7 +3203,11 @@ mod tests {
             SupportLedgerError::Storage(FixedStorageError::Capacity)
         );
         // Cell exhaustion when the vector needs more cells than remain free.
-        let mut ledger = bundle_ledger(4, 3);
+        let mut ledger = bundle_ledger(4, 4);
+        ledger
+            .bundles
+            .reserve_bundle(&bundle_record(9), &axis_cells(1, 1), &mut work())
+            .unwrap();
         let wide = axis_cells(4, 1);
         let input = bundle_input::<8>(3, &wide);
         assert_eq!(
@@ -3345,13 +3383,13 @@ mod tests {
         );
     }
     #[test]
-    fn c16_bundle_constructor_rejects_unbounded_reserve_work() {
+    fn c16_bundle_constructor_rejects_vector_above_axis_domain() {
         let generation = SupportLedgerGeneration::new(1).unwrap();
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
         assert_eq!(
-            Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 4_000).unwrap_err(),
+            Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 4_000, 22).unwrap_err(),
             SupportLedgerError::InvalidInput
         );
     }
@@ -3432,7 +3470,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([3, 346, 0, 0, 18])
+            HotPathWorkWitness::new([75, 366, 0, 0, 20])
         );
         // Lifecycle reserve m = 1 with the reciprocal preflight frozen.
         let mut ledger = new_ledger();
@@ -3459,7 +3497,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([3, 280, 0, 0, 29])
+            HotPathWorkWitness::new([75, 300, 0, 0, 29])
         );
     }
     fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
