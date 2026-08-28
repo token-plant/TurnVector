@@ -756,6 +756,10 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         Ok(Self { bounds, history })
     }
 
+    pub(crate) fn bounds(&self, cell: usize) -> Option<&[FixedStartCountBound; H]> {
+        self.bounds.get(cell)
+    }
+
     pub fn try_start(
         &mut self,
         cell: usize,

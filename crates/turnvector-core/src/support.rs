@@ -794,6 +794,154 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         Ok(())
     }
+    fn bundle_logical_delta(
+        &self,
+        cells: impl IntoIterator<Item = OutstandingCreditCell>,
+    ) -> Result<BundleLogicalDelta<H>, SupportLedgerError> {
+        let invalid = SupportLedgerError::InvalidInput;
+        let mut delta = BundleLogicalDelta {
+            usage: [[0; POOLS]; 5],
+            reserved: [[0; POOLS]; 5],
+            vector: [[0; H]; 21],
+        };
+        let mut maxima = [[0u64; POOLS]; 7];
+        let mut pool_totals = [0u64; POOLS];
+        for cell in cells {
+            let operation = cell.operation as usize;
+            let pool = cell.pool as usize;
+            let axis = operation
+                .checked_mul(POOLS)
+                .and_then(|value| value.checked_add(pool))
+                .filter(|&value| value < 21)
+                .ok_or(invalid)?;
+            let horizon = self
+                .starts
+                .bounds(axis)
+                .ok_or(invalid)?
+                .iter()
+                .position(|bound| bound.0 == cell.horizon)
+                .ok_or(invalid)?;
+            delta.vector[axis][horizon] = cell.max_outstanding;
+            let prior = maxima[operation][pool];
+            let maximum = prior.max(cell.max_outstanding);
+            pool_totals[pool] = pool_totals[pool]
+                .checked_add(maximum - prior)
+                .ok_or(invalid)?;
+            maxima[operation][pool] = maximum;
+        }
+        let mandatory = MandatoryCompletion as usize;
+        for class in [CONDITIONAL, CREDITS, CLAIMS] {
+            delta.usage[class][mandatory] = 3;
+        }
+        for class in [PENDING, ACTIVE] {
+            delta.reserved[class][mandatory] = 3;
+        }
+        for class in 0..5 {
+            for (pool, total) in pool_totals.into_iter().enumerate() {
+                delta.reserved[class][pool] = u32::try_from(total).map_err(|_| invalid)?;
+            }
+        }
+        delta.reserved[PENDING][mandatory] = delta.reserved[PENDING][mandatory]
+            .checked_add(3)
+            .ok_or(invalid)?;
+        delta.reserved[ACTIVE][mandatory] = delta.reserved[ACTIVE][mandatory]
+            .checked_add(3)
+            .ok_or(invalid)?;
+        Ok(delta)
+    }
+    fn validate_bundle_logical_delta(
+        &self,
+        cells: &[OutstandingCreditCell],
+        work: &mut WorkMeter,
+    ) -> Result<BundleLogicalDelta<H>, SupportLedgerError> {
+        let delta = self.bundle_logical_delta(cells.iter().copied())?;
+        for cell in cells {
+            work.record(WorkDimension::VisitedEntities, H as u64 + 1)?;
+            let axis = cell.operation as usize * POOLS + cell.pool as usize;
+            let horizon = self
+                .starts
+                .bounds(axis)
+                .and_then(|bounds| bounds.iter().position(|bound| bound.0 == cell.horizon));
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let horizon = horizon.ok_or(SupportLedgerError::InvalidInput)?;
+            let updated = self.vector_usage[axis][horizon].checked_add(cell.max_outstanding);
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let updated = updated.ok_or(SupportLedgerError::InvalidInput)?;
+            check!(
+                work,
+                updated <= self.vector_capacity[axis][horizon],
+                CAPACITY_ERROR
+            )?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+        }
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                let valid = self.usage[class][pool]
+                    .checked_add(self.reserved[class][pool])
+                    .and_then(|value| value.checked_add(delta.usage[class][pool]))
+                    .and_then(|value| value.checked_add(delta.reserved[class][pool]))
+                    .is_some_and(|value| value <= self.capacities[class][pool]);
+                check!(work, valid, CAPACITY_ERROR)?;
+            }
+        }
+        Ok(delta)
+    }
+    fn apply_bundle_logical_delta(&mut self, cells: &[OutstandingCreditCell], add: bool) {
+        let delta = self
+            .bundle_logical_delta(cells.iter().copied())
+            .expect("validated bundle logical delta");
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                if add {
+                    self.usage[class][pool] += delta.usage[class][pool];
+                    self.reserved[class][pool] += delta.reserved[class][pool];
+                } else {
+                    self.usage[class][pool] -= delta.usage[class][pool];
+                    self.reserved[class][pool] -= delta.reserved[class][pool];
+                }
+            }
+        }
+        for axis in 0..21 {
+            for horizon in 0..H {
+                if add {
+                    self.vector_usage[axis][horizon] += delta.vector[axis][horizon];
+                } else {
+                    self.vector_usage[axis][horizon] -= delta.vector[axis][horizon];
+                }
+            }
+        }
+    }
+    fn remove_stored_bundle_logical_delta(&mut self, record_index: u32) {
+        let record = self
+            .bundles
+            .get_record(record_index)
+            .expect("validated occupied bundle");
+        let mut next = record.vector_head;
+        let cells = &self.bundles.cells.slots;
+        let delta = self
+            .bundle_logical_delta((0..record.vector_len).map(|_| {
+                let CellSlot::Occupied {
+                    cell, next_owned, ..
+                } = cells[next as usize]
+                else {
+                    unreachable!("validated occupied bundle cell")
+                };
+                next = next_owned;
+                cell
+            }))
+            .expect("validated stored bundle logical delta");
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                self.usage[class][pool] -= delta.usage[class][pool];
+                self.reserved[class][pool] -= delta.reserved[class][pool];
+            }
+        }
+        for axis in 0..21 {
+            for horizon in 0..H {
+                self.vector_usage[axis][horizon] -= delta.vector[axis][horizon];
+            }
+        }
+    }
     /// Read-only metered preparation of one complete C16 request bundle. The
     /// input binds exactly `K = 11` tagged identities (`q = 3` canonical
     /// obligations, credits, and `AdmissionInitial` claims, one Future Turn
@@ -885,6 +1033,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             let absent = self.records.find(identity, work)?.is_none();
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
+        self.validate_bundle_logical_delta(input.cells, work)?;
         let branch_need = if self.bundles.is_empty() { K - 1 } else { K };
         check!(work, self.bundles.free_record_len() >= 1, CAPACITY_ERROR)?;
         check!(
@@ -925,6 +1074,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let stale = SupportLedgerError::Generation;
         check!(work, change.nonce == self.instance_nonce, stale)?;
         self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
+        self.validate_bundle_logical_delta(change.vector, work)?;
         for (slot, key) in change.record.tagged_keys().into_iter().enumerate() {
             let found = self.bundles.find(key.tag, &key.identity, work)?;
             check!(
@@ -1203,6 +1353,7 @@ impl<'ledger, 'input, 'work, const R: usize, const F: usize, const H: usize>
         let change = self.change;
         let ledger = self.ledger;
         ledger.bundles.commit_bundle(&change.record, change.vector);
+        ledger.apply_bundle_logical_delta(change.vector, true);
         let next = change
             .snapshot
             .generation
@@ -1225,6 +1376,7 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
     pub(crate) fn commit_withdraw(self) -> SupportLedgerGeneration {
         let change = self.change;
         let ledger = self.ledger;
+        ledger.remove_stored_bundle_logical_delta(change.record_index);
         ledger
             .bundles
             .withdraw_bundle_unmetered(change.record_index);
@@ -1237,6 +1389,13 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
         next
     }
 }
+#[derive(Clone, Copy)]
+struct BundleLogicalDelta<const H: usize> {
+    usage: [[u32; POOLS]; 5],
+    reserved: [[u32; POOLS]; 5],
+    vector: [[u64; H]; 21],
+}
+
 fn support_storage_bytes(
     horizon_count: usize,
     records: usize,
@@ -2932,7 +3091,7 @@ mod tests {
     use SupportTransition::{
         BeginSupport as Begin, CloseCausalCallImpossible as Close, FinishSupport as Finish,
     };
-    type Ledger = SupportChargeLedger<12, 12, 1>;
+    type Ledger = SupportChargeLedger<64, 64, 1>;
     type Result = std::result::Result<SupportLedgerGeneration, SupportLedgerError>;
     type Claim = SupportFundingClaim;
     fn new_ledger() -> Ledger {
@@ -3632,6 +3791,22 @@ mod tests {
             entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(), vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(), cells,
         }
     }
+    fn configured_cells(count: usize, outstanding: u64) -> Vec<OutstandingCreditCell> {
+        let operations = [
+            SupportOperation::DescribeModel,
+            SupportOperation::DescribeRequest,
+            SupportOperation::MaterializeRequest,
+            SupportOperation::ReleaseRequest,
+            SupportOperation::FormCandidates,
+            SupportOperation::ObserveTurnReceipt,
+            SupportOperation::SampleBackendResources,
+        ];
+        operations
+            .into_iter()
+            .take(count)
+            .map(|operation| oc(operation, Ordinary, 10, outstanding))
+            .collect()
+    }
     fn bundle_entitlement(n: u8) -> FutureTurnSupportEntitlementId {
         let mut identity = [0; 32];
         identity[0] = n;
@@ -3640,7 +3815,7 @@ mod tests {
     }
     fn bundle_ledger(records: usize, cells: usize) -> Ledger {
         let generation = SupportLedgerGeneration::new(1).unwrap();
-        let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
+        let capacities = [[6; POOLS]; 5];
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
         Ledger::try_new(
@@ -3680,9 +3855,9 @@ mod tests {
     }
     #[test]
     fn c16_bundle_prepare_binds_exact_before_image() {
-        let ledger = new_ledger();
+        let ledger = bundle_ledger(4, 8);
         let before = ledger.generation();
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         let input = bundle_input(1, &cells);
         let mut measured = work();
         let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
@@ -3691,7 +3866,7 @@ mod tests {
         // 17, free capacity 4).
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([3, 0, 0, 0, 68])
+            HotPathWorkWitness::new([9, 0, 0, 0, 95])
         );
         assert_eq!(ledger.generation(), before, "prepare is read-only");
         assert_eq!(change.nonce, ledger.instance_nonce);
@@ -3747,15 +3922,15 @@ mod tests {
         ledger.prepare_bundle(&input, &mut measured).unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([3, 0, 0, 0, 68])
+            HotPathWorkWitness::new([9, 0, 0, 0, 95])
         );
     }
     #[test]
     fn c16_bundle_prepare_rejects_invalid_inputs() {
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         let mut invalid = bundle_input(1, &cells);
         invalid.initial.materialize.predecessor = SupportCausalPredecessorId([0; 32]);
-        let ledger = new_ledger();
+        let ledger = bundle_ledger(4, 8);
         assert!(matches!(
             ledger.prepare_bundle(&invalid, &mut work()),
             Err(InvalidInput)
@@ -3784,7 +3959,7 @@ mod tests {
     }
     #[test]
     fn c16_bundle_prepare_rejects_collisions_and_capacity() {
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         let reject = |ledger: &mut Ledger, input: &RequestSupportBundleInput<'_>| {
             let before = bundle_snapshot(ledger);
             let mut measured = work();
@@ -3797,7 +3972,7 @@ mod tests {
             result.unwrap_err()
         };
         // A live legacy obligation blocks a matching C16 obligation.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         add(&mut ledger, 1, 1).unwrap();
         assert_eq!(ledger.records.get(0).unwrap().1, Ordinary);
         let mut legacy = bundle_input(1, &cells);
@@ -3807,10 +3982,10 @@ mod tests {
             SupportLedgerError::Storage(Duplicate)
         );
         // A live C16 bundle blocks every shared identity namespace.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         ledger
             .bundles
-            .reserve_bundle(&bundle_record(1), &axis_cells(2, 1), &mut work())
+            .reserve_bundle(&bundle_record(1), &configured_cells(2, 1), &mut work())
             .unwrap();
         let input = bundle_input(1, &cells);
         assert_eq!(
@@ -3818,10 +3993,10 @@ mod tests {
             SupportLedgerError::Storage(Duplicate)
         );
         // A retained tombstone keeps blocking until pristine withdrawal.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         ledger
             .bundles
-            .reserve_bundle(&bundle_record(1), &axis_cells(2, 1), &mut work())
+            .reserve_bundle(&bundle_record(1), &configured_cells(2, 1), &mut work())
             .unwrap();
         ledger.bundles.retain_bundle(0, &mut work()).unwrap();
         let input = bundle_input(1, &cells);
@@ -3833,7 +4008,7 @@ mod tests {
         let mut ledger = bundle_ledger(1, 8);
         ledger
             .bundles
-            .reserve_bundle(&bundle_record(9), &axis_cells(1, 1), &mut work())
+            .reserve_bundle(&bundle_record(9), &configured_cells(1, 1), &mut work())
             .unwrap();
         let input = bundle_input(2, &cells);
         assert_eq!(
@@ -3844,9 +4019,9 @@ mod tests {
         let mut ledger = bundle_ledger(4, 4);
         ledger
             .bundles
-            .reserve_bundle(&bundle_record(9), &axis_cells(1, 1), &mut work())
+            .reserve_bundle(&bundle_record(9), &configured_cells(1, 1), &mut work())
             .unwrap();
-        let wide = axis_cells(4, 1);
+        let wide = configured_cells(4, 1);
         let input = bundle_input(3, &wide);
         assert_eq!(
             reject(&mut ledger, &input),
@@ -3855,9 +4030,9 @@ mod tests {
     }
     #[test]
     fn c16_bundle_prepare_work_exhaustion_rolls_back() {
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         let input = bundle_input(1, &cells);
-        let ledger = new_ledger();
+        let ledger = bundle_ledger(4, 8);
         let before = bundle_snapshot(&ledger);
         let mut exhausted = work();
         exhausted
@@ -3874,7 +4049,7 @@ mod tests {
             Some(SupportLedgerError::Storage(FixedStorageError::Work(error)))
         );
         assert_eq!(bundle_snapshot(&ledger), before);
-        let ledger = new_ledger();
+        let ledger = bundle_ledger(4, 8);
         let mut exhausted = work();
         exhausted
             .record(WorkDimension::InvariantChecks, 28_707)
@@ -3893,26 +4068,39 @@ mod tests {
     }
     #[test]
     fn c16_bundle_transaction_commits_exactly_once() {
-        let mut ledger = new_ledger();
-        let cells = axis_cells(3, 1);
+        let mut ledger = bundle_ledger(4, 8);
+        let cells = configured_cells(3, 1);
         let input = bundle_input(1, &cells);
         let before = ledger.generation();
         let mut measured = work();
         let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([3, 0, 0, 0, 68])
+            HotPathWorkWitness::new([9, 0, 0, 0, 95])
         );
         let validated = ledger
             .validate_bundle(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([28, 0, 0, 0, 258])
+            HotPathWorkWitness::new([40, 0, 0, 0, 312])
         );
         let next = validated.commit_bundle();
         assert_eq!(next, before.next().unwrap());
         assert_eq!(ledger.generation(), next);
+        assert_eq!(
+            ledger.usage,
+            [[0, 3, 0], [0, 0, 0], [0, 0, 0], [0, 3, 0], [0, 3, 0]]
+        );
+        assert_eq!(
+            ledger.reserved,
+            [[3, 0, 0], [3, 3, 0], [3, 3, 0], [3, 0, 0], [3, 0, 0]]
+        );
+        let mut expected_vector = [[0; 1]; 21];
+        for axis in [0, 3, 6] {
+            expected_vector[axis][0] = 1;
+        }
+        assert_eq!(ledger.vector_usage, expected_vector);
         // Every K identity now resolves to the committed record.
         let owner = ledger
             .bundles
@@ -3968,10 +4156,44 @@ mod tests {
         );
     }
     #[test]
+    fn c16_bundle_logical_backing_uses_horizon_max_not_sum() {
+        type H2Ledger = SupportChargeLedger<64, 64, 2>;
+        let bounds = [
+            FixedStartCountBound(Duration::from_micros(10), 10),
+            FixedStartCountBound(Duration::from_micros(20), 10),
+        ];
+        let mut ledger = H2Ledger::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            [[6; POOLS]; 5],
+            2,
+            [bounds; 21],
+            LifecycleReserveMaxima([1, 2, 2, 1, 1]),
+            4,
+            8,
+            6,
+        )
+        .unwrap();
+        let cells = [
+            oc(SupportOperation::DescribeModel, Ordinary, 10, 2),
+            oc(SupportOperation::DescribeModel, Ordinary, 20, 3),
+        ];
+        let input = bundle_input(1, &cells);
+        let mut meter = work();
+        let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
+        ledger.validate_bundle(change).unwrap().commit_bundle();
+        assert_eq!(
+            ledger.reserved,
+            [[3, 0, 0], [3, 3, 0], [3, 3, 0], [3, 0, 0], [3, 0, 0]],
+            "future backing is max(2,3), never 2+3"
+        );
+        assert_eq!(ledger.vector_usage[0], [2, 3]);
+    }
+
+    #[test]
     fn c16_bundle_transaction_drift_drops_and_moves() {
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         // Dropping the validated capability changes no state.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let before = bundle_snapshot(&ledger);
         let input = bundle_input(1, &cells);
         let mut meter = work();
@@ -3981,7 +4203,7 @@ mod tests {
         ledger.validate_bundle(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
         // An intervening legal mutation makes the prepared change stale.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let input = bundle_input(1, &cells);
         let mut meter = work();
         let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
@@ -3995,7 +4217,7 @@ mod tests {
             (SupportLedgerGeneration::new(2).unwrap(), 4, 8, 44, 43)
         );
         // Moving the ledger preserves the instance nonce: validation succeeds.
-        let ledger = new_ledger();
+        let ledger = bundle_ledger(4, 8);
         let input = bundle_input(1, &cells);
         let mut meter = work();
         let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
@@ -4004,11 +4226,11 @@ mod tests {
         validated.commit_bundle();
         assert_eq!(moved.bundles.free_record_len(), 3);
         // A same-state different-instance ledger rejects the change.
-        let first = new_ledger();
+        let first = bundle_ledger(4, 8);
         let input = bundle_input(1, &cells);
         let mut meter = work();
         let change = first.prepare_bundle(&input, &mut meter).unwrap();
-        let mut second = new_ledger();
+        let mut second = bundle_ledger(4, 8);
         assert_eq!(
             second.validate_bundle(change).unwrap_err(),
             SupportLedgerError::Generation
@@ -4027,7 +4249,7 @@ mod tests {
     }
     #[test]
     fn c16_bundle_snapshot_reports_capacity_facts() {
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let mut measured = work();
         let snapshot = ledger.snapshot(&mut measured).unwrap();
         assert_eq!(
@@ -4064,7 +4286,7 @@ mod tests {
             ),
             (0, 4, 8, 44, 43)
         );
-        let cells = axis_cells(2, 1);
+        let cells = configured_cells(2, 1);
         let input = bundle_input(1, &cells);
         let mut meter = work();
         let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
@@ -4084,7 +4306,7 @@ mod tests {
     }
     #[test]
     fn generic_reserve_rejects_c16_only_claims() {
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let mut reject = |claims: &[Claim]| {
             let before = (ledger.generation(), ledger.records.len());
             let mut measured = work();
@@ -4099,7 +4321,7 @@ mod tests {
         reject(&[Initial([7; 32])]);
         reject(&[SupportFundingClaim::EntitlementVector([7; 32])]);
         // C16-only facts remain constructible only by the complete bundle path.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         reserve_bundle(&mut ledger, 1, 3);
         assert_eq!(ledger.bundles.free_record_len(), 3);
         assert_eq!(
@@ -4154,7 +4376,7 @@ mod tests {
         );
     }
     fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
-        let cells = axis_cells(v, 1);
+        let cells = configured_cells(v, 1);
         let input = bundle_input(n, &cells);
         let mut meter = work();
         let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
@@ -4164,7 +4386,7 @@ mod tests {
     }
     #[test]
     fn c16_bundle_pristine_withdraw_commits_once_and_releases() {
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
         let before = ledger.generation();
         let mut measured = work();
@@ -4190,6 +4412,9 @@ mod tests {
         let next = validated.commit_withdraw();
         assert_eq!(next, before.next().unwrap());
         assert_eq!(ledger.generation(), next);
+        assert_eq!(ledger.usage, [[0; POOLS]; 5]);
+        assert_eq!(ledger.reserved, [[0; POOLS]; 5]);
+        assert_eq!(ledger.vector_usage, [[0; 1]; 21]);
         // The store is pristine again: every identity is released and the
         // exact later reuse of the same facts succeeds.
         assert!(ledger.bundles.is_empty());
@@ -4211,7 +4436,7 @@ mod tests {
             .unwrap();
         // Exact later reuse of the same C16 facts succeeds after pristine
         // withdrawal on a fresh ledger.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let first = reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
@@ -4224,9 +4449,9 @@ mod tests {
     }
     #[test]
     fn c16_bundle_withdraw_drift_and_non_pristine_reject() {
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         // An intervening legal mutation makes the prepared withdrawal stale.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
@@ -4238,7 +4463,7 @@ mod tests {
             SupportLedgerError::Generation
         );
         // Dropping the validated capability changes no state.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         reserve_bundle(&mut ledger, 1, 3);
         let before = bundle_snapshot(&ledger);
         let change = ledger
@@ -4257,11 +4482,17 @@ mod tests {
             SupportLedgerError::InvalidTransition
         );
         // A retained terminal tombstone is not pristine: withdrawal rejects.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let retained = (ledger.usage, ledger.reserved, ledger.vector_usage);
         ledger
             .close_bundle(ledger.generation(), obligation, &mut work())
             .unwrap();
+        assert_eq!(
+            (ledger.usage, ledger.reserved, ledger.vector_usage),
+            retained,
+            "tombstone retains every logical and vector delta"
+        );
         assert_eq!(
             ledger
                 .prepare_withdraw(bundle_entitlement(1), &mut measured)
@@ -4295,7 +4526,7 @@ mod tests {
         );
         // Post-removal reuse: close then pristine-withdraw is impossible, so
         // reuse is tested on a fresh Live bundle below.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
@@ -4320,7 +4551,7 @@ mod tests {
     }
     #[test]
     fn c16_reciprocal_uniqueness_across_legacy_paths() {
-        let cells = axis_cells(3, 1);
+        let cells = configured_cells(3, 1);
         let at = MonotonicTime::from_micros;
         let duplicate = SupportLedgerError::Storage(Duplicate);
         let legacy_blocks = |ledger: &mut Ledger, obligation: [u8; 32], credit: [u8; 32]| {
@@ -4339,7 +4570,7 @@ mod tests {
             );
         };
         // Generic reserve keys block a later C16 bundle in both namespaces.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         add(&mut ledger, 1, 1).unwrap();
         legacy_blocks(&mut ledger, [1; 32], [1; 32]);
         // Prepared ordinary keys block a later C16 bundle.
@@ -4347,7 +4578,7 @@ mod tests {
         begin(&mut ledger, ordinary((1, 1, 3, Reserved([4; 32]))), at(1)).unwrap();
         legacy_blocks(&mut ledger, [1; 32], [1; 32]);
         // Lifecycle reserve keys block a later C16 bundle.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         for capacity in &mut ledger.capacities {
             capacity[1] = 4;
         }
@@ -4366,7 +4597,7 @@ mod tests {
         legacy_blocks(&mut ledger, [1; 32], [2; 32]);
         // A live C16 bundle blocks every earlier-row legacy path in both
         // shared namespaces.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
         let credit = PhysicalStartCreditId::new([
             1, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -4436,7 +4667,7 @@ mod tests {
             duplicate
         );
         // A retained terminal tombstone keeps blocking every earlier-row path.
-        let mut ledger = new_ledger();
+        let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
         ledger
             .close_bundle(ledger.generation(), obligation, &mut work())
