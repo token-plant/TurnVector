@@ -466,6 +466,22 @@ impl AvlIndex {
         Ok(None)
     }
 
+    fn find_precharged(&self, key: [u8; 33]) -> Result<Option<u32>, FixedStorageError> {
+        let mut node = self.root;
+        while node != NO_NODE {
+            let current = self
+                .nodes
+                .get(node as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            match key.cmp(&current.key) {
+                std::cmp::Ordering::Less => node = current.left,
+                std::cmp::Ordering::Greater => node = current.right,
+                std::cmp::Ordering::Equal => return Ok(Some(current.record)),
+            }
+        }
+        Ok(None)
+    }
+
     fn insert_prevalidated(&mut self, key: [u8; 33], record: u32) {
         let index = u32::try_from(self.nodes.len()).expect("constructor-bounded AVL index");
         let mut parent = NO_NODE;
@@ -689,6 +705,16 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         work: &mut WorkMeter,
     ) -> Result<Option<usize>, FixedStorageError> {
         Ok(self.identities.find(key, work)?.map(|index| index as usize))
+    }
+
+    pub(crate) fn find_precharged(
+        &self,
+        key: [u8; 33],
+    ) -> Result<Option<usize>, FixedStorageError> {
+        Ok(self
+            .identities
+            .find_precharged(key)?
+            .map(|index| index as usize))
     }
 
     pub(crate) fn maximum_identity_height(&self) -> Result<u8, FixedStorageError> {

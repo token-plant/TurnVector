@@ -886,6 +886,25 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         Ok(delta)
     }
+    fn validate_bundle_logical_delta_precharged(
+        &self,
+        cells: &[OutstandingCreditCell],
+    ) -> Result<(), SupportLedgerError> {
+        let delta = self.bundle_logical_delta(cells.iter().copied())?;
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                let valid = self.usage[class][pool]
+                    .checked_add(self.reserved[class][pool])
+                    .and_then(|value| value.checked_add(delta.usage[class][pool]))
+                    .and_then(|value| value.checked_add(delta.reserved[class][pool]))
+                    .is_some_and(|value| value <= self.capacities[class][pool]);
+                if !valid {
+                    return Err(CAPACITY_ERROR);
+                }
+            }
+        }
+        Ok(())
+    }
     fn apply_bundle_logical_delta(&mut self, cells: &[OutstandingCreditCell], add: bool) {
         let delta = self
             .bundle_logical_delta(cells.iter().copied())
@@ -955,16 +974,29 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         input: &'input RequestSupportBundleInput<'input>,
         work: &'work mut WorkMeter,
     ) -> Result<BundleChange<'input, 'work, H>, SupportLedgerError> {
-        let expected = self.generation;
-        self.next(expected, work)?;
+        let height = self.records.maximum_identity_height()?;
+        work.charge(bundle_reserve_work::<H>(input.cells.len(), height)?)?;
+        self.generation
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
         let invalid = SupportLedgerError::InvalidInput;
-        SupportOutstandingCreditVector::<168>::try_new(input.cells, work).map_err(|error| {
-            if let SupportOutstandingCreditVectorError::Work(error) = error {
-                SupportLedgerError::from(error)
-            } else {
-                invalid
+        if input.cells.is_empty()
+            || input.cells.len() > usize::from(self.bundle_vector_max)
+            || input.cells.len() > 168
+        {
+            return Err(invalid);
+        }
+        let mut prior_axis = None;
+        for cell in input.cells {
+            if cell.max_outstanding == 0 || cell.horizon.as_micros() == 0 {
+                return Err(invalid);
             }
-        })?;
+            let axis = (cell.operation, cell.pool, cell.horizon.as_micros());
+            if prior_axis.is_some_and(|prior| prior >= axis) {
+                return Err(invalid);
+            }
+            prior_axis = Some(axis);
+        }
         let initial = input.initial.values();
         let obligations = initial.map(|requirement| requirement.obligation);
         let credits = initial.map(|requirement| requirement.credit);
@@ -974,10 +1006,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             credits.map(|id| id.get()),
             claims,
         ] {
-            let mut prior = None;
-            for identity in group {
-                check!(work, prior.is_none_or(|prior| prior < identity), invalid)?;
-                prior = Some(identity);
+            if !group.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err(invalid);
             }
         }
         let initial_shapes = [
@@ -986,15 +1016,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             (SupportOperation::ReleaseRequest, MandatoryCompletion),
         ];
         for (requirement, shape) in initial.into_iter().zip(initial_shapes) {
-            check!(
-                work,
-                (requirement.operation, requirement.pool) == shape,
-                invalid
-            )?;
-            check!(work, requirement.predecessor.0 != [0; 32], invalid)?;
-            check!(work, requirement.scope.0 != [0; 32], invalid)?;
-            check!(work, requirement.input_bucket.get() > 0, invalid)?;
-            check!(work, requirement.prospective_bound.as_micros() > 0, invalid)?;
+            if (requirement.operation, requirement.pool) != shape
+                || requirement.predecessor.0 == [0; 32]
+                || requirement.scope.0 == [0; 32]
+                || requirement.input_bucket.get() == 0
+                || requirement.prospective_bound.as_micros() == 0
+            {
+                return Err(invalid);
+            }
         }
         let branch_shapes = [
             (SupportOperation::ObserveTurnReceipt, MandatoryCompletion),
@@ -1002,53 +1031,42 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             (SupportOperation::FormCandidates, MandatoryCompletion),
             (SupportOperation::FormCandidates, MandatoryCompletion),
         ];
-        let branches = input.branches.values();
-        for (requirement, shape) in branches.into_iter().zip(branch_shapes) {
-            check!(
-                work,
-                (requirement.operation, requirement.pool) == shape,
-                invalid
-            )?;
-            check!(work, requirement.input_bucket.get() > 0, invalid)?;
-            check!(work, requirement.prospective_bound.as_micros() > 0, invalid)?;
+        for (requirement, shape) in input.branches.values().into_iter().zip(branch_shapes) {
+            if (requirement.operation, requirement.pool) != shape
+                || requirement.input_bucket.get() == 0
+                || requirement.prospective_bound.as_micros() == 0
+            {
+                return Err(invalid);
+            }
         }
-        check!(
-            work,
-            !input.cells.is_empty() && input.cells.len() <= usize::from(self.bundle_vector_max),
-            invalid
-        )?;
         let vector_len = u32::try_from(input.cells.len()).map_err(|_| invalid)?;
         let record = BundleRecord::from_input(input, vector_len);
         let mut identities = [NO_NODE; 17];
         for (slot, key) in identities[..K].iter_mut().zip(record.tagged_keys()) {
-            let found = self.bundles.find(key.tag, &key.identity, work)?;
-            check!(work, found.is_none(), FixedStorageError::Duplicate)?;
-            *slot = found.unwrap_or(NO_NODE);
+            let found = self.bundles.find_precharged(key.tag, &key.identity)?;
+            if found.is_some() {
+                return Err(FixedStorageError::Duplicate.into());
+            }
+            *slot = NO_NODE;
         }
         for identity in obligations
             .iter()
             .map(|id| key(0, id.get()))
             .chain(credits.iter().map(|id| key(1, id.get())))
         {
-            let absent = self.records.find(identity, work)?.is_none();
-            check!(work, absent, FixedStorageError::Duplicate)?;
+            if self.records.find_precharged(identity)?.is_some() {
+                return Err(FixedStorageError::Duplicate.into());
+            }
         }
-        self.validate_bundle_logical_delta(input.cells, work)?;
+        self.validate_bundle_logical_delta_precharged(input.cells)?;
         let branch_need = if self.bundles.is_empty() { K - 1 } else { K };
-        check!(work, self.bundles.free_record_len() >= 1, CAPACITY_ERROR)?;
-        check!(
-            work,
-            self.bundles.free_cell_len() >= input.cells.len(),
-            CAPACITY_ERROR
-        )?;
-        check!(work, self.bundles.free_leaf_len() >= K, CAPACITY_ERROR)?;
-        check!(
-            work,
-            self.bundles.free_branch_len() >= branch_need,
-            CAPACITY_ERROR
-        )?;
-        let height = self.records.maximum_identity_height()?;
-        work.ensure(bundle_reserve_work::<H>(input.cells.len(), height)?)?;
+        if self.bundles.free_record_len() < 1
+            || self.bundles.free_cell_len() < input.cells.len()
+            || self.bundles.free_leaf_len() < K
+            || self.bundles.free_branch_len() < branch_need
+        {
+            return Err(CAPACITY_ERROR);
+        }
         Ok(BundleChange {
             work,
             nonce: self.instance_nonce,
@@ -1070,18 +1088,27 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &'ledger mut self,
         change: BundleChange<'input, 'work, H>,
     ) -> Result<ValidatedBundleChange<'ledger, 'input, 'work, R, F, H>, SupportLedgerError> {
-        let work = &mut *change.work;
+        let branches = if change.snapshot.occupied_records == 0 {
+            K - 1
+        } else {
+            K
+        };
+        let height = self.records.maximum_identity_height()?;
+        change.work.charge(bundle_validate_commit_work::<H>(
+            change.vector.len(),
+            branches,
+            height,
+        )?)?;
         let stale = SupportLedgerError::Generation;
-        check!(work, change.nonce == self.instance_nonce, stale)?;
-        self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
-        self.validate_bundle_logical_delta(change.vector, work)?;
+        if change.nonce != self.instance_nonce || change.snapshot != self.capacity_snapshot() {
+            return Err(stale);
+        }
+        self.validate_bundle_logical_delta_precharged(change.vector)?;
         for (slot, key) in change.record.tagged_keys().into_iter().enumerate() {
-            let found = self.bundles.find(key.tag, &key.identity, work)?;
-            check!(
-                work,
-                found.unwrap_or(NO_NODE) == change.identities[slot],
-                stale
-            )?;
+            let found = self.bundles.find_precharged(key.tag, &key.identity)?;
+            if found.unwrap_or(NO_NODE) != change.identities[slot] {
+                return Err(stale);
+            }
         }
         for identity in change
             .record
@@ -1090,22 +1117,12 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .map(|id| key(0, id.get()))
             .chain(change.record.credits().iter().map(|id| key(1, id.get())))
         {
-            let absent = self.records.find(identity, work)?.is_none();
-            check!(work, absent, stale)?;
+            if self.records.find_precharged(identity)?.is_some() {
+                return Err(stale);
+            }
         }
-        self.bundles.validate_record_slot(work)?;
-        self.bundles.validate_cell_selection(
-            usize::try_from(change.record.vector_len).expect("u32 vector length fits usize"),
-            work,
-        )?;
-        let branches = if self.bundles.is_empty() { K - 1 } else { K };
-        self.bundles.validate_index_selection(branches, work)?;
-        let height = self.records.maximum_identity_height()?;
-        work.ensure(bundle_validate_commit_work::<H>(
-            change.vector.len(),
-            branches,
-            height,
-        )?)?;
+        self.bundles
+            .validate_bundle_selection_precharged(change.vector.len(), branches)?;
         Ok(ValidatedBundleChange {
             ledger: self,
             change,
@@ -1996,6 +2013,27 @@ impl EntitlementCellArena {
         }
         Ok(())
     }
+    fn validate_selection_precharged(&self, count: usize) -> Result<(), FixedStorageError> {
+        if count > self.free.len() {
+            return Err(FixedStorageError::Capacity);
+        }
+        let start = self.free.len() - count;
+        for position in start..self.free.len() {
+            let index = *self
+                .free
+                .get(position)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            let slot = self
+                .slots
+                .get(index as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            if !matches!(slot, CellSlot::Vacant { free_position } if *free_position == position as u32)
+            {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        Ok(())
+    }
     fn install(&mut self, owner: u32, cells: &[OutstandingCreditCell]) -> (u32, u32) {
         let mut head = NO_NODE;
         for cell in cells.iter().rev() {
@@ -2367,6 +2405,36 @@ impl TaggedIdentityIndex {
         }
         Ok(())
     }
+    fn validate_selection_precharged(
+        &self,
+        leaves: usize,
+        branches: usize,
+    ) -> Result<(), FixedStorageError> {
+        if leaves > self.free_leaves.len() || branches > self.free_branches.len() {
+            return Err(FixedStorageError::Capacity);
+        }
+        let leaf_start = self.free_leaves.len() - leaves;
+        for position in leaf_start..self.free_leaves.len() {
+            let index = self.free_leaves[position];
+            if !matches!(
+                self.leaf_slots.get(index as usize),
+                Some(LeafSlot::Vacant { free_position }) if *free_position == position as u32
+            ) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        let branch_start = self.free_branches.len() - branches;
+        for position in branch_start..self.free_branches.len() {
+            let index = self.free_branches[position];
+            if !matches!(
+                self.branch_slots.get(index as usize),
+                Some(BranchSlot::Vacant { free_position }) if *free_position == position as u32
+            ) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        Ok(())
+    }
     /// Borrowed bounded lookup: follows at most `B = 264` branches plus one
     /// leaf, independent of `E`. No key copy and no allocation; each visited
     /// branch and the visited leaf charge one VisitedEntities and one
@@ -2385,6 +2453,37 @@ impl TaggedIdentityIndex {
             .leaf((node as usize) as u32)
             .expect("validated occupied leaf slot");
         Ok((leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record))
+    }
+    fn find_precharged(
+        &self,
+        tag: u8,
+        identity: &[u8; 32],
+    ) -> Result<Option<u32>, FixedStorageError> {
+        let mut node = self.root;
+        let mut prior = None;
+        for _ in 0..=IDENTITY_BITS {
+            if node == NO_NODE {
+                return Ok(None);
+            }
+            if !is_branch(node) {
+                let leaf = self.leaf(node).ok_or(FixedStorageError::NonCanonical)?;
+                return Ok(
+                    (leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record)
+                );
+            }
+            let branch = self.branch(node).ok_or(FixedStorageError::NonCanonical)?;
+            if branch.bit >= IDENTITY_BITS
+                || prior.is_some_and(|bit| bit >= branch.bit)
+                || branch.zero == branch.one
+                || branch.zero == node
+                || branch.one == node
+            {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            prior = Some(branch.bit);
+            node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
+        }
+        Err(FixedStorageError::NonCanonical)
     }
     /// Walks to the terminal node for a borrowed key, charging one
     /// VisitedEntities and one InvariantChecks per visited branch and one of
@@ -2913,6 +3012,13 @@ impl RequestBundleStore {
     ) -> Result<Option<u32>, FixedStorageError> {
         self.identities.find(tag, identity, work)
     }
+    fn find_precharged(
+        &self,
+        tag: u8,
+        identity: &[u8; 32],
+    ) -> Result<Option<u32>, FixedStorageError> {
+        self.identities.find_precharged(tag, identity)
+    }
     fn get_record(&self, index: u32) -> Option<&BundleRecord> {
         match self.records.get(index as usize)? {
             RecordSlot::Occupied(record) => Some(record),
@@ -3083,6 +3189,26 @@ impl RequestBundleStore {
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
         self.identities.validate_selection(K, branches, work)
+    }
+    fn validate_bundle_selection_precharged(
+        &self,
+        cells: usize,
+        branches: usize,
+    ) -> Result<(), FixedStorageError> {
+        let position = self
+            .free_records
+            .len()
+            .checked_sub(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let record = self.free_records[position];
+        if !matches!(
+            self.records.get(record as usize),
+            Some(RecordSlot::Vacant { free_position }) if *free_position == position as u32
+        ) {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        self.cells.validate_selection_precharged(cells)?;
+        self.identities.validate_selection_precharged(K, branches)
     }
     /// Infallible consuming installation under the validated selection: pops
     /// one record slot, `K` leaf slots, the required branches, and exactly `v`
@@ -3950,7 +4076,7 @@ mod tests {
         // 17, free capacity 4).
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([9, 0, 0, 0, 95])
+            HotPathWorkWitness::new([2_984, 1_664, 0, 0, 3_061])
         );
         assert_eq!(ledger.generation(), before, "prepare is read-only");
         assert_eq!(change.nonce, ledger.instance_nonce);
@@ -4011,7 +4137,7 @@ mod tests {
         ledger.prepare_bundle(&input, &mut measured).unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([9, 0, 0, 0, 95])
+            HotPathWorkWitness::new([2_984, 1_664, 0, 0, 3_061])
         );
     }
     #[test]
@@ -4131,7 +4257,7 @@ mod tests {
         let error = WorkBudgetError::BudgetExceeded(
             WorkDimension::VisitedEntities,
             1_704_575,
-            1_704_575 + 3,
+            1_704_575 + 2_984,
         );
         assert_eq!(
             fault.err(),
@@ -4141,7 +4267,24 @@ mod tests {
         let ledger = bundle_ledger(4, 8);
         let mut exhausted = work();
         exhausted
-            .record(WorkDimension::InvariantChecks, 28_707)
+            .record(WorkDimension::CopiedBytes, 2_095_489)
+            .unwrap();
+        let fault = ledger.prepare_bundle(&input, &mut exhausted);
+        let error =
+            WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 2_097_152, 2_097_153);
+        assert_eq!(
+            fault.err(),
+            Some(SupportLedgerError::Storage(FixedStorageError::Work(error)))
+        );
+        assert_eq!(
+            exhausted.witness().value(WorkDimension::CopiedBytes),
+            2_095_489
+        );
+        assert_eq!(bundle_snapshot(&ledger), before);
+        let ledger = bundle_ledger(4, 8);
+        let mut exhausted = work();
+        exhausted
+            .record(WorkDimension::InvariantChecks, 25_648)
             .unwrap();
         let fault = ledger.prepare_bundle(&input, &mut exhausted);
         let error = WorkBudgetError::BudgetExceeded(WorkDimension::InvariantChecks, 28_708, 28_709);
@@ -4151,10 +4294,43 @@ mod tests {
         );
         assert_eq!(
             exhausted.witness().value(WorkDimension::InvariantChecks),
-            28_708
+            25_648
         );
         assert_eq!(bundle_snapshot(&ledger), before);
     }
+    #[test]
+    fn c16_bundle_validate_phase_charge_is_atomic_one_under() {
+        let cells = configured_cells(3, 1);
+        let input = bundle_input(1, &cells);
+        let prepare = bundle_reserve_work::<1>(3, 7).unwrap();
+        let validate = bundle_validate_commit_work::<1>(3, 10, 7).unwrap();
+        for (dimension, maximum) in [
+            (WorkDimension::VisitedEntities, 1_704_575),
+            (WorkDimension::CopiedBytes, 2_097_152),
+            (WorkDimension::InvariantChecks, 28_708),
+        ] {
+            let mut ledger = bundle_ledger(4, 8);
+            let initial = maximum - prepare.value(dimension) - validate.value(dimension) + 1;
+            let mut meter = work();
+            meter.record(dimension, initial).unwrap();
+            let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
+            let after_prepare = change.work.witness();
+            let error = ledger.validate_bundle(change).unwrap_err();
+            assert_eq!(
+                error,
+                SupportLedgerError::Storage(FixedStorageError::Work(
+                    WorkBudgetError::BudgetExceeded(dimension, maximum, maximum + 1)
+                ))
+            );
+            assert_eq!(
+                meter.witness(),
+                after_prepare,
+                "phase charge is all-or-none"
+            );
+            assert!(ledger.bundles.is_empty());
+        }
+    }
+
     #[test]
     fn c16_bundle_transaction_commits_exactly_once() {
         let mut ledger = bundle_ledger(4, 8);
@@ -4165,16 +4341,21 @@ mod tests {
         let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([9, 0, 0, 0, 95])
+            HotPathWorkWitness::new([2_984, 1_664, 0, 0, 3_061])
         );
         let validated = ledger
             .validate_bundle(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([40, 0, 0, 0, 312])
+            HotPathWorkWitness::new([11_987, 4_936, 0, 0, 6_218])
         );
         let next = validated.commit_bundle();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([11_987, 4_936, 0, 0, 6_218]),
+            "commit performs no Work call"
+        );
         assert_eq!(next, before.next().unwrap());
         assert_eq!(ledger.generation(), next);
         assert_eq!(
