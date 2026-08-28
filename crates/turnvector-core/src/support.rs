@@ -194,12 +194,14 @@ pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     max_claims: u16,
     records: FixedRecordArena<Record, SupportFundingClaim, 2>,
     usage: [[u32; POOLS]; 5],
-    reserved: [[u32; POOLS]; 3],
+    reserved: [[u32; POOLS]; 5],
     starts: FixedWindowCounter<21, H>,
     lifecycle_maxima: LifecycleReserveMaxima,
     lifecycle_batch_max: u16,
     bundles: RequestBundleStore,
     bundle_vector_max: u16,
+    vector_capacity: [[u64; H]; 21],
+    vector_usage: [[u64; H]; 21],
     instance_nonce: u64,
 }
 /// Process-local one-issuance dispenser for private per-ledger instance
@@ -301,6 +303,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             return Err(SupportLedgerError::InvalidInput);
         }
         let records = FixedRecordArena::try_new(records, claims)?;
+        let vector_capacity = std::array::from_fn(|cell| {
+            std::array::from_fn(|horizon| u64::from(starts[cell][horizon].1))
+        });
         let starts = FixedWindowCounter::try_new(starts)?;
         let bundles = RequestBundleStore::try_new(bundle_records, bundle_cells)?;
         let bundle_vector_max =
@@ -313,12 +318,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             max_claims,
             records,
             usage: [[0; POOLS]; 5],
-            reserved: [[0; POOLS]; 3],
+            reserved: [[0; POOLS]; 5],
             starts,
             lifecycle_maxima,
             lifecycle_batch_max,
             bundles,
             bundle_vector_max,
+            vector_capacity,
+            vector_usage: [[0; H]; 21],
             instance_nonce,
         })
     }
@@ -903,7 +910,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 )?;
             }
         }
-        for class in 0..3 {
+        for class in 0..5 {
             for pool in 0..POOLS {
                 check!(
                     work,
@@ -959,17 +966,30 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     pub(crate) fn snapshot(
         &self,
         work: &mut WorkMeter,
-    ) -> Result<SupportCapacitySnapshot, SupportLedgerError> {
-        work.record(WorkDimension::InvariantChecks, 1)?;
+    ) -> Result<SupportCapacitySnapshot<H>, SupportLedgerError> {
+        let copied = u64::try_from(H)
+            .ok()
+            .and_then(|horizon| horizon.checked_mul(336))
+            .and_then(|bytes| bytes.checked_add(216))
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        work.charge(HotPathWorkWitness::new([0, copied, 0, 0, 1]))?;
         Ok(SupportCapacitySnapshot {
+            generation: self.generation,
             capacities: self.capacities,
             usage: self.usage,
             reserved: self.reserved,
+            bundle_vector_max: self.bundle_vector_max,
+            vector_capacity: self.vector_capacity,
+            vector_usage: self.vector_usage,
+            free_records: u32::try_from(self.bundles.free_record_len())
+                .expect("constructor-bounded record count"),
+            free_cells: u32::try_from(self.bundles.free_cell_len())
+                .expect("constructor-bounded cell count"),
+            free_leaves: u32::try_from(self.bundles.free_leaf_len())
+                .expect("constructor-bounded leaf count"),
+            free_branches: u32::try_from(self.bundles.free_branch_len())
+                .expect("constructor-bounded branch count"),
             occupied_records: self.bundles.occupied_records,
-            free_records: self.bundles.free_record_len() as u32,
-            free_cells: self.bundles.free_cell_len(),
-            free_leaves: self.bundles.free_leaf_len(),
-            free_branches: self.bundles.free_branch_len(),
         })
     }
     /// Read-only metered preparation of one pristine C16 bundle withdrawal:
@@ -1327,7 +1347,7 @@ pub(crate) struct BundleChange<'a, const V: usize> {
     expected: SupportLedgerGeneration,
     capacities: [[u32; POOLS]; 5],
     usage: [[u32; POOLS]; 5],
-    reserved: [[u32; POOLS]; 3],
+    reserved: [[u32; POOLS]; 5],
     free_records: u32,
     free_cells: usize,
     free_leaves: usize,
@@ -1357,15 +1377,19 @@ pub(crate) struct ValidatedBundleChange<
 /// current usage/reserved aggregates and C16 free record/cell/index-node
 /// counts. Read-only; never an authority or mutation seam.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct SupportCapacitySnapshot {
+pub(crate) struct SupportCapacitySnapshot<const H: usize> {
+    pub(crate) generation: SupportLedgerGeneration,
     pub(crate) capacities: [[u32; POOLS]; 5],
     pub(crate) usage: [[u32; POOLS]; 5],
-    pub(crate) reserved: [[u32; POOLS]; 3],
-    pub(crate) occupied_records: u32,
+    pub(crate) reserved: [[u32; POOLS]; 5],
+    pub(crate) bundle_vector_max: u16,
+    pub(crate) vector_capacity: [[u64; H]; 21],
+    pub(crate) vector_usage: [[u64; H]; 21],
     pub(crate) free_records: u32,
-    pub(crate) free_cells: usize,
-    pub(crate) free_leaves: usize,
-    pub(crate) free_branches: usize,
+    pub(crate) free_cells: u32,
+    pub(crate) free_leaves: u32,
+    pub(crate) free_branches: u32,
+    pub(crate) occupied_records: u32,
 }
 /// Non-forgeable prepared pristine-withdrawal change: the exact instance
 /// nonce, expected generation, target record index, and fixed record
@@ -3451,7 +3475,7 @@ mod tests {
             .expect("same-instance same-state validation");
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([4, 0, 0, 0, 113])
+            HotPathWorkWitness::new([4, 0, 0, 0, 119])
         );
         let next = validated.commit_bundle();
         assert_eq!(next, before.next().unwrap());
@@ -3577,10 +3601,30 @@ mod tests {
         let mut ledger = new_ledger();
         let mut measured = work();
         let snapshot = ledger.snapshot(&mut measured).unwrap();
-        assert_eq!(measured.witness(), HotPathWorkWitness::new([0, 0, 0, 0, 1]));
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new([0, 552, 0, 0, 1])
+        );
+        assert_eq!(snapshot.generation, ledger.generation);
         assert_eq!(snapshot.capacities, ledger.capacities);
         assert_eq!(snapshot.usage, ledger.usage);
         assert_eq!(snapshot.reserved, ledger.reserved);
+        assert_eq!(snapshot.bundle_vector_max, ledger.bundle_vector_max);
+        assert_eq!(snapshot.vector_capacity, ledger.vector_capacity);
+        assert_eq!(snapshot.vector_usage, ledger.vector_usage);
+        assert_eq!(std::mem::size_of_val(&snapshot), 552);
+        assert_eq!(std::mem::size_of::<SupportCapacitySnapshot<8>>(), 2_904);
+        let copied_one_under =
+            HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_704_575, 551, 0, 2, 28_708]))
+                .unwrap();
+        let mut rejected = WorkMeter::new(copied_one_under);
+        assert!(matches!(
+            ledger.snapshot(&mut rejected),
+            Err(SupportLedgerError::Storage(FixedStorageError::Work(
+                WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 551, 552)
+            )))
+        ));
+        assert_eq!(rejected.witness(), HotPathWorkWitness::default());
         assert_eq!(
             (
                 snapshot.occupied_records,
