@@ -271,6 +271,20 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         valid
             .then_some(())
             .ok_or(SupportLedgerError::InvalidInput)?;
+        let history_slots = starts.iter().try_fold(0u64, |total, row| {
+            total.checked_add(u64::from(row[H - 1].1))
+        });
+        let storage = support_storage_bytes(
+            H,
+            records,
+            claims,
+            history_slots.ok_or(SupportLedgerError::InvalidInput)?,
+            bundle_records,
+            bundle_cells,
+        )?;
+        if storage > 2_097_152 {
+            return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
+        }
         let maxima = lifecycle_maxima.0;
         let shared = u32::from(maxima[0])
             .checked_add(u32::from(maxima[1]))
@@ -1210,6 +1224,46 @@ impl<'ledger, const R: usize, const F: usize, const H: usize>
         ledger.generation = next;
         next
     }
+}
+fn support_storage_bytes(
+    horizon_count: usize,
+    records: usize,
+    claims: usize,
+    history_slots: u64,
+    bundle_records: usize,
+    bundle_cells: usize,
+) -> Result<u64, SupportLedgerError> {
+    let invalid = SupportLedgerError::InvalidInput;
+    let h = u64::try_from(horizon_count).map_err(|_| invalid)?;
+    let r = u64::try_from(records).map_err(|_| invalid)?;
+    let f = u64::try_from(claims).map_err(|_| invalid)?;
+    let e = u64::try_from(bundle_records).map_err(|_| invalid)?;
+    let c = u64::try_from(bundle_cells).map_err(|_| invalid)?;
+    let fixed = h
+        .checked_mul(672)
+        .and_then(|value| value.checked_add(1_232))
+        .ok_or(invalid)?;
+    let legacy = r
+        .checked_mul(260)
+        .and_then(|value| {
+            f.checked_mul(40)
+                .and_then(|claims| value.checked_add(claims))
+        })
+        .and_then(|value| {
+            history_slots
+                .checked_mul(8)
+                .and_then(|history| value.checked_add(history))
+        })
+        .ok_or(invalid)?;
+    let bundles = e
+        .checked_mul(1_364)
+        .and_then(|value| value.checked_sub(20))
+        .and_then(|value| c.checked_mul(44).and_then(|cells| value.checked_add(cells)))
+        .ok_or(invalid)?;
+    fixed
+        .checked_add(legacy)
+        .and_then(|value| value.checked_add(bundles))
+        .ok_or(invalid)
 }
 #[allow(dead_code, reason = "used by the C08 adapter constructor")]
 fn total(values: impl IntoIterator<Item = u32>) -> u64 {
@@ -2815,6 +2869,18 @@ mod tests {
         assert_eq!(std::mem::size_of::<InitialRequirementRecord>(), 208);
         assert_eq!(std::mem::size_of::<FutureBranchRequirementRecord>(), 32);
         assert_eq!(std::mem::size_of::<BundleState>(), 1);
+        assert_eq!(
+            support_storage_bytes(3, 1_025, 1_025, 21 * 1_025, 4, 8),
+            Ok(488_736)
+        );
+        assert_eq!(
+            support_storage_bytes(3, 7_211, 1_025, 21 * 1_025, 4, 8),
+            Ok(2_097_096)
+        );
+        assert_eq!(
+            support_storage_bytes(3, 7_212, 1_025, 21 * 1_025, 4, 8),
+            Ok(2_097_356)
+        );
         assert_eq!(
             bundle_reserve_work::<8>(168, 19),
             Ok(HotPathWorkWitness::new([4_727, 4_016, 0, 0, 4_051]))
