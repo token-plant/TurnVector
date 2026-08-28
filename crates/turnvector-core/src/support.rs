@@ -788,20 +788,25 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     /// record/cell/leaf/branch capacity and the complete reserve Work
     /// envelope preflighted before any mutation. Returns the non-forgeable
     /// instance-bound `BundleChange`; dropping it changes no state.
-    pub(crate) fn prepare_bundle<'a, const V: usize>(
+    pub(crate) fn prepare_bundle<'a>(
         &self,
         expected: SupportLedgerGeneration,
-        input: &RequestBundleInput<'a, V>,
+        input: &RequestSupportBundleInput<'a>,
         work: &mut WorkMeter,
-    ) -> Result<BundleChange<'a, V>, SupportLedgerError> {
+    ) -> Result<BundleChange<'a>, SupportLedgerError> {
         self.next(expected, work)?;
         let invalid = SupportLedgerError::InvalidInput;
-        let obligations = input.obligations;
-        let credits = input.credits;
-        let claims = input.claims;
-        // Canonical strict order inside each same-tag group proves internal
-        // distinctness in O(q) before any index work; every identity is
-        // nonzero and the borrowed vector is nonempty.
+        SupportOutstandingCreditVector::<168>::try_new(input.cells, work).map_err(|error| {
+            if let SupportOutstandingCreditVectorError::Work(error) = error {
+                SupportLedgerError::from(error)
+            } else {
+                invalid
+            }
+        })?;
+        let initial = input.initial.values();
+        let obligations = initial.map(|requirement| requirement.obligation);
+        let credits = initial.map(|requirement| requirement.credit);
+        let claims = initial.map(|requirement| requirement.claim.get());
         for group in [
             obligations.map(|id| id.get()),
             credits.map(|id| id.get()),
@@ -809,30 +814,49 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         ] {
             let mut prior = None;
             for identity in group {
-                check!(work, identity != [0; 32], invalid)?;
                 check!(work, prior.is_none_or(|prior| prior < identity), invalid)?;
                 prior = Some(identity);
             }
         }
-        check!(work, input.entitlement.get() != [0; 32], invalid)?;
-        check!(work, input.vector.get() != [0; 32], invalid)?;
+        let initial_shapes = [
+            (SupportOperation::MaterializeRequest, MandatoryCompletion),
+            (SupportOperation::FormCandidates, MandatoryCompletion),
+            (SupportOperation::ReleaseRequest, MandatoryCompletion),
+        ];
+        for (requirement, shape) in initial.into_iter().zip(initial_shapes) {
+            check!(
+                work,
+                (requirement.operation, requirement.pool) == shape,
+                invalid
+            )?;
+            check!(work, requirement.predecessor.0 != [0; 32], invalid)?;
+            check!(work, requirement.scope.0 != [0; 32], invalid)?;
+            check!(work, requirement.input_bucket.get() > 0, invalid)?;
+            check!(work, requirement.prospective_bound.as_micros() > 0, invalid)?;
+        }
+        let branch_shapes = [
+            (SupportOperation::ObserveTurnReceipt, MandatoryCompletion),
+            (SupportOperation::FormCandidates, MandatoryCompletion),
+            (SupportOperation::FormCandidates, MandatoryCompletion),
+            (SupportOperation::FormCandidates, MandatoryCompletion),
+        ];
+        let branches = input.branches.values();
+        for (requirement, shape) in branches.into_iter().zip(branch_shapes) {
+            check!(
+                work,
+                (requirement.operation, requirement.pool) == shape,
+                invalid
+            )?;
+            check!(work, requirement.input_bucket.get() > 0, invalid)?;
+            check!(work, requirement.prospective_bound.as_micros() > 0, invalid)?;
+        }
         check!(
             work,
-            input.cells.len() > 0 && input.cells.len() <= usize::from(self.bundle_vector_max),
+            !input.cells.is_empty() && input.cells.len() <= usize::from(self.bundle_vector_max),
             invalid
         )?;
-        let record = BundleRecord {
-            obligations,
-            credits,
-            claims,
-            entitlement: input.entitlement,
-            vector: input.vector,
-            vector_head: None,
-            vector_len: input.cells.len(),
-            state: BundleRecordState::Live,
-        };
-        // All K tagged identities absent from the C16 store and the six
-        // shared obligation/credit identities absent from the legacy arena.
+        let vector_len = u32::try_from(input.cells.len()).map_err(|_| invalid)?;
+        let record = BundleRecord::from_input(input, vector_len);
         let mut identities = [None; K];
         for (slot, key) in identities.iter_mut().zip(record.tagged_keys()) {
             let found = self.bundles.find(key.tag, &key.identity, work)?;
@@ -847,13 +871,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             let absent = self.records.find(identity, work)?.is_none();
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
-        // Logical and physical free capacity for one record, v cells, K
-        // leaves, and the required branches.
         let branch_need = if self.bundles.is_empty() { K - 1 } else { K };
         check!(work, self.bundles.free_record_len() >= 1, CAPACITY_ERROR)?;
         check!(
             work,
-            self.bundles.free_cell_len() >= record.vector_len,
+            self.bundles.free_cell_len() >= input.cells.len(),
             CAPACITY_ERROR
         )?;
         check!(work, self.bundles.free_leaf_len() >= K, CAPACITY_ERROR)?;
@@ -862,9 +884,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             self.bundles.free_branch_len() >= branch_need,
             CAPACITY_ERROR
         )?;
-        // Complete reserve envelope: prepare/validate lookups plus the
-        // commit's copy/link/index work, charged before mutation.
-        work.ensure(bundle_reserve_work(record.vector_len))?;
+        work.ensure(bundle_reserve_work(input.cells.len()))?;
         Ok(BundleChange {
             nonce: self.instance_nonce,
             expected,
@@ -888,11 +908,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     /// will use are selected after exclusivity. Returns the non-forgeable
     /// exclusive `ValidatedBundleChange`; a rejection or a drop changes no
     /// state.
-    pub(crate) fn validate_bundle<'a, const V: usize>(
+    pub(crate) fn validate_bundle<'a>(
         &mut self,
-        change: BundleChange<'a, V>,
+        change: BundleChange<'a>,
         work: &mut WorkMeter,
-    ) -> Result<ValidatedBundleChange<'_, 'a, R, F, H, V>, SupportLedgerError> {
+    ) -> Result<ValidatedBundleChange<'_, 'a, R, F, H>, SupportLedgerError> {
         let stale = SupportLedgerError::Generation;
         check!(work, change.nonce == self.instance_nonce, stale)?;
         check!(work, change.expected == self.generation, stale)?;
@@ -945,17 +965,19 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         for identity in change
             .record
-            .obligations
+            .obligations()
             .iter()
             .map(|id| key(0, id.get()))
-            .chain(change.record.credits.iter().map(|id| key(1, id.get())))
+            .chain(change.record.credits().iter().map(|id| key(1, id.get())))
         {
             let absent = self.records.find(identity, work)?.is_none();
             check!(work, absent, stale)?;
         }
         self.bundles.validate_record_slot(work)?;
-        self.bundles
-            .validate_cell_selection(change.record.vector_len, work)?;
+        self.bundles.validate_cell_selection(
+            usize::try_from(change.record.vector_len).expect("u32 vector length fits usize"),
+            work,
+        )?;
         Ok(ValidatedBundleChange {
             ledger: self,
             change,
@@ -1011,11 +1033,18 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .find(TAG_OBLIGATION, &obligation.get(), work)?
             .ok_or(invalid)?;
         let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
-        check!(work, record.state == BundleRecordState::Live, invalid)?;
-        check!(work, record.obligations.contains(&obligation), invalid)?;
-        let head = record.vector_head.ok_or(invalid)?;
+        check!(
+            work,
+            record.state == BundleState::LivePristine
+                && record.linked_claims == 0
+                && record.initial.iter().all(|item| item.state == Conditional),
+            invalid
+        )?;
+        check!(work, record.obligations().contains(&obligation), invalid)?;
+        let head = usize::try_from(record.vector_head).map_err(|_| invalid)?;
+        let len = usize::try_from(record.vector_len).map_err(|_| invalid)?;
         self.bundles
-            .validate_owner_chain(head, record.vector_len, record_index as usize, work)?;
+            .validate_owner_chain(head, len, record_index as usize, work)?;
         work.ensure(HotPathWorkWitness::new([
             K as u64 * (u64::from(IDENTITY_BITS) + 1),
             0,
@@ -1046,7 +1075,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         check!(work, change.expected == self.generation, stale)?;
         let found = self
             .bundles
-            .find(TAG_OBLIGATION, &change.record.obligations[0].get(), work)?
+            .find(
+                TAG_OBLIGATION,
+                &change.record.initial[0].obligation.get(),
+                work,
+            )?
             .ok_or(stale)?;
         check!(work, found == change.record_index, stale)?;
         check!(
@@ -1054,10 +1087,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             self.bundles.get_record(change.record_index) == Some(&change.record),
             stale
         )?;
-        let head = change.record.vector_head.ok_or(stale)?;
+        let head = usize::try_from(change.record.vector_head).map_err(|_| stale)?;
         self.bundles.validate_owner_chain(
             head,
-            change.record.vector_len,
+            usize::try_from(change.record.vector_len).map_err(|_| stale)?,
             change.record_index as usize,
             work,
         )?;
@@ -1083,15 +1116,22 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .find(TAG_OBLIGATION, &obligation.get(), work)?
             .ok_or(invalid)?;
         let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
-        check!(work, record.state == BundleRecordState::Live, invalid)?;
-        check!(work, record.obligations.contains(&obligation), invalid)?;
+        check!(
+            work,
+            matches!(
+                record.state,
+                BundleState::LivePristine | BundleState::LiveConsumed
+            ),
+            invalid
+        )?;
+        check!(work, record.obligations().contains(&obligation), invalid)?;
         self.bundles.retain_bundle(record_index, work)?;
         self.generation = next;
         Ok(next)
     }
 }
-impl<'ledger, 'input, const R: usize, const F: usize, const H: usize, const V: usize>
-    ValidatedBundleChange<'ledger, 'input, R, F, H, V>
+impl<'ledger, 'input, const R: usize, const F: usize, const H: usize>
+    ValidatedBundleChange<'ledger, 'input, R, F, H>
 {
     /// Consuming infallible commit of the validated C16 bundle: performs no
     /// new fallible lookup, check, allocation, Work call, or legal rejection
@@ -1103,9 +1143,7 @@ impl<'ledger, 'input, const R: usize, const F: usize, const H: usize, const V: u
     pub(crate) fn commit_bundle(self) -> SupportLedgerGeneration {
         let change = self.change;
         let ledger = self.ledger;
-        ledger
-            .bundles
-            .commit_bundle(&change.record, change.vector.cells);
+        ledger.bundles.commit_bundle(&change.record, change.vector);
         let next = change.expected.next().expect("prepared bundle generation");
         ledger.generation = next;
         next
@@ -1321,20 +1359,6 @@ pub(crate) struct RequestSupportBundleInput<'a> {
     pub(crate) vector: SupportOutstandingCreditVectorId,
     pub(crate) cells: &'a [OutstandingCreditCell],
 }
-/// Complete C16 request-bundle input: exactly three operation-specific
-/// initial/release obligations, three physical credits, three distinct
-/// request-owned `AdmissionInitial` claims, one Future Turn Support
-/// Entitlement, one Support Outstanding Credit Vector, and its borrowed
-/// validated cells. The vector view is constructed and validated first; the
-/// ledger transaction never copies the cells.
-pub(crate) struct RequestBundleInput<'a, const V: usize> {
-    pub(crate) obligations: [SupportOperationObligationId; 3],
-    pub(crate) credits: [PhysicalStartCreditId; 3],
-    pub(crate) claims: [[u8; 32]; 3],
-    pub(crate) entitlement: FutureTurnSupportEntitlementId,
-    pub(crate) vector: SupportOutstandingCreditVectorId,
-    pub(crate) cells: SupportOutstandingCreditVector<'a, V>,
-}
 /// Non-forgeable prepared C16 bundle change: fixed-size semantic before-image
 /// facts (exact instance nonce, expected generation, complete capacity/usage
 /// aggregates, free record/cell/index-node counts, and all `K = 11` tagged
@@ -1342,7 +1366,7 @@ pub(crate) struct RequestBundleInput<'a, const V: usize> {
 /// fixed target record. Intentionally not Clone or Copy; dropping it changes
 /// no state.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct BundleChange<'a, const V: usize> {
+pub(crate) struct BundleChange<'a> {
     nonce: u64,
     expected: SupportLedgerGeneration,
     capacities: [[u32; POOLS]; 5],
@@ -1354,7 +1378,7 @@ pub(crate) struct BundleChange<'a, const V: usize> {
     free_branches: usize,
     identities: [Option<u32>; K],
     record: BundleRecord,
-    vector: SupportOutstandingCreditVector<'a, V>,
+    vector: &'a [OutstandingCreditCell],
 }
 /// Exclusive non-forgeable validated C16 bundle capability: holds the sole
 /// `&mut` ledger borrow, the immutable validated change, and no variable
@@ -1368,10 +1392,9 @@ pub(crate) struct ValidatedBundleChange<
     const R: usize,
     const F: usize,
     const H: usize,
-    const V: usize,
 > {
     ledger: &'ledger mut SupportChargeLedger<R, F, H>,
-    change: BundleChange<'input, V>,
+    change: BundleChange<'input>,
 }
 /// Immutable capacity-facts snapshot: constructor-fixed capacities plus the
 /// current usage/reserved aggregates and C16 free record/cell/index-node
@@ -2147,41 +2170,84 @@ enum BundleState {
     LiveConsumed,
     RetainedTombstone,
 }
-/// Live or retained-tombstone state of one request-bundle record. A retained
-/// tombstone keeps its record, identities, cells, and claims.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BundleRecordState {
-    Live,
-    RetainedTombstone,
-}
-/// One fixed request-bundle record: three operation-specific initial/release
-/// obligations, three physical credits, three distinct request-owned
-/// `AdmissionInitial` claims, one Future Turn Support Entitlement, one
-/// Support Outstanding Credit Vector with its occupied cell-chain head and
-/// validated length, and the live/tombstone state.
+/// One fixed complete semantic request-bundle record. Initial requirement state
+/// and time remain independent; retained tombstones preserve every identity,
+/// cell, claim, timing fact, branch fact, and logical reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BundleRecord {
-    obligations: [SupportOperationObligationId; 3],
-    credits: [PhysicalStartCreditId; 3],
-    claims: [[u8; 32]; 3],
+    initial: [InitialRequirementRecord; 3],
+    request_owner: RequestId,
+    timing_commitment: TimingCommitmentId,
+    request_closure: RequestClosureId,
+    support_budget: OwnerThreadSupportBudgetId,
+    bound_set: RuntimeOverheadBoundSetId,
+    branches: [FutureBranchRequirementRecord; 4],
     entitlement: FutureTurnSupportEntitlementId,
     vector: SupportOutstandingCreditVectorId,
-    vector_head: Option<usize>,
-    vector_len: usize,
-    state: BundleRecordState,
+    vector_head: u32,
+    vector_len: u32,
+    linked_claims: u32,
+    state: BundleState,
 }
 impl BundleRecord {
+    fn from_input(input: &RequestSupportBundleInput<'_>, vector_len: u32) -> Self {
+        Self {
+            initial: input
+                .initial
+                .values()
+                .map(|requirement| InitialRequirementRecord {
+                    obligation: requirement.obligation,
+                    credit: requirement.credit,
+                    claim: requirement.claim,
+                    operation: requirement.operation,
+                    pool: requirement.pool,
+                    predecessor: requirement.predecessor,
+                    scope: requirement.scope,
+                    input_bucket: requirement.input_bucket,
+                    prospective_bound: requirement.prospective_bound,
+                    state: Conditional,
+                    state_time: MonotonicTime::from_micros(0),
+                }),
+            request_owner: input.request_owner,
+            timing_commitment: input.timing.timing_commitment,
+            request_closure: input.timing.request_closure,
+            support_budget: input.timing.support_budget,
+            bound_set: input.timing.bound_set,
+            branches: input
+                .branches
+                .values()
+                .map(|requirement| FutureBranchRequirementRecord {
+                    operation: requirement.operation,
+                    pool: requirement.pool,
+                    input_bucket: requirement.input_bucket,
+                    prospective_bound: requirement.prospective_bound,
+                }),
+            entitlement: input.entitlement,
+            vector: input.vector,
+            vector_head: NO_NODE,
+            vector_len,
+            linked_claims: 0,
+            state: BundleState::LivePristine,
+        }
+    }
+    fn obligations(&self) -> [SupportOperationObligationId; 3] {
+        self.initial.map(|requirement| requirement.obligation)
+    }
+    fn credits(&self) -> [PhysicalStartCreditId; 3] {
+        self.initial.map(|requirement| requirement.credit)
+    }
     fn tagged_keys(&self) -> [TaggedKey; K] {
+        let initial = self.initial;
         [
-            TaggedKey::new(TAG_OBLIGATION, self.obligations[0].get()),
-            TaggedKey::new(TAG_OBLIGATION, self.obligations[1].get()),
-            TaggedKey::new(TAG_OBLIGATION, self.obligations[2].get()),
-            TaggedKey::new(TAG_CREDIT, self.credits[0].get()),
-            TaggedKey::new(TAG_CREDIT, self.credits[1].get()),
-            TaggedKey::new(TAG_CREDIT, self.credits[2].get()),
-            TaggedKey::new(TAG_ADMISSION_CLAIM, self.claims[0]),
-            TaggedKey::new(TAG_ADMISSION_CLAIM, self.claims[1]),
-            TaggedKey::new(TAG_ADMISSION_CLAIM, self.claims[2]),
+            TaggedKey::new(TAG_OBLIGATION, initial[0].obligation.get()),
+            TaggedKey::new(TAG_OBLIGATION, initial[1].obligation.get()),
+            TaggedKey::new(TAG_OBLIGATION, initial[2].obligation.get()),
+            TaggedKey::new(TAG_CREDIT, initial[0].credit.get()),
+            TaggedKey::new(TAG_CREDIT, initial[1].credit.get()),
+            TaggedKey::new(TAG_CREDIT, initial[2].credit.get()),
+            TaggedKey::new(TAG_ADMISSION_CLAIM, initial[0].claim.get()),
+            TaggedKey::new(TAG_ADMISSION_CLAIM, initial[1].claim.get()),
+            TaggedKey::new(TAG_ADMISSION_CLAIM, initial[2].claim.get()),
             TaggedKey::new(TAG_ENTITLEMENT, self.entitlement.get()),
             TaggedKey::new(TAG_VECTOR, self.vector.get()),
         ]
@@ -2368,8 +2434,8 @@ impl RequestBundleStore {
         }
         let (head, len) = self.cells.install(record_index as usize, cells);
         self.records[record_index as usize] = Some(BundleRecord {
-            vector_head: Some(head),
-            vector_len: len,
+            vector_head: u32::try_from(head).expect("constructor-bounded cell index"),
+            vector_len: u32::try_from(len).expect("constructor-bounded cell count"),
             ..*record
         });
         self.occupied_records = occupied_records;
@@ -2390,10 +2456,10 @@ impl RequestBundleStore {
             .get(record as usize)
             .and_then(Option::as_ref)
             .ok_or(FixedStorageError::NonCanonical)?;
-        let head = record_slot
-            .vector_head
-            .ok_or(FixedStorageError::NonCanonical)?;
-        let len = record_slot.vector_len;
+        let head = usize::try_from(record_slot.vector_head)
+            .map_err(|_| FixedStorageError::NonCanonical)?;
+        let len =
+            usize::try_from(record_slot.vector_len).map_err(|_| FixedStorageError::NonCanonical)?;
         self.cells
             .validate_owner_chain(head, len, record as usize, work)?;
         let bits = u64::from(IDENTITY_BITS);
@@ -2477,8 +2543,8 @@ impl RequestBundleStore {
         }
         let (head, len) = self.cells.install(record_index as usize, cells);
         self.records[record_index as usize] = Some(BundleRecord {
-            vector_head: Some(head),
-            vector_len: len,
+            vector_head: u32::try_from(head).expect("constructor-bounded cell index"),
+            vector_len: u32::try_from(len).expect("constructor-bounded cell count"),
             ..*record
         });
         self.occupied_records = occupied_records;
@@ -2498,8 +2564,8 @@ impl RequestBundleStore {
         let record_slot = self.records[record as usize]
             .as_ref()
             .expect("validated occupied record");
-        let head = record_slot.vector_head.expect("validated vector head");
-        let len = record_slot.vector_len;
+        let head = usize::try_from(record_slot.vector_head).expect("validated vector head");
+        let len = usize::try_from(record_slot.vector_len).expect("validated vector length");
         for key in record_slot.tagged_keys() {
             self.identities.remove_unmetered(key.tag, &key.identity);
         }
@@ -2521,10 +2587,10 @@ impl RequestBundleStore {
             .get_mut(record as usize)
             .and_then(Option::as_mut)
             .ok_or(FixedStorageError::NonCanonical)?;
-        if slot.state != BundleRecordState::Live {
+        if slot.state == BundleState::RetainedTombstone {
             return Err(FixedStorageError::NonCanonical);
         }
-        slot.state = BundleRecordState::RetainedTombstone;
+        slot.state = BundleState::RetainedTombstone;
         Ok(())
     }
 }
@@ -3201,32 +3267,20 @@ mod tests {
     }
 
     /// Test-only complete bundle input over `n`-derived canonical identities.
-    fn bundle_input<'a, const V: usize>(
-        n: u8,
-        cells: &'a [OutstandingCreditCell],
-    ) -> RequestBundleInput<'a, V> {
-        let identity = |offset: u8| {
-            let mut id = [0u8; 32];
-            id[0] = n;
-            id[1] = offset;
-            id
+    #[rustfmt::skip]
+    fn bundle_input<'a>(n: u8, cells: &'a [OutstandingCreditCell]) -> RequestSupportBundleInput<'a> {
+        let identity = |offset: u8| { let mut id = [0u8; 32]; id[0] = n; id[1] = offset; id };
+        let requirement = |offset: u8, operation| InitialSupportRequirement {
+            obligation: SupportOperationObligationId::new(identity(offset)).unwrap(), credit: PhysicalStartCreditId::new(identity(offset + 10)).unwrap(), claim: AdmissionInitialClaimId::new(identity(offset + 20)).unwrap(), operation, pool: Mandatory,
+            predecessor: SupportCausalPredecessorId(identity(offset + 50)), scope: SupportCallScopeId(identity(offset + 60)), input_bucket: SupportInputBucket::new(u16::from(offset)).unwrap(), prospective_bound: Duration::from_micros(u64::from(offset)),
         };
-        let view = SupportOutstandingCreditVector::<V>::try_new(cells, &mut work()).unwrap();
-        RequestBundleInput {
-            obligations: [
-                SupportOperationObligationId::new(identity(1)).unwrap(),
-                SupportOperationObligationId::new(identity(2)).unwrap(),
-                SupportOperationObligationId::new(identity(3)).unwrap(),
-            ],
-            credits: [
-                PhysicalStartCreditId::new(identity(11)).unwrap(),
-                PhysicalStartCreditId::new(identity(12)).unwrap(),
-                PhysicalStartCreditId::new(identity(13)).unwrap(),
-            ],
-            claims: [identity(21), identity(22), identity(23)],
-            entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(),
-            vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(),
-            cells: view,
+        let branch = |offset: u8, operation| FutureSupportBranchRequirement { operation, pool: Mandatory, input_bucket: SupportInputBucket::new(u16::from(offset)).unwrap(), prospective_bound: Duration::from_micros(u64::from(offset)) };
+        RequestSupportBundleInput {
+            request_owner: RequestId::new(crate::DaemonInstanceId::new(u128::from(n)).unwrap(), crate::ConnectionId::new(1).unwrap(), crate::RequestSequence::new(1).unwrap()),
+            timing: SupportTimingFacts { timing_commitment: TimingCommitmentId::new(identity(70)).unwrap(), request_closure: RequestClosureId::new(identity(71)).unwrap(), support_budget: OwnerThreadSupportBudgetId::new(identity(72)).unwrap(), bound_set: RuntimeOverheadBoundSetId::new(identity(73)).unwrap() },
+            initial: InitialSupportRequirements { materialize: requirement(1, SupportOperation::MaterializeRequest), form_candidates: requirement(2, SupportOperation::FormCandidates), release: requirement(3, SupportOperation::ReleaseRequest) },
+            branches: FutureSupportBranchRequirements { receipt_observation: branch(1, SupportOperation::ObserveTurnReceipt), continuation_formation: branch(2, SupportOperation::FormCandidates), rejection_or_local_stale_formation: branch(3, SupportOperation::FormCandidates), terminal_membership_change_formation: branch(4, SupportOperation::FormCandidates) },
+            entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(), vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(), cells,
         }
     }
     fn bundle_ledger(records: usize, cells: usize) -> Ledger {
@@ -3274,7 +3328,7 @@ mod tests {
         let ledger = new_ledger();
         let before = ledger.generation();
         let cells = axis_cells(3, 1);
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let mut measured = work();
         let change = ledger
             .prepare_bundle(before, &input, &mut measured)
@@ -3284,7 +3338,7 @@ mod tests {
         // 17, free capacity 4).
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([0, 0, 0, 0, 44])
+            HotPathWorkWitness::new([3, 0, 0, 0, 68])
         );
         assert_eq!(ledger.generation(), before, "prepare is read-only");
         assert_eq!(change.nonce, ledger.instance_nonce);
@@ -3303,11 +3357,26 @@ mod tests {
         );
         assert!(change.identities.iter().all(|found| found.is_none()));
         assert_eq!(change.record.vector_len, 3);
-        assert_eq!(change.record.vector_head, None);
-        assert_eq!(change.record.state, BundleRecordState::Live);
-        assert_eq!(change.record.obligations, input.obligations);
-        assert_eq!(change.record.credits, input.credits);
-        assert_eq!(change.record.claims, input.claims);
+        assert_eq!(change.record.vector_head, NO_NODE);
+        assert_eq!(change.record.state, BundleState::LivePristine);
+        assert_eq!(
+            change.record.obligations(),
+            input.initial.values().map(|item| item.obligation)
+        );
+        assert_eq!(
+            change.record.credits(),
+            input.initial.values().map(|item| item.credit)
+        );
+        assert_eq!(change.record.request_owner, input.request_owner);
+        assert_eq!(
+            change.record.timing_commitment,
+            input.timing.timing_commitment
+        );
+        assert_eq!(change.record.request_closure, input.timing.request_closure);
+        assert_eq!(change.record.support_budget, input.timing.support_budget);
+        assert_eq!(change.record.bound_set, input.timing.bound_set);
+        assert_eq!(change.record.linked_claims, 0);
+        assert_eq!(std::mem::size_of::<BundleRecord>(), 1_008);
         // The same input prepares again against the same before-image.
         let mut measured = work();
         ledger
@@ -3315,33 +3384,36 @@ mod tests {
             .unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([0, 0, 0, 0, 44])
+            HotPathWorkWitness::new([3, 0, 0, 0, 68])
         );
     }
     #[test]
     fn c16_bundle_prepare_rejects_invalid_inputs() {
         let cells = axis_cells(3, 1);
-        let mut invalid = bundle_input::<8>(1, &cells);
-        invalid.claims[0] = [0; 32];
+        let mut invalid = bundle_input(1, &cells);
+        invalid.initial.materialize.predecessor = SupportCausalPredecessorId([0; 32]);
         let ledger = new_ledger();
         assert_eq!(
             ledger.prepare_bundle(ledger.generation(), &invalid, &mut work()),
             Err(InvalidInput)
         );
-        invalid = bundle_input::<8>(1, &cells);
-        invalid.obligations.swap(0, 1);
+        invalid = bundle_input(1, &cells);
+        std::mem::swap(
+            &mut invalid.initial.materialize,
+            &mut invalid.initial.form_candidates,
+        );
         assert_eq!(
             ledger.prepare_bundle(ledger.generation(), &invalid, &mut work()),
             Err(InvalidInput)
         );
-        invalid = bundle_input::<8>(1, &cells);
-        invalid.credits[0] = invalid.credits[1];
+        invalid = bundle_input(1, &cells);
+        invalid.initial.materialize.credit = invalid.initial.form_candidates.credit;
         assert_eq!(
             ledger.prepare_bundle(ledger.generation(), &invalid, &mut work()),
             Err(InvalidInput)
         );
-        invalid = bundle_input::<8>(1, &cells);
-        invalid.claims[2] = invalid.claims[1];
+        invalid = bundle_input(1, &cells);
+        invalid.initial.release.claim = invalid.initial.form_candidates.claim;
         assert_eq!(
             ledger.prepare_bundle(ledger.generation(), &invalid, &mut work()),
             Err(InvalidInput)
@@ -3350,7 +3422,7 @@ mod tests {
     #[test]
     fn c16_bundle_prepare_rejects_collisions_and_capacity() {
         let cells = axis_cells(3, 1);
-        let reject = |ledger: &mut Ledger, input: &RequestBundleInput<'_, 8>| {
+        let reject = |ledger: &mut Ledger, input: &RequestSupportBundleInput<'_>| {
             let before = bundle_snapshot(ledger);
             let mut measured = work();
             let result = ledger.prepare_bundle(ledger.generation(), input, &mut measured);
@@ -3365,8 +3437,8 @@ mod tests {
         let mut ledger = new_ledger();
         add(&mut ledger, 1, 1).unwrap();
         assert_eq!(ledger.records.get(0).unwrap().1, Ordinary);
-        let mut legacy = bundle_input::<8>(1, &cells);
-        legacy.obligations[0] = SupportOperationObligationId::new([1; 32]).unwrap();
+        let mut legacy = bundle_input(1, &cells);
+        legacy.initial.materialize.obligation = SupportOperationObligationId::new([1; 32]).unwrap();
         assert_eq!(
             reject(&mut ledger, &legacy),
             SupportLedgerError::Storage(Duplicate)
@@ -3377,7 +3449,7 @@ mod tests {
             .bundles
             .reserve_bundle(&bundle_record(1), &axis_cells(2, 1), &mut work())
             .unwrap();
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         assert_eq!(
             reject(&mut ledger, &input),
             SupportLedgerError::Storage(Duplicate)
@@ -3389,7 +3461,7 @@ mod tests {
             .reserve_bundle(&bundle_record(1), &axis_cells(2, 1), &mut work())
             .unwrap();
         ledger.bundles.retain_bundle(0, &mut work()).unwrap();
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         assert_eq!(
             reject(&mut ledger, &input),
             SupportLedgerError::Storage(Duplicate)
@@ -3400,7 +3472,7 @@ mod tests {
             .bundles
             .reserve_bundle(&bundle_record(9), &axis_cells(1, 1), &mut work())
             .unwrap();
-        let input = bundle_input::<8>(2, &cells);
+        let input = bundle_input(2, &cells);
         assert_eq!(
             reject(&mut ledger, &input),
             SupportLedgerError::Storage(FixedStorageError::Capacity)
@@ -3412,7 +3484,7 @@ mod tests {
             .reserve_bundle(&bundle_record(9), &axis_cells(1, 1), &mut work())
             .unwrap();
         let wide = axis_cells(4, 1);
-        let input = bundle_input::<8>(3, &wide);
+        let input = bundle_input(3, &wide);
         assert_eq!(
             reject(&mut ledger, &input),
             SupportLedgerError::Storage(FixedStorageError::Capacity)
@@ -3421,7 +3493,7 @@ mod tests {
     #[test]
     fn c16_bundle_prepare_work_exhaustion_rolls_back() {
         let cells = axis_cells(3, 1);
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let ledger = new_ledger();
         let before = bundle_snapshot(&ledger);
         let mut exhausted = work();
@@ -3432,7 +3504,7 @@ mod tests {
         let error = WorkBudgetError::BudgetExceeded(
             WorkDimension::VisitedEntities,
             1_704_575,
-            1_704_575 + 15_219,
+            1_704_575 + 3,
         );
         assert_eq!(
             fault,
@@ -3460,7 +3532,7 @@ mod tests {
     fn c16_bundle_transaction_commits_exactly_once() {
         let mut ledger = new_ledger();
         let cells = axis_cells(3, 1);
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let before = ledger.generation();
         let mut measured = work();
         let change = ledger
@@ -3468,14 +3540,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([0, 0, 0, 0, 44])
+            HotPathWorkWitness::new([3, 0, 0, 0, 68])
         );
         let validated = ledger
             .validate_bundle(change, &mut measured)
             .expect("same-instance same-state validation");
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([4, 0, 0, 0, 119])
+            HotPathWorkWitness::new([7, 0, 0, 0, 143])
         );
         let next = validated.commit_bundle();
         assert_eq!(next, before.next().unwrap());
@@ -3497,9 +3569,9 @@ mod tests {
             .bundles
             .get_record(owner.expect("committed bundle"))
             .expect("occupied bundle record");
-        assert_eq!(record.state, BundleRecordState::Live);
+        assert_eq!(record.state, BundleState::LivePristine);
         assert_eq!(record.vector_len, 3);
-        assert!(record.vector_head.is_some());
+        assert_ne!(record.vector_head, NO_NODE);
         assert_eq!(
             (
                 ledger.bundles.free_record_len(),
@@ -3540,7 +3612,7 @@ mod tests {
         // Dropping the validated capability changes no state.
         let mut ledger = new_ledger();
         let before = bundle_snapshot(&ledger);
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let change = ledger
             .prepare_bundle(ledger.generation(), &input, &mut work())
             .unwrap();
@@ -3550,7 +3622,7 @@ mod tests {
         assert_eq!(bundle_snapshot(&ledger), before);
         // An intervening legal mutation makes the prepared change stale.
         let mut ledger = new_ledger();
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let change = ledger
             .prepare_bundle(ledger.generation(), &input, &mut work())
             .unwrap();
@@ -3565,7 +3637,7 @@ mod tests {
         );
         // Moving the ledger preserves the instance nonce: validation succeeds.
         let ledger = new_ledger();
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let change = ledger
             .prepare_bundle(ledger.generation(), &input, &mut work())
             .unwrap();
@@ -3575,7 +3647,7 @@ mod tests {
         assert_eq!(moved.bundles.free_record_len(), 3);
         // A same-state different-instance ledger rejects the change.
         let first = new_ledger();
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let change = first
             .prepare_bundle(first.generation(), &input, &mut work())
             .unwrap();
@@ -3636,7 +3708,7 @@ mod tests {
             (0, 4, 8, 44, 43)
         );
         let cells = axis_cells(2, 1);
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let change = ledger
             .prepare_bundle(ledger.generation(), &input, &mut work())
             .unwrap();
@@ -3727,13 +3799,13 @@ mod tests {
     }
     fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
         let cells = axis_cells(v, 1);
-        let input = bundle_input::<8>(n, &cells);
+        let input = bundle_input(n, &cells);
         let change = ledger
             .prepare_bundle(ledger.generation(), &input, &mut work())
             .unwrap();
         let validated = ledger.validate_bundle(change, &mut work()).unwrap();
         validated.commit_bundle();
-        input.obligations[0]
+        input.initial.materialize.obligation
     }
     #[test]
     fn c16_bundle_pristine_withdraw_commits_once_and_releases() {
@@ -3850,7 +3922,7 @@ mod tests {
         assert_eq!(ledger.bundles.free_cell_len(), 5);
         assert_eq!(ledger.bundles.free_leaf_len(), 33);
         assert_eq!(ledger.bundles.free_branch_len(), 33);
-        let input = bundle_input::<8>(1, &cells);
+        let input = bundle_input(1, &cells);
         let second = ledger
             .prepare_bundle(ledger.generation(), &input, &mut work())
             .unwrap_err();
@@ -3889,7 +3961,7 @@ mod tests {
             .expect("tombstone identity retained");
         assert_eq!(
             ledger.bundles.get_record(owner).unwrap().state,
-            BundleRecordState::RetainedTombstone
+            BundleState::RetainedTombstone
         );
     }
     #[test]
@@ -3898,16 +3970,17 @@ mod tests {
         let at = MonotonicTime::from_micros;
         let duplicate = SupportLedgerError::Storage(Duplicate);
         let legacy_blocks = |ledger: &mut Ledger, obligation: [u8; 32], credit: [u8; 32]| {
-            let mut input = bundle_input::<8>(2, &cells);
-            input.obligations[0] = SupportOperationObligationId::new(obligation).unwrap();
+            let mut input = bundle_input(2, &cells);
+            input.initial.materialize.obligation =
+                SupportOperationObligationId::new(obligation).unwrap();
             assert_eq!(
                 ledger
                     .prepare_bundle(ledger.generation(), &input, &mut work())
                     .unwrap_err(),
                 duplicate
             );
-            let mut input = bundle_input::<8>(3, &cells);
-            input.credits[0] = PhysicalStartCreditId::new(credit).unwrap();
+            let mut input = bundle_input(3, &cells);
+            input.initial.materialize.credit = PhysicalStartCreditId::new(credit).unwrap();
             assert_eq!(
                 ledger
                     .prepare_bundle(ledger.generation(), &input, &mut work())
@@ -4923,32 +4996,7 @@ mod tests {
 
     /// Test-only distinct bundle record with canonical same-tag identity groups.
     fn bundle_record(n: u8) -> BundleRecord {
-        // Two-byte identities: byte 0 is the record, byte 1 the member offset,
-        // so distinct records never share an identity within u8 range.
-        let identity = |offset: u8| {
-            let mut id = [0u8; 32];
-            id[0] = n;
-            id[1] = offset;
-            id
-        };
-        BundleRecord {
-            obligations: [
-                SupportOperationObligationId::new(identity(1)).unwrap(),
-                SupportOperationObligationId::new(identity(2)).unwrap(),
-                SupportOperationObligationId::new(identity(3)).unwrap(),
-            ],
-            credits: [
-                PhysicalStartCreditId::new(identity(11)).unwrap(),
-                PhysicalStartCreditId::new(identity(12)).unwrap(),
-                PhysicalStartCreditId::new(identity(13)).unwrap(),
-            ],
-            claims: [identity(21), identity(22), identity(23)],
-            entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(),
-            vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(),
-            vector_head: None,
-            vector_len: 0,
-            state: BundleRecordState::Live,
-        }
+        BundleRecord::from_input(&bundle_input(n, &[]), 0)
     }
     /// Test-only full request-bundle store oracle: record/cell/leaf/branch
     /// partitions, free-stack validity, trie and arena oracles, and every
@@ -4995,10 +5043,15 @@ mod tests {
                     "every record identity present and owned"
                 );
             }
-            let head = slot.vector_head.expect("occupied record has a cell chain");
+            let head = usize::try_from(slot.vector_head).expect("occupied record has a cell chain");
             store
                 .cells
-                .validate_owner_chain(head, slot.vector_len, record as usize, &mut work())
+                .validate_owner_chain(
+                    head,
+                    usize::try_from(slot.vector_len).unwrap(),
+                    record as usize,
+                    &mut work(),
+                )
                 .unwrap();
         }
         for leaf in store.identities.leaf_slots.iter().flatten() {
@@ -5010,10 +5063,13 @@ mod tests {
         let cells_owned: usize = occupied
             .iter()
             .map(|&record| {
-                store.records[record as usize]
-                    .as_ref()
-                    .expect("occupied record")
-                    .vector_len
+                usize::try_from(
+                    store.records[record as usize]
+                        .as_ref()
+                        .expect("occupied record")
+                        .vector_len,
+                )
+                .unwrap()
             })
             .sum();
         assert_eq!(
@@ -5141,7 +5197,7 @@ mod tests {
         store.retain_bundle(0, &mut meter).unwrap();
         assert_eq!(
             store.get_record(0).unwrap().state,
-            BundleRecordState::RetainedTombstone
+            BundleState::RetainedTombstone
         );
         // Retained tombstone keeps every identity and cell occupied.
         for key in record.tagged_keys() {
