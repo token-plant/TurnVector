@@ -2,8 +2,8 @@ use crate::bounded::FixedWindowStart;
 use crate::{
     Duration, FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
     FutureTurnSupportEntitlementId, HotPathWorkWitness, MonotonicTime, PhysicalStartCreditId,
-    SupportLedgerGeneration, SupportOperationObligationId, SupportOutstandingCreditVectorId,
-    WorkBudgetError, WorkDimension, WorkMeter,
+    RequestId, RuntimeOverheadBoundSetId, SupportLedgerGeneration, SupportOperationObligationId,
+    SupportOutstandingCreditVectorId, WorkBudgetError, WorkDimension, WorkMeter,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 const POOLS: usize = 3;
@@ -51,6 +51,40 @@ impl SupportFundingClaim {
 pub struct SupportCausalPredecessorId(pub [u8; 32]);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SupportCallScopeId(pub(crate) [u8; 32]);
+macro_rules! private_digest_identity {
+    ($($name:ident),+ $(,)?) => {$(
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub(crate) struct $name([u8; 32]);
+        impl $name {
+            pub(crate) fn new(bytes: [u8; 32]) -> Result<Self, crate::DomainValueError> {
+                (bytes != [0; 32])
+                    .then_some(Self(bytes))
+                    .ok_or(crate::DomainValueError::Zero)
+            }
+            pub(crate) const fn get(self) -> [u8; 32] {
+                self.0
+            }
+        }
+    )+ };
+}
+private_digest_identity!(
+    AdmissionInitialClaimId,
+    TimingCommitmentId,
+    RequestClosureId,
+    OwnerThreadSupportBudgetId,
+);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupportInputBucket(u16);
+impl SupportInputBucket {
+    pub(crate) fn new(value: u16) -> Result<Self, crate::DomainValueError> {
+        (value != 0)
+            .then_some(Self(value))
+            .ok_or(crate::DomainValueError::Zero)
+    }
+    pub(crate) const fn get(self) -> u16 {
+        self.0
+    }
+}
 pub struct SupportObligationSpec<'a> {
     pub id: SupportOperationObligationId,
     pub operation: SupportOperation,
@@ -1197,6 +1231,76 @@ impl<'a, const V: usize> SupportOutstandingCreditVector<'a, V> {
         self.cells.iter()
     }
 }
+/// Immutable timing, finite closure, owner-thread budget, and runtime-bound
+/// identities bound unchanged into one C16 request support entitlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupportTimingFacts {
+    pub(crate) timing_commitment: TimingCommitmentId,
+    pub(crate) request_closure: RequestClosureId,
+    pub(crate) support_budget: OwnerThreadSupportBudgetId,
+    pub(crate) bound_set: RuntimeOverheadBoundSetId,
+}
+/// One named initial requirement. Its exact operation/pool mapping is validated
+/// by bundle preparation rather than inferred from caller-selectable ordinals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InitialSupportRequirement {
+    pub(crate) obligation: SupportOperationObligationId,
+    pub(crate) credit: PhysicalStartCreditId,
+    pub(crate) claim: AdmissionInitialClaimId,
+    pub(crate) operation: SupportOperation,
+    pub(crate) pool: SupportPool,
+    pub(crate) predecessor: SupportCausalPredecessorId,
+    pub(crate) scope: SupportCallScopeId,
+    pub(crate) input_bucket: SupportInputBucket,
+    pub(crate) prospective_bound: Duration,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InitialSupportRequirements {
+    pub(crate) materialize: InitialSupportRequirement,
+    pub(crate) form_candidates: InitialSupportRequirement,
+    pub(crate) release: InitialSupportRequirement,
+}
+impl InitialSupportRequirements {
+    fn values(self) -> [InitialSupportRequirement; 3] {
+        [self.materialize, self.form_candidates, self.release]
+    }
+}
+/// One named future entitlement branch and its immutable resource axis facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FutureSupportBranchRequirement {
+    pub(crate) operation: SupportOperation,
+    pub(crate) pool: SupportPool,
+    pub(crate) input_bucket: SupportInputBucket,
+    pub(crate) prospective_bound: Duration,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FutureSupportBranchRequirements {
+    pub(crate) receipt_observation: FutureSupportBranchRequirement,
+    pub(crate) continuation_formation: FutureSupportBranchRequirement,
+    pub(crate) rejection_or_local_stale_formation: FutureSupportBranchRequirement,
+    pub(crate) terminal_membership_change_formation: FutureSupportBranchRequirement,
+}
+impl FutureSupportBranchRequirements {
+    fn values(self) -> [FutureSupportBranchRequirement; 4] {
+        [
+            self.receipt_observation,
+            self.continuation_formation,
+            self.rejection_or_local_stale_formation,
+            self.terminal_membership_change_formation,
+        ]
+    }
+}
+/// Complete accepted C16 semantic input. Cells remain an immutable borrowed
+/// canonical sparse vector through validation and consuming commit.
+pub(crate) struct RequestSupportBundleInput<'a> {
+    pub(crate) request_owner: RequestId,
+    pub(crate) timing: SupportTimingFacts,
+    pub(crate) initial: InitialSupportRequirements,
+    pub(crate) branches: FutureSupportBranchRequirements,
+    pub(crate) entitlement: FutureTurnSupportEntitlementId,
+    pub(crate) vector: SupportOutstandingCreditVectorId,
+    pub(crate) cells: &'a [OutstandingCreditCell],
+}
 /// Complete C16 request-bundle input: exactly three operation-specific
 /// initial/release obligations, three physical credits, three distinct
 /// request-owned `AdmissionInitial` claims, one Future Turn Support
@@ -1989,6 +2093,36 @@ const TAG_CREDIT: u8 = 1;
 const TAG_ADMISSION_CLAIM: u8 = 2;
 const TAG_ENTITLEMENT: u8 = 4;
 const TAG_VECTOR: u8 = 5;
+/// Stored independent state/time and immutable facts for one named initial
+/// request-support requirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InitialRequirementRecord {
+    obligation: SupportOperationObligationId,
+    credit: PhysicalStartCreditId,
+    claim: AdmissionInitialClaimId,
+    operation: SupportOperation,
+    pool: SupportPool,
+    predecessor: SupportCausalPredecessorId,
+    scope: SupportCallScopeId,
+    input_bucket: SupportInputBucket,
+    prospective_bound: Duration,
+    state: SupportObligationState,
+    state_time: MonotonicTime,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FutureBranchRequirementRecord {
+    operation: SupportOperation,
+    pool: SupportPool,
+    input_bucket: SupportInputBucket,
+    prospective_bound: Duration,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum BundleState {
+    LivePristine,
+    LiveConsumed,
+    RetainedTombstone,
+}
 /// Live or retained-tombstone state of one request-bundle record. A retained
 /// tombstone keeps its record, identities, cells, and claims.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2430,6 +2564,27 @@ mod tests {
     fn go(ledger: &mut Ledger, n: u8, transition: SupportTransition) -> Result {
         let id = SupportOperationObligationId::new([n; 32]).unwrap();
         ledger.transition(ledger.generation(), id, transition, &mut work())
+    }
+    #[test]
+    fn c16_semantic_identity_and_record_layout_contract() {
+        macro_rules! identity_contract {
+            ($kind:ident) => {{
+                assert_eq!($kind::new([0; 32]), Err(crate::DomainValueError::Zero));
+                assert_eq!($kind::new([1; 32]).unwrap().get(), [1; 32]);
+            }};
+        }
+        identity_contract!(AdmissionInitialClaimId);
+        identity_contract!(TimingCommitmentId);
+        identity_contract!(RequestClosureId);
+        identity_contract!(OwnerThreadSupportBudgetId);
+        assert_eq!(
+            SupportInputBucket::new(0),
+            Err(crate::DomainValueError::Zero)
+        );
+        assert_eq!(SupportInputBucket::new(1).unwrap().get(), 1);
+        assert_eq!(std::mem::size_of::<InitialRequirementRecord>(), 208);
+        assert_eq!(std::mem::size_of::<FutureBranchRequirementRecord>(), 32);
+        assert_eq!(std::mem::size_of::<BundleState>(), 1);
     }
     #[test]
     fn support_ledger_contract() {
