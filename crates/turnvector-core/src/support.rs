@@ -884,7 +884,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             self.bundles.free_branch_len() >= branch_need,
             CAPACITY_ERROR
         )?;
-        work.ensure(bundle_reserve_work(input.cells.len()))?;
+        let height = self.records.maximum_identity_height()?;
+        work.ensure(bundle_reserve_work::<H>(input.cells.len(), height)?)?;
         Ok(BundleChange {
             nonce: self.instance_nonce,
             expected,
@@ -978,6 +979,13 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             usize::try_from(change.record.vector_len).expect("u32 vector length fits usize"),
             work,
         )?;
+        let height = self.records.maximum_identity_height()?;
+        let branches = if self.bundles.is_empty() { K - 1 } else { K };
+        work.ensure(bundle_validate_commit_work::<H>(
+            change.vector.len(),
+            branches,
+            height,
+        )?)?;
         Ok(ValidatedBundleChange {
             ledger: self,
             change,
@@ -1197,19 +1205,112 @@ fn lifecycle_result(result: LifecycleTriggerResult) -> (u8, bool) {
     let encoded = LIFECYCLE_RESULTS[result as usize];
     (encoded >> 1, encoded & 1 != 0)
 }
-fn bundle_reserve_work(cells: usize) -> HotPathWorkWitness {
-    let v = cells as u64;
-    let bits = u64::from(IDENTITY_BITS) + 1;
-    let fixed = K as u64;
-    let visits = fixed * (4 * bits + 33) + 12 * bits + 1 + 5 * v;
-    let checks = fixed * (4 * bits) + 113 + 5 * v;
-    let copied = (std::mem::size_of::<BundleRecord>() as u64 + 4)
-        + fixed
-            * (2 * std::mem::size_of::<Option<IdentityLeaf>>() as u64
-                + 2 * std::mem::size_of::<Option<IdentityBranch>>() as u64
-                + 16)
-        + 4 * v * (std::mem::size_of::<CellSlot>() as u64 + 8);
-    HotPathWorkWitness::new([visits, copied, 0, 0, checks])
+fn bundle_reserve_work<const H: usize>(
+    cells: usize,
+    avl_height: u8,
+) -> Result<HotPathWorkWitness, SupportLedgerError> {
+    let invalid = SupportLedgerError::InvalidInput;
+    let v = u64::try_from(cells).map_err(|_| invalid)?;
+    let horizon = u64::try_from(H).map_err(|_| invalid)?;
+    let keys = u64::try_from(K).map_err(|_| invalid)?;
+    let route = u64::from(IDENTITY_BITS).checked_add(2).ok_or(invalid)?;
+    let visits = horizon
+        .checked_add(2)
+        .and_then(|factor| factor.checked_mul(v))
+        .and_then(|value| {
+            keys.checked_mul(route)
+                .and_then(|fixed| value.checked_add(fixed))
+        })
+        .and_then(|value| {
+            u64::from(avl_height)
+                .checked_mul(6)
+                .and_then(|padding| value.checked_add(padding))
+        })
+        .and_then(|value| value.checked_add(7))
+        .ok_or(invalid)?;
+    let copied = horizon
+        .checked_mul(336)
+        .and_then(|value| value.checked_add(1_328))
+        .ok_or(invalid)?;
+    let checks = v
+        .checked_mul(6)
+        .and_then(|value| {
+            u64::from(IDENTITY_BITS)
+                .checked_add(4)
+                .and_then(|route| keys.checked_mul(route))
+                .and_then(|fixed| value.checked_add(fixed))
+        })
+        .and_then(|value| value.checked_add(95))
+        .ok_or(invalid)?;
+    Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
+}
+fn bundle_validate_commit_work<const H: usize>(
+    cells: usize,
+    branches: usize,
+    avl_height: u8,
+) -> Result<HotPathWorkWitness, SupportLedgerError> {
+    let invalid = SupportLedgerError::InvalidInput;
+    let v = u64::try_from(cells).map_err(|_| invalid)?;
+    let b = u64::try_from(branches).map_err(|_| invalid)?;
+    let h = u64::try_from(H).map_err(|_| invalid)?;
+    let keys = u64::try_from(K).map_err(|_| invalid)?;
+    let route = u64::from(IDENTITY_BITS).checked_add(2).ok_or(invalid)?;
+    let sum = |terms: &[u64]| {
+        terms
+            .iter()
+            .try_fold(0u64, |total, term| total.checked_add(*term))
+            .ok_or(invalid)
+    };
+    let snapshot = h
+        .checked_mul(42)
+        .and_then(|value| value.checked_add(45))
+        .ok_or(invalid)?;
+    let visits = sum(&[
+        snapshot,
+        keys.checked_mul(route).ok_or(invalid)?,
+        u64::from(avl_height).checked_mul(6).ok_or(invalid)?,
+        sum(&[1, v, keys, b])?,
+        keys.checked_mul(
+            route
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(5))
+                .ok_or(invalid)?,
+        )
+        .ok_or(invalid)?,
+        v.checked_mul(2)
+            .and_then(|value| value.checked_add(10))
+            .ok_or(invalid)?,
+    ])?;
+    let validated = h
+        .checked_mul(336)
+        .and_then(|value| value.checked_add(1_344))
+        .ok_or(invalid)?;
+    let mutation = sum(&[
+        1_012,
+        keys.checked_mul(12).ok_or(invalid)?,
+        b.checked_mul(20).ok_or(invalid)?,
+        v.checked_mul(52).ok_or(invalid)?,
+        44,
+        keys.checked_mul(4)
+            .and_then(|value| value.checked_add(4))
+            .ok_or(invalid)?,
+    ])?;
+    let copied = validated.checked_add(mutation).ok_or(invalid)?;
+    let checks = sum(&[
+        snapshot,
+        3,
+        17,
+        keys.checked_mul(u64::from(IDENTITY_BITS).checked_add(4).ok_or(invalid)?)
+            .ok_or(invalid)?,
+        3,
+        v.checked_mul(3).ok_or(invalid)?,
+        keys.checked_mul(3).ok_or(invalid)?,
+        b.checked_mul(3).ok_or(invalid)?,
+        keys,
+        10,
+        v.checked_mul(2).ok_or(invalid)?,
+    ])?;
+    Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
 }
 fn key(tag: u8, id: [u8; 32]) -> [u8; 33] {
     let mut key = [0; 33];
@@ -2675,6 +2776,18 @@ mod tests {
         assert_eq!(std::mem::size_of::<InitialRequirementRecord>(), 208);
         assert_eq!(std::mem::size_of::<FutureBranchRequirementRecord>(), 32);
         assert_eq!(std::mem::size_of::<BundleState>(), 1);
+        assert_eq!(
+            bundle_reserve_work::<8>(168, 19),
+            Ok(HotPathWorkWitness::new([4_727, 4_016, 0, 0, 4_051]))
+        );
+        assert_eq!(
+            bundle_validate_commit_work::<8>(168, 11, 19),
+            Ok(HotPathWorkWitness::new([9_865, 14_224, 0, 0, 4_279]))
+        );
+        assert_eq!(
+            bundle_reserve_work::<{ usize::MAX }>(usize::MAX, u8::MAX),
+            Err(SupportLedgerError::InvalidInput)
+        );
     }
     #[test]
     fn support_ledger_contract() {
