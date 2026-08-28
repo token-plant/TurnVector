@@ -948,8 +948,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             usize::try_from(change.record.vector_len).expect("u32 vector length fits usize"),
             work,
         )?;
-        let height = self.records.maximum_identity_height()?;
         let branches = if self.bundles.is_empty() { K - 1 } else { K };
+        self.bundles.validate_index_selection(branches, work)?;
+        let height = self.records.maximum_identity_height()?;
         work.ensure(bundle_validate_commit_work::<H>(
             change.vector.len(),
             branches,
@@ -1913,12 +1914,20 @@ const NO_NODE: u32 = u32::MAX;
 /// hot-path growth, no public seam. `I` leaf slots and `J = I - 1` branch
 /// slots; every slot starts Vacant and each free stack initially holds its
 /// full index domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeafSlot {
+    Vacant { free_position: u32 },
+    Occupied(IdentityLeaf),
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BranchSlot {
+    Vacant { free_position: u32 },
+    Occupied(IdentityBranch),
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TaggedIdentityIndex {
-    leaf_capacity: usize,
-    branch_capacity: usize,
-    leaf_slots: Vec<Option<IdentityLeaf>>,
-    branch_slots: Vec<Option<IdentityBranch>>,
+    leaf_slots: Vec<LeafSlot>,
+    branch_slots: Vec<BranchSlot>,
     free_leaves: Vec<u32>,
     free_branches: Vec<u32>,
     root: u32,
@@ -1928,8 +1937,8 @@ impl TaggedIdentityIndex {
     /// branch slots plus their LIFO free stacks, against the binary
     /// Storage/CopiedBytes maximum.
     fn storage_bytes(leaf_capacity: u64) -> Option<u64> {
-        let leaf_slot_bytes = std::mem::size_of::<Option<IdentityLeaf>>() as u64;
-        let branch_slot_bytes = std::mem::size_of::<Option<IdentityBranch>>() as u64;
+        let leaf_slot_bytes = std::mem::size_of::<LeafSlot>() as u64;
+        let branch_slot_bytes = std::mem::size_of::<BranchSlot>() as u64;
         let index_bytes = std::mem::size_of::<u32>() as u64;
         let branches = leaf_capacity.checked_sub(1)?;
         let total = leaf_capacity
@@ -1951,8 +1960,8 @@ impl TaggedIdentityIndex {
             u64::try_from(leaf_capacity).map_err(|_| FixedStorageError::Allocation)?;
         let branch_capacity_u64 =
             u64::try_from(branch_capacity).map_err(|_| FixedStorageError::Allocation)?;
-        let leaf_slot_bytes = std::mem::size_of::<Option<IdentityLeaf>>() as u64;
-        let branch_slot_bytes = std::mem::size_of::<Option<IdentityBranch>>() as u64;
+        let leaf_slot_bytes = std::mem::size_of::<LeafSlot>() as u64;
+        let branch_slot_bytes = std::mem::size_of::<BranchSlot>() as u64;
         let index_bytes = std::mem::size_of::<u32>() as u64;
         let leaf_storage = leaf_capacity_u64
             .checked_mul(leaf_slot_bytes)
@@ -1990,12 +1999,20 @@ impl TaggedIdentityIndex {
         leaf_slots
             .try_reserve_exact(leaf_capacity)
             .map_err(|_| FixedStorageError::Allocation)?;
-        leaf_slots.resize(leaf_capacity, None);
+        for position in (0..leaf_capacity).rev() {
+            leaf_slots.push(LeafSlot::Vacant {
+                free_position: u32::try_from(position).map_err(|_| FixedStorageError::Capacity)?,
+            });
+        }
         let mut branch_slots = Vec::new();
         branch_slots
             .try_reserve_exact(branch_capacity)
             .map_err(|_| FixedStorageError::Allocation)?;
-        branch_slots.resize(branch_capacity, None);
+        for position in (0..branch_capacity).rev() {
+            branch_slots.push(BranchSlot::Vacant {
+                free_position: u32::try_from(position).map_err(|_| FixedStorageError::Capacity)?,
+            });
+        }
         let mut free_leaves = Vec::new();
         free_leaves
             .try_reserve_exact(leaf_capacity)
@@ -2018,8 +2035,6 @@ impl TaggedIdentityIndex {
             return Err(FixedStorageError::Capacity);
         }
         Ok(Self {
-            leaf_capacity,
-            branch_capacity,
             leaf_slots,
             branch_slots,
             free_leaves,
@@ -2028,10 +2043,28 @@ impl TaggedIdentityIndex {
         })
     }
     fn leaf_capacity(&self) -> usize {
-        self.leaf_capacity
+        self.leaf_slots.len()
     }
     fn branch_capacity(&self) -> usize {
-        self.branch_capacity
+        self.branch_slots.len()
+    }
+    fn leaf(&self, index: u32) -> Option<&IdentityLeaf> {
+        match self.leaf_slots.get(index as usize)? {
+            LeafSlot::Occupied(leaf) => Some(leaf),
+            LeafSlot::Vacant { .. } => None,
+        }
+    }
+    fn branch(&self, node: u32) -> Option<&IdentityBranch> {
+        match self.branch_slots.get(branch_index(node))? {
+            BranchSlot::Occupied(branch) => Some(branch),
+            BranchSlot::Vacant { .. } => None,
+        }
+    }
+    fn branch_mut(&mut self, node: u32) -> Option<&mut IdentityBranch> {
+        match self.branch_slots.get_mut(branch_index(node))? {
+            BranchSlot::Occupied(branch) => Some(branch),
+            BranchSlot::Vacant { .. } => None,
+        }
     }
     fn free_leaf_len(&self) -> usize {
         self.free_leaves.len()
@@ -2041,6 +2074,62 @@ impl TaggedIdentityIndex {
     }
     fn is_empty(&self) -> bool {
         self.root == NO_NODE
+    }
+    fn validate_selection(
+        &self,
+        leaves: usize,
+        branches: usize,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        check!(
+            work,
+            leaves <= self.free_leaves.len(),
+            FixedStorageError::Capacity
+        )?;
+        check!(
+            work,
+            branches <= self.free_branches.len(),
+            FixedStorageError::Capacity
+        )?;
+        let leaf_start = self.free_leaves.len() - leaves;
+        for position in leaf_start..self.free_leaves.len() {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            let index = self.free_leaves[position];
+            check!(
+                work,
+                (index as usize) < self.leaf_slots.len(),
+                FixedStorageError::NonCanonical
+            )?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let LeafSlot::Vacant { free_position } = self.leaf_slots[index as usize] else {
+                return Err(FixedStorageError::NonCanonical);
+            };
+            check!(
+                work,
+                free_position == position as u32,
+                FixedStorageError::NonCanonical
+            )?;
+        }
+        let branch_start = self.free_branches.len() - branches;
+        for position in branch_start..self.free_branches.len() {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            let index = self.free_branches[position];
+            check!(
+                work,
+                (index as usize) < self.branch_slots.len(),
+                FixedStorageError::NonCanonical
+            )?;
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            let BranchSlot::Vacant { free_position } = self.branch_slots[index as usize] else {
+                return Err(FixedStorageError::NonCanonical);
+            };
+            check!(
+                work,
+                free_position == position as u32,
+                FixedStorageError::NonCanonical
+            )?;
+        }
+        Ok(())
     }
     /// Borrowed bounded lookup: follows at most `B = 264` branches plus one
     /// leaf, independent of `E`. No key copy and no allocation; each visited
@@ -2056,8 +2145,8 @@ impl TaggedIdentityIndex {
         if node == NO_NODE {
             return Ok(None);
         }
-        let leaf = self.leaf_slots[node as usize]
-            .as_ref()
+        let leaf = self
+            .leaf((node as usize) as u32)
             .expect("validated occupied leaf slot");
         Ok((leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record))
     }
@@ -2075,9 +2164,7 @@ impl TaggedIdentityIndex {
         while node != NO_NODE && is_branch(node) {
             work.record(WorkDimension::VisitedEntities, 1)?;
             work.record(WorkDimension::InvariantChecks, 1)?;
-            let branch = self.branch_slots[branch_index(node)]
-                .as_ref()
-                .expect("validated occupied branch slot");
+            let branch = self.branch(node).expect("validated occupied branch slot");
             node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
         }
         if node == NO_NODE {
@@ -2106,8 +2193,8 @@ impl TaggedIdentityIndex {
             self.install_root(key, record);
             return Ok(());
         }
-        let peer_key = self.leaf_slots[peer as usize]
-            .as_ref()
+        let peer_key = self
+            .leaf((peer as usize) as u32)
             .expect("validated occupied leaf slot")
             .key;
         if peer_key == key {
@@ -2127,9 +2214,7 @@ impl TaggedIdentityIndex {
         let (mut parent, mut child) = (NO_NODE, self.root);
         while is_branch(child) {
             visits += 1;
-            let branch = self.branch_slots[branch_index(child)]
-                .as_ref()
-                .expect("validated occupied branch slot");
+            let branch = self.branch(child).expect("validated occupied branch slot");
             if branch.bit >= bit {
                 break;
             }
@@ -2153,17 +2238,15 @@ impl TaggedIdentityIndex {
             self.install_root(key, record);
             return;
         }
-        let peer_key = self.leaf_slots[peer as usize]
-            .as_ref()
+        let peer_key = self
+            .leaf((peer as usize) as u32)
             .expect("validated occupied leaf slot")
             .key;
         debug_assert_ne!(peer_key, key, "validated absent bundle identity");
         let (bit, _) = first_difference(&key, &peer_key);
         let (mut parent, mut child) = (NO_NODE, self.root);
         while is_branch(child) {
-            let branch = self.branch_slots[branch_index(child)]
-                .as_ref()
-                .expect("validated occupied branch slot");
+            let branch = self.branch(child).expect("validated occupied branch slot");
             if branch.bit >= bit {
                 break;
             }
@@ -2176,9 +2259,7 @@ impl TaggedIdentityIndex {
     fn locate_unmetered(&self, tag: u8, identity: &[u8; 32]) -> u32 {
         let mut node = self.root;
         while node != NO_NODE && is_branch(node) {
-            let branch = self.branch_slots[branch_index(node)]
-                .as_ref()
-                .expect("validated occupied branch slot");
+            let branch = self.branch(node).expect("validated occupied branch slot");
             node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
         }
         node
@@ -2186,14 +2267,14 @@ impl TaggedIdentityIndex {
     /// Infallible installation of the first leaf into an empty tree.
     fn install_root(&mut self, key: TaggedKey, record: u32) {
         let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
-        self.leaf_slots[leaf as usize] = Some(IdentityLeaf { key, record });
+        self.leaf_slots[leaf as usize] = LeafSlot::Occupied(IdentityLeaf { key, record });
         self.root = leaf;
     }
     /// Infallible installation of one leaf plus one branch above `child`, whose
     /// first discriminating bit `bit` is strictly larger than every parent bit.
     fn install_branch(&mut self, key: TaggedKey, record: u32, bit: u16, parent: u32, child: u32) {
         let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
-        self.leaf_slots[leaf as usize] = Some(IdentityLeaf { key, record });
+        self.leaf_slots[leaf as usize] = LeafSlot::Occupied(IdentityLeaf { key, record });
         let branch = self
             .free_branches
             .pop()
@@ -2204,7 +2285,7 @@ impl TaggedIdentityIndex {
             [child, leaf]
         };
         let branch_node = BRANCH_TAG | branch;
-        self.branch_slots[branch as usize] = Some(IdentityBranch {
+        self.branch_slots[branch as usize] = BranchSlot::Occupied(IdentityBranch {
             bit,
             zero: children[0],
             one: children[1],
@@ -2212,8 +2293,8 @@ impl TaggedIdentityIndex {
         if parent == NO_NODE {
             self.root = branch_node;
         } else {
-            let parent = self.branch_slots[branch_index(parent)]
-                .as_mut()
+            let parent = self
+                .branch_mut(parent)
                 .expect("validated occupied parent branch");
             *[&mut parent.zero, &mut parent.one]
                 [identity_bit(key.tag, &key.identity, parent.bit)] = branch_node;
@@ -2237,9 +2318,7 @@ impl TaggedIdentityIndex {
         while node != NO_NODE && is_branch(node) {
             work.record(WorkDimension::VisitedEntities, 1)?;
             work.record(WorkDimension::InvariantChecks, 1)?;
-            let branch = self.branch_slots[branch_index(node)]
-                .as_ref()
-                .expect("validated occupied branch slot");
+            let branch = self.branch(node).expect("validated occupied branch slot");
             let children = [branch.zero, branch.one];
             let bit = identity_bit(tag, identity, branch.bit);
             sibling = children[1 - bit];
@@ -2252,8 +2331,8 @@ impl TaggedIdentityIndex {
         }
         work.record(WorkDimension::VisitedEntities, 1)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
-        let leaf = self.leaf_slots[node as usize]
-            .as_ref()
+        let leaf = self
+            .leaf((node as usize) as u32)
             .expect("validated occupied leaf slot");
         if leaf.key.tag != tag || leaf.key.identity != *identity {
             return Ok(None);
@@ -2275,9 +2354,7 @@ impl TaggedIdentityIndex {
         let mut sibling = NO_NODE;
         let mut node = self.root;
         while node != NO_NODE && is_branch(node) {
-            let branch = self.branch_slots[branch_index(node)]
-                .as_ref()
-                .expect("validated occupied branch slot");
+            let branch = self.branch(node).expect("validated occupied branch slot");
             let children = [branch.zero, branch.one];
             let bit = identity_bit(tag, identity, branch.bit);
             sibling = children[1 - bit];
@@ -2297,11 +2374,13 @@ impl TaggedIdentityIndex {
         } else if grandparent == NO_NODE {
             self.root = sibling;
             let branch = branch_index(parent);
-            self.branch_slots[branch] = None;
+            let free_position = u32::try_from(self.free_branches.len())
+                .expect("constructor-bounded branch free stack");
+            self.branch_slots[branch] = BranchSlot::Vacant { free_position };
             self.free_branches.push(branch as u32);
         } else {
-            let grandparent = self.branch_slots[branch_index(grandparent)]
-                .as_mut()
+            let grandparent = self
+                .branch_mut(grandparent)
                 .expect("validated occupied grandparent branch");
             if grandparent.zero == parent {
                 grandparent.zero = sibling;
@@ -2309,10 +2388,14 @@ impl TaggedIdentityIndex {
                 grandparent.one = sibling;
             }
             let branch = branch_index(parent);
-            self.branch_slots[branch] = None;
+            let free_position = u32::try_from(self.free_branches.len())
+                .expect("constructor-bounded branch free stack");
+            self.branch_slots[branch] = BranchSlot::Vacant { free_position };
             self.free_branches.push(branch as u32);
         }
-        self.leaf_slots[leaf as usize] = None;
+        let free_position =
+            u32::try_from(self.free_leaves.len()).expect("constructor-bounded leaf free stack");
+        self.leaf_slots[leaf as usize] = LeafSlot::Vacant { free_position };
         self.free_leaves.push(leaf);
     }
 }
@@ -2757,6 +2840,13 @@ impl RequestBundleStore {
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
         self.cells.validate_selection(count, work)
+    }
+    fn validate_index_selection(
+        &self,
+        branches: usize,
+        work: &mut WorkMeter,
+    ) -> Result<(), FixedStorageError> {
+        self.identities.validate_selection(K, branches, work)
     }
     /// Infallible consuming installation under the validated selection: pops
     /// one record slot, `K` leaf slots, the required branches, and exactly `v`
@@ -3818,7 +3908,7 @@ mod tests {
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([7, 0, 0, 0, 193])
+            HotPathWorkWitness::new([28, 0, 0, 0, 258])
         );
         let next = validated.commit_bundle();
         assert_eq!(next, before.next().unwrap());
@@ -4715,25 +4805,25 @@ mod tests {
     /// Branch slot 0 discriminates bit 8, branch slot 1 bit 7 (tag parity).
     fn three_leaf_tree() -> TaggedIdentityIndex {
         let mut index = TaggedIdentityIndex::try_new(16).unwrap();
-        index.leaf_slots[0] = Some(IdentityLeaf {
+        index.leaf_slots[0] = LeafSlot::Occupied(IdentityLeaf {
             key: tagged(0, 0x00),
             record: 10,
         });
-        index.leaf_slots[1] = Some(IdentityLeaf {
+        index.leaf_slots[1] = LeafSlot::Occupied(IdentityLeaf {
             key: tagged(0, 0x80),
             record: 11,
         });
-        index.leaf_slots[2] = Some(IdentityLeaf {
+        index.leaf_slots[2] = LeafSlot::Occupied(IdentityLeaf {
             key: tagged(1, 0x00),
             record: 12,
         });
         index.free_leaves = (3..16).rev().map(|index| index as u32).collect();
-        index.branch_slots[0] = Some(IdentityBranch {
+        index.branch_slots[0] = BranchSlot::Occupied(IdentityBranch {
             bit: 8,
             zero: 0,
             one: 1,
         });
-        index.branch_slots[1] = Some(IdentityBranch {
+        index.branch_slots[1] = BranchSlot::Occupied(IdentityBranch {
             bit: 7,
             zero: BRANCH_TAG,
             one: 2,
@@ -4750,41 +4840,50 @@ mod tests {
     fn trie_oracle(index: &TaggedIdentityIndex) {
         use std::collections::HashSet;
         let mut free_leaves = HashSet::new();
-        for &leaf in &index.free_leaves {
-            assert!(leaf < index.leaf_capacity as u32, "free leaf in range");
+        for (position, &leaf) in index.free_leaves.iter().enumerate() {
+            assert!(leaf < index.leaf_capacity() as u32, "free leaf in range");
             assert!(free_leaves.insert(leaf), "free leaf indices unique");
-            assert_eq!(index.leaf_slots[leaf as usize], None, "free leaf vacant");
+            assert_eq!(
+                index.leaf_slots[leaf as usize],
+                LeafSlot::Vacant {
+                    free_position: position as u32
+                },
+                "free leaf vacant"
+            );
         }
         let mut free_branches = HashSet::new();
-        for &branch in &index.free_branches {
+        for (position, &branch) in index.free_branches.iter().enumerate() {
             assert!(
-                branch < index.branch_capacity as u32,
+                branch < index.branch_capacity() as u32,
                 "free branch in range"
             );
             assert!(free_branches.insert(branch), "free branch indices unique");
             assert_eq!(
-                index.branch_slots[branch as usize], None,
+                index.branch_slots[branch as usize],
+                BranchSlot::Vacant {
+                    free_position: position as u32
+                },
                 "free branch vacant"
             );
         }
         let occupied_leaves = index
             .leaf_slots
             .iter()
-            .filter(|slot| slot.is_some())
+            .filter(|slot| matches!(slot, LeafSlot::Occupied(_)))
             .count();
         let occupied_branches = index
             .branch_slots
             .iter()
-            .filter(|slot| slot.is_some())
+            .filter(|slot| matches!(slot, BranchSlot::Occupied(_)))
             .count();
         assert_eq!(
             free_leaves.len() + occupied_leaves,
-            index.leaf_capacity,
+            index.leaf_capacity(),
             "leaf partition"
         );
         assert_eq!(
             free_branches.len() + occupied_branches,
-            index.branch_capacity,
+            index.branch_capacity(),
             "branch partition"
         );
         assert_eq!(
@@ -4805,9 +4904,7 @@ mod tests {
             if is_branch(node) {
                 let slot = branch_index(node);
                 assert!(seen_branches.insert(slot), "branch reachable exactly once");
-                let branch = index.branch_slots[slot]
-                    .as_ref()
-                    .expect("reachable occupied branch");
+                let branch = index.branch(node).expect("reachable occupied branch");
                 assert!(branch.bit < IDENTITY_BITS, "branch bit in range");
                 if let Some(parent) = parent_bit {
                     assert!(parent < branch.bit, "branch bits strictly increase");
@@ -4817,10 +4914,8 @@ mod tests {
                 stack.push((branch.one, Some(branch.bit)));
             } else {
                 let slot = node as usize;
-                assert!(slot < index.leaf_capacity, "leaf reference in range");
-                let leaf = index.leaf_slots[slot]
-                    .as_ref()
-                    .expect("reachable occupied leaf");
+                assert!(slot < index.leaf_capacity(), "leaf reference in range");
+                let leaf = index.leaf(node).expect("reachable occupied leaf");
                 assert!(seen_leaves.insert(slot), "leaf reachable exactly once");
                 assert!(keys.insert(leaf.key), "leaf keys unique");
                 assert!(
@@ -4851,8 +4946,8 @@ mod tests {
         }
         // First storage-invalid boundary: leaf+branch slots and free stacks
         // exceed the binary Storage/CopiedBytes maximum.
-        let leaf_slot_bytes = std::mem::size_of::<Option<IdentityLeaf>>() as u64;
-        let branch_slot_bytes = std::mem::size_of::<Option<IdentityBranch>>() as u64;
+        let leaf_slot_bytes = std::mem::size_of::<LeafSlot>() as u64;
+        let branch_slot_bytes = std::mem::size_of::<BranchSlot>() as u64;
         let index_bytes = std::mem::size_of::<u32>() as u64;
         let storage = |leaves: u64| {
             leaves * (leaf_slot_bytes + index_bytes)
@@ -4872,12 +4967,56 @@ mod tests {
             TaggedIdentityIndex::try_new(maximum + 1).unwrap_err(),
             FixedStorageError::Capacity
         );
+        assert_eq!(std::mem::size_of::<BranchSlot>(), 16);
+        assert_eq!(std::mem::size_of::<TaggedIdentityIndex>(), 104);
         let index = TaggedIdentityIndex::try_new(16).unwrap();
         assert_eq!((index.leaf_capacity(), index.branch_capacity()), (16, 15));
         assert_eq!((index.free_leaf_len(), index.free_branch_len()), (16, 15));
         assert!(index.is_empty());
         assert_eq!(index.root, NO_NODE);
     }
+    #[test]
+    fn c16_identity_index_selected_slot_corruption_rejects_safely() {
+        let index = TaggedIdentityIndex::try_new(16).unwrap();
+        let mut exact = work();
+        index.validate_selection(2, 1, &mut exact).unwrap();
+        assert_eq!(exact.witness(), witness([3, 0, 0, 0, 11]));
+
+        let mut leaf_oob = index.clone();
+        *leaf_oob.free_leaves.last_mut().unwrap() = u32::MAX;
+        assert_eq!(
+            leaf_oob.validate_selection(1, 0, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut leaf_position = index.clone();
+        leaf_position.leaf_slots[0] = LeafSlot::Vacant { free_position: 0 };
+        assert_eq!(
+            leaf_position.validate_selection(1, 0, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut branch_oob = index.clone();
+        *branch_oob.free_branches.last_mut().unwrap() = u32::MAX;
+        assert_eq!(
+            branch_oob.validate_selection(0, 1, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut branch_position = index.clone();
+        branch_position.branch_slots[0] = BranchSlot::Vacant { free_position: 0 };
+        assert_eq!(
+            branch_position.validate_selection(0, 1, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        let mut occupied = index;
+        occupied.leaf_slots[0] = LeafSlot::Occupied(IdentityLeaf {
+            key: tagged(0, 1),
+            record: 0,
+        });
+        assert_eq!(
+            occupied.validate_selection(1, 0, &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+    }
+
     #[test]
     fn c16_identity_index_empty_lookup() {
         let index = TaggedIdentityIndex::try_new(16).unwrap();
@@ -4893,7 +5032,7 @@ mod tests {
     #[test]
     fn c16_identity_index_single_leaf_lookup() {
         let mut index = TaggedIdentityIndex::try_new(16).unwrap();
-        index.leaf_slots[0] = Some(IdentityLeaf {
+        index.leaf_slots[0] = LeafSlot::Occupied(IdentityLeaf {
             key: tagged(0, 0xAB),
             record: 7,
         });
@@ -4977,7 +5116,7 @@ mod tests {
         assert_eq!(index.root, 0);
         assert_eq!(
             index.leaf_slots[0],
-            Some(IdentityLeaf {
+            LeafSlot::Occupied(IdentityLeaf {
                 key: tagged(0, 0x00),
                 record: 10
             })
@@ -4989,7 +5128,7 @@ mod tests {
         assert_eq!(index.root, BRANCH_TAG);
         assert_eq!(
             index.branch_slots[0],
-            Some(IdentityBranch {
+            BranchSlot::Occupied(IdentityBranch {
                 bit: 8,
                 zero: 0,
                 one: 1
@@ -4997,7 +5136,7 @@ mod tests {
         );
         assert_eq!(
             index.leaf_slots[1],
-            Some(IdentityLeaf {
+            LeafSlot::Occupied(IdentityLeaf {
                 key: tagged(0, 0x80),
                 record: 11
             })
@@ -5051,7 +5190,7 @@ mod tests {
         assert_eq!(index.root, BRANCH_TAG);
         assert_eq!(
             index.branch_slots[0],
-            Some(IdentityBranch {
+            BranchSlot::Occupied(IdentityBranch {
                 bit: 0,
                 zero: 0,
                 one: 1
@@ -5073,7 +5212,7 @@ mod tests {
         assert_eq!(index.root, BRANCH_TAG);
         assert_eq!(
             index.branch_slots[0],
-            Some(IdentityBranch {
+            BranchSlot::Occupied(IdentityBranch {
                 bit: 263,
                 zero: 0,
                 one: 1
@@ -5139,7 +5278,7 @@ mod tests {
         assert_eq!(meter.witness(), witness([2, 0, 0, 0, 2]));
         assert_eq!(index.root, 1);
         assert_eq!(index.find(0, &[0x80; 32], &mut work()), Ok(Some(2)));
-        assert_eq!(index.branch_slots[0], None);
+        assert!(matches!(index.branch_slots[0], BranchSlot::Vacant { .. }));
         trie_oracle(&index);
     }
     #[test]
@@ -5152,13 +5291,13 @@ mod tests {
         assert_eq!(index.root, BRANCH_TAG | 1);
         assert_eq!(
             index.branch_slots[1],
-            Some(IdentityBranch {
+            BranchSlot::Occupied(IdentityBranch {
                 bit: 7,
                 zero: 0,
                 one: 2
             })
         );
-        assert_eq!(index.branch_slots[0], None);
+        assert!(matches!(index.branch_slots[0], BranchSlot::Vacant { .. }));
         assert_eq!(index.find(0, &[0; 32], &mut work()), Ok(Some(10)));
         assert_eq!(index.find(1, &[0; 32], &mut work()), Ok(Some(12)));
         trie_oracle(&index);
@@ -5170,13 +5309,13 @@ mod tests {
         assert_eq!(index.root, BRANCH_TAG);
         assert_eq!(
             index.branch_slots[0],
-            Some(IdentityBranch {
+            BranchSlot::Occupied(IdentityBranch {
                 bit: 8,
                 zero: 0,
                 one: 1
             })
         );
-        assert_eq!(index.branch_slots[1], None);
+        assert!(matches!(index.branch_slots[1], BranchSlot::Vacant { .. }));
         assert_eq!(index.find(0, &[0; 32], &mut work()), Ok(Some(10)));
         assert_eq!(index.find(0, &[0x80; 32], &mut work()), Ok(Some(11)));
         trie_oracle(&index);
@@ -5188,13 +5327,13 @@ mod tests {
         assert_eq!(index.root, BRANCH_TAG | 1);
         assert_eq!(
             index.branch_slots[1],
-            Some(IdentityBranch {
+            BranchSlot::Occupied(IdentityBranch {
                 bit: 7,
                 zero: 1,
                 one: 2
             })
         );
-        assert_eq!(index.branch_slots[0], None);
+        assert!(matches!(index.branch_slots[0], BranchSlot::Vacant { .. }));
         assert_eq!(index.find(0, &[0x80; 32], &mut work()), Ok(Some(11)));
         assert_eq!(index.find(1, &[0; 32], &mut work()), Ok(Some(12)));
         trie_oracle(&index);
@@ -5255,7 +5394,7 @@ mod tests {
         index.insert(tagged(2, 0), 3, &mut work()).unwrap();
         assert_eq!(
             index.leaf_slots[1],
-            Some(IdentityLeaf {
+            LeafSlot::Occupied(IdentityLeaf {
                 key: tagged(2, 0),
                 record: 3
             }),
@@ -5350,7 +5489,15 @@ mod tests {
                 )
                 .unwrap();
         }
-        for leaf in store.identities.leaf_slots.iter().flatten() {
+        for leaf in store
+            .identities
+            .leaf_slots
+            .iter()
+            .filter_map(|slot| match slot {
+                LeafSlot::Occupied(leaf) => Some(leaf),
+                LeafSlot::Vacant { .. } => None,
+            })
+        {
             assert!(
                 matches!(store.records[leaf.record as usize], RecordSlot::Occupied(_)),
                 "every index leaf owner is an occupied record"
@@ -5425,6 +5572,7 @@ mod tests {
             FixedStorageError::Capacity
         );
         assert_eq!(std::mem::size_of::<RecordSlot>(), 1_008);
+        assert_eq!(std::mem::size_of::<RequestBundleStore>(), 208);
         // E = 1 boundary and exact-capacity seal.
         let store = RequestBundleStore::try_new(1, 4).unwrap();
         assert_eq!(store.record_capacity(), 1);
