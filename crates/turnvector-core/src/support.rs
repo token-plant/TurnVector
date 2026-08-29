@@ -103,8 +103,12 @@ pub(crate) struct OrdinarySupportSpec {
 }
 #[rustfmt::skip]
 pub(crate) enum SupportChangeInput { BeginOrdinary(OrdinarySupportSpec, MonotonicTime), BeginPending(SupportOperationObligationId, LifecycleReserveKind, MonotonicTime), FinishActive(SupportOperationObligationId) }
-#[rustfmt::skip]
-enum SupportDelta { BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart), BeginPending(usize, Record, MonotonicTime, FixedWindowStart), FinishActive(usize, Record), FinishInitial(u32, u8, InitialRequirementRecord, BundleState) }
+enum SupportDelta {
+    BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart),
+    BeginPending(usize, Record, MonotonicTime, FixedWindowStart),
+    FinishActive(usize, Record),
+    FinishInitial(u32, u8, InitialRequirementRecord, BundleState),
+}
 pub(crate) struct SupportChange {
     expected: SupportLedgerGeneration,
     records: usize,
@@ -1541,6 +1545,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         {
             return Err(stale);
         }
+        if !change.record.complete_semantic_envelope_is_valid(true) {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
         for (slot, key) in change.leaves.iter_mut().zip(change.record.tagged_keys()) {
             let (leaf, owner) = self.bundles.route_precharged(key.tag, &key.identity)?;
             if owner != Some(change.record_index) {
@@ -1605,6 +1612,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             )
         {
             return Err(stale);
+        }
+        if !change.record.complete_semantic_envelope_is_valid(false) {
+            return Err(SupportLedgerError::InvalidTransition);
         }
         for key in change.record.tagged_keys() {
             let (_, owner) = self.bundles.route_precharged(key.tag, &key.identity)?;
@@ -3330,7 +3340,10 @@ fn initial_semantic_envelope_is_valid(
         BundleState::LiveConsumed => true,
         BundleState::RetainedTombstone => false,
     };
-    item.operation == expected_operation
+    item.obligation.get() != [0; 32]
+        && item.credit.get() != [0; 32]
+        && item.claim.get() != [0; 32]
+        && item.operation == expected_operation
         && item.pool == MandatoryCompletion
         && item.predecessor.0 != [0; 32]
         && item.scope.0 != [0; 32]
@@ -3360,6 +3373,57 @@ struct BundleRecord {
     state: BundleState,
 }
 impl BundleRecord {
+    fn complete_semantic_envelope_is_valid(&self, pristine: bool) -> bool {
+        let ordered =
+            |identities: [[u8; 32]; 3]| identities.windows(2).all(|pair| pair[0] < pair[1]);
+        let initial_is_valid = self.initial.into_iter().enumerate().all(|(ordinal, item)| {
+            initial_semantic_envelope_is_valid(self.state, ordinal as u8, item)
+        });
+        let identities_are_ordered = ordered(self.initial.map(|item| item.obligation.get()))
+            && ordered(self.initial.map(|item| item.credit.get()))
+            && ordered(self.initial.map(|item| item.claim.get()));
+        let branch_shapes = [
+            SupportOperation::ObserveTurnReceipt,
+            SupportOperation::FormCandidates,
+            SupportOperation::FormCandidates,
+            SupportOperation::FormCandidates,
+        ];
+        let branches_are_valid =
+            self.branches
+                .into_iter()
+                .zip(branch_shapes)
+                .all(|(branch, operation)| {
+                    branch.operation == operation
+                        && branch.pool == MandatoryCompletion
+                        && branch.input_bucket.get() != 0
+                        && branch.prospective_bound.as_micros() != 0
+                        && branch.operation as usize * POOLS + (branch.pool as usize) < 21
+                });
+        let fixed_identities_are_valid = self.timing_commitment.get() != [0; 32]
+            && self.request_closure.get() != [0; 32]
+            && self.support_budget.get() != [0; 32]
+            && self.bound_set.get() != [0; 32]
+            && self.entitlement.get() != [0; 32]
+            && self.vector.get() != [0; 32];
+        let terminal_state_is_valid = if pristine {
+            self.state == BundleState::LivePristine
+                && self.linked_claims == 0
+                && self.initial.iter().all(|item| {
+                    item.state == Conditional && item.state_time == MonotonicTime::from_micros(0)
+                })
+        } else {
+            matches!(
+                self.state,
+                BundleState::LivePristine | BundleState::LiveConsumed
+            )
+        };
+        initial_is_valid
+            && identities_are_ordered
+            && branches_are_valid
+            && fixed_identities_are_valid
+            && terminal_state_is_valid
+    }
+
     fn from_input(input: &RequestSupportBundleInput<'_>, vector_len: u32) -> Self {
         Self {
             initial: input
@@ -4744,20 +4808,59 @@ mod tests {
     }
 
     /// Test-only complete bundle input over `n`-derived canonical identities.
-    #[rustfmt::skip]
-    fn bundle_input<'a>(n: u8, cells: &'a [OutstandingCreditCell]) -> RequestSupportBundleInput<'a> {
-        let identity = |offset: u8| { let mut id = [0u8; 32]; id[0] = n; id[1] = offset; id };
-        let requirement = |offset: u8, operation| InitialSupportRequirement {
-            obligation: SupportOperationObligationId::new(identity(offset)).unwrap(), credit: PhysicalStartCreditId::new(identity(offset + 10)).unwrap(), claim: AdmissionInitialClaimId::new(identity(offset + 20)).unwrap(), operation, pool: Mandatory,
-            predecessor: SupportCausalPredecessorId(identity(offset + 50)), scope: SupportCallScopeId(identity(offset + 60)), input_bucket: SupportInputBucket::new(u16::from(offset)).unwrap(), prospective_bound: Duration::from_micros(u64::from(offset)),
+    fn bundle_input<'a>(
+        n: u8,
+        cells: &'a [OutstandingCreditCell],
+    ) -> RequestSupportBundleInput<'a> {
+        let identity = |offset: u8| {
+            let mut id = [0u8; 32];
+            id[0] = n;
+            id[1] = offset;
+            id
         };
-        let branch = |offset: u8, operation| FutureSupportBranchRequirement { operation, pool: Mandatory, input_bucket: SupportInputBucket::new(u16::from(offset)).unwrap(), prospective_bound: Duration::from_micros(u64::from(offset)) };
+        let requirement = |offset: u8, operation| InitialSupportRequirement {
+            obligation: SupportOperationObligationId::new(identity(offset)).unwrap(),
+            credit: PhysicalStartCreditId::new(identity(offset + 10)).unwrap(),
+            claim: AdmissionInitialClaimId::new(identity(offset + 20)).unwrap(),
+            operation,
+            pool: Mandatory,
+            predecessor: SupportCausalPredecessorId(identity(offset + 50)),
+            scope: SupportCallScopeId(identity(offset + 60)),
+            input_bucket: SupportInputBucket::new(u16::from(offset)).unwrap(),
+            prospective_bound: Duration::from_micros(u64::from(offset)),
+        };
+        let branch = |offset: u8, operation| FutureSupportBranchRequirement {
+            operation,
+            pool: Mandatory,
+            input_bucket: SupportInputBucket::new(u16::from(offset)).unwrap(),
+            prospective_bound: Duration::from_micros(u64::from(offset)),
+        };
         RequestSupportBundleInput {
-            request_owner: RequestId::new(crate::DaemonInstanceId::new(u128::from(n)).unwrap(), crate::ConnectionId::new(1).unwrap(), crate::RequestSequence::new(1).unwrap()),
-            timing: SupportTimingFacts { timing_commitment: TimingCommitmentId::new(identity(70)).unwrap(), request_closure: RequestClosureId::new(identity(71)).unwrap(), support_budget: OwnerThreadSupportBudgetId::new(identity(72)).unwrap(), bound_set: RuntimeOverheadBoundSetId::new(identity(73)).unwrap() },
-            initial: InitialSupportRequirements { materialize: requirement(1, SupportOperation::MaterializeRequest), form_candidates: requirement(2, SupportOperation::FormCandidates), release: requirement(3, SupportOperation::ReleaseRequest) },
-            branches: FutureSupportBranchRequirements { receipt_observation: branch(1, SupportOperation::ObserveTurnReceipt), continuation_formation: branch(2, SupportOperation::FormCandidates), rejection_or_local_stale_formation: branch(3, SupportOperation::FormCandidates), terminal_membership_change_formation: branch(4, SupportOperation::FormCandidates) },
-            entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(), vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(), cells,
+            request_owner: RequestId::new(
+                crate::DaemonInstanceId::new(u128::from(n)).unwrap(),
+                crate::ConnectionId::new(1).unwrap(),
+                crate::RequestSequence::new(1).unwrap(),
+            ),
+            timing: SupportTimingFacts {
+                timing_commitment: TimingCommitmentId::new(identity(70)).unwrap(),
+                request_closure: RequestClosureId::new(identity(71)).unwrap(),
+                support_budget: OwnerThreadSupportBudgetId::new(identity(72)).unwrap(),
+                bound_set: RuntimeOverheadBoundSetId::new(identity(73)).unwrap(),
+            },
+            initial: InitialSupportRequirements {
+                materialize: requirement(1, SupportOperation::MaterializeRequest),
+                form_candidates: requirement(2, SupportOperation::FormCandidates),
+                release: requirement(3, SupportOperation::ReleaseRequest),
+            },
+            branches: FutureSupportBranchRequirements {
+                receipt_observation: branch(1, SupportOperation::ObserveTurnReceipt),
+                continuation_formation: branch(2, SupportOperation::FormCandidates),
+                rejection_or_local_stale_formation: branch(3, SupportOperation::FormCandidates),
+                terminal_membership_change_formation: branch(4, SupportOperation::FormCandidates),
+            },
+            entitlement: FutureTurnSupportEntitlementId::new(identity(31)).unwrap(),
+            vector: SupportOutstandingCreditVectorId::new(identity(41)).unwrap(),
+            cells,
         }
     }
     fn configured_cells(count: usize, outstanding: u64) -> Vec<OutstandingCreditCell> {
@@ -6129,6 +6232,97 @@ mod tests {
             BundleState::RetainedTombstone
         );
     }
+    #[test]
+    fn c16_terminal_validation_rejects_complete_semantic_corruption_matrix() {
+        let corrupt = |record: &mut BundleRecord, corruption: usize| match corruption {
+            0 => record.initial[0].operation = SupportOperation::ReleaseRequest,
+            1 => record.initial[1].operation = SupportOperation::MaterializeRequest,
+            2 => record.initial[2].operation = SupportOperation::FormCandidates,
+            3 => record.initial[0].pool = Ordinary,
+            4 => record.initial[1].obligation = record.initial[0].obligation,
+            5 => record.initial[1].credit = record.initial[0].credit,
+            6 => record.initial[1].claim = record.initial[0].claim,
+            7 => record.initial[0].predecessor = SupportCausalPredecessorId([0; 32]),
+            8 => record.initial[0].scope = SupportCallScopeId([0; 32]),
+            9 => record.initial[0].input_bucket = SupportInputBucket(0),
+            10 => record.initial[0].prospective_bound = Duration::from_micros(0),
+            11 => record.initial[0].state_time = MonotonicTime::from_micros(1),
+            12 => record.initial[0].state = ClosedConditional,
+            13 => record.timing_commitment = TimingCommitmentId([0; 32]),
+            14 => record.request_closure = RequestClosureId([0; 32]),
+            15 => record.support_budget = OwnerThreadSupportBudgetId([0; 32]),
+            16 => record.branches[0].operation = SupportOperation::FormCandidates,
+            17 => record.branches[1].operation = SupportOperation::ObserveTurnReceipt,
+            18 => record.branches[2].operation = SupportOperation::ObserveTurnReceipt,
+            19 => record.branches[3].operation = SupportOperation::ObserveTurnReceipt,
+            20 => record.branches[0].pool = Ordinary,
+            21 => record.branches[0].input_bucket = SupportInputBucket(0),
+            22 => record.branches[0].prospective_bound = Duration::from_micros(0),
+            _ => unreachable!(),
+        };
+
+        for tombstone in [false, true] {
+            for corruption in 0..23 {
+                let mut ledger = bundle_ledger(4, 8);
+                reserve_bundle(&mut ledger, 1, 3);
+                let RecordSlot::Occupied(record) = &mut ledger.bundles.records[0] else {
+                    unreachable!("fixture record is occupied")
+                };
+                corrupt(record, corruption);
+                let before_store = ledger.bundles.clone();
+                let before_generation = ledger.generation();
+                let before_usage = ledger.usage;
+                let before_reserved = ledger.reserved;
+                let before_vector_usage = ledger.vector_usage;
+                let target =
+                    bundle_target_work::<1>(if tombstone { 1_248 } else { 1_296 }).unwrap();
+                let remainder = if tombstone {
+                    tombstone_remainder_work::<1>(3).unwrap()
+                } else {
+                    withdraw_remainder_work::<1>(3, K - 1).unwrap()
+                };
+                let expected_work = target.checked_add(remainder).unwrap();
+                let expected_error = if !tombstone && matches!(corruption, 11 | 12) {
+                    SupportLedgerError::Generation
+                } else {
+                    SupportLedgerError::InvalidTransition
+                };
+                let mut meter = work();
+                let error = if tombstone {
+                    let change = ledger
+                        .prepare_tombstone(bundle_entitlement(1), &mut meter)
+                        .unwrap();
+                    ledger
+                        .validate_tombstone(change)
+                        .err()
+                        .unwrap_or_else(|| panic!("accepted tombstone corruption {corruption}"))
+                } else {
+                    let change = ledger
+                        .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                        .unwrap();
+                    ledger
+                        .validate_withdraw(change)
+                        .err()
+                        .unwrap_or_else(|| panic!("accepted withdrawal corruption {corruption}"))
+                };
+                assert_eq!(
+                    error, expected_error,
+                    "tombstone {tombstone}, corruption {corruption}"
+                );
+                assert_eq!(
+                    meter.witness(),
+                    expected_work,
+                    "tombstone {tombstone}, corruption {corruption} retains exact Work"
+                );
+                assert_eq!(ledger.generation(), before_generation);
+                assert_eq!(ledger.usage, before_usage);
+                assert_eq!(ledger.reserved, before_reserved);
+                assert_eq!(ledger.vector_usage, before_vector_usage);
+                assert_eq!(ledger.bundles, before_store);
+            }
+        }
+    }
+
     #[test]
     fn c16_terminal_validation_rejects_cell_record_and_aggregate_corruption() {
         let occupied =
