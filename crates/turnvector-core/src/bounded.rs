@@ -737,6 +737,22 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         Some(&self.claims[start..end])
     }
 
+    #[cfg(test)]
+    pub(crate) fn allocation_facts(&self) -> [(usize, usize); 4] {
+        [
+            (self.records.as_ptr() as usize, self.records.capacity()),
+            (self.claims.as_ptr() as usize, self.claims.capacity()),
+            (
+                self.claim_ends.as_ptr() as usize,
+                self.claim_ends.capacity(),
+            ),
+            (
+                self.identities.nodes.as_ptr() as usize,
+                self.identities.nodes.capacity(),
+            ),
+        ]
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }

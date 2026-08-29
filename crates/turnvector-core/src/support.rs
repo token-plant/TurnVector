@@ -1151,7 +1151,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         self.bundles
             .validate_owner_chain_precharged(record.vector_head, len, record_index)?;
         let mut next = record.vector_head;
-        self.bundle_logical_delta((0..len).map(|_| {
+        let mut delta = self.bundle_logical_delta((0..len).map(|_| {
             let CellSlot::Occupied {
                 cell, next_owned, ..
             } = self.bundles.cells.slots[next as usize]
@@ -1160,7 +1160,24 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             };
             next = next_owned;
             cell
-        }))
+        }))?;
+        let mandatory = MandatoryCompletion as usize;
+        for item in record.initial {
+            let current = state_class(item.state);
+            if current != CONDITIONAL {
+                delta.usage[CONDITIONAL][mandatory] -= 1;
+                delta.usage[current][mandatory] += 1;
+            }
+            match item.state {
+                Conditional => {}
+                Pending => delta.reserved[PENDING][mandatory] -= 1,
+                Active | Retained | ClosedConditional | ClosedPending => {
+                    delta.reserved[PENDING][mandatory] -= 1;
+                    delta.reserved[ACTIVE][mandatory] -= 1;
+                }
+            }
+        }
+        Ok(delta)
     }
     fn validate_stored_bundle_aggregates_precharged(
         &self,
@@ -3765,6 +3782,199 @@ mod tests {
             Err(SupportLedgerError::InvalidInput)
         );
     }
+    #[test]
+    fn c16_whole_ledger_storage_accepts_exact_boundary_and_rejects_first_invalid() {
+        type BoundaryLedger = SupportChargeLedger<8_192, 1_025, 3>;
+        let generation = SupportLedgerGeneration::new(1).unwrap();
+        let capacities = |records: u32| {
+            [
+                [1, 0, 0],
+                [1, 0, 0],
+                [1, 0, 0],
+                [records, 0, 0],
+                [1_025, 0, 0],
+            ]
+        };
+        let starts = [[
+            FixedStartCountBound(Duration::from_micros(1), 1),
+            FixedStartCountBound(Duration::from_micros(2), 1),
+            FixedStartCountBound(Duration::from_micros(3), 1_025),
+        ]; 21];
+        let maxima = LifecycleReserveMaxima([1, 1_024, 1_024, 1, 1]);
+        let ledger = BoundaryLedger::try_new(
+            generation,
+            capacities(7_211),
+            1_024,
+            starts,
+            maxima,
+            4,
+            8,
+            8,
+        )
+        .expect("2,097,096-byte whole ledger is valid");
+        assert_eq!(ledger.capacities[CREDITS], [7_211, 0, 0]);
+        assert_eq!(ledger.bundles.record_capacity(), 4);
+        drop(ledger);
+
+        assert_eq!(
+            BoundaryLedger::try_new(
+                generation,
+                capacities(7_212),
+                1_024,
+                starts,
+                maxima,
+                4,
+                8,
+                8,
+            )
+            .unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::Capacity)
+        );
+    }
+
+    #[test]
+    fn c16_all_backing_allocations_remain_pointer_and_capacity_stable() {
+        let c16_facts = |ledger: &Ledger| {
+            let store = &ledger.bundles;
+            [
+                (store.records.as_ptr() as usize, store.records.capacity()),
+                (
+                    store.free_records.as_ptr() as usize,
+                    store.free_records.capacity(),
+                ),
+                (
+                    store.identities.leaf_slots.as_ptr() as usize,
+                    store.identities.leaf_slots.capacity(),
+                ),
+                (
+                    store.identities.free_leaves.as_ptr() as usize,
+                    store.identities.free_leaves.capacity(),
+                ),
+                (
+                    store.identities.branch_slots.as_ptr() as usize,
+                    store.identities.branch_slots.capacity(),
+                ),
+                (
+                    store.identities.free_branches.as_ptr() as usize,
+                    store.identities.free_branches.capacity(),
+                ),
+                (
+                    store.cells.slots.as_ptr() as usize,
+                    store.cells.slots.capacity(),
+                ),
+                (
+                    store.cells.free.as_ptr() as usize,
+                    store.cells.free.capacity(),
+                ),
+            ]
+        };
+        let mut ledger = bundle_ledger(4, 8);
+        let legacy = ledger.records.allocation_facts();
+        let c16 = c16_facts(&ledger);
+        let stable = |ledger: &Ledger| {
+            assert_eq!(ledger.records.allocation_facts(), legacy);
+            assert_eq!(c16_facts(ledger), c16);
+        };
+
+        add(&mut ledger, 200, 201).unwrap();
+        stable(&ledger);
+        reserve_bundle(&mut ledger, 1, 3);
+        stable(&ledger);
+        let mut meter = work();
+        let change = ledger
+            .prepare_withdraw(bundle_entitlement(1), &mut meter)
+            .unwrap();
+        ledger.validate_withdraw(change).unwrap().commit_withdraw();
+        stable(&ledger);
+        let obligation = reserve_bundle(&mut ledger, 2, 3);
+        stable(&ledger);
+        ledger
+            .transition(
+                ledger.generation(),
+                obligation,
+                CloseCausalCallImpossible,
+                &mut work(),
+            )
+            .unwrap();
+        stable(&ledger);
+        tombstone_bundle(&mut ledger, 2);
+        stable(&ledger);
+    }
+
+    #[test]
+    fn c16_tombstone_recomputes_every_initial_state_contribution() {
+        for terminal_state in [
+            Conditional,
+            Pending,
+            Active,
+            Retained,
+            ClosedConditional,
+            ClosedPending,
+        ] {
+            let mut ledger = bundle_ledger(4, 8);
+            let cells = configured_cells(3, 1);
+            let input = bundle_input(1, &cells);
+            let requirement = input.initial.materialize;
+            let obligation = reserve_bundle(&mut ledger, 1, 3);
+            if matches!(terminal_state, Pending | Active | Retained | ClosedPending) {
+                ledger
+                    .transition(
+                        ledger.generation(),
+                        obligation,
+                        PredecessorEnded(requirement.predecessor, MonotonicTime::from_micros(5)),
+                        &mut work(),
+                    )
+                    .unwrap();
+            }
+            if matches!(terminal_state, Active | Retained) {
+                ledger
+                    .transition(
+                        ledger.generation(),
+                        obligation,
+                        Begin(MonotonicTime::from_micros(6)),
+                        &mut work(),
+                    )
+                    .unwrap();
+            }
+            if terminal_state == Retained {
+                let mut meter = work();
+                let change = ledger
+                    .prepare(
+                        ledger.generation(),
+                        SupportChangeInput::FinishActive(obligation),
+                        &mut meter,
+                    )
+                    .unwrap();
+                ledger.commit(change, &mut meter).unwrap();
+            }
+            if matches!(terminal_state, ClosedConditional | ClosedPending) {
+                ledger
+                    .transition(
+                        ledger.generation(),
+                        obligation,
+                        CloseCausalCallImpossible,
+                        &mut work(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                ledger.bundles.get_record(0).unwrap().initial[0].state,
+                terminal_state
+            );
+            let retained = (ledger.usage, ledger.reserved, ledger.vector_usage);
+            tombstone_bundle(&mut ledger, 1);
+            assert_eq!(
+                (ledger.usage, ledger.reserved, ledger.vector_usage),
+                retained,
+                "tombstone preserves aggregates for {terminal_state:?}"
+            );
+            assert_eq!(
+                ledger.bundles.get_record(0).unwrap().initial[0].state,
+                terminal_state
+            );
+        }
+    }
+
     #[test]
     fn support_ledger_contract() {
         let fail = |result: Result, error| assert_eq!(result, Err(error));
