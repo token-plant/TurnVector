@@ -2762,6 +2762,10 @@ impl TaggedIdentityIndex {
         identity: &[u8; 32],
         work: &mut WorkMeter,
     ) -> Result<Option<u32>, FixedStorageError> {
+        if self.root != NO_NODE {
+            let route = u64::from(IDENTITY_BITS) + 1;
+            work.ensure(HotPathWorkWitness::new([route, 0, 0, 0, route]))?;
+        }
         let node = self.locate(tag, identity, work)?;
         if node == NO_NODE {
             return Ok(None);
@@ -2815,18 +2819,35 @@ impl TaggedIdentityIndex {
         work: &mut WorkMeter,
     ) -> Result<u32, FixedStorageError> {
         let mut node = self.root;
-        while node != NO_NODE && is_branch(node) {
+        let mut prior = None;
+        for _ in 0..=IDENTITY_BITS {
+            if node == NO_NODE {
+                return if prior.is_none() {
+                    Ok(NO_NODE)
+                } else {
+                    Err(FixedStorageError::NonCanonical)
+                };
+            }
+            if !is_branch(node) {
+                work.record(WorkDimension::VisitedEntities, 1)?;
+                work.record(WorkDimension::InvariantChecks, 1)?;
+                return Ok(node);
+            }
             work.record(WorkDimension::VisitedEntities, 1)?;
             work.record(WorkDimension::InvariantChecks, 1)?;
-            let branch = self.branch(node).expect("validated occupied branch slot");
+            let branch = self.branch(node).ok_or(FixedStorageError::NonCanonical)?;
+            if branch.bit >= IDENTITY_BITS
+                || prior.is_some_and(|bit| bit >= branch.bit)
+                || branch.zero == branch.one
+                || branch.zero == node
+                || branch.one == node
+            {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            prior = Some(branch.bit);
             node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
         }
-        if node == NO_NODE {
-            return Ok(NO_NODE);
-        }
-        work.record(WorkDimension::VisitedEntities, 1)?;
-        work.record(WorkDimension::InvariantChecks, 1)?;
-        Ok(node)
+        Err(FixedStorageError::NonCanonical)
     }
     /// Metered prevalidated insertion: proves leaf and branch capacity and
     /// key absence, meters the peer traversal, the first-difference byte pass,
@@ -6491,6 +6512,86 @@ mod tests {
             key_ordinal: K as u8,
         };
         reject(&ledger);
+    }
+
+    #[test]
+    fn c16_legacy_reciprocal_routes_are_preflighted_and_corruption_safe() {
+        let make = || {
+            let mut ledger = bundle_ledger(4, 8);
+            reserve_bundle(&mut ledger, 1, 3);
+            ledger
+        };
+        let reject = |ledger: &mut Ledger| {
+            let before = (bundle_snapshot(ledger), ledger.records.len());
+            assert_eq!(
+                ledger.reserve(
+                    ledger.generation(),
+                    spec(200, 201, Ordinary, &[Reserved([202; 32])]),
+                    &mut work(),
+                ),
+                Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+            );
+            assert_eq!((bundle_snapshot(ledger), ledger.records.len()), before);
+        };
+
+        let mut ledger = make();
+        let root = ledger.bundles.identities.root;
+        let branch = branch_index(root);
+        let BranchSlot::Occupied(original) = ledger.bundles.identities.branch_slots[branch] else {
+            unreachable!("nonempty bundle index has a root branch")
+        };
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Occupied(IdentityBranch {
+            bit: IDENTITY_BITS,
+            ..original
+        });
+        reject(&mut ledger);
+
+        let mut ledger = make();
+        let root = ledger.bundles.identities.root;
+        let branch = branch_index(root);
+        let BranchSlot::Occupied(original) = ledger.bundles.identities.branch_slots[branch] else {
+            unreachable!("nonempty bundle index has a root branch")
+        };
+        let identity = [200; 32];
+        let selected = identity_bit(TAG_OBLIGATION, &identity, original.bit);
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Occupied(IdentityBranch {
+            zero: if selected == 0 {
+                NO_NODE
+            } else {
+                original.zero
+            },
+            one: if selected == 1 { NO_NODE } else { original.one },
+            ..original
+        });
+        reject(&mut ledger);
+
+        let mut ledger = make();
+        let identity = [200; 32];
+        let (leaf, _) = ledger
+            .bundles
+            .route_precharged(TAG_OBLIGATION, &identity)
+            .unwrap();
+        ledger.bundles.identities.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record: u32::MAX,
+            key_ordinal: 0,
+        };
+        reject(&mut ledger);
+
+        let ledger = make();
+        let mut meter = work();
+        meter
+            .record(WorkDimension::VisitedEntities, 1_704_575 - 264)
+            .unwrap();
+        let before = meter.witness();
+        assert!(matches!(
+            ledger.bundles.find(TAG_OBLIGATION, &[200; 32], &mut meter),
+            Err(FixedStorageError::Work(WorkBudgetError::BudgetExceeded(
+                WorkDimension::VisitedEntities,
+                1_704_575,
+                1_704_576
+            )))
+        ));
+        assert_eq!(meter.witness(), before, "route preflight is all-or-none");
     }
 
     #[test]
