@@ -565,19 +565,24 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     }
     #[rustfmt::skip]
     fn prepare_pending(&self, expected: SupportLedgerGeneration, id: SupportOperationObligationId, kind: LifecycleReserveKind, at: MonotonicTime, work: &mut WorkMeter) -> Result<SupportChange, SupportLedgerError> { self.next(expected, work)?; let (index, record) = self.find_record(id, work)?; let reserve = record.6.ok_or(SupportLedgerError::InvalidTransition)?; check!(work, record.3 == Pending && reserve.0 == kind && at >= record.4 && self.reserved[ACTIVE][record.1 as usize] > 0, SupportLedgerError::InvalidTransition)?; let start = self.starts.prepare_start(record.0 as usize * POOLS + record.1 as usize, at, work)?; Ok(SupportChange { expected, records: self.records.len(), delta: SupportDelta::BeginPending(index, record, at, start) }) }
-    #[rustfmt::skip]
     pub(crate) fn validate(&self, change: &SupportChange) -> Result<(), SupportLedgerError> {
         let target = match &change.delta {
             SupportDelta::BeginOrdinary(..) => true,
-            SupportDelta::BeginPending(index, record, ..) => self.records.get(*index) == Some(record),
+            SupportDelta::BeginPending(index, record, ..) => {
+                self.records.get(*index) == Some(record)
+            }
             SupportDelta::FinishActive(index, record) => self.records.get(*index) == Some(record),
-            SupportDelta::FinishInitial(index, ordinal, item, state) => self.bundles.get_record(*index).is_some_and(|bundle| bundle.initial.get(usize::from(*ordinal)) == Some(item) && bundle.state == *state),
+            SupportDelta::FinishInitial(index, ordinal, item, state) => {
+                self.bundles.get_record(*index).is_some_and(|bundle| {
+                    bundle.initial.get(usize::from(*ordinal)) == Some(item)
+                        && bundle.state == *state
+                })
+            }
         };
         (self.generation == change.expected && self.records.len() == change.records && target)
             .then_some(())
             .ok_or(SupportLedgerError::Generation)
     }
-    #[rustfmt::skip]
     pub(crate) fn commit(
         &mut self,
         change: SupportChange,
@@ -617,7 +622,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     bundle.state = BundleState::LiveConsumed;
                 }
             }
-            SupportDelta::BeginPending(index, record, at, start) => self.commit_pending(index, record, at, start),
+            SupportDelta::BeginPending(index, record, at, start) => {
+                self.commit_pending(index, record, at, start)
+            }
         }
         let next = change.expected.next().expect("prepared support generation");
         self.generation = next;
