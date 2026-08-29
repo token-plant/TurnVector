@@ -1052,6 +1052,20 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         cells: &[OutstandingCreditCell],
     ) -> Result<(), SupportLedgerError> {
         let delta = self.bundle_logical_delta(cells.iter().copied())?;
+        for cell in cells {
+            let axis = cell.operation as usize * POOLS + cell.pool as usize;
+            let horizon = self
+                .starts
+                .bounds(axis)
+                .and_then(|bounds| bounds.iter().position(|bound| bound.0 == cell.horizon))
+                .ok_or(SupportLedgerError::InvalidInput)?;
+            let valid = self.vector_usage[axis][horizon]
+                .checked_add(cell.max_outstanding)
+                .is_some_and(|value| value <= self.vector_capacity[axis][horizon]);
+            if !valid {
+                return Err(CAPACITY_ERROR);
+            }
+        }
         for class in 0..5 {
             for pool in 0..POOLS {
                 let valid = self.usage[class][pool]
@@ -4866,6 +4880,55 @@ mod tests {
             "future backing is max(2,3), never 2+3"
         );
         assert_eq!(ledger.vector_usage[0], [2, 3]);
+    }
+
+    #[test]
+    fn c16_bundle_logical_capacity_is_nonborrowable_across_all_classes_and_pools() {
+        for class in 0..5 {
+            for pool in [Ordinary, Mandatory, Safety] {
+                let mut ledger = bundle_ledger(4, 8);
+                let cells = [oc(SupportOperation::DescribeModel, pool, 10, 1)];
+                let input = bundle_input(1, &cells);
+                let delta = ledger.bundle_logical_delta(cells).unwrap();
+                let pool_index = pool as usize;
+                let required = delta.usage[class][pool_index] + delta.reserved[class][pool_index];
+                assert!(required > 0, "matrix cell has a real delta");
+                ledger.capacities[class][pool_index] = required - 1;
+                for peer in 0..POOLS {
+                    if peer != pool_index {
+                        ledger.capacities[class][peer] = u32::MAX;
+                    }
+                }
+                let before = bundle_snapshot(&ledger);
+                assert_eq!(
+                    ledger.prepare_bundle(&input, &mut work()).unwrap_err(),
+                    CAPACITY_ERROR,
+                    "class {class}, pool {pool_index} cannot borrow"
+                );
+                assert_eq!(bundle_snapshot(&ledger), before);
+            }
+        }
+    }
+
+    #[test]
+    fn c16_bundle_logical_capacity_accumulates_across_records() {
+        let mut ledger = bundle_ledger(4, 8);
+        ledger.vector_capacity[SupportOperation::DescribeModel as usize * POOLS][0] = 3;
+        let cells = [oc(SupportOperation::DescribeModel, Ordinary, 10, 2)];
+        let first = bundle_input(1, &cells);
+        let mut meter = work();
+        let change = ledger.prepare_bundle(&first, &mut meter).unwrap();
+        ledger.validate_bundle(change).unwrap().commit_bundle();
+        let usage = ledger.vector_usage;
+        let second = bundle_input(2, &cells);
+        assert_eq!(
+            ledger.prepare_bundle(&second, &mut work()).unwrap_err(),
+            CAPACITY_ERROR
+        );
+        assert_eq!(
+            ledger.vector_usage, usage,
+            "failed aggregate reserve is read-only"
+        );
     }
 
     #[test]
