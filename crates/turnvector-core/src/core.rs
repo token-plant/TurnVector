@@ -1862,12 +1862,200 @@ mod tests {
         let input = request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5); let mut constrained = registered_request_core(); constrained.work_budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); let rejected = constrained.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), input)); assert_eq!(rejected.outcome(), &CoreOutcome::Rejected(DomainRejection::HotPathWorkBudget(WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 0, 224)))); assert_eq!((rejected.work(), rejected.request_acceptance(), constrained.requests.as_ref().unwrap().len()), (HotPathWorkWitness::new([2, 0, 0, 0, 1]), None, 0)); constrained.work_budget = HotPathWorkBudget::binary_maximum(); let retried = constrained.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), input)); assert_eq!((retried.request_acceptance().unwrap().id().sequence().get(), retried.work(), constrained.requests.as_ref().unwrap().len()), (1, HotPathWorkWitness::new([3, 736, 0, 0, 14]), 1));
     }
     #[test]
-    #[rustfmt::skip]
     fn request_capacity_and_internal_rejections_are_closed() {
-        let mut obligations = DescriptionObligations::new(); for _ in 0..=REQUEST_LIMIT { obligations.try_push(SupportOperationObligationId::new([1; 32]).unwrap()).unwrap(); } assert_eq!(obligations.len(), REQUEST_LIMIT + 1); std::thread::Builder::new().stack_size(8 << 20).spawn(|| { let mut capacities = [[0; 3]; 5]; for capacity in &mut capacities { capacity[1] = 1_025; } let starts = std::array::from_fn(|_| [FixedStartCountBound(Duration::from_micros(10), 1_025), FixedStartCountBound(Duration::from_micros(20), 1_025), FixedStartCountBound(Duration::from_micros(30), 1_025)]); let mut ledger = SupportChargeLedger::<4_096, 1_100, 3>::try_new(SupportLedgerGeneration::new(1).unwrap(), capacities, 1, starts, LifecycleReserveMaxima([1, 1_024, 1_024, 1, 1]), 4, 8, 6).unwrap(); let identity = |tag: u8, value: usize| { let mut id = [0; 32]; id[0] = tag; id[28..].copy_from_slice(&u32::try_from(value).unwrap().to_be_bytes()); id }; let predecessor = SupportCausalPredecessorId([9; 32]); let specs: Vec<_> = (1..=1_025).map(|value| LifecycleReserveSpec { id: SupportOperationObligationId::new(identity(1, value)).unwrap(), kind: if value == 1 { LifecycleReserveKind::PostLoadModelDescription } else { LifecycleReserveKind::PostLoadRequestDescription }, physical_credit: PhysicalStartCreditId::new(identity(2, value)).unwrap(), predecessor, scope: SupportCallScopeId(identity(3, value)), claim: SupportFundingClaim::LifecycleReserve(identity(4, value)), expires_at: None }).collect(); let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum()); ledger.reserve_lifecycle(ledger.generation(), MonotonicTime::from_micros(5), &specs, &mut work).unwrap(); assert_eq!(work.witness(), HotPathWorkWitness::new([158_875, 307_500, 0, 0, 16_413])); }).unwrap().join().unwrap(); let revision = ModelRevisionId::new([2; 32]).unwrap(); let mut core = registered_request_core(); for offset in 0..REQUEST_LIMIT { let transition = core.handle(CoreEvent::accept_request(EventSequence::new(3 + offset as u64).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))); assert_eq!(transition.request_acceptance().unwrap().id().sequence().get(), offset as u64 + 1); } let rejected = core.handle(CoreEvent::accept_request(EventSequence::new(3 + REQUEST_LIMIT as u64).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))); assert_eq!((rejected.outcome(), rejected.request_acceptance(), core.requests.as_ref().unwrap().len()), (&CoreOutcome::Rejected(DomainRejection::RequestCapacityExceeded), None, REQUEST_LIMIT));
-        let mut connections = registered_request_core(); for offset in 0..64 { let accepted = connections.handle(CoreEvent::accept_request(EventSequence::new(3 + offset).unwrap(), request_input(RequestSelector::Direct(revision), u128::from(offset + 1), &[1], 1, 0, 9, 5))); assert!(accepted.request_acceptance().is_some()); } let before = connections.requests.clone(); let rejected = connections.handle(CoreEvent::accept_request(EventSequence::new(67).unwrap(), request_input(RequestSelector::Direct(revision), 65, &[1], 1, 0, 9, 5))); assert_eq!((rejected.outcome(), rejected.request_acceptance(), rejected.work(), &connections.requests), (&CoreOutcome::Rejected(DomainRejection::RequestConnectionCapacityExceeded), None, HotPathWorkWitness::new([66, 224, 0, 0, 12]), &before));
-        for (last, rejection, witness) in [(u64::MAX, DomainRejection::RequestIdExhausted, [3, 224, 0, 0, 13]), (1, DomainRejection::RequestContinuity, [3, 224, 0, 0, 13])] { let mut core = registered_request_core(); core.requests.as_mut().unwrap().force_cursor(ConnectionId::new(2).unwrap(), RequestSequence::new(last).unwrap()); let before = core.requests.clone(); let rejected = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))); assert_eq!((rejected.outcome(), rejected.request_acceptance(), rejected.work(), &core.requests), (&CoreOutcome::Rejected(rejection), None, HotPathWorkWitness::new(witness), &before)); }
-        let mut stale = registered_request_core(); stale.request_generation_override = Some(RequestBookGeneration::new(2).unwrap()); let before = stale.requests.clone(); let rejected = stale.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))); assert_eq!((rejected.outcome(), rejected.request_acceptance(), rejected.work(), &stale.requests), (&CoreOutcome::Rejected(DomainRejection::RequestAcceptanceStale), None, HotPathWorkWitness::new([2, 224, 0, 0, 2]), &before));
+        let mut obligations = DescriptionObligations::new();
+        for _ in 0..=REQUEST_LIMIT {
+            obligations
+                .try_push(SupportOperationObligationId::new([1; 32]).unwrap())
+                .unwrap();
+        }
+        assert_eq!(obligations.len(), REQUEST_LIMIT + 1);
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let mut capacities = [[0; 3]; 5];
+                for capacity in &mut capacities {
+                    capacity[1] = 1_025;
+                }
+                let starts = std::array::from_fn(|_| {
+                    [
+                        FixedStartCountBound(Duration::from_micros(10), 1_025),
+                        FixedStartCountBound(Duration::from_micros(20), 1_025),
+                        FixedStartCountBound(Duration::from_micros(30), 1_025),
+                    ]
+                });
+                let mut ledger = SupportChargeLedger::<4_096, 1_100, 3>::try_new(
+                    SupportLedgerGeneration::new(1).unwrap(),
+                    capacities,
+                    1,
+                    starts,
+                    LifecycleReserveMaxima([1, 1_024, 1_024, 1, 1]),
+                    4,
+                    8,
+                    6,
+                )
+                .unwrap();
+                let identity = |tag: u8, value: usize| {
+                    let mut id = [0; 32];
+                    id[0] = tag;
+                    id[28..].copy_from_slice(&u32::try_from(value).unwrap().to_be_bytes());
+                    id
+                };
+                let predecessor = SupportCausalPredecessorId([9; 32]);
+                let specs: Vec<_> = (1..=1_025)
+                    .map(|value| LifecycleReserveSpec {
+                        id: SupportOperationObligationId::new(identity(1, value)).unwrap(),
+                        kind: if value == 1 {
+                            LifecycleReserveKind::PostLoadModelDescription
+                        } else {
+                            LifecycleReserveKind::PostLoadRequestDescription
+                        },
+                        physical_credit: PhysicalStartCreditId::new(identity(2, value)).unwrap(),
+                        predecessor,
+                        scope: SupportCallScopeId(identity(3, value)),
+                        claim: SupportFundingClaim::LifecycleReserve(identity(4, value)),
+                        expires_at: None,
+                    })
+                    .collect();
+                let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+                ledger
+                    .reserve_lifecycle(
+                        ledger.generation(),
+                        MonotonicTime::from_micros(5),
+                        &specs,
+                        &mut work,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    work.witness(),
+                    HotPathWorkWitness::new([158_875, 307_500, 0, 0, 16_413])
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let revision = ModelRevisionId::new([2; 32]).unwrap();
+        let mut core = registered_request_core();
+        for offset in 0..REQUEST_LIMIT {
+            let transition = core.handle(CoreEvent::accept_request(
+                EventSequence::new(3 + offset as u64).unwrap(),
+                request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5),
+            ));
+            assert_eq!(
+                transition
+                    .request_acceptance()
+                    .unwrap()
+                    .id()
+                    .sequence()
+                    .get(),
+                offset as u64 + 1
+            );
+        }
+        let rejected = core.handle(CoreEvent::accept_request(
+            EventSequence::new(3 + REQUEST_LIMIT as u64).unwrap(),
+            request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5),
+        ));
+        assert_eq!(
+            (
+                rejected.outcome(),
+                rejected.request_acceptance(),
+                core.requests.as_ref().unwrap().len()
+            ),
+            (
+                &CoreOutcome::Rejected(DomainRejection::RequestCapacityExceeded),
+                None,
+                REQUEST_LIMIT
+            )
+        );
+        let mut connections = registered_request_core();
+        for offset in 0..64 {
+            let accepted = connections.handle(CoreEvent::accept_request(
+                EventSequence::new(3 + offset).unwrap(),
+                request_input(
+                    RequestSelector::Direct(revision),
+                    u128::from(offset + 1),
+                    &[1],
+                    1,
+                    0,
+                    9,
+                    5,
+                ),
+            ));
+            assert!(accepted.request_acceptance().is_some());
+        }
+        let before = connections.requests.clone();
+        let rejected = connections.handle(CoreEvent::accept_request(
+            EventSequence::new(67).unwrap(),
+            request_input(RequestSelector::Direct(revision), 65, &[1], 1, 0, 9, 5),
+        ));
+        assert_eq!(
+            (
+                rejected.outcome(),
+                rejected.request_acceptance(),
+                rejected.work(),
+                &connections.requests
+            ),
+            (
+                &CoreOutcome::Rejected(DomainRejection::RequestConnectionCapacityExceeded),
+                None,
+                HotPathWorkWitness::new([66, 224, 0, 0, 12]),
+                &before
+            )
+        );
+        for (last, rejection, witness) in [
+            (
+                u64::MAX,
+                DomainRejection::RequestIdExhausted,
+                [3, 224, 0, 0, 13],
+            ),
+            (1, DomainRejection::RequestContinuity, [3, 224, 0, 0, 13]),
+        ] {
+            let mut core = registered_request_core();
+            core.requests.as_mut().unwrap().force_cursor(
+                ConnectionId::new(2).unwrap(),
+                RequestSequence::new(last).unwrap(),
+            );
+            let before = core.requests.clone();
+            let rejected = core.handle(CoreEvent::accept_request(
+                EventSequence::new(3).unwrap(),
+                request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5),
+            ));
+            assert_eq!(
+                (
+                    rejected.outcome(),
+                    rejected.request_acceptance(),
+                    rejected.work(),
+                    &core.requests
+                ),
+                (
+                    &CoreOutcome::Rejected(rejection),
+                    None,
+                    HotPathWorkWitness::new(witness),
+                    &before
+                )
+            );
+        }
+        let mut stale = registered_request_core();
+        stale.request_generation_override = Some(RequestBookGeneration::new(2).unwrap());
+        let before = stale.requests.clone();
+        let rejected = stale.handle(CoreEvent::accept_request(
+            EventSequence::new(3).unwrap(),
+            request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5),
+        ));
+        assert_eq!(
+            (
+                rejected.outcome(),
+                rejected.request_acceptance(),
+                rejected.work(),
+                &stale.requests
+            ),
+            (
+                &CoreOutcome::Rejected(DomainRejection::RequestAcceptanceStale),
+                None,
+                HotPathWorkWitness::new([2, 224, 0, 0, 2]),
+                &before
+            )
+        );
     }
     #[test]
     #[rustfmt::skip]
