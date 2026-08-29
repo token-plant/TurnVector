@@ -4645,6 +4645,34 @@ mod tests {
         assert_eq!(dispenser.load(Ordering::Relaxed), u64::MAX);
     }
     #[test]
+    fn c16_generation_exhaustion_rejects_prepare_without_state_change() {
+        let mut ledger = bundle_ledger(4, 8);
+        ledger.generation = SupportLedgerGeneration::new(u64::MAX).unwrap();
+        let cells = configured_cells(3, 1);
+        let input = bundle_input(1, &cells);
+        let before = bundle_snapshot(&ledger);
+        assert!(matches!(
+            ledger.prepare_bundle(&input, &mut work()),
+            Err(SupportLedgerError::Generation)
+        ));
+        assert_eq!(bundle_snapshot(&ledger), before);
+
+        ledger.generation = SupportLedgerGeneration::new(1).unwrap();
+        reserve_bundle(&mut ledger, 1, 3);
+        ledger.generation = SupportLedgerGeneration::new(u64::MAX).unwrap();
+        let before = bundle_snapshot(&ledger);
+        assert!(matches!(
+            ledger.prepare_withdraw(bundle_entitlement(1), &mut work()),
+            Err(SupportLedgerError::Generation)
+        ));
+        assert!(matches!(
+            ledger.prepare_tombstone(bundle_entitlement(1), &mut work()),
+            Err(SupportLedgerError::Generation)
+        ));
+        assert_eq!(bundle_snapshot(&ledger), before);
+    }
+
+    #[test]
     fn c16_bundle_prepare_binds_exact_before_image() {
         let ledger = bundle_ledger(4, 8);
         let before = ledger.generation();
@@ -6893,6 +6921,64 @@ mod tests {
             occupied.validate_record_slot(&mut work()),
             Err(FixedStorageError::NonCanonical)
         );
+    }
+    #[test]
+    fn c16_bundle_leaf_and_branch_destinations_reject_every_selected_corruption() {
+        for corruption in 0..8 {
+            let mut ledger = bundle_ledger(4, 8);
+            let cells = configured_cells(3, 1);
+            let input = bundle_input(1, &cells);
+            let mut meter = work();
+            let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
+            match corruption {
+                0 => *ledger.bundles.identities.free_leaves.last_mut().unwrap() = u32::MAX,
+                1 => {
+                    let free = &mut ledger.bundles.identities.free_leaves;
+                    let len = free.len();
+                    free[len - 1] = free[len - 2];
+                }
+                2 => {
+                    let index = *ledger.bundles.identities.free_leaves.last().unwrap();
+                    ledger.bundles.identities.leaf_slots[index as usize] = LeafSlot::Occupied {
+                        owner_record: 0,
+                        key_ordinal: 0,
+                    };
+                }
+                3 => {
+                    let free = &mut ledger.bundles.identities.free_leaves;
+                    let len = free.len();
+                    free.swap(len - 1, len - 2);
+                }
+                4 => *ledger.bundles.identities.free_branches.last_mut().unwrap() = u32::MAX,
+                5 => {
+                    let free = &mut ledger.bundles.identities.free_branches;
+                    let len = free.len();
+                    free[len - 1] = free[len - 2];
+                }
+                6 => {
+                    let index = *ledger.bundles.identities.free_branches.last().unwrap();
+                    ledger.bundles.identities.branch_slots[index as usize] =
+                        BranchSlot::Occupied(IdentityBranch {
+                            bit: 0,
+                            zero: 0,
+                            one: 1,
+                        });
+                }
+                7 => {
+                    let free = &mut ledger.bundles.identities.free_branches;
+                    let len = free.len();
+                    free.swap(len - 1, len - 2);
+                }
+                _ => unreachable!(),
+            }
+            let before = bundle_snapshot(&ledger);
+            assert_eq!(
+                ledger.validate_bundle(change).unwrap_err(),
+                SupportLedgerError::Storage(FixedStorageError::NonCanonical),
+                "selected destination corruption {corruption}"
+            );
+            assert_eq!(bundle_snapshot(&ledger), before);
+        }
     }
     #[test]
     fn c16_bundle_store_reserve_and_withdraw() {
