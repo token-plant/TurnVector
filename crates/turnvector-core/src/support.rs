@@ -2733,15 +2733,6 @@ impl TaggedIdentityIndex {
         let (key, owner) = self.resolved_leaf(node, records)?;
         Ok((key.tag == tag && key.identity == *identity).then_some(owner))
     }
-    fn find_precharged(
-        &self,
-        records: &[RecordSlot],
-        tag: u8,
-        identity: &[u8; 32],
-    ) -> Result<Option<u32>, FixedStorageError> {
-        self.route_precharged(records, tag, identity)
-            .map(|(_, owner)| owner)
-    }
     fn route_precharged(
         &self,
         records: &[RecordSlot],
@@ -2752,7 +2743,11 @@ impl TaggedIdentityIndex {
         let mut prior = None;
         for _ in 0..=IDENTITY_BITS {
             if node == NO_NODE {
-                return Ok((NO_NODE, None));
+                return if prior.is_none() {
+                    Ok((NO_NODE, None))
+                } else {
+                    Err(FixedStorageError::NonCanonical)
+                };
             }
             if !is_branch(node) {
                 let (key, owner) = self.resolved_leaf(node, records)?;
@@ -3311,6 +3306,9 @@ impl RequestBundleStore {
         identity: &[u8; 32],
         work: &mut WorkMeter,
     ) -> Result<Option<u32>, FixedStorageError> {
+        if (self.identities.root == NO_NODE) != (self.occupied_records == 0) {
+            return Err(FixedStorageError::NonCanonical);
+        }
         self.identities.find(&self.records, tag, identity, work)
     }
     fn route_precharged(
@@ -3318,16 +3316,11 @@ impl RequestBundleStore {
         tag: u8,
         identity: &[u8; 32],
     ) -> Result<(u32, Option<u32>), FixedStorageError> {
+        if (self.identities.root == NO_NODE) != (self.occupied_records == 0) {
+            return Err(FixedStorageError::NonCanonical);
+        }
         self.identities
             .route_precharged(&self.records, tag, identity)
-    }
-    fn find_precharged(
-        &self,
-        tag: u8,
-        identity: &[u8; 32],
-    ) -> Result<Option<u32>, FixedStorageError> {
-        self.identities
-            .find_precharged(&self.records, tag, identity)
     }
     fn get_record(&self, index: u32) -> Option<&BundleRecord> {
         match self.records.get(index as usize)? {
@@ -5956,6 +5949,7 @@ mod tests {
         assert_eq!(store.find(TAG_ENTITLEMENT, &[1; 32], &mut work()), Ok(None));
         let record = bundle_record(1);
         store.records[0] = RecordSlot::Occupied(record);
+        store.occupied_records = 1;
         store.identities.leaf_slots[0] = LeafSlot::Occupied {
             owner_record: 0,
             key_ordinal: 9,
@@ -6111,6 +6105,156 @@ mod tests {
             "branch scalar conservation"
         );
     }
+    #[test]
+    fn c16_staged_routes_reject_root_branch_and_terminal_corruption_safely() {
+        let make = || {
+            let mut ledger = bundle_ledger(4, 8);
+            reserve_bundle(&mut ledger, 1, 3);
+            ledger
+        };
+        let entitlement = bundle_entitlement(1);
+        let reject = |ledger: &Ledger| {
+            let before = bundle_snapshot(ledger);
+            assert_eq!(
+                ledger
+                    .prepare_withdraw(entitlement, &mut work())
+                    .unwrap_err(),
+                SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+            );
+            assert_eq!(
+                bundle_snapshot(ledger),
+                before,
+                "corrupt route rejection is read-only"
+            );
+        };
+
+        let mut ledger = make();
+        ledger.bundles.identities.root = NO_NODE;
+        reject(&ledger);
+
+        let mut ledger = make();
+        ledger.bundles.identities.root = BRANCH_TAG | 1_000_000;
+        reject(&ledger);
+
+        let mut ledger = make();
+        let branch = branch_index(ledger.bundles.identities.root);
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Vacant { free_position: 0 };
+        reject(&ledger);
+
+        let mut ledger = make();
+        let root = ledger.bundles.identities.root;
+        let branch = branch_index(root);
+        let original = match ledger.bundles.identities.branch_slots[branch] {
+            BranchSlot::Occupied(branch) => branch,
+            BranchSlot::Vacant { .. } => unreachable!("nonempty K-leaf tree has a root branch"),
+        };
+        let selected = identity_bit(TAG_ENTITLEMENT, &entitlement.get(), original.bit);
+        let child = [original.zero, original.one][selected];
+        assert!(
+            is_branch(child),
+            "fixture entitlement route has a child branch"
+        );
+        let child_index = branch_index(child);
+        let child_branch = match ledger.bundles.identities.branch_slots[child_index] {
+            BranchSlot::Occupied(branch) => branch,
+            BranchSlot::Vacant { .. } => unreachable!("valid route has occupied child branch"),
+        };
+        ledger.bundles.identities.branch_slots[child_index] =
+            BranchSlot::Occupied(IdentityBranch {
+                bit: original.bit,
+                ..child_branch
+            });
+        reject(&ledger);
+
+        let mut ledger = make();
+        let root = ledger.bundles.identities.root;
+        let branch = branch_index(root);
+        let original = match ledger.bundles.identities.branch_slots[branch] {
+            BranchSlot::Occupied(branch) => branch,
+            BranchSlot::Vacant { .. } => unreachable!("nonempty K-leaf tree has a root branch"),
+        };
+        let selected = identity_bit(TAG_ENTITLEMENT, &entitlement.get(), original.bit);
+        let corrupt = IdentityBranch {
+            zero: if selected == 0 {
+                NO_NODE
+            } else {
+                original.zero
+            },
+            one: if selected == 1 { NO_NODE } else { original.one },
+            ..original
+        };
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Occupied(corrupt);
+        reject(&ledger);
+
+        let mut ledger = make();
+        let root = ledger.bundles.identities.root;
+        let branch = branch_index(root);
+        let original = match ledger.bundles.identities.branch_slots[branch] {
+            BranchSlot::Occupied(branch) => branch,
+            BranchSlot::Vacant { .. } => unreachable!("nonempty K-leaf tree has a root branch"),
+        };
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Occupied(IdentityBranch {
+            bit: IDENTITY_BITS,
+            ..original
+        });
+        reject(&ledger);
+
+        let mut ledger = make();
+        let branch = branch_index(ledger.bundles.identities.root);
+        let original = match ledger.bundles.identities.branch_slots[branch] {
+            BranchSlot::Occupied(branch) => branch,
+            BranchSlot::Vacant { .. } => unreachable!("nonempty K-leaf tree has a root branch"),
+        };
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Occupied(IdentityBranch {
+            one: original.zero,
+            ..original
+        });
+        reject(&ledger);
+
+        let mut ledger = make();
+        let root = ledger.bundles.identities.root;
+        let branch = branch_index(root);
+        let original = match ledger.bundles.identities.branch_slots[branch] {
+            BranchSlot::Occupied(branch) => branch,
+            BranchSlot::Vacant { .. } => unreachable!("nonempty K-leaf tree has a root branch"),
+        };
+        ledger.bundles.identities.branch_slots[branch] = BranchSlot::Occupied(IdentityBranch {
+            zero: root,
+            ..original
+        });
+        reject(&ledger);
+
+        let mut ledger = make();
+        let (leaf, _) = ledger
+            .bundles
+            .route_precharged(TAG_ENTITLEMENT, &entitlement.get())
+            .unwrap();
+        ledger.bundles.identities.leaf_slots[leaf as usize] = LeafSlot::Vacant { free_position: 0 };
+        reject(&ledger);
+
+        let mut ledger = make();
+        let (leaf, _) = ledger
+            .bundles
+            .route_precharged(TAG_ENTITLEMENT, &entitlement.get())
+            .unwrap();
+        ledger.bundles.identities.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record: u32::MAX,
+            key_ordinal: 9,
+        };
+        reject(&ledger);
+
+        let mut ledger = make();
+        let (leaf, _) = ledger
+            .bundles
+            .route_precharged(TAG_ENTITLEMENT, &entitlement.get())
+            .unwrap();
+        ledger.bundles.identities.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record: 0,
+            key_ordinal: K as u8,
+        };
+        reject(&ledger);
+    }
+
     #[test]
     fn c16_bundle_store_constructor() {
         for (records, cells) in [(0usize, 8usize), (4, 0)] {
