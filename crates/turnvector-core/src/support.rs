@@ -104,7 +104,7 @@ pub(crate) struct OrdinarySupportSpec {
 #[rustfmt::skip]
 pub(crate) enum SupportChangeInput { BeginOrdinary(OrdinarySupportSpec, MonotonicTime), BeginPending(SupportOperationObligationId, LifecycleReserveKind, MonotonicTime), FinishActive(SupportOperationObligationId) }
 #[rustfmt::skip]
-enum SupportDelta { BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart), BeginPending(usize, Record, MonotonicTime, FixedWindowStart), FinishActive(usize, Record) }
+enum SupportDelta { BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart), BeginPending(usize, Record, MonotonicTime, FixedWindowStart), FinishActive(usize, Record), FinishInitial(u32, u8, InitialRequirementRecord, BundleState) }
 pub(crate) struct SupportChange {
     expected: SupportLedgerGeneration,
     records: usize,
@@ -187,6 +187,11 @@ type Record = (
     Option<LifecycleReservation>,
 );
 type LifecycleReservation = (LifecycleReserveKind, SupportOperationObligationId, u16);
+#[derive(Clone, Copy)]
+enum ObligationOwner {
+    Legacy { index: usize, record: Record },
+    InitialBundle { record: u32, ordinal: u8 },
+}
 #[derive(Debug, Eq, PartialEq)]
 pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     generation: SupportLedgerGeneration,
@@ -494,16 +499,34 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         work: &mut WorkMeter,
     ) -> Result<SupportChange, SupportLedgerError> {
         self.next(expected, work)?;
-        let (index, record) = self.find_record(id, work)?;
-        check!(
-            work,
-            record.3 == Active,
-            SupportLedgerError::InvalidTransition
-        )?;
+        let delta = match self.find_obligation(id, work)? {
+            ObligationOwner::Legacy { index, record } => {
+                check!(
+                    work,
+                    record.3 == Active,
+                    SupportLedgerError::InvalidTransition
+                )?;
+                SupportDelta::FinishActive(index, record)
+            }
+            ObligationOwner::InitialBundle { record, ordinal } => {
+                let bundle = *self
+                    .bundles
+                    .get_record(record)
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let item = *bundle
+                    .initial
+                    .get(usize::from(ordinal))
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                if item.state != Active {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                SupportDelta::FinishInitial(record, ordinal, item, bundle.state)
+            }
+        };
         Ok(SupportChange {
             expected,
             records: self.records.len(),
-            delta: SupportDelta::FinishActive(index, record),
+            delta,
         })
     }
     #[rustfmt::skip]
@@ -514,6 +537,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             SupportDelta::BeginOrdinary(..) => true,
             SupportDelta::BeginPending(index, record, ..) => self.records.get(*index) == Some(record),
             SupportDelta::FinishActive(index, record) => self.records.get(*index) == Some(record),
+            SupportDelta::FinishInitial(index, ordinal, item, state) => self.bundles.get_record(*index).is_some_and(|bundle| bundle.initial.get(usize::from(*ordinal)) == Some(item) && bundle.state == *state),
         };
         (self.generation == change.expected && self.records.len() == change.records && target)
             .then_some(())
@@ -549,6 +573,15 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     .get_mut(index)
                     .expect("validated support record")
                     .3 = Retained;
+            }
+            SupportDelta::FinishInitial(index, ordinal, _, _) => {
+                let RecordSlot::Occupied(bundle) = &mut self.bundles.records[index as usize] else {
+                    unreachable!("validated initial bundle")
+                };
+                bundle.initial[usize::from(ordinal)].state = Retained;
+                if bundle.state == BundleState::LivePristine {
+                    bundle.state = BundleState::LiveConsumed;
+                }
             }
             SupportDelta::BeginPending(index, record, at, start) => self.commit_pending(index, record, at, start),
         }
@@ -706,43 +739,171 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         transition: SupportTransition,
         work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
-        if transition == FinishSupport {
-            let change = self.prepare(expected, SupportChangeInput::FinishActive(id), work)?;
-            return self.commit(change, work);
-        }
         let next = self.next(expected, work)?;
-        let (index, record) = self.find_record(id, work)?;
-        work.record(WorkDimension::InvariantChecks, 1)?;
-        let generic = record.6.is_none();
-        let (state, time) = match (record.3, transition) {
-            (Conditional, PredecessorEnded(id, at)) if id == record.2 && generic => (Pending, at),
-            (Pending, BeginSupport(at)) if at >= record.4 => (Active, at),
-            (Conditional, CloseCausalCallImpossible) if generic => (ClosedConditional, record.4),
-            (Pending, CloseCausalCallImpossible) => (ClosedPending, record.4),
+        match self.find_obligation(id, work)? {
+            ObligationOwner::InitialBundle { record, ordinal } => {
+                return self.transition_initial(next, record, ordinal, transition);
+            }
+            ObligationOwner::Legacy { index, record } => {
+                work.record(WorkDimension::InvariantChecks, 1)?;
+                let generic = record.6.is_none();
+                let (state, time) = match (record.3, transition) {
+                    (Conditional, PredecessorEnded(id, at)) if id == record.2 && generic => {
+                        (Pending, at)
+                    }
+                    (Pending, BeginSupport(at)) if at >= record.4 => (Active, at),
+                    (Active, FinishSupport) => (Retained, record.4),
+                    (Conditional, CloseCausalCallImpossible) if generic => {
+                        (ClosedConditional, record.4)
+                    }
+                    (Pending, CloseCausalCallImpossible) => (ClosedPending, record.4),
+                    _ => return Err(SupportLedgerError::InvalidTransition),
+                };
+                let pool = record.1 as usize;
+                let (before, after) = (state_class(record.3), state_class(state));
+                if before != after {
+                    let held =
+                        after == ACTIVE && record.6.is_some() && self.reserved[ACTIVE][pool] > 0;
+                    check!(work, held || self.available(after, pool, 1), CAPACITY_ERROR)?;
+                }
+                if state == Active {
+                    self.starts
+                        .try_start(record.0 as usize * POOLS + pool, time, work)?;
+                }
+                if before != after {
+                    self.usage[before][pool] -= 1;
+                    self.usage[after][pool] += 1;
+                }
+                if record.6.is_some() && (state == Active || state == ClosedPending) {
+                    self.reserved[ACTIVE][pool] -= 1;
+                }
+                let record = self.records.get_mut(index).expect("indexed support record");
+                record.3 = state;
+                record.4 = time;
+            }
+        }
+        self.generation = next;
+        Ok(next)
+    }
+    fn transition_initial(
+        &mut self,
+        next: SupportLedgerGeneration,
+        record_index: u32,
+        ordinal: u8,
+        transition: SupportTransition,
+    ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        let bundle = self
+            .bundles
+            .get_record(record_index)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        if !matches!(
+            bundle.state,
+            BundleState::LivePristine | BundleState::LiveConsumed
+        ) {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let item = *bundle
+            .initial
+            .get(usize::from(ordinal))
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        let (state, time, release_pending, release_active) = match (item.state, transition) {
+            (Conditional, PredecessorEnded(id, at))
+                if id == item.predecessor && at >= item.state_time =>
+            {
+                (Pending, at, true, false)
+            }
+            (Pending, BeginSupport(at)) if at >= item.state_time => (Active, at, false, true),
+            (Active, FinishSupport) => (Retained, item.state_time, false, false),
+            (Conditional, CloseCausalCallImpossible) => {
+                (ClosedConditional, item.state_time, true, true)
+            }
+            (Pending, CloseCausalCallImpossible) => (ClosedPending, item.state_time, false, true),
             _ => return Err(SupportLedgerError::InvalidTransition),
         };
-        let pool = record.1 as usize;
-        let (before, after) = (state_class(record.3), state_class(state));
-        if before != after {
-            let held = after == ACTIVE && record.6.is_some() && self.reserved[ACTIVE][pool] > 0;
-            check!(work, held || self.available(after, pool, 1), CAPACITY_ERROR)?;
+        let pool = item.pool as usize;
+        if (release_pending && self.reserved[PENDING][pool] == 0)
+            || (release_active && self.reserved[ACTIVE][pool] == 0)
+        {
+            return Err(SupportLedgerError::InvalidTransition);
         }
-        if state == Active {
-            self.starts
-                .try_start(record.0 as usize * POOLS + pool, time, work)?;
+        let start = if state == Active {
+            Some(
+                self.starts
+                    .prepare_start_precharged(item.operation as usize * POOLS + pool, time)?,
+            )
+        } else {
+            None
+        };
+        let before = state_class(item.state);
+        let after = state_class(state);
+        if self.usage[before][pool] == 0 {
+            return Err(SupportLedgerError::InvalidTransition);
         }
         if before != after {
             self.usage[before][pool] -= 1;
             self.usage[after][pool] += 1;
         }
-        if record.6.is_some() && (state == Active || state == ClosedPending) {
-            self.reserved[ACTIVE][pool] -= 1;
+        self.reserved[PENDING][pool] -= u32::from(release_pending);
+        self.reserved[ACTIVE][pool] -= u32::from(release_active);
+        if let Some(start) = start {
+            self.starts.apply_start(start);
         }
-        let record = self.records.get_mut(index).expect("indexed support record");
-        record.3 = state;
-        record.4 = time;
+        let RecordSlot::Occupied(bundle) = &mut self.bundles.records[record_index as usize] else {
+            unreachable!("validated initial bundle owner")
+        };
+        let item = &mut bundle.initial[usize::from(ordinal)];
+        item.state = state;
+        item.state_time = time;
+        if bundle.state == BundleState::LivePristine {
+            bundle.state = BundleState::LiveConsumed;
+        }
         self.generation = next;
         Ok(next)
+    }
+    fn find_obligation(
+        &self,
+        id: SupportOperationObligationId,
+        work: &mut WorkMeter,
+    ) -> Result<ObligationOwner, SupportLedgerError> {
+        work.record(WorkDimension::CopiedBytes, 33)?;
+        let lookup = key(TAG_OBLIGATION, id.get());
+        let before = work.witness().value(WorkDimension::VisitedEntities);
+        if let Some(index) = self.records.find(lookup, work)? {
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            work.record(
+                WorkDimension::CopiedBytes,
+                std::mem::size_of::<Record>() as u64,
+            )?;
+            let record = *self.records.get(index).expect("indexed support record");
+            return Ok(ObligationOwner::Legacy { index, record });
+        }
+        let visited = work
+            .witness()
+            .value(WorkDimension::VisitedEntities)
+            .checked_sub(before)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        let height = u64::from(self.records.maximum_identity_height()?);
+        let padding = height
+            .checked_sub(visited)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        work.charge(HotPathWorkWitness::new([
+            padding + u64::from(IDENTITY_BITS) + 2 + H as u64,
+            32,
+            0,
+            0,
+            u64::from(IDENTITY_BITS) + 19 + H as u64,
+        ]))?;
+        let (leaf, owner) = self.bundles.route_precharged(TAG_OBLIGATION, &id.get())?;
+        let record = owner.ok_or(SupportLedgerError::InvalidTransition)?;
+        let (leaf_owner, ordinal) = self
+            .bundles
+            .identities
+            .leaf(leaf)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        if leaf_owner != record || ordinal >= 3 {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        Ok(ObligationOwner::InitialBundle { record, ordinal })
     }
     fn find_record(
         &self,
@@ -4830,6 +4991,95 @@ mod tests {
         validated.commit_bundle();
         input.initial.materialize.obligation
     }
+    #[test]
+    fn c16_initial_transitions_are_legacy_first_exact_and_sibling_isolated() {
+        let mut ledger = bundle_ledger(4, 8);
+        let cells = configured_cells(3, 1);
+        let input = bundle_input(1, &cells);
+        let initial = input.initial.values();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let before = *ledger.bundles.get_record(0).unwrap();
+        let mut meter = work();
+        ledger
+            .transition(
+                ledger.generation(),
+                obligation,
+                PredecessorEnded(initial[0].predecessor, MonotonicTime::from_micros(5)),
+                &mut meter,
+            )
+            .unwrap();
+        assert_eq!(meter.witness(), witness([274, 65, 0, 0, 286]));
+        let pending = *ledger.bundles.get_record(0).unwrap();
+        assert_eq!(pending.state, BundleState::LiveConsumed);
+        assert_eq!(pending.initial[0].state, Pending);
+        assert_eq!(pending.initial[0].state_time, MonotonicTime::from_micros(5));
+        assert_eq!(pending.initial[1..], before.initial[1..]);
+        assert_eq!(ledger.reserved[PENDING][Mandatory as usize], 2);
+        assert_eq!(ledger.reserved[ACTIVE][Mandatory as usize], 3);
+
+        let mut meter = work();
+        ledger
+            .transition(
+                ledger.generation(),
+                obligation,
+                Begin(MonotonicTime::from_micros(6)),
+                &mut meter,
+            )
+            .unwrap();
+        assert_eq!(meter.witness(), witness([274, 65, 0, 0, 286]));
+        let active = *ledger.bundles.get_record(0).unwrap();
+        assert_eq!(active.initial[0].state, Active);
+        assert_eq!(active.initial[0].state_time, MonotonicTime::from_micros(6));
+        assert_eq!(active.initial[1..], before.initial[1..]);
+        assert_eq!(ledger.reserved[ACTIVE][Mandatory as usize], 2);
+
+        let sibling = initial[1].obligation;
+        ledger
+            .transition(
+                ledger.generation(),
+                sibling,
+                CloseCausalCallImpossible,
+                &mut work(),
+            )
+            .unwrap();
+        let closed = *ledger.bundles.get_record(0).unwrap();
+        assert_eq!(closed.initial[1].state, ClosedConditional);
+        assert_eq!(closed.initial[0], active.initial[0]);
+        assert_eq!(closed.initial[2], before.initial[2]);
+        assert_eq!(ledger.reserved[PENDING][Mandatory as usize], 1);
+        assert_eq!(ledger.reserved[ACTIVE][Mandatory as usize], 1);
+
+        let mut meter = work();
+        let change = ledger
+            .prepare(
+                ledger.generation(),
+                SupportChangeInput::FinishActive(obligation),
+                &mut meter,
+            )
+            .unwrap();
+        assert_eq!(meter.witness(), witness([274, 65, 0, 0, 286]));
+        ledger.validate(&change).unwrap();
+        ledger.commit(change, &mut meter).unwrap();
+        assert_eq!(
+            ledger.bundles.get_record(0).unwrap().initial[0].state,
+            Retained
+        );
+
+        let snapshot = bundle_snapshot(&ledger);
+        let mut missing = work();
+        assert_eq!(
+            ledger.transition(
+                ledger.generation(),
+                SupportOperationObligationId::new([250; 32]).unwrap(),
+                CloseCausalCallImpossible,
+                &mut missing,
+            ),
+            Err(SupportLedgerError::InvalidTransition)
+        );
+        assert_eq!(missing.witness(), witness([274, 65, 0, 0, 286]));
+        assert_eq!(bundle_snapshot(&ledger), snapshot);
+    }
+
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
         let mut meter = work();
         let change = ledger

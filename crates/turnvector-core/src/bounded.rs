@@ -833,6 +833,33 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         Ok(FixedWindowStart(cell, at))
     }
 
+    pub(crate) fn prepare_start_precharged(
+        &self,
+        cell: usize,
+        at: MonotonicTime,
+    ) -> Result<FixedWindowStart, FixedStorageError> {
+        let (bounds, history) = self
+            .bounds
+            .get(cell)
+            .zip(self.history.get(cell))
+            .ok_or(FixedStorageError::Capacity)?;
+        if history.back().is_some_and(|prior| at < *prior) {
+            return Err(FixedStorageError::InvalidTime);
+        }
+        for bound in bounds {
+            if history.len() >= bound.1 as usize {
+                let prior = history[history.len() - bound.1 as usize];
+                let elapsed = at
+                    .checked_duration_since(prior)
+                    .map_err(|_| FixedStorageError::InvalidTime)?;
+                if elapsed < bound.0 {
+                    return Err(FixedStorageError::WindowExceeded);
+                }
+            }
+        }
+        Ok(FixedWindowStart(cell, at))
+    }
+
     pub(crate) fn apply_start(&mut self, start: FixedWindowStart) {
         let FixedWindowStart(cell, at) = start;
         let history = &mut self.history[cell];
