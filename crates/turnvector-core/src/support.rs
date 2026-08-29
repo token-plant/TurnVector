@@ -4478,6 +4478,78 @@ mod tests {
     }
 
     #[test]
+    fn c16_terminal_phase_charges_are_atomic_one_under() {
+        for (prepared, target) in [
+            (1_296, bundle_target_work::<1>(1_296).unwrap()),
+            (1_248, bundle_target_work::<1>(1_248).unwrap()),
+        ] {
+            for (dimension, maximum) in [
+                (WorkDimension::VisitedEntities, 1_704_575),
+                (WorkDimension::CopiedBytes, 2_097_152),
+                (WorkDimension::InvariantChecks, 28_708),
+            ] {
+                let ledger = bundle_ledger(4, 8);
+                let mut meter = work();
+                let entry = maximum - target.value(dimension) + 1;
+                meter.record(dimension, entry).unwrap();
+                let before = meter.witness();
+                let result = if prepared == 1_296 {
+                    ledger
+                        .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                        .map(|_| ())
+                } else {
+                    ledger
+                        .prepare_tombstone(bundle_entitlement(1), &mut meter)
+                        .map(|_| ())
+                };
+                assert_eq!(
+                    result.unwrap_err(),
+                    SupportLedgerError::Storage(FixedStorageError::Work(
+                        WorkBudgetError::BudgetExceeded(dimension, maximum, maximum + 1)
+                    ))
+                );
+                assert_eq!(meter.witness(), before, "target charge is all-or-none");
+            }
+        }
+
+        for tombstone in [false, true] {
+            for (dimension, maximum) in [
+                (WorkDimension::VisitedEntities, 1_704_575),
+                (WorkDimension::CopiedBytes, 2_097_152),
+                (WorkDimension::InvariantChecks, 28_708),
+            ] {
+                let mut ledger = bundle_ledger(4, 8);
+                reserve_bundle(&mut ledger, 1, 3);
+                let target =
+                    bundle_target_work::<1>(if tombstone { 1_248 } else { 1_296 }).unwrap();
+                let remainder = if tombstone {
+                    tombstone_remainder_work::<1>(3).unwrap()
+                } else {
+                    withdraw_remainder_work::<1>(3, K - 1).unwrap()
+                };
+                let mut meter = work();
+                let entry = maximum - target.value(dimension) - remainder.value(dimension) + 1;
+                meter.record(dimension, entry).unwrap();
+                if tombstone {
+                    let change = ledger
+                        .prepare_tombstone(bundle_entitlement(1), &mut meter)
+                        .unwrap();
+                    let after_target = change.work.witness();
+                    assert!(ledger.validate_tombstone(change).is_err());
+                    assert_eq!(meter.witness(), after_target);
+                } else {
+                    let change = ledger
+                        .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                        .unwrap();
+                    let after_target = change.work.witness();
+                    assert!(ledger.validate_withdraw(change).is_err());
+                    assert_eq!(meter.witness(), after_target);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn c16_bundle_prepare_rejects_invalid_inputs() {
         let cells = configured_cells(3, 1);
         let mut invalid = bundle_input(1, &cells);
