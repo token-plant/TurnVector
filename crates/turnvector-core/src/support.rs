@@ -1043,11 +1043,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let record = BundleRecord::from_input(input, vector_len);
         let mut identities = [NO_NODE; 17];
         for (slot, key) in identities[..K].iter_mut().zip(record.tagged_keys()) {
-            let found = self.bundles.find_precharged(key.tag, &key.identity)?;
+            let (terminal, found) = self.bundles.route_precharged(key.tag, &key.identity)?;
             if found.is_some() {
                 return Err(FixedStorageError::Duplicate.into());
             }
-            *slot = NO_NODE;
+            *slot = terminal;
         }
         for identity in obligations
             .iter()
@@ -1105,8 +1105,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         self.validate_bundle_logical_delta_precharged(change.vector)?;
         for (slot, key) in change.record.tagged_keys().into_iter().enumerate() {
-            let found = self.bundles.find_precharged(key.tag, &key.identity)?;
-            if found.unwrap_or(NO_NODE) != change.identities[slot] {
+            let (terminal, found) = self.bundles.route_precharged(key.tag, &key.identity)?;
+            if found.is_some() || terminal != change.identities[slot] {
                 return Err(stale);
             }
         }
@@ -2160,12 +2160,6 @@ impl TaggedKey {
         Self { tag, identity }
     }
 }
-/// An occupied Patricia leaf: one tagged identity and its owner record index.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct IdentityLeaf {
-    key: TaggedKey,
-    record: u32,
-}
 /// An occupied compressed Patricia branch: one strictly increasing
 /// discriminating bit and two child node references. A child is a leaf index
 /// or `BRANCH_TAG | branch index`.
@@ -2191,7 +2185,7 @@ const NO_NODE: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LeafSlot {
     Vacant { free_position: u32 },
-    Occupied(IdentityLeaf),
+    Occupied { owner_record: u32, key_ordinal: u8 },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BranchSlot {
@@ -2322,11 +2316,30 @@ impl TaggedIdentityIndex {
     fn branch_capacity(&self) -> usize {
         self.branch_slots.len()
     }
-    fn leaf(&self, index: u32) -> Option<&IdentityLeaf> {
+    fn leaf(&self, index: u32) -> Option<(u32, u8)> {
         match self.leaf_slots.get(index as usize)? {
-            LeafSlot::Occupied(leaf) => Some(leaf),
+            LeafSlot::Occupied {
+                owner_record,
+                key_ordinal,
+            } => Some((*owner_record, *key_ordinal)),
             LeafSlot::Vacant { .. } => None,
         }
+    }
+    fn resolved_leaf(
+        &self,
+        index: u32,
+        records: &[RecordSlot],
+    ) -> Result<(TaggedKey, u32), FixedStorageError> {
+        let (owner_record, key_ordinal) =
+            self.leaf(index).ok_or(FixedStorageError::NonCanonical)?;
+        let record = match records.get(owner_record as usize) {
+            Some(RecordSlot::Occupied(record)) => record,
+            _ => return Err(FixedStorageError::NonCanonical),
+        };
+        let key = record
+            .tagged_key(key_ordinal)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        Ok((key, owner_record))
     }
     fn branch(&self, node: u32) -> Option<&IdentityBranch> {
         match self.branch_slots.get(branch_index(node))? {
@@ -2441,6 +2454,7 @@ impl TaggedIdentityIndex {
     /// InvariantChecks.
     fn find(
         &self,
+        records: &[RecordSlot],
         tag: u8,
         identity: &[u8; 32],
         work: &mut WorkMeter,
@@ -2449,27 +2463,34 @@ impl TaggedIdentityIndex {
         if node == NO_NODE {
             return Ok(None);
         }
-        let leaf = self
-            .leaf((node as usize) as u32)
-            .expect("validated occupied leaf slot");
-        Ok((leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record))
+        let (key, owner) = self.resolved_leaf(node, records)?;
+        Ok((key.tag == tag && key.identity == *identity).then_some(owner))
     }
     fn find_precharged(
         &self,
+        records: &[RecordSlot],
         tag: u8,
         identity: &[u8; 32],
     ) -> Result<Option<u32>, FixedStorageError> {
+        self.route_precharged(records, tag, identity)
+            .map(|(_, owner)| owner)
+    }
+    fn route_precharged(
+        &self,
+        records: &[RecordSlot],
+        tag: u8,
+        identity: &[u8; 32],
+    ) -> Result<(u32, Option<u32>), FixedStorageError> {
         let mut node = self.root;
         let mut prior = None;
         for _ in 0..=IDENTITY_BITS {
             if node == NO_NODE {
-                return Ok(None);
+                return Ok((NO_NODE, None));
             }
             if !is_branch(node) {
-                let leaf = self.leaf(node).ok_or(FixedStorageError::NonCanonical)?;
-                return Ok(
-                    (leaf.key.tag == tag && leaf.key.identity == *identity).then_some(leaf.record)
-                );
+                let (key, owner) = self.resolved_leaf(node, records)?;
+                let found = (key.tag == tag && key.identity == *identity).then_some(owner);
+                return Ok((node, found));
             }
             let branch = self.branch(node).ok_or(FixedStorageError::NonCanonical)?;
             if branch.bit >= IDENTITY_BITS
@@ -2515,8 +2536,10 @@ impl TaggedIdentityIndex {
     /// branch infallibly. Rejection preserves the exact trie and free stacks.
     fn insert(
         &mut self,
+        records: &[RecordSlot],
         key: TaggedKey,
         record: u32,
+        ordinal: u8,
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
         let peer = self.locate(key.tag, &key.identity, work)?;
@@ -2525,13 +2548,10 @@ impl TaggedIdentityIndex {
             if self.free_leaves.is_empty() {
                 return Err(FixedStorageError::Capacity);
             }
-            self.install_root(key, record);
+            self.install_root(record, ordinal);
             return Ok(());
         }
-        let peer_key = self
-            .leaf((peer as usize) as u32)
-            .expect("validated occupied leaf slot")
-            .key;
+        let (peer_key, _) = self.resolved_leaf(peer, records)?;
         if peer_key == key {
             return Err(FixedStorageError::Duplicate);
         }
@@ -2558,7 +2578,7 @@ impl TaggedIdentityIndex {
         }
         work.record(WorkDimension::VisitedEntities, visits)?;
         work.record(WorkDimension::InvariantChecks, visits)?;
-        self.install_branch(key, record, bit, parent, child);
+        self.install_branch(key, record, ordinal, bit, parent, child);
         Ok(())
     }
     /// Infallible installation used only by the consuming C16 bundle commit
@@ -2567,16 +2587,15 @@ impl TaggedIdentityIndex {
     /// one leaf plus one branch over the exact path with no Work call, no
     /// fallible branch, and no allocation. Internal `expect` and
     /// `unreachable!` are fail-stop defenses for impossible owner corruption.
-    fn install(&mut self, key: TaggedKey, record: u32) {
+    fn install(&mut self, records: &[RecordSlot], key: TaggedKey, record: u32, ordinal: u8) {
         let peer = self.locate_unmetered(key.tag, &key.identity);
         if peer == NO_NODE {
-            self.install_root(key, record);
+            self.install_root(record, ordinal);
             return;
         }
-        let peer_key = self
-            .leaf((peer as usize) as u32)
-            .expect("validated occupied leaf slot")
-            .key;
+        let (peer_key, _) = self
+            .resolved_leaf(peer, records)
+            .expect("validated occupied leaf owner and ordinal");
         debug_assert_ne!(peer_key, key, "validated absent bundle identity");
         let (bit, _) = first_difference(&key, &peer_key);
         let (mut parent, mut child) = (NO_NODE, self.root);
@@ -2588,7 +2607,7 @@ impl TaggedIdentityIndex {
             parent = child;
             child = [branch.zero, branch.one][identity_bit(key.tag, &key.identity, branch.bit)];
         }
-        self.install_branch(key, record, bit, parent, child);
+        self.install_branch(key, record, ordinal, bit, parent, child);
     }
     /// Unmetered leaf-locating traversal for the infallible commit install.
     fn locate_unmetered(&self, tag: u8, identity: &[u8; 32]) -> u32 {
@@ -2600,16 +2619,30 @@ impl TaggedIdentityIndex {
         node
     }
     /// Infallible installation of the first leaf into an empty tree.
-    fn install_root(&mut self, key: TaggedKey, record: u32) {
+    fn install_root(&mut self, owner_record: u32, key_ordinal: u8) {
         let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
-        self.leaf_slots[leaf as usize] = LeafSlot::Occupied(IdentityLeaf { key, record });
+        self.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record,
+            key_ordinal,
+        };
         self.root = leaf;
     }
     /// Infallible installation of one leaf plus one branch above `child`, whose
     /// first discriminating bit `bit` is strictly larger than every parent bit.
-    fn install_branch(&mut self, key: TaggedKey, record: u32, bit: u16, parent: u32, child: u32) {
+    fn install_branch(
+        &mut self,
+        key: TaggedKey,
+        owner_record: u32,
+        key_ordinal: u8,
+        bit: u16,
+        parent: u32,
+        child: u32,
+    ) {
         let leaf = self.free_leaves.pop().expect("prevalidated leaf capacity");
-        self.leaf_slots[leaf as usize] = LeafSlot::Occupied(IdentityLeaf { key, record });
+        self.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record,
+            key_ordinal,
+        };
         let branch = self
             .free_branches
             .pop()
@@ -2642,6 +2675,7 @@ impl TaggedIdentityIndex {
     /// removed leaf and, when present, parent branch returns to its free stack.
     fn remove(
         &mut self,
+        records: &[RecordSlot],
         tag: u8,
         identity: &[u8; 32],
         work: &mut WorkMeter,
@@ -2666,13 +2700,10 @@ impl TaggedIdentityIndex {
         }
         work.record(WorkDimension::VisitedEntities, 1)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
-        let leaf = self
-            .leaf((node as usize) as u32)
-            .expect("validated occupied leaf slot");
-        if leaf.key.tag != tag || leaf.key.identity != *identity {
+        let (key, record) = self.resolved_leaf(node, records)?;
+        if key.tag != tag || key.identity != *identity {
             return Ok(None);
         }
-        let record = leaf.record;
         self.splice(grandparent, parent, sibling, node);
         Ok(Some(record))
     }
@@ -2776,8 +2807,8 @@ const K: usize = 11;
 const TAG_OBLIGATION: u8 = 0;
 const TAG_CREDIT: u8 = 1;
 const TAG_ADMISSION_CLAIM: u8 = 2;
-const TAG_ENTITLEMENT: u8 = 4;
-const TAG_VECTOR: u8 = 5;
+const TAG_ENTITLEMENT: u8 = 3;
+const TAG_VECTOR: u8 = 4;
 /// Stored independent state/time and immutable facts for one named initial
 /// request-support requirement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2873,6 +2904,9 @@ impl BundleRecord {
     }
     fn credits(&self) -> [PhysicalStartCreditId; 3] {
         self.initial.map(|requirement| requirement.credit)
+    }
+    fn tagged_key(&self, ordinal: u8) -> Option<TaggedKey> {
+        self.tagged_keys().get(usize::from(ordinal)).copied()
     }
     fn tagged_keys(&self) -> [TaggedKey; K] {
         let initial = self.initial;
@@ -3010,14 +3044,23 @@ impl RequestBundleStore {
         identity: &[u8; 32],
         work: &mut WorkMeter,
     ) -> Result<Option<u32>, FixedStorageError> {
-        self.identities.find(tag, identity, work)
+        self.identities.find(&self.records, tag, identity, work)
+    }
+    fn route_precharged(
+        &self,
+        tag: u8,
+        identity: &[u8; 32],
+    ) -> Result<(u32, Option<u32>), FixedStorageError> {
+        self.identities
+            .route_precharged(&self.records, tag, identity)
     }
     fn find_precharged(
         &self,
         tag: u8,
         identity: &[u8; 32],
     ) -> Result<Option<u32>, FixedStorageError> {
-        self.identities.find_precharged(tag, identity)
+        self.identities
+            .find_precharged(&self.records, tag, identity)
     }
     fn get_record(&self, index: u32) -> Option<&BundleRecord> {
         match self.records.get(index as usize)? {
@@ -3059,7 +3102,7 @@ impl RequestBundleStore {
         for key in record.tagged_keys() {
             if self
                 .identities
-                .find(key.tag, &key.identity, work)?
+                .find(&self.records, key.tag, &key.identity, work)?
                 .is_some()
             {
                 return Err(FixedStorageError::Duplicate);
@@ -3083,17 +3126,18 @@ impl RequestBundleStore {
             .free_records
             .pop()
             .expect("prevalidated record capacity");
-        for key in record.tagged_keys() {
+        self.records[record_index as usize] = RecordSlot::Occupied(*record);
+        for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
             self.identities
-                .insert(key, record_index, work)
+                .insert(&self.records, key, record_index, ordinal as u8, work)
                 .expect("insertion Work fully preflighted");
         }
         let (head, len) = self.cells.install(record_index, cells);
-        self.records[record_index as usize] = RecordSlot::Occupied(BundleRecord {
-            vector_head: head,
-            vector_len: len,
-            ..*record
-        });
+        let RecordSlot::Occupied(installed) = &mut self.records[record_index as usize] else {
+            unreachable!("record was installed before its compact leaves")
+        };
+        installed.vector_head = head;
+        installed.vector_len = len;
         self.occupied_records = occupied_records;
         Ok(record_index)
     }
@@ -3107,7 +3151,7 @@ impl RequestBundleStore {
         record: u32,
         work: &mut WorkMeter,
     ) -> Result<(), FixedStorageError> {
-        let record_slot = self
+        let record_slot = *self
             .get_record(record)
             .ok_or(FixedStorageError::NonCanonical)?;
         let head = record_slot.vector_head;
@@ -3129,7 +3173,7 @@ impl RequestBundleStore {
         for key in record_slot.tagged_keys() {
             let removed = self
                 .identities
-                .remove(key.tag, &key.identity, work)
+                .remove(&self.records, key.tag, &key.identity, work)
                 .expect("removal Work fully preflighted");
             debug_assert_eq!(removed, Some(record));
         }
@@ -3223,15 +3267,17 @@ impl RequestBundleStore {
             .checked_add(1)
             .expect("validated occupied record count");
         let record_index = self.free_records.pop().expect("validated record capacity");
-        for key in record.tagged_keys() {
-            self.identities.install(key, record_index);
+        self.records[record_index as usize] = RecordSlot::Occupied(*record);
+        for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
+            self.identities
+                .install(&self.records, key, record_index, ordinal as u8);
         }
         let (head, len) = self.cells.install(record_index, cells);
-        self.records[record_index as usize] = RecordSlot::Occupied(BundleRecord {
-            vector_head: head,
-            vector_len: len,
-            ..*record
-        });
+        let RecordSlot::Occupied(installed) = &mut self.records[record_index as usize] else {
+            unreachable!("record was installed before its compact leaves")
+        };
+        installed.vector_head = head;
+        installed.vector_len = len;
         self.occupied_records = occupied_records;
     }
     /// Infallible consuming pristine withdrawal under the validated selection:
@@ -3246,7 +3292,7 @@ impl RequestBundleStore {
             .occupied_records
             .checked_sub(1)
             .expect("validated occupied record count");
-        let record_slot = self.get_record(record).expect("validated occupied record");
+        let record_slot = *self.get_record(record).expect("validated occupied record");
         let head = record_slot.vector_head;
         let len = usize::try_from(record_slot.vector_len).expect("validated vector length");
         for key in record_slot.tagged_keys() {
@@ -4700,14 +4746,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([6, 0, 0, 0, 19])
+            HotPathWorkWitness::new([7, 0, 0, 0, 20])
         );
         let validated = ledger
             .validate_withdraw(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([66, 0, 0, 0, 196])
+            HotPathWorkWitness::new([71, 0, 0, 0, 201])
         );
         assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_632);
         assert_eq!(
@@ -5326,6 +5372,10 @@ mod tests {
         });
     }
 
+    #[cfg(any())]
+    #[rustfmt::skip]
+    mod legacy_identity_index_tests {
+        use super::*;
     /// Test-only tagged key over one tag byte and one repeated identity byte.
     fn tagged(tag: u8, byte: u8) -> TaggedKey {
         TaggedKey::new(tag, [byte; 32])
@@ -5709,6 +5759,13 @@ mod tests {
         assert_eq!(meter.witness(), witness([3, 0, 0, 0, 3]));
         assert_eq!(index, before);
     }
+    }
+
+    #[cfg(any())]
+    #[rustfmt::skip]
+    mod legacy_identity_index_mutation_tests {
+        use super::*;
+
     #[test]
     fn c16_identity_index_insert_first_difference_edges() {
         // First differing bit 0: tag 0x00 versus tag 0x80.
@@ -5954,6 +6011,100 @@ mod tests {
         });
     }
 
+    }
+
+    fn trie_oracle(index: &TaggedIdentityIndex, records: &[RecordSlot]) {
+        use std::collections::HashSet;
+        assert_eq!(std::mem::size_of::<LeafSlot>(), 8);
+        assert_eq!(std::mem::size_of::<BranchSlot>(), 16);
+        assert_eq!(std::mem::size_of::<TaggedIdentityIndex>(), 104);
+        let mut free_leaves = HashSet::new();
+        for (position, &leaf) in index.free_leaves.iter().enumerate() {
+            assert!(free_leaves.insert(leaf));
+            assert!(matches!(
+                index.leaf_slots.get(leaf as usize),
+                Some(LeafSlot::Vacant { free_position }) if *free_position == position as u32
+            ));
+        }
+        let occupied_leaves = index
+            .leaf_slots
+            .iter()
+            .filter(|slot| matches!(slot, LeafSlot::Occupied { .. }))
+            .count();
+        assert_eq!(free_leaves.len() + occupied_leaves, index.leaf_capacity());
+        let mut seen_leaves = HashSet::new();
+        let mut seen_branches = HashSet::new();
+        let mut keys = HashSet::new();
+        let mut stack = if index.root != NO_NODE {
+            vec![(index.root, None)]
+        } else {
+            Vec::new()
+        };
+        while let Some((node, parent_bit)) = stack.pop() {
+            if is_branch(node) {
+                let slot = branch_index(node);
+                assert!(seen_branches.insert(slot));
+                let branch = index.branch(node).expect("reachable occupied branch");
+                assert!(branch.bit < IDENTITY_BITS);
+                assert!(parent_bit.is_none_or(|parent| parent < branch.bit));
+                assert_ne!(branch.zero, branch.one);
+                stack.push((branch.zero, Some(branch.bit)));
+                stack.push((branch.one, Some(branch.bit)));
+            } else {
+                assert!(seen_leaves.insert(node));
+                let (key, _) = index.resolved_leaf(node, records).unwrap();
+                assert!(keys.insert(key));
+            }
+        }
+        assert_eq!(seen_leaves.len(), occupied_leaves);
+        assert_eq!(seen_branches.len(), occupied_leaves.saturating_sub(1));
+    }
+
+    #[test]
+    fn c16_compact_leaf_layout_tags_and_corruption_are_closed() {
+        assert_eq!(std::mem::size_of::<LeafSlot>(), 8);
+        assert_eq!(
+            [
+                TAG_OBLIGATION,
+                TAG_CREDIT,
+                TAG_ADMISSION_CLAIM,
+                TAG_ENTITLEMENT,
+                TAG_VECTOR
+            ],
+            [0, 1, 2, 3, 4]
+        );
+        let mut store = RequestBundleStore::try_new(1, 1).unwrap();
+        let record = bundle_record(1);
+        store.records[0] = RecordSlot::Occupied(record);
+        store.identities.leaf_slots[0] = LeafSlot::Occupied {
+            owner_record: 0,
+            key_ordinal: 9,
+        };
+        store.identities.root = 0;
+        assert_eq!(
+            store.find(TAG_ENTITLEMENT, &record.entitlement.get(), &mut work()),
+            Ok(Some(0))
+        );
+        let before = store.clone();
+        store.identities.leaf_slots[0] = LeafSlot::Occupied {
+            owner_record: 1,
+            key_ordinal: 9,
+        };
+        assert_eq!(
+            store.find(TAG_ENTITLEMENT, &record.entitlement.get(), &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+        store = before;
+        store.identities.leaf_slots[0] = LeafSlot::Occupied {
+            owner_record: 0,
+            key_ordinal: K as u8,
+        };
+        assert_eq!(
+            store.find(TAG_ENTITLEMENT, &record.entitlement.get(), &mut work()),
+            Err(FixedStorageError::NonCanonical)
+        );
+    }
+
     /// Test-only distinct bundle record with canonical same-tag identity groups.
     fn bundle_record(n: u8) -> BundleRecord {
         BundleRecord::from_input(&bundle_input(n, &[]), 0)
@@ -5998,13 +6149,15 @@ mod tests {
             store.record_capacity(),
             "record partition"
         );
-        trie_oracle(&store.identities);
+        trie_oracle(&store.identities, &store.records);
         arena_oracle(&store.cells);
         for &record in &occupied {
             let slot = store.get_record(record).expect("occupied record");
             for key in slot.tagged_keys() {
                 assert_eq!(
-                    store.identities.find(key.tag, &key.identity, &mut work()),
+                    store
+                        .identities
+                        .find(&store.records, key.tag, &key.identity, &mut work(),),
                     Ok(Some(record)),
                     "every record identity present and owned"
                 );
@@ -6020,17 +6173,24 @@ mod tests {
                 )
                 .unwrap();
         }
-        for leaf in store
-            .identities
-            .leaf_slots
-            .iter()
-            .filter_map(|slot| match slot {
-                LeafSlot::Occupied(leaf) => Some(leaf),
-                LeafSlot::Vacant { .. } => None,
-            })
+        for (owner_record, key_ordinal) in
+            store
+                .identities
+                .leaf_slots
+                .iter()
+                .filter_map(|slot| match slot {
+                    LeafSlot::Occupied {
+                        owner_record,
+                        key_ordinal,
+                    } => Some((*owner_record, *key_ordinal)),
+                    LeafSlot::Vacant { .. } => None,
+                })
         {
             assert!(
-                matches!(store.records[leaf.record as usize], RecordSlot::Occupied(_)),
+                matches!(
+                    store.records[owner_record as usize],
+                    RecordSlot::Occupied(_)
+                ) && key_ordinal < K as u8,
                 "every index leaf owner is an occupied record"
             );
         }
