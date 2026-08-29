@@ -796,16 +796,13 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .bundles
             .get_record(record_index)
             .ok_or(SupportLedgerError::InvalidTransition)?;
-        if !matches!(
-            bundle.state,
-            BundleState::LivePristine | BundleState::LiveConsumed
-        ) {
-            return Err(SupportLedgerError::InvalidTransition);
-        }
         let item = *bundle
             .initial
             .get(usize::from(ordinal))
             .ok_or(SupportLedgerError::InvalidTransition)?;
+        if !initial_semantic_envelope_is_valid(bundle.state, ordinal, item) {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
         let (state, time, release_pending, release_active) = match (item.state, transition) {
             (Conditional, PredecessorEnded(id, at))
                 if id == item.predecessor && at >= item.state_time =>
@@ -2798,6 +2795,8 @@ impl TaggedIdentityIndex {
     ) -> Result<(u32, Option<u32>), FixedStorageError> {
         let mut node = self.root;
         let mut prior = None;
+        let mut route_masks = [0u64; 5];
+        let mut route_values = [0u64; 5];
         for _ in 0..=IDENTITY_BITS {
             if node == NO_NODE {
                 return if prior.is_none() {
@@ -2808,6 +2807,15 @@ impl TaggedIdentityIndex {
             }
             if !is_branch(node) {
                 let (key, owner) = self.resolved_leaf(node, records)?;
+                let chunks = tagged_key_chunks(key.tag, &key.identity);
+                if chunks
+                    .into_iter()
+                    .zip(route_masks)
+                    .zip(route_values)
+                    .any(|((chunk, mask), value)| chunk & mask != value)
+                {
+                    return Err(FixedStorageError::NonCanonical);
+                }
                 let found = (key.tag == tag && key.identity == *identity).then_some(owner);
                 return Ok((node, found));
             }
@@ -2821,7 +2829,12 @@ impl TaggedIdentityIndex {
                 return Err(FixedStorageError::NonCanonical);
             }
             prior = Some(branch.bit);
-            node = [branch.zero, branch.one][identity_bit(tag, identity, branch.bit)];
+            let selected = identity_bit(tag, identity, branch.bit);
+            let word = usize::from(branch.bit / 64);
+            let mask = 1u64 << (63 - branch.bit % 64);
+            route_masks[word] |= mask;
+            route_values[word] |= mask * selected as u64;
+            node = [branch.zero, branch.one][selected];
         }
         Err(FixedStorageError::NonCanonical)
     }
@@ -3107,6 +3120,22 @@ fn is_branch(node: u32) -> bool {
 fn branch_index(node: u32) -> usize {
     (node & !BRANCH_TAG) as usize
 }
+fn tagged_key_chunks(tag: u8, identity: &[u8; 32]) -> [u64; 5] {
+    let chunk = |start: usize| {
+        u64::from_be_bytes(
+            identity[start..start + 8]
+                .try_into()
+                .expect("fixed tagged-key chunk"),
+        )
+    };
+    [
+        u64::from(tag) << 56 | chunk(0) >> 8,
+        u64::from(identity[7]) << 56 | chunk(8) >> 8,
+        u64::from(identity[15]) << 56 | chunk(16) >> 8,
+        u64::from(identity[23]) << 56 | chunk(24) >> 8,
+        u64::from(identity[31]) << 56,
+    ]
+}
 fn identity_bit(tag: u8, identity: &[u8; 32], bit: u16) -> usize {
     let byte = if bit < 8 {
         tag
@@ -3174,6 +3203,37 @@ enum BundleState {
     LivePristine,
     LiveConsumed,
     RetainedTombstone,
+}
+fn initial_semantic_envelope_is_valid(
+    bundle_state: BundleState,
+    ordinal: u8,
+    item: InitialRequirementRecord,
+) -> bool {
+    let expected_operation = match ordinal {
+        0 => SupportOperation::MaterializeRequest,
+        1 => SupportOperation::FormCandidates,
+        2 => SupportOperation::ReleaseRequest,
+        _ => return false,
+    };
+    let zero_time = item.state_time == MonotonicTime::from_micros(0);
+    let state_time_is_valid = match item.state {
+        Conditional | ClosedConditional => zero_time,
+        Pending | Active | Retained | ClosedPending => true,
+    };
+    let bundle_state_is_valid = match bundle_state {
+        BundleState::LivePristine => item.state == Conditional && zero_time,
+        BundleState::LiveConsumed => true,
+        BundleState::RetainedTombstone => false,
+    };
+    item.operation == expected_operation
+        && item.pool == MandatoryCompletion
+        && item.predecessor.0 != [0; 32]
+        && item.scope.0 != [0; 32]
+        && item.input_bucket.get() != 0
+        && item.prospective_bound.as_micros() != 0
+        && item.operation as usize * POOLS + (item.pool as usize) < 21
+        && state_time_is_valid
+        && bundle_state_is_valid
 }
 /// One fixed complete semantic request-bundle record. Initial requirement state
 /// and time remain independent; retained tombstones preserve every identity,
@@ -5504,6 +5564,58 @@ mod tests {
     }
 
     #[test]
+    fn c16_initial_transition_revalidates_each_immutable_semantic_envelope() {
+        for ordinal in 0..3 {
+            for corruption in 0..8 {
+                let mut ledger = bundle_ledger(4, 8);
+                let cells = configured_cells(3, 1);
+                let input = bundle_input(1, &cells);
+                let initial = input.initial.values();
+                reserve_bundle(&mut ledger, 1, 3);
+                let record = match &mut ledger.bundles.records[0] {
+                    RecordSlot::Occupied(record) => record,
+                    RecordSlot::Vacant { .. } => unreachable!("reserved fixture record"),
+                };
+                let item = &mut record.initial[ordinal];
+                match corruption {
+                    0 => item.operation = SupportOperation::DescribeModel,
+                    1 => item.pool = Ordinary,
+                    2 => item.predecessor = SupportCausalPredecessorId([0; 32]),
+                    3 => item.scope = SupportCallScopeId([0; 32]),
+                    4 => item.prospective_bound = Duration::from_micros(0),
+                    5 => item.state_time = MonotonicTime::from_micros(1),
+                    6 => item.state = ClosedConditional,
+                    7 => record.state = BundleState::RetainedTombstone,
+                    _ => unreachable!(),
+                }
+                let before_store = ledger.bundles.clone();
+                let before_generation = ledger.generation();
+                let before_usage = ledger.usage;
+                let before_reserved = ledger.reserved;
+                let mut measured = work();
+                assert_eq!(
+                    ledger.transition(
+                        before_generation,
+                        initial[ordinal].obligation,
+                        PredecessorEnded(
+                            initial[ordinal].predecessor,
+                            MonotonicTime::from_micros(5),
+                        ),
+                        &mut measured,
+                    ),
+                    Err(InvalidTransition),
+                    "ordinal {ordinal}, corruption {corruption}"
+                );
+                assert_eq!(measured.witness(), witness([274, 65, 0, 0, 286]));
+                assert_eq!(ledger.generation(), before_generation);
+                assert_eq!(ledger.usage, before_usage);
+                assert_eq!(ledger.reserved, before_reserved);
+                assert_eq!(ledger.bundles, before_store);
+            }
+        }
+    }
+
+    #[test]
     fn c16_initial_claim_lookup_binds_request_owner_and_compact_leaf() {
         let facts = bundle_input(1, &[]);
         let claims = facts.initial.values().map(|requirement| requirement.claim);
@@ -6402,11 +6514,11 @@ mod tests {
         let mut seen_branches = HashSet::new();
         let mut keys = HashSet::new();
         let mut stack = if index.root != NO_NODE {
-            vec![(index.root, None)]
+            vec![(index.root, None, [0u64; 5], [0u64; 5])]
         } else {
             Vec::new()
         };
-        while let Some((node, parent_bit)) = stack.pop() {
+        while let Some((node, parent_bit, route_masks, route_values)) = stack.pop() {
             if is_branch(node) {
                 let slot = branch_index(node);
                 assert!(seen_branches.insert(slot));
@@ -6414,11 +6526,25 @@ mod tests {
                 assert!(branch.bit < IDENTITY_BITS);
                 assert!(parent_bit.is_none_or(|parent| parent < branch.bit));
                 assert_ne!(branch.zero, branch.one);
-                stack.push((branch.zero, Some(branch.bit)));
-                stack.push((branch.one, Some(branch.bit)));
+                for (selected, child) in [branch.zero, branch.one].into_iter().enumerate() {
+                    let mut child_masks = route_masks;
+                    let mut child_values = route_values;
+                    let word = usize::from(branch.bit / 64);
+                    let mask = 1u64 << (63 - branch.bit % 64);
+                    child_masks[word] |= mask;
+                    child_values[word] |= mask * selected as u64;
+                    stack.push((child, Some(branch.bit), child_masks, child_values));
+                }
             } else {
                 assert!(seen_leaves.insert(node));
                 let (key, _) = index.resolved_leaf(node, records).unwrap();
+                assert!(
+                    tagged_key_chunks(key.tag, &key.identity)
+                        .into_iter()
+                        .zip(route_masks)
+                        .zip(route_values)
+                        .all(|((chunk, mask), value)| chunk & mask == value)
+                );
                 assert!(keys.insert(key));
             }
         }
@@ -6602,6 +6728,63 @@ mod tests {
             "branch scalar conservation"
         );
     }
+    #[test]
+    fn c16_route_rejects_terminal_peer_violating_any_selected_ancestor() {
+        for selected_position in 0..3 {
+            let mut ledger = bundle_ledger(4, 8);
+            reserve_bundle(&mut ledger, 1, 3);
+            let cells = configured_cells(3, 1);
+            let input = bundle_input(1, &cells);
+            let key = TaggedKey::new(TAG_OBLIGATION, input.initial.materialize.obligation.get());
+            let mut node = ledger.bundles.identities.root;
+            let mut route = Vec::new();
+            while is_branch(node) {
+                let branch = ledger
+                    .bundles
+                    .identities
+                    .branch(node)
+                    .expect("fixture route branch");
+                let selected = identity_bit(key.tag, &key.identity, branch.bit);
+                route.push((branch_index(node), selected));
+                node = [branch.zero, branch.one][selected];
+            }
+            assert!(
+                route.len() >= 3,
+                "fixture exposes first, middle, and last ancestors"
+            );
+            let position = [0, route.len() / 2, route.len() - 1][selected_position];
+            let (branch_index, _) = route[position];
+            let branch = match ledger.bundles.identities.branch_slots[branch_index] {
+                BranchSlot::Occupied(branch) => branch,
+                BranchSlot::Vacant { .. } => unreachable!("fixture route branch is occupied"),
+            };
+            ledger.bundles.identities.branch_slots[branch_index] =
+                BranchSlot::Occupied(IdentityBranch {
+                    zero: branch.one,
+                    one: branch.zero,
+                    ..branch
+                });
+
+            assert_eq!(
+                ledger.bundles.route_precharged(key.tag, &key.identity),
+                Err(FixedStorageError::NonCanonical),
+                "ancestor position {position} cannot hide an existing identity"
+            );
+            let before = ledger.bundles.clone();
+            let mut measured = work();
+            assert_eq!(
+                ledger.prepare_bundle(&input, &mut measured).unwrap_err(),
+                SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+            );
+            assert_eq!(
+                measured.witness(),
+                bundle_reserve_work::<1>(3, 7).unwrap(),
+                "corruption at ancestor position {position} retains exact preflight work"
+            );
+            assert_eq!(ledger.bundles, before, "rejection is read-only");
+        }
+    }
+
     #[test]
     fn c16_staged_routes_reject_root_branch_and_terminal_corruption_safely() {
         let make = || {
