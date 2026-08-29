@@ -1488,8 +1488,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     /// retained terminal tombstone is not pristine and rejects.
     pub(crate) fn prepare_withdraw<'work>(
         &self,
-        entitlement: FutureTurnSupportEntitlementId,
         expected_request_owner: RequestId,
+        entitlement: FutureTurnSupportEntitlementId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedWithdrawal<'work, H>, SupportLedgerError> {
         work.charge(bundle_target_work::<H>(1_344)?)?;
@@ -1574,8 +1574,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     /// before-image snapshot and the same Work-meter borrow.
     pub(crate) fn prepare_tombstone<'work>(
         &self,
-        entitlement: FutureTurnSupportEntitlementId,
         expected_request_owner: RequestId,
+        entitlement: FutureTurnSupportEntitlementId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedTombstone<'work, H>, SupportLedgerError> {
         work.charge(bundle_target_work::<H>(1_296)?)?;
@@ -3361,7 +3361,6 @@ fn initial_semantic_envelope_is_valid(
         && item.scope.0 != [0; 32]
         && item.input_bucket.get() != 0
         && item.prospective_bound.as_micros() != 0
-        && item.operation as usize * POOLS + (item.pool as usize) < 21
         && state_time_is_valid
         && bundle_state_is_valid
 }
@@ -3424,7 +3423,6 @@ fn terminal_semantic_envelope_is_valid(
                     && branch.pool == MandatoryCompletion
                     && branch.input_bucket.get() != 0
                     && branch.prospective_bound.as_micros() != 0
-                    && branch.operation as usize * POOLS + (branch.pool as usize) < 21
             });
     let fixed_identities_are_valid = record.timing_commitment.get() != [0; 32]
         && record.request_closure.get() != [0; 32]
@@ -4151,7 +4149,7 @@ mod tests {
         stable(&ledger);
         let mut meter = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         stable(&ledger);
@@ -5010,11 +5008,11 @@ mod tests {
         ledger.generation = SupportLedgerGeneration::new(u64::MAX).unwrap();
         let before = bundle_snapshot(&ledger);
         assert!(matches!(
-            ledger.prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut work()),
+            ledger.prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut work()),
             Err(SupportLedgerError::Generation)
         ));
         assert!(matches!(
-            ledger.prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut work()),
+            ledger.prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut work()),
             Err(SupportLedgerError::Generation)
         ));
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -5169,11 +5167,11 @@ mod tests {
                 let before = meter.witness();
                 let result = if prepared == 1_344 {
                     ledger
-                        .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
+                        .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
                         .map(|_| ())
                 } else {
                     ledger
-                        .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
+                        .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
                         .map(|_| ())
                 };
                 assert_eq!(
@@ -5206,14 +5204,14 @@ mod tests {
                 meter.record(dimension, entry).unwrap();
                 if tombstone {
                     let change = ledger
-                        .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
+                        .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
                         .unwrap();
                     let after_target = change.work.witness();
                     assert!(ledger.validate_tombstone(change).is_err());
                     assert_eq!(meter.witness(), after_target);
                 } else {
                     let change = ledger
-                        .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
+                        .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
                         .unwrap();
                     let after_target = change.work.witness();
                     assert!(ledger.validate_withdraw(change).is_err());
@@ -6090,7 +6088,7 @@ mod tests {
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(n), request_owner(n), &mut meter)
+            .prepare_tombstone(request_owner(n), bundle_entitlement(n), &mut meter)
             .unwrap();
         ledger
             .validate_tombstone(change)
@@ -6104,7 +6102,7 @@ mod tests {
         let before = bundle_snapshot(&ledger);
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
+            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
             .unwrap();
         ledger.validate_tombstone(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -6113,7 +6111,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
+            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
             .unwrap();
         add(&mut ledger, 9, 9).unwrap();
         assert_eq!(
@@ -6129,7 +6127,7 @@ mod tests {
         let before = ledger.generation();
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
         assert_eq!(
             change.work.witness(),
@@ -6178,7 +6176,7 @@ mod tests {
         let first = reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let reused = reserve_bundle(&mut ledger, 1, 3);
@@ -6193,7 +6191,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
         add(&mut ledger, 9, 9).unwrap();
         assert_eq!(
@@ -6205,7 +6203,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let before = bundle_snapshot(&ledger);
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
         ledger.validate_withdraw(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -6213,8 +6211,8 @@ mod tests {
         assert_eq!(
             ledger
                 .prepare_withdraw(
-                    FutureTurnSupportEntitlementId::new([200; 32]).unwrap(),
                     request_owner(1),
+                    FutureTurnSupportEntitlementId::new([200; 32]).unwrap(),
                     &mut measured,
                 )
                 .unwrap_err(),
@@ -6231,7 +6229,7 @@ mod tests {
             "tombstone retains every logical and vector delta"
         );
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
         assert_eq!(
             ledger.validate_withdraw(change).unwrap_err(),
@@ -6241,8 +6239,8 @@ mod tests {
         let mut tombstone_meter = work();
         let change = ledger
             .prepare_tombstone(
-                bundle_entitlement(1),
                 request_owner(1),
+                bundle_entitlement(1),
                 &mut tombstone_meter,
             )
             .unwrap();
@@ -6274,7 +6272,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let tombstone = reserve_bundle(&mut ledger, 2, 3);
@@ -6306,12 +6304,12 @@ mod tests {
             let mut meter = work();
             let error = if tombstone {
                 let change = ledger
-                    .prepare_tombstone(bundle_entitlement(1), request_owner(2), &mut meter)
+                    .prepare_tombstone(request_owner(2), bundle_entitlement(1), &mut meter)
                     .unwrap();
                 ledger.validate_tombstone(change).unwrap_err()
             } else {
                 let change = ledger
-                    .prepare_withdraw(bundle_entitlement(1), request_owner(2), &mut meter)
+                    .prepare_withdraw(request_owner(2), bundle_entitlement(1), &mut meter)
                     .unwrap();
                 ledger.validate_withdraw(change).unwrap_err()
             };
@@ -6375,7 +6373,7 @@ mod tests {
                 let mut meter = work();
                 let error = if tombstone {
                     let change = ledger
-                        .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
+                        .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
                         .unwrap();
                     ledger
                         .validate_tombstone(change)
@@ -6383,7 +6381,7 @@ mod tests {
                         .unwrap_or_else(|| panic!("accepted tombstone corruption {corruption}"))
                 } else {
                     let change = ledger
-                        .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
+                        .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
                         .unwrap();
                     ledger
                         .validate_withdraw(change)
@@ -6428,7 +6426,7 @@ mod tests {
                 .unwrap();
             let mut meter = work();
             let change = ledger
-                .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
+                .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
                 .unwrap();
             assert!(ledger.validate_withdraw(change).is_err());
             assert_eq!(
@@ -6541,7 +6539,7 @@ mod tests {
         };
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
+            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
             .unwrap();
         assert!(ledger.validate_tombstone(change).is_err());
     }
@@ -7326,7 +7324,7 @@ mod tests {
             let before = bundle_snapshot(ledger);
             assert_eq!(
                 ledger
-                    .prepare_withdraw(entitlement, request_owner(1), &mut work())
+                    .prepare_withdraw(request_owner(1), entitlement, &mut work())
                     .unwrap_err(),
                 SupportLedgerError::Storage(FixedStorageError::NonCanonical)
             );
