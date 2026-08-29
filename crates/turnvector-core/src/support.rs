@@ -930,6 +930,58 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             }
         }
     }
+    fn stored_bundle_logical_delta_precharged(
+        &self,
+        record_index: u32,
+        record: &BundleRecord,
+    ) -> Result<BundleLogicalDelta<H>, SupportLedgerError> {
+        let len = usize::try_from(record.vector_len)
+            .map_err(|_| SupportLedgerError::InvalidTransition)?;
+        self.bundles
+            .validate_owner_chain_precharged(record.vector_head, len, record_index)?;
+        let mut next = record.vector_head;
+        self.bundle_logical_delta((0..len).map(|_| {
+            let CellSlot::Occupied {
+                cell, next_owned, ..
+            } = self.bundles.cells.slots[next as usize]
+            else {
+                unreachable!("prevalidated occupied bundle cell")
+            };
+            next = next_owned;
+            cell
+        }))
+    }
+    fn validate_stored_bundle_aggregates_precharged(
+        &self,
+        record_index: u32,
+        record: &BundleRecord,
+    ) -> Result<(), SupportLedgerError> {
+        let delta = self.stored_bundle_logical_delta_precharged(record_index, record)?;
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                if self.usage[class][pool]
+                    .checked_sub(delta.usage[class][pool])
+                    .is_none()
+                    || self.reserved[class][pool]
+                        .checked_sub(delta.reserved[class][pool])
+                        .is_none()
+                {
+                    return Err(SupportLedgerError::Generation);
+                }
+            }
+        }
+        for axis in 0..21 {
+            for horizon in 0..H {
+                if self.vector_usage[axis][horizon]
+                    .checked_sub(delta.vector[axis][horizon])
+                    .is_none()
+                {
+                    return Err(SupportLedgerError::Generation);
+                }
+            }
+        }
+        Ok(())
+    }
     fn remove_stored_bundle_logical_delta(&mut self, record_index: u32) {
         let record = self
             .bundles
@@ -1162,78 +1214,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             occupied_records: self.bundles.occupied_records,
         }
     }
-    fn validate_capacity_snapshot(
-        &self,
-        snapshot: &SupportCapacitySnapshot<H>,
-        work: &mut WorkMeter,
-        stale: SupportLedgerError,
-    ) -> Result<(), SupportLedgerError> {
-        check!(work, snapshot.generation == self.generation, stale)?;
-        check!(
-            work,
-            snapshot.bundle_vector_max == self.bundle_vector_max,
-            stale
-        )?;
-        for class in 0..5 {
-            for pool in 0..POOLS {
-                check!(
-                    work,
-                    self.capacities[class][pool] == snapshot.capacities[class][pool],
-                    stale
-                )?;
-                check!(
-                    work,
-                    self.usage[class][pool] == snapshot.usage[class][pool],
-                    stale
-                )?;
-                check!(
-                    work,
-                    self.reserved[class][pool] == snapshot.reserved[class][pool],
-                    stale
-                )?;
-            }
-        }
-        for cell in 0..21 {
-            for horizon in 0..H {
-                check!(
-                    work,
-                    self.vector_capacity[cell][horizon] == snapshot.vector_capacity[cell][horizon],
-                    stale
-                )?;
-                check!(
-                    work,
-                    self.vector_usage[cell][horizon] == snapshot.vector_usage[cell][horizon],
-                    stale
-                )?;
-            }
-        }
-        check!(
-            work,
-            self.bundles.occupied_records == snapshot.occupied_records,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_record_len() as u32 == snapshot.free_records,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_cell_len() as u32 == snapshot.free_cells,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_leaf_len() as u32 == snapshot.free_leaves,
-            stale
-        )?;
-        check!(
-            work,
-            self.bundles.free_branch_len() as u32 == snapshot.free_branches,
-            stale
-        )?;
-        Ok(())
-    }
     /// Read-only metered preparation of one pristine C16 bundle withdrawal:
     /// locates the exact live record by its entitlement, proves the record and
     /// its complete owned cell chain, and preflights the complete removal Work
@@ -1245,39 +1225,32 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         entitlement: FutureTurnSupportEntitlementId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedWithdrawal<'work, H>, SupportLedgerError> {
-        let expected = self.generation;
-        self.next(expected, work)?;
+        work.charge(bundle_target_work::<H>(1_296)?)?;
+        self.generation
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
         let invalid = SupportLedgerError::InvalidTransition;
-        let record_index = self
+        let (leaf, owner) = self
             .bundles
-            .find(TAG_ENTITLEMENT, &entitlement.get(), work)?
-            .ok_or(invalid)?;
+            .route_precharged(TAG_ENTITLEMENT, &entitlement.get())?;
+        let record_index = owner.ok_or(invalid)?;
         let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
-        check!(
-            work,
-            record.state == BundleState::LivePristine
-                && record.linked_claims == 0
-                && record.initial.iter().all(|item| item.state == Conditional),
-            invalid
-        )?;
-        check!(work, record.entitlement == entitlement, invalid)?;
-        let head = record.vector_head;
         let len = usize::try_from(record.vector_len).map_err(|_| invalid)?;
-        self.bundles
-            .validate_owner_chain(head, len, record_index, work)?;
-        work.ensure(HotPathWorkWitness::new([
-            K as u64 * (u64::from(IDENTITY_BITS) + 1),
-            0,
-            0,
-            0,
-            K as u64 * (u64::from(IDENTITY_BITS) + 1),
-        ]))?;
+        if record.entitlement != entitlement
+            || len == 0
+            || len > usize::from(self.bundle_vector_max)
+            || self.bundles.occupied_records == 0
+        {
+            return Err(invalid);
+        }
+        let mut leaves = [NO_NODE; K];
+        leaves[9] = leaf;
         Ok(PreparedWithdrawal {
             work,
             nonce: self.instance_nonce,
             snapshot: self.capacity_snapshot(),
             record_index,
-            leaves: [NO_NODE; K],
+            leaves,
             record,
         })
     }
@@ -1291,35 +1264,36 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &'ledger mut self,
         mut change: PreparedWithdrawal<'work, H>,
     ) -> Result<ValidatedWithdrawal<'ledger, 'work, R, F, H>, SupportLedgerError> {
-        let work = &mut *change.work;
+        let len = usize::try_from(change.record.vector_len)
+            .map_err(|_| SupportLedgerError::InvalidTransition)?;
+        let branches = if change.snapshot.occupied_records == 1 {
+            K - 1
+        } else {
+            K
+        };
+        change
+            .work
+            .charge(withdraw_remainder_work::<H>(len, branches)?)?;
         let stale = SupportLedgerError::Generation;
-        check!(work, change.nonce == self.instance_nonce, stale)?;
-        self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
-        let found = self
-            .bundles
-            .find(TAG_ENTITLEMENT, &change.record.entitlement.get(), work)?
-            .ok_or(stale)?;
-        check!(work, found == change.record_index, stale)?;
-        check!(
-            work,
-            self.bundles.get_record(change.record_index) == Some(&change.record),
-            stale
-        )?;
-        for (slot, key) in change.leaves.iter_mut().zip(change.record.tagged_keys()) {
-            let owner = self
-                .bundles
-                .find(key.tag, &key.identity, work)?
-                .ok_or(stale)?;
-            check!(work, owner == change.record_index, stale)?;
-            *slot = owner;
+        if change.nonce != self.instance_nonce
+            || change.snapshot != self.capacity_snapshot()
+            || self.bundles.get_record(change.record_index) != Some(&change.record)
+            || change.record.state != BundleState::LivePristine
+            || change.record.linked_claims != 0
+            || !change.record.initial.iter().all(|item| {
+                item.state == Conditional && item.state_time == MonotonicTime::from_micros(0)
+            })
+        {
+            return Err(stale);
         }
-        let head = change.record.vector_head;
-        self.bundles.validate_owner_chain(
-            head,
-            usize::try_from(change.record.vector_len).map_err(|_| stale)?,
-            change.record_index,
-            work,
-        )?;
+        for (slot, key) in change.leaves.iter_mut().zip(change.record.tagged_keys()) {
+            let (leaf, owner) = self.bundles.route_precharged(key.tag, &key.identity)?;
+            if owner != Some(change.record_index) {
+                return Err(stale);
+            }
+            *slot = leaf;
+        }
+        self.validate_stored_bundle_aggregates_precharged(change.record_index, &change.record)?;
         Ok(ValidatedWithdrawal {
             ledger: self,
             change,
@@ -1333,22 +1307,24 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         entitlement: FutureTurnSupportEntitlementId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedTombstone<'work, H>, SupportLedgerError> {
-        self.next(self.generation, work)?;
+        work.charge(bundle_target_work::<H>(1_248)?)?;
+        self.generation
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
         let invalid = SupportLedgerError::InvalidTransition;
-        let record_index = self
+        let (_, owner) = self
             .bundles
-            .find(TAG_ENTITLEMENT, &entitlement.get(), work)?
-            .ok_or(invalid)?;
+            .route_precharged(TAG_ENTITLEMENT, &entitlement.get())?;
+        let record_index = owner.ok_or(invalid)?;
         let record = *self.bundles.get_record(record_index).ok_or(invalid)?;
-        check!(
-            work,
-            matches!(
-                record.state,
-                BundleState::LivePristine | BundleState::LiveConsumed
-            ),
-            invalid
-        )?;
-        check!(work, record.entitlement == entitlement, invalid)?;
+        let len = usize::try_from(record.vector_len).map_err(|_| invalid)?;
+        if record.entitlement != entitlement
+            || len == 0
+            || len > usize::from(self.bundle_vector_max)
+            || self.bundles.occupied_records == 0
+        {
+            return Err(invalid);
+        }
         Ok(PreparedTombstone {
             work,
             nonce: self.instance_nonce,
@@ -1361,28 +1337,27 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &'ledger mut self,
         change: PreparedTombstone<'work, H>,
     ) -> Result<ValidatedTombstone<'ledger, 'work, R, F, H>, SupportLedgerError> {
-        let work = &mut *change.work;
+        let len = usize::try_from(change.record.vector_len)
+            .map_err(|_| SupportLedgerError::InvalidTransition)?;
+        change.work.charge(tombstone_remainder_work::<H>(len)?)?;
         let stale = SupportLedgerError::Generation;
-        check!(work, change.nonce == self.instance_nonce, stale)?;
-        self.validate_capacity_snapshot(&change.snapshot, work, stale)?;
-        for key in change.record.tagged_keys() {
-            let owner = self
-                .bundles
-                .find(key.tag, &key.identity, work)?
-                .ok_or(stale)?;
-            check!(work, owner == change.record_index, stale)?;
+        if change.nonce != self.instance_nonce
+            || change.snapshot != self.capacity_snapshot()
+            || self.bundles.get_record(change.record_index) != Some(&change.record)
+            || !matches!(
+                change.record.state,
+                BundleState::LivePristine | BundleState::LiveConsumed
+            )
+        {
+            return Err(stale);
         }
-        check!(
-            work,
-            self.bundles.get_record(change.record_index) == Some(&change.record),
-            stale
-        )?;
-        self.bundles.validate_owner_chain(
-            change.record.vector_head,
-            usize::try_from(change.record.vector_len).map_err(|_| stale)?,
-            change.record_index,
-            work,
-        )?;
+        for key in change.record.tagged_keys() {
+            let (_, owner) = self.bundles.route_precharged(key.tag, &key.identity)?;
+            if owner != Some(change.record_index) {
+                return Err(stale);
+            }
+        }
+        self.validate_stored_bundle_aggregates_precharged(change.record_index, &change.record)?;
         Ok(ValidatedTombstone {
             ledger: self,
             change,
@@ -1631,6 +1606,93 @@ fn bundle_validate_commit_work<const H: usize>(
         10,
         v.checked_mul(2).ok_or(invalid)?,
     ])?;
+    Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
+}
+fn bundle_target_work<const H: usize>(
+    prepared_base: u64,
+) -> Result<HotPathWorkWitness, SupportLedgerError> {
+    let invalid = SupportLedgerError::InvalidInput;
+    let copied = u64::try_from(H)
+        .map_err(|_| invalid)?
+        .checked_mul(336)
+        .and_then(|value| value.checked_add(prepared_base))
+        .ok_or(invalid)?;
+    Ok(HotPathWorkWitness::new([
+        u64::from(IDENTITY_BITS).checked_add(3).ok_or(invalid)?,
+        copied,
+        0,
+        0,
+        u64::from(IDENTITY_BITS).checked_add(10).ok_or(invalid)?,
+    ]))
+}
+fn bundle_mutation_bytes(cells: u64, branches: u64) -> Option<u64> {
+    1_012u64
+        .checked_add(K as u64 * 12)?
+        .checked_add(branches.checked_mul(20)?)?
+        .checked_add(cells.checked_mul(52)?)?
+        .checked_add(44)?
+        .checked_add(K as u64 * 4 + 4)
+}
+fn withdraw_remainder_work<const H: usize>(
+    cells: usize,
+    branches: usize,
+) -> Result<HotPathWorkWitness, SupportLedgerError> {
+    let invalid = SupportLedgerError::InvalidInput;
+    let v = u64::try_from(cells).map_err(|_| invalid)?;
+    let b = u64::try_from(branches).map_err(|_| invalid)?;
+    let h = u64::try_from(H).map_err(|_| invalid)?;
+    let snapshot = h
+        .checked_mul(42)
+        .and_then(|value| value.checked_add(45))
+        .ok_or(invalid)?;
+    let route = u64::from(IDENTITY_BITS).checked_add(2).ok_or(invalid)?;
+    let key_routes = (K as u64).checked_mul(route).ok_or(invalid)?;
+    let visits = snapshot
+        .checked_add(key_routes.checked_mul(2).ok_or(invalid)?)
+        .and_then(|value| value.checked_add(v.checked_mul(3)?))
+        .and_then(|value| value.checked_add(K as u64 + b + 10))
+        .ok_or(invalid)?;
+    let copied = h
+        .checked_mul(336)
+        .and_then(|value| value.checked_add(1_312))
+        .and_then(|value| value.checked_add(bundle_mutation_bytes(v, b)?))
+        .ok_or(invalid)?;
+    let checks = snapshot
+        .checked_add(2)
+        .and_then(|value| value.checked_add((K as u64).checked_mul(u64::from(IDENTITY_BITS) + 4)?))
+        .and_then(|value| value.checked_add(v.checked_mul(7)?))
+        .and_then(|value| value.checked_add(3 * (K as u64 + b)))
+        .and_then(|value| value.checked_add(30))
+        .ok_or(invalid)?;
+    Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
+}
+fn tombstone_remainder_work<const H: usize>(
+    cells: usize,
+) -> Result<HotPathWorkWitness, SupportLedgerError> {
+    let invalid = SupportLedgerError::InvalidInput;
+    let v = u64::try_from(cells).map_err(|_| invalid)?;
+    let h = u64::try_from(H).map_err(|_| invalid)?;
+    let snapshot = h
+        .checked_mul(42)
+        .and_then(|value| value.checked_add(45))
+        .ok_or(invalid)?;
+    let key_routes = (K as u64)
+        .checked_mul(u64::from(IDENTITY_BITS).checked_add(2).ok_or(invalid)?)
+        .ok_or(invalid)?;
+    let visits = snapshot
+        .checked_add(key_routes)
+        .and_then(|value| value.checked_add(v + 10))
+        .ok_or(invalid)?;
+    let copied = h
+        .checked_mul(336)
+        .and_then(|value| value.checked_add(1_273))
+        .ok_or(invalid)?;
+    let checks = snapshot
+        .checked_add(2)
+        .and_then(|value| value.checked_add((K as u64).checked_mul(u64::from(IDENTITY_BITS) + 4)?))
+        .and_then(|value| value.checked_add(v.checked_mul(6)?))
+        .and_then(|value| value.checked_add(30))
+        .ok_or(invalid)?;
     Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
 }
 fn key(tag: u8, id: [u8; 32]) -> [u8; 33] {
@@ -2117,6 +2179,36 @@ impl EntitlementCellArena {
                 (next_owned == NO_NODE) == (position + 1 == count),
                 FixedStorageError::NonCanonical
             )?;
+            index = next_owned;
+        }
+        Ok(())
+    }
+    fn validate_owner_chain_precharged(
+        &self,
+        head: u32,
+        count: usize,
+        owner: u32,
+    ) -> Result<(), FixedStorageError> {
+        let mut index = head;
+        for position in 0..count {
+            if index == NO_NODE {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let slot = self
+                .slots
+                .get(index as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            let CellSlot::Occupied {
+                owner_record,
+                next_owned,
+                ..
+            } = *slot
+            else {
+                return Err(FixedStorageError::NonCanonical);
+            };
+            if owner_record != owner || (next_owned == NO_NODE) != (position + 1 == count) {
+                return Err(FixedStorageError::NonCanonical);
+            }
             index = next_owned;
         }
         Ok(())
@@ -3218,6 +3310,14 @@ impl RequestBundleStore {
     ) -> Result<(), FixedStorageError> {
         self.cells.validate_owner_chain(head, len, owner, work)
     }
+    fn validate_owner_chain_precharged(
+        &self,
+        head: u32,
+        len: usize,
+        owner: u32,
+    ) -> Result<(), FixedStorageError> {
+        self.cells.validate_owner_chain_precharged(head, len, owner)
+    }
     /// Metered validation that the current top `count` free cell indices name
     /// Vacant slots, the exact destinations the consuming commit will pop.
     fn validate_cell_selection(
@@ -4187,6 +4287,36 @@ mod tests {
         );
     }
     #[test]
+    fn c16_terminal_phase_formulas_and_layouts_are_exact() {
+        assert_eq!(
+            bundle_target_work::<8>(1_296).unwrap(),
+            witness([267, 3_984, 0, 0, 274])
+        );
+        assert_eq!(
+            withdraw_remainder_work::<8>(168, 11).unwrap(),
+            witness([6_769, 14_192, 0, 0, 4_603])
+        );
+        assert_eq!(
+            bundle_target_work::<8>(1_248).unwrap(),
+            witness([267, 3_936, 0, 0, 274])
+        );
+        assert_eq!(
+            tombstone_remainder_work::<8>(168).unwrap(),
+            witness([3_485, 3_961, 0, 0, 4_369])
+        );
+        assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 8>>(), 3_984);
+        assert_eq!(
+            std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 8>>(),
+            4_000
+        );
+        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 8>>(), 3_936);
+        assert_eq!(
+            std::mem::size_of::<ValidatedTombstone<'static, 'static, 12, 12, 8>>(),
+            3_952
+        );
+    }
+
+    #[test]
     fn c16_bundle_prepare_rejects_invalid_inputs() {
         let cells = configured_cells(3, 1);
         let mut invalid = bundle_input(1, &cells);
@@ -4746,14 +4876,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([7, 0, 0, 0, 20])
+            HotPathWorkWitness::new([267, 1_632, 0, 0, 274])
         );
         let validated = ledger
             .validate_withdraw(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([71, 0, 0, 0, 201])
+            HotPathWorkWitness::new([6_246, 4_872, 0, 0, 3_425])
         );
         assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_632);
         assert_eq!(
@@ -4842,19 +4972,21 @@ mod tests {
             retained,
             "tombstone retains every logical and vector delta"
         );
+        let change = ledger
+            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .unwrap();
         assert_eq!(
-            ledger
-                .prepare_withdraw(bundle_entitlement(1), &mut measured)
-                .unwrap_err(),
-            SupportLedgerError::InvalidTransition
+            ledger.validate_withdraw(change).unwrap_err(),
+            SupportLedgerError::Generation
         );
-        // Double close rejects.
+        // Double close rejects during the remainder validation phase.
         let mut tombstone_meter = work();
+        let change = ledger
+            .prepare_tombstone(bundle_entitlement(1), &mut tombstone_meter)
+            .unwrap();
         assert_eq!(
-            ledger
-                .prepare_tombstone(bundle_entitlement(1), &mut tombstone_meter)
-                .unwrap_err(),
-            SupportLedgerError::InvalidTransition
+            ledger.validate_tombstone(change).unwrap_err(),
+            SupportLedgerError::Generation
         );
         // The tombstone keeps every identity and cell occupied.
         assert_eq!(ledger.bundles.free_record_len(), 3);
