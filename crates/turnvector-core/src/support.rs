@@ -5258,6 +5258,101 @@ mod tests {
     }
 
     #[test]
+    fn c16_capability_compile_fail_contracts() {
+        use std::fs;
+        use std::path::Path;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn copy_source(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let destination = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_source(&entry.path(), &destination);
+                } else {
+                    fs::copy(entry.path(), destination).unwrap();
+                }
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "turnvector-c16-compile-fail-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("src");
+        copy_source(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &source);
+        fs::create_dir(root.join("out")).unwrap();
+        let original = fs::read_to_string(source.join("support.rs")).unwrap();
+        let probes = [
+            (
+                "fresh_meter_validate",
+                "let mut ledger = ledger();\nlet change = prepared_static();\nlet mut fresh = WorkMeter::new(crate::HotPathWorkBudget::binary_maximum());\nlet _ = ledger.validate_bundle(change, &mut fresh);",
+                "E0061",
+            ),
+            (
+                "two_exclusive_capabilities",
+                "let mut ledger = ledger();\nlet first = prepared_static();\nlet second = prepared_static();\nlet first = ledger.validate_bundle(first).unwrap();\nlet second = ledger.validate_bundle(second).unwrap();\ndrop((first, second));",
+                "E0499",
+            ),
+            (
+                "use_after_commit",
+                "let change = validated_static();\nchange.commit_bundle();\nchange.commit_bundle();",
+                "E0382",
+            ),
+            (
+                "bound_meter_while_prepared",
+                "fn prepared<'work>(work: &'work mut WorkMeter) -> BundleChange<'static, 'work, 1> { let _ = work; todo!() }\nlet mut meter = WorkMeter::new(crate::HotPathWorkBudget::binary_maximum());\nlet change = prepared(&mut meter);\nlet _ = meter.record(WorkDimension::InvariantChecks, 1);\ndrop(change);",
+                "E0499",
+            ),
+            (
+                "bound_meter_while_validated",
+                "fn validated<'ledger, 'work>(ledger: &'ledger mut Ledger, work: &'work mut WorkMeter) -> ValidatedBundleChange<'ledger, 'static, 'work, 64, 64, 1> { let _ = (ledger, work); todo!() }\nlet mut ledger = ledger();\nlet mut meter = WorkMeter::new(crate::HotPathWorkBudget::binary_maximum());\nlet change = validated(&mut ledger, &mut meter);\nlet _ = meter.record(WorkDimension::InvariantChecks, 1);\ndrop(change);",
+                "E0499",
+            ),
+        ];
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        for (name, body, diagnostic) in probes {
+            let module = format!(
+                "\nmod c16_compile_fail_probe {{\nuse super::*;\ntype Ledger = SupportChargeLedger<64, 64, 1>;\nfn ledger() -> Ledger {{ todo!() }}\nfn prepared_static() -> BundleChange<'static, 'static, 1> {{ todo!() }}\nfn validated_static() -> ValidatedBundleChange<'static, 'static, 'static, 64, 64, 1> {{ todo!() }}\nfn probe() {{\n{body}\n}}\n}}\n"
+            );
+            fs::write(source.join("support.rs"), format!("{original}{module}")).unwrap();
+            let output = Command::new(&rustc)
+                .current_dir(&root)
+                .args([
+                    "--crate-name",
+                    "turnvector_c16_compile_probe",
+                    "--edition=2024",
+                    "--crate-type=lib",
+                    "src/lib.rs",
+                    "--out-dir",
+                    "out",
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                !output.status.success(),
+                "probe {name} unexpectedly compiled"
+            );
+            assert!(
+                stderr.contains(diagnostic),
+                "probe {name} missed intended {diagnostic}:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("E0603"),
+                "probe {name} failed on privacy instead of ownership:\n{stderr}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn c16_bundle_transaction_commits_exactly_once() {
         let mut ledger = bundle_ledger(4, 8);
         let cells = configured_cells(3, 1);
