@@ -994,7 +994,16 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         };
         let mut maxima = [[0u64; POOLS]; 7];
         let mut pool_totals = [0u64; POOLS];
+        let mut prior_axis = None;
         for cell in cells {
+            let canonical_axis = (cell.operation, cell.pool, cell.horizon.as_micros());
+            if cell.max_outstanding == 0
+                || cell.horizon.as_micros() == 0
+                || prior_axis.is_some_and(|prior| prior >= canonical_axis)
+            {
+                return Err(invalid);
+            }
+            prior_axis = Some(canonical_axis);
             let operation = cell.operation as usize;
             let pool = cell.pool as usize;
             let axis = operation
@@ -5498,6 +5507,143 @@ mod tests {
             ledger.bundles.get_record(owner).unwrap().state,
             BundleState::RetainedTombstone
         );
+    }
+    #[test]
+    fn c16_terminal_validation_rejects_cell_record_and_aggregate_corruption() {
+        let occupied =
+            |ledger: &Ledger, index: u32| match ledger.bundles.cells.slots[index as usize] {
+                CellSlot::Occupied {
+                    owner_record,
+                    cell,
+                    next_owned,
+                } => (owner_record, cell, next_owned),
+                CellSlot::Vacant { .. } => unreachable!("fixture chain is occupied"),
+            };
+        let reject = |ledger: &mut Ledger| {
+            let before = bundle_snapshot(ledger);
+            let len = ledger.bundles.get_record(0).unwrap().vector_len as usize;
+            let expected = bundle_target_work::<1>(1_296)
+                .unwrap()
+                .checked_add(withdraw_remainder_work::<1>(len, K - 1).unwrap())
+                .unwrap();
+            let mut meter = work();
+            let change = ledger
+                .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                .unwrap();
+            assert!(ledger.validate_withdraw(change).is_err());
+            assert_eq!(
+                meter.witness(),
+                expected,
+                "post-target corruption retains both charged phases"
+            );
+            assert_eq!(bundle_snapshot(ledger), before);
+        };
+
+        for corruption in 0..13 {
+            let mut ledger = bundle_ledger(4, 8);
+            reserve_bundle(&mut ledger, 1, 3);
+            let record = *ledger.bundles.get_record(0).unwrap();
+            let first = record.vector_head;
+            let (_, _, middle) = occupied(&ledger, first);
+            let (_, _, tail) = occupied(&ledger, middle);
+            match corruption {
+                0 => {
+                    let RecordSlot::Occupied(record) = &mut ledger.bundles.records[0] else {
+                        unreachable!("fixture record is occupied")
+                    };
+                    record.vector_head = u32::MAX - 1;
+                }
+                1 => {
+                    let RecordSlot::Occupied(record) = &mut ledger.bundles.records[0] else {
+                        unreachable!("fixture record is occupied")
+                    };
+                    record.vector_len += 1;
+                }
+                2 => {
+                    let (owner_record, cell, _) = occupied(&ledger, first);
+                    ledger.bundles.cells.slots[first as usize] = CellSlot::Occupied {
+                        owner_record,
+                        cell,
+                        next_owned: NO_NODE,
+                    };
+                }
+                3 => {
+                    let (owner_record, cell, _) = occupied(&ledger, tail);
+                    ledger.bundles.cells.slots[tail as usize] = CellSlot::Occupied {
+                        owner_record,
+                        cell,
+                        next_owned: first,
+                    };
+                }
+                4 => {
+                    let (_, cell, next_owned) = occupied(&ledger, middle);
+                    ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
+                        owner_record: 1,
+                        cell,
+                        next_owned,
+                    };
+                }
+                5 => {
+                    ledger.bundles.cells.slots[middle as usize] =
+                        CellSlot::Vacant { free_position: 0 };
+                }
+                6 => {
+                    let (owner_record, cell, _) = occupied(&ledger, middle);
+                    ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
+                        owner_record,
+                        cell,
+                        next_owned: middle,
+                    };
+                }
+                7 => {
+                    let (owner_record, _, next_owned) = occupied(&ledger, middle);
+                    let (_, first_cell, _) = occupied(&ledger, first);
+                    ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
+                        owner_record,
+                        cell: first_cell,
+                        next_owned,
+                    };
+                }
+                8 => {
+                    let (owner_record, mut cell, next_owned) = occupied(&ledger, first);
+                    cell.max_outstanding = 0;
+                    ledger.bundles.cells.slots[first as usize] = CellSlot::Occupied {
+                        owner_record,
+                        cell,
+                        next_owned,
+                    };
+                }
+                9 => ledger.vector_usage[0][0] = 0,
+                10 => ledger.usage[CONDITIONAL][Mandatory as usize] = 2,
+                11 => ledger.reserved[PENDING][Mandatory as usize] = 2,
+                12 => {
+                    let RecordSlot::Occupied(record) = &mut ledger.bundles.records[0] else {
+                        unreachable!("fixture record is occupied")
+                    };
+                    record.linked_claims = 1;
+                }
+                _ => unreachable!(),
+            }
+            reject(&mut ledger);
+        }
+
+        let mut ledger = bundle_ledger(4, 8);
+        reserve_bundle(&mut ledger, 1, 3);
+        let record = *ledger.bundles.get_record(0).unwrap();
+        let first = record.vector_head;
+        let (_, _, middle) = occupied(&ledger, first);
+        let (owner_record, _, next_owned) = occupied(&ledger, middle);
+        let (_, first_cell, _) = occupied(&ledger, first);
+        ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
+            owner_record,
+            cell: first_cell,
+            next_owned,
+        };
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(bundle_entitlement(1), &mut meter)
+            .unwrap();
+        assert!(ledger.validate_tombstone(change).is_err());
     }
     #[test]
     fn c16_reciprocal_uniqueness_across_legacy_paths() {
