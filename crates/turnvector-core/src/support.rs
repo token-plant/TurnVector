@@ -321,16 +321,46 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         if worst_visits > 1_704_575 || worst_copied > 2_097_152 || worst_checks > 28_708 {
             return Err(SupportLedgerError::InvalidInput);
         }
+        let identity_capacity = records
+            .checked_mul(2)
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        let bundle_identity_capacity = bundle_records
+            .checked_mul(K)
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        let expected_backing = SupportBackingCapacities {
+            legacy: [records, claims, records, identity_capacity],
+            history: starts.each_ref().map(|row| row[H - 1].1 as usize),
+            bundles: [
+                bundle_records,
+                bundle_records,
+                bundle_identity_capacity,
+                bundle_identity_capacity,
+                bundle_identity_capacity - 1,
+                bundle_identity_capacity - 1,
+                bundle_cells,
+                bundle_cells,
+            ],
+        };
         let records = FixedRecordArena::try_new(records, claims)?;
         let vector_capacity = std::array::from_fn(|cell| {
             std::array::from_fn(|horizon| u64::from(starts[cell][horizon].1))
         });
         let starts = FixedWindowCounter::try_new(starts)?;
         let bundles = RequestBundleStore::try_new(bundle_records, bundle_cells)?;
+        let actual_backing = SupportBackingCapacities {
+            legacy: records.backing_capacities(),
+            history: starts.backing_capacities(),
+            bundles: bundles.backing_capacities(),
+        };
         let bundle_vector_max =
             u16::try_from(bundle_vector_max).map_err(|_| SupportLedgerError::InvalidInput)?;
-        let instance_nonce = issue_instance_nonce(&PROCESS_INSTANCE_DISPENSER)
-            .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+        let instance_nonce = seal_backing_and_issue_nonce(
+            &PROCESS_INSTANCE_DISPENSER,
+            H,
+            storage,
+            expected_backing,
+            actual_backing,
+        )?;
         Ok(Self {
             generation,
             capacities,
@@ -1660,6 +1690,81 @@ struct BundleLogicalDelta<const H: usize> {
     usage: [[u32; POOLS]; 5],
     reserved: [[u32; POOLS]; 5],
     vector: [[u64; H]; 21],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SupportBackingCapacities {
+    legacy: [usize; 4],
+    history: [usize; 21],
+    bundles: [usize; 8],
+}
+
+fn actual_support_storage_bytes(
+    horizon_count: usize,
+    capacities: SupportBackingCapacities,
+) -> Option<u64> {
+    let bytes = |capacity: usize, element: usize| {
+        u64::try_from(capacity)
+            .ok()?
+            .checked_mul(u64::try_from(element).ok()?)
+    };
+    let fixed = u64::try_from(horizon_count)
+        .ok()?
+        .checked_mul(672)?
+        .checked_add(1_232)?;
+    let legacy = bytes(capacities.legacy[0], std::mem::size_of::<Record>())?
+        .checked_add(bytes(
+            capacities.legacy[1],
+            std::mem::size_of::<SupportFundingClaim>(),
+        )?)?
+        .checked_add(bytes(capacities.legacy[2], std::mem::size_of::<u32>())?)?
+        .checked_add(bytes(
+            capacities.legacy[3],
+            std::mem::size_of::<crate::bounded::AvlNode>(),
+        )?)?;
+    let history = capacities
+        .history
+        .into_iter()
+        .try_fold(0u64, |total, capacity| {
+            total.checked_add(bytes(capacity, std::mem::size_of::<MonotonicTime>())?)
+        })?;
+    let bundle_sizes = [
+        std::mem::size_of::<RecordSlot>(),
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<LeafSlot>(),
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<BranchSlot>(),
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<CellSlot>(),
+        std::mem::size_of::<u32>(),
+    ];
+    let bundles = capacities
+        .bundles
+        .into_iter()
+        .zip(bundle_sizes)
+        .try_fold(0u64, |total, (capacity, size)| {
+            total.checked_add(bytes(capacity, size)?)
+        })?;
+    fixed
+        .checked_add(legacy)?
+        .checked_add(history)?
+        .checked_add(bundles)
+}
+
+fn seal_backing_and_issue_nonce(
+    dispenser: &AtomicU64,
+    horizon_count: usize,
+    expected_storage: u64,
+    expected: SupportBackingCapacities,
+    actual: SupportBackingCapacities,
+) -> Result<u64, SupportLedgerError> {
+    if actual != expected
+        || actual_support_storage_bytes(horizon_count, actual) != Some(expected_storage)
+        || expected_storage > 2_097_152
+    {
+        return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
+    }
+    issue_instance_nonce(dispenser).ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))
 }
 
 fn support_storage_bytes(
@@ -3341,6 +3446,19 @@ struct RequestBundleStore {
     cells: EntitlementCellArena,
 }
 impl RequestBundleStore {
+    fn backing_capacities(&self) -> [usize; 8] {
+        [
+            self.records.capacity(),
+            self.free_records.capacity(),
+            self.identities.leaf_slots.capacity(),
+            self.identities.free_leaves.capacity(),
+            self.identities.branch_slots.capacity(),
+            self.identities.free_branches.capacity(),
+            self.cells.slots.capacity(),
+            self.cells.free.capacity(),
+        ]
+    }
+
     /// Creates exact-capacity storage for `E` request-bundle records, `I = 11E`
     /// tagged identity leaves, `J = I - 1` Patricia branches, and `C`
     /// entitlement cells. Every storage product and sum is checked against the
@@ -4690,6 +4808,43 @@ mod tests {
             ledger.bundles.free_branch_len(),
         )
     }
+    #[test]
+    fn c16_complete_actual_backing_seals_before_nonce_issuance() {
+        let expected = SupportBackingCapacities {
+            legacy: [18, 18, 18, 36],
+            history: [1; 21],
+            bundles: [4, 4, 44, 44, 43, 43, 8, 8],
+        };
+        let storage = support_storage_bytes(1, 18, 18, 21, 4, 8).unwrap();
+        assert_eq!(actual_support_storage_bytes(1, expected), Some(storage));
+        for backing in 0..33 {
+            let mut actual = expected;
+            match backing {
+                0..=3 => actual.legacy[backing] += 1,
+                4..=24 => actual.history[backing - 4] += 1,
+                25..=32 => actual.bundles[backing - 25] += 1,
+                _ => unreachable!(),
+            }
+            let dispenser = AtomicU64::new(0);
+            assert_eq!(
+                seal_backing_and_issue_nonce(&dispenser, 1, storage, expected, actual),
+                Err(SupportLedgerError::Storage(FixedStorageError::Capacity)),
+                "backing {backing} must seal exactly"
+            );
+            assert_eq!(
+                dispenser.load(Ordering::Relaxed),
+                0,
+                "a rejected backing cannot burn a nonce"
+            );
+        }
+        let dispenser = AtomicU64::new(0);
+        assert_eq!(
+            seal_backing_and_issue_nonce(&dispenser, 1, storage, expected, expected),
+            Ok(1)
+        );
+        assert_eq!(dispenser.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn c16_instance_nonce_issuance() {
         let dispenser = AtomicU64::new(0);

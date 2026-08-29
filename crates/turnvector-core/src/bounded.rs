@@ -375,6 +375,9 @@ fn reserved_index<T>(capacity: usize) -> Result<Vec<T>, FixedIndexError> {
     values
         .try_reserve_exact(capacity)
         .map_err(|_| FixedIndexError::Allocation)?;
+    if values.capacity() != capacity {
+        return Err(FixedIndexError::Capacity);
+    }
     Ok(values)
 }
 
@@ -515,18 +518,49 @@ impl AvlIndex {
         self.rebalance_after_insert(parent);
     }
 
-    #[rustfmt::skip]
-    fn height(&self, node: u32) -> u8 { if node == NO_NODE { 0 } else { self.nodes[node as usize].height } }
+    fn height(&self, node: u32) -> u8 {
+        if node == NO_NODE {
+            0
+        } else {
+            self.nodes[node as usize].height
+        }
+    }
 
-    #[rustfmt::skip]
-    fn refresh(&mut self, node: u32) { let value = self.nodes[node as usize]; self.nodes[node as usize].height = 1 + self.height(value.left).max(self.height(value.right)); }
+    fn refresh(&mut self, node: u32) {
+        let value = self.nodes[node as usize];
+        self.nodes[node as usize].height =
+            1 + self.height(value.left).max(self.height(value.right));
+    }
 
-    #[rustfmt::skip]
-    fn balance(&self, node: u32) -> i16 { let value = self.nodes[node as usize]; i16::from(self.height(value.left)) - i16::from(self.height(value.right)) }
+    fn balance(&self, node: u32) -> i16 {
+        let value = self.nodes[node as usize];
+        i16::from(self.height(value.left)) - i16::from(self.height(value.right))
+    }
 
-    #[rustfmt::skip]
     fn rebalance_after_insert(&mut self, mut node: u32) {
-        while node != NO_NODE { let old_height = self.nodes[node as usize].height; self.refresh(node); let balance = self.balance(node); if balance == 2 { let left = self.nodes[node as usize].left; if self.balance(left) < 0 { self.rotate_left(left); } self.rotate_right(node); break; } else if balance == -2 { let right = self.nodes[node as usize].right; if self.balance(right) > 0 { self.rotate_right(right); } self.rotate_left(node); break; } else if self.nodes[node as usize].height == old_height { break; } node = self.nodes[node as usize].parent; }
+        while node != NO_NODE {
+            let old_height = self.nodes[node as usize].height;
+            self.refresh(node);
+            let balance = self.balance(node);
+            if balance == 2 {
+                let left = self.nodes[node as usize].left;
+                if self.balance(left) < 0 {
+                    self.rotate_left(left);
+                }
+                self.rotate_right(node);
+                break;
+            } else if balance == -2 {
+                let right = self.nodes[node as usize].right;
+                if self.balance(right) > 0 {
+                    self.rotate_right(right);
+                }
+                self.rotate_left(node);
+                break;
+            } else if self.nodes[node as usize].height == old_height {
+                break;
+            }
+            node = self.nodes[node as usize].parent;
+        }
     }
 
     fn rotate_left(&mut self, node: u32) -> u32 {
@@ -737,6 +771,15 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         Some(&self.claims[start..end])
     }
 
+    pub(crate) fn backing_capacities(&self) -> [usize; 4] {
+        [
+            self.records.capacity(),
+            self.claims.capacity(),
+            self.claim_ends.capacity(),
+            self.identities.nodes.capacity(),
+        ]
+    }
+
     #[cfg(test)]
     pub(crate) fn allocation_facts(&self) -> [(usize, usize); 4] {
         [
@@ -791,11 +834,19 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         }
         let mut history = std::array::from_fn(|_| VecDeque::new());
         for (queue, cell) in history.iter_mut().zip(&bounds) {
+            let capacity = cell[H - 1].1 as usize;
             queue
-                .try_reserve_exact(cell[H - 1].1 as usize)
+                .try_reserve_exact(capacity)
                 .map_err(|_| FixedStorageError::Allocation)?;
+            if queue.capacity() != capacity {
+                return Err(FixedStorageError::Capacity);
+            }
         }
         Ok(Self { bounds, history })
+    }
+
+    pub(crate) fn backing_capacities(&self) -> [usize; CELLS] {
+        self.history.each_ref().map(VecDeque::capacity)
     }
 
     pub(crate) fn bounds(&self, cell: usize) -> Option<&[FixedStartCountBound; H]> {
