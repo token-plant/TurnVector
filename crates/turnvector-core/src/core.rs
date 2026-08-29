@@ -1463,18 +1463,76 @@ mod tests {
     fn start<const O: usize, const I: usize, const S: usize, const T: usize>(core: &mut Core<O, I, S, T>, sequence: u64, operation: u128, intent: RegistrationIntent, support: u8) -> CoreTransition { core.handle(CoreEvent::describe_model(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), intent, ordinary(support), MonotonicTime::from_micros(sequence))) }
     #[rustfmt::skip]
     fn result<const O: usize, const I: usize, const S: usize, const T: usize>(core: &mut Core<O, I, S, T>, sequence: u64, operation: u128, descriptor: RawModelDescriptor<'_>) -> CoreTransition { core.handle(CoreEvent::model_descriptor_result(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), generations(), descriptor)) }
-    #[rustfmt::skip]
     fn registration_core(capacity: u32) -> Core<4> {
-        let mut capacities = [[0; 3]; 5]; for class in [2, 3, 4] { capacities[class][0] = capacity; }
-        let starts = std::array::from_fn(|_| [FixedStartCountBound(Duration::from_micros(10), 2), FixedStartCountBound(Duration::from_micros(20), 2), FixedStartCountBound(Duration::from_micros(30), 2)]);
-        let support = CoreSupport::try_new(SupportLedgerGeneration::new(1).unwrap(), capacities, 1, starts, LifecycleReserveMaxima([1; 5]), 4, 8, 6).unwrap();
+        let mut capacities = [[0; 3]; 5];
+        for class in [2, 3, 4] {
+            capacities[class][0] = capacity;
+        }
+        let starts = std::array::from_fn(|_| {
+            [
+                FixedStartCountBound(Duration::from_micros(10), 2),
+                FixedStartCountBound(Duration::from_micros(20), 2),
+                FixedStartCountBound(Duration::from_micros(30), 2),
+            ]
+        });
+        let support = CoreSupport::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            capacities,
+            1,
+            starts,
+            LifecycleReserveMaxima([1; 5]),
+            4,
+            8,
+            6,
+        )
+        .unwrap();
         let registry = CoreRegistry::try_new(RegistryGeneration::new(1).unwrap()).unwrap();
-        Core::bootstrap_with_registration(EventSequence::new(1).unwrap(), generations(), support, registry)
+        Core::bootstrap_with_registration(
+            EventSequence::new(1).unwrap(),
+            generations(),
+            support,
+            registry,
+        )
     }
     #[rustfmt::skip]
     fn request_core() -> Core<4, 2, 1, 2> { request_core_with(2) }
-    #[rustfmt::skip]
-    fn request_core_with<const O: usize>(ordinary: u32) -> Core<O, 2, 1, 2> { let mut capacities = [[0; 3]; 5]; for class in [2, 3, 4] { capacities[class][0] = ordinary; } for capacity in &mut capacities { capacity[1] = 4; } let starts = std::array::from_fn(|_| [FixedStartCountBound(Duration::from_micros(10), 4), FixedStartCountBound(Duration::from_micros(20), 4), FixedStartCountBound(Duration::from_micros(30), 4)]); let support = CoreSupport::try_new(SupportLedgerGeneration::new(1).unwrap(), capacities, 1, starts, LifecycleReserveMaxima([4; 5]), 4, 8, 6).unwrap(); let registry = CoreRegistry::try_new(RegistryGeneration::new(1).unwrap()).unwrap(); Core::bootstrap_with_request_acceptance(EventSequence::new(1).unwrap(), generations(), support, registry, DaemonInstanceId::new(1).unwrap(), RequestBookGeneration::new(1).unwrap()).unwrap() }
+    fn request_core_with<const O: usize>(ordinary: u32) -> Core<O, 2, 1, 2> {
+        let mut capacities = [[0; 3]; 5];
+        for class in [2, 3, 4] {
+            capacities[class][0] = ordinary;
+        }
+        for capacity in &mut capacities {
+            capacity[1] = 4;
+        }
+        let starts = std::array::from_fn(|_| {
+            [
+                FixedStartCountBound(Duration::from_micros(10), 4),
+                FixedStartCountBound(Duration::from_micros(20), 4),
+                FixedStartCountBound(Duration::from_micros(30), 4),
+            ]
+        });
+        let support = CoreSupport::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            capacities,
+            1,
+            starts,
+            LifecycleReserveMaxima([4; 5]),
+            4,
+            8,
+            6,
+        )
+        .unwrap();
+        let registry = CoreRegistry::try_new(RegistryGeneration::new(1).unwrap()).unwrap();
+        Core::bootstrap_with_request_acceptance(
+            EventSequence::new(1).unwrap(),
+            generations(),
+            support,
+            registry,
+            DaemonInstanceId::new(1).unwrap(),
+            RequestBookGeneration::new(1).unwrap(),
+        )
+        .unwrap()
+    }
     #[rustfmt::skip]
     fn request_input(selector: RequestSelector, connection: u128, input: &[u32], output: u64, top_k: u32, seed: u64, timeout: u64) -> AcceptanceInput<2, 1, 2> { let parameters = if top_k == 0 { GenerationParameters::try_new(SamplingMode::Greedy, 0.0f32.to_bits(), 1.0f32.to_bits(), 0) } else { GenerationParameters::try_new(SamplingMode::Categorical, 1.0f32.to_bits(), 1.0f32.to_bits(), top_k) }.unwrap(); AcceptanceInput { connection: ConnectionId::new(connection).unwrap(), request: TokenRequest::try_new(selector, input, parameters, ServiceClass::Interactive, TokenCount::new(output), &[&[3]], EffectiveSamplingSeed::new(seed, SamplingSeedOrigin::Caller)).unwrap(), accepted_at: MonotonicTime::from_micros(3), preparation_timeout: Duration::from_micros(timeout) } }
     #[rustfmt::skip]
@@ -1509,22 +1567,78 @@ mod tests {
     }
 
     #[test]
-    #[rustfmt::skip]
     fn describe_model_starts_only_after_support_charge() {
-        fn public_contract<T: std::fmt::Debug + Eq + PartialEq>() {} public_contract::<Core<4>>(); let _: Option<CoreEvent> = None;
-        let registration = registration(HASH); let mut core = registration_core(2); let transition = core.handle(CoreEvent::describe_model(EventSequence::new(1).unwrap(), OperationId::new(1).unwrap(), registration, ordinary(5), MonotonicTime::from_micros(1)));
+        fn public_contract<T: std::fmt::Debug + Eq + PartialEq>() {}
+        public_contract::<Core<4>>();
+        let _: Option<CoreEvent> = None;
+        let registration = registration(HASH);
+        let mut core = registration_core(2);
+        let transition = core.handle(CoreEvent::describe_model(
+            EventSequence::new(1).unwrap(),
+            OperationId::new(1).unwrap(),
+            registration,
+            ordinary(5),
+            MonotonicTime::from_micros(1),
+        ));
         assert_eq!(transition.outcome(), &CoreOutcome::Accepted);
-        assert_eq!((transition.effects().len(), transition.effects().get(0).unwrap().registration()), (1, Some(registration)));
-        assert_eq!(transition.work(), HotPathWorkWitness::new([59, 468, 0, 1, 33]));
-        let result = core.handle(CoreEvent::model_descriptor_result(EventSequence::new(2).unwrap(), OperationId::new(1).unwrap(), generations(), raw(&FRAME, ID, HASH, 7)));
-        assert_eq!((result.outcome(), result.effects().is_empty()), (&CoreOutcome::Accepted, true));
+        assert_eq!(
+            (
+                transition.effects().len(),
+                transition.effects().get(0).unwrap().registration()
+            ),
+            (1, Some(registration))
+        );
+        assert_eq!(
+            transition.work(),
+            HotPathWorkWitness::new([59, 468, 0, 1, 33])
+        );
+        let result = core.handle(CoreEvent::model_descriptor_result(
+            EventSequence::new(2).unwrap(),
+            OperationId::new(1).unwrap(),
+            generations(),
+            raw(&FRAME, ID, HASH, 7),
+        ));
+        assert_eq!(
+            (result.outcome(), result.effects().is_empty()),
+            (&CoreOutcome::Accepted, true)
+        );
         assert_eq!(result.work(), HotPathWorkWitness::new([832, 823, 0, 2, 29]));
         let state = core.registration.as_ref().unwrap();
-        assert_eq!((state.pending.is_none(), state.registry.counts().registered, state.support.generation()), (true, 1, SupportLedgerGeneration::new(3).unwrap()));
-        assert_eq!(state.registry.request_revision_fact(state.registry.generation(), crate::model_registry::RevisionSelection::Direct(ModelRevisionId::new([2; 32]).unwrap()), &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap().unwrap().context_limit(), TokenCount::new(8));
+        assert_eq!(
+            (
+                state.pending.is_none(),
+                state.registry.counts().registered,
+                state.support.generation()
+            ),
+            (true, 1, SupportLedgerGeneration::new(3).unwrap())
+        );
+        assert_eq!(
+            state
+                .registry
+                .request_revision_fact(
+                    state.registry.generation(),
+                    crate::model_registry::RevisionSelection::Direct(
+                        ModelRevisionId::new([2; 32]).unwrap()
+                    ),
+                    &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())
+                )
+                .unwrap()
+                .unwrap()
+                .context_limit(),
+            TokenCount::new(8)
+        );
         let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
-        let descriptor = state.registry.descriptor(ModelRevisionId::new([2; 32]).unwrap(), &mut work).unwrap().unwrap();
-        let sealed = verify(raw(&FRAME, ID, HASH, 7), ModelDescriptorHash::from_manifest(1, HASH).unwrap(), &mut work).unwrap();
+        let descriptor = state
+            .registry
+            .descriptor(ModelRevisionId::new([2; 32]).unwrap(), &mut work)
+            .unwrap()
+            .unwrap();
+        let sealed = verify(
+            raw(&FRAME, ID, HASH, 7),
+            ModelDescriptorHash::from_manifest(1, HASH).unwrap(),
+            &mut work,
+        )
+        .unwrap();
         assert!(descriptor.exactly_matches(&sealed, &mut work).unwrap());
     }
     #[test]
@@ -1542,11 +1656,189 @@ mod tests {
         assert_eq!(next.work(), HotPathWorkWitness::new([5, 736, 0, 0, 16]));
         assert_eq!((accepted.id().sequence().get(), accepted.revision(), accepted.seed().value(), core.requests.as_ref().unwrap().len()), (2, revision, 10, 2));
     }
-    #[rustfmt::skip] #[test]
+    #[test]
     fn drives_request_descriptions_without_admission() {
-        let revision = ModelRevisionId::new([2; 32]).unwrap(); let mut core = registered_request_core(); let accepted = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap(); let started = core.handle(CoreEvent::describe_request(EventSequence::new(4).unwrap(), OperationId::new(2).unwrap(), accepted.id(), ordinary_request(6), MonotonicTime::from_micros(4))); assert_eq!((started.outcome(), started.effects().len(), started.effects().get(0).unwrap().request_description(), started.work()), (&CoreOutcome::Accepted, 1, Some(accepted.id()), HotPathWorkWitness::new([83, 689, 0, 1, 33])));
-        let facts = description_facts(); let result = core.request_description_input().unwrap().bound_result(facts); let mut wrong = result; wrong.backend = BackendGeneration::new(2).unwrap(); let rejected = core.handle(CoreEvent::request_description_result(EventSequence::new(5).unwrap(), OperationId::new(2).unwrap(), wrong)); assert_eq!((rejected.outcome(), core.pending_description.is_some()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionResultMismatch), true)); let mut incomplete = result; incomplete.facts.requirements = BoundedVec::new(); let rejected = core.handle(CoreEvent::request_description_result(EventSequence::new(6).unwrap(), OperationId::new(2).unwrap(), incomplete)); assert_eq!((rejected.outcome(), core.pending_description.is_some()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionResultMismatch), true)); let other = RegistrationIntent { model: ModelId::new(2).unwrap(), revision: ModelRevisionId::new([4; 32]).unwrap(), manifest: ModelManifestId::new([5; 32]).unwrap(), ..registration(HASH) }; install_revision(&mut core, other); let (predecessor, ids) = reserve_descriptions::<4, 1>(&mut core, 10, [LifecycleReserveKind::PostObservationRequestDescription]); let invalidated = core.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(7).unwrap(), predecessor, MonotonicTime::from_micros(6), ids, LifecycleTriggerResult::ObservationDescriptionsRequired, Some(BackendGeneration::new(2).unwrap()), None)); assert_eq!((invalidated.outcome(), invalidated.effects().len()), (&CoreOutcome::Accepted, 0));
-        core.work_budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 321, 0, 2, 2_100])).unwrap(); let underfunded = core.handle(CoreEvent::request_description_result(EventSequence::new(8).unwrap(), OperationId::new(2).unwrap(), result)); assert_eq!((underfunded.outcome(), underfunded.work(), core.pending_description.is_some(), core.requests.as_ref().unwrap().description_facts(accepted.id(), &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap()), (&CoreOutcome::Rejected(DomainRejection::HotPathWorkBudget(WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 321, 27_872))), HotPathWorkWitness::new([6, 0, 0, 0, 30]), true, None)); core.work_budget = HotPathWorkBudget::binary_maximum(); let initial_completed = core.handle(CoreEvent::request_description_result(EventSequence::new(9).unwrap(), OperationId::new(2).unwrap(), result)); assert_eq!((initial_completed.outcome(), initial_completed.effects().len(), initial_completed.request_acceptance(), initial_completed.work()), (&CoreOutcome::Accepted, 0, None, HotPathWorkWitness::new([8, 28_049, 0, 0, 35]))); let refreshed = core.handle(CoreEvent::drive_request_description(EventSequence::new(10).unwrap(), OperationId::new(3).unwrap(), MonotonicTime::from_micros(7))); assert_eq!((invalidated.work(), refreshed.outcome(), refreshed.effects().get(0).unwrap().request_description(), refreshed.work()), (HotPathWorkWitness::new([7, 353, 0, 0, 6]), &CoreOutcome::Accepted, Some(accepted.id()), HotPathWorkWitness::new([9, 566, 0, 1, 17]))); let result = core.request_description_input().unwrap().bound_result(facts); let completed = core.handle(CoreEvent::request_description_result(EventSequence::new(11).unwrap(), OperationId::new(3).unwrap(), result)); assert_eq!((completed.outcome(), completed.effects().len(), completed.request_acceptance(), completed.work()), (&CoreOutcome::Accepted, 0, None, HotPathWorkWitness::new([9, 28_049, 0, 0, 35])));
+        let revision = ModelRevisionId::new([2; 32]).unwrap();
+        let mut core = registered_request_core();
+        let accepted = core
+            .handle(CoreEvent::accept_request(
+                EventSequence::new(3).unwrap(),
+                request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5),
+            ))
+            .request_acceptance()
+            .unwrap();
+        let started = core.handle(CoreEvent::describe_request(
+            EventSequence::new(4).unwrap(),
+            OperationId::new(2).unwrap(),
+            accepted.id(),
+            ordinary_request(6),
+            MonotonicTime::from_micros(4),
+        ));
+        assert_eq!(
+            (
+                started.outcome(),
+                started.effects().len(),
+                started.effects().get(0).unwrap().request_description(),
+                started.work()
+            ),
+            (
+                &CoreOutcome::Accepted,
+                1,
+                Some(accepted.id()),
+                HotPathWorkWitness::new([83, 689, 0, 1, 33])
+            )
+        );
+        let facts = description_facts();
+        let result = core
+            .request_description_input()
+            .unwrap()
+            .bound_result(facts);
+        let mut wrong = result;
+        wrong.backend = BackendGeneration::new(2).unwrap();
+        let rejected = core.handle(CoreEvent::request_description_result(
+            EventSequence::new(5).unwrap(),
+            OperationId::new(2).unwrap(),
+            wrong,
+        ));
+        assert_eq!(
+            (rejected.outcome(), core.pending_description.is_some()),
+            (
+                &CoreOutcome::Rejected(DomainRejection::RequestDescriptionResultMismatch),
+                true
+            )
+        );
+        let mut incomplete = result;
+        incomplete.facts.requirements = BoundedVec::new();
+        let rejected = core.handle(CoreEvent::request_description_result(
+            EventSequence::new(6).unwrap(),
+            OperationId::new(2).unwrap(),
+            incomplete,
+        ));
+        assert_eq!(
+            (rejected.outcome(), core.pending_description.is_some()),
+            (
+                &CoreOutcome::Rejected(DomainRejection::RequestDescriptionResultMismatch),
+                true
+            )
+        );
+        let other = RegistrationIntent {
+            model: ModelId::new(2).unwrap(),
+            revision: ModelRevisionId::new([4; 32]).unwrap(),
+            manifest: ModelManifestId::new([5; 32]).unwrap(),
+            ..registration(HASH)
+        };
+        install_revision(&mut core, other);
+        let (predecessor, ids) = reserve_descriptions::<4, 1>(
+            &mut core,
+            10,
+            [LifecycleReserveKind::PostObservationRequestDescription],
+        );
+        let invalidated = core.handle(CoreEvent::refresh_request_descriptions(
+            EventSequence::new(7).unwrap(),
+            predecessor,
+            MonotonicTime::from_micros(6),
+            ids,
+            LifecycleTriggerResult::ObservationDescriptionsRequired,
+            Some(BackendGeneration::new(2).unwrap()),
+            None,
+        ));
+        assert_eq!(
+            (invalidated.outcome(), invalidated.effects().len()),
+            (&CoreOutcome::Accepted, 0)
+        );
+        core.work_budget =
+            HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 321, 0, 2, 2_100]))
+                .unwrap();
+        let underfunded = core.handle(CoreEvent::request_description_result(
+            EventSequence::new(8).unwrap(),
+            OperationId::new(2).unwrap(),
+            result,
+        ));
+        assert_eq!(
+            (
+                underfunded.outcome(),
+                underfunded.work(),
+                core.pending_description.is_some(),
+                core.requests
+                    .as_ref()
+                    .unwrap()
+                    .description_facts(
+                        accepted.id(),
+                        &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())
+                    )
+                    .unwrap()
+            ),
+            (
+                &CoreOutcome::Rejected(DomainRejection::HotPathWorkBudget(
+                    WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 321, 27_872)
+                )),
+                HotPathWorkWitness::new([6, 0, 0, 0, 30]),
+                true,
+                None
+            )
+        );
+        core.work_budget = HotPathWorkBudget::binary_maximum();
+        let initial_completed = core.handle(CoreEvent::request_description_result(
+            EventSequence::new(9).unwrap(),
+            OperationId::new(2).unwrap(),
+            result,
+        ));
+        assert_eq!(
+            (
+                initial_completed.outcome(),
+                initial_completed.effects().len(),
+                initial_completed.request_acceptance(),
+                initial_completed.work()
+            ),
+            (
+                &CoreOutcome::Accepted,
+                0,
+                None,
+                HotPathWorkWitness::new([8, 28_049, 0, 0, 35])
+            )
+        );
+        let refreshed = core.handle(CoreEvent::drive_request_description(
+            EventSequence::new(10).unwrap(),
+            OperationId::new(3).unwrap(),
+            MonotonicTime::from_micros(7),
+        ));
+        assert_eq!(
+            (
+                invalidated.work(),
+                refreshed.outcome(),
+                refreshed.effects().get(0).unwrap().request_description(),
+                refreshed.work()
+            ),
+            (
+                HotPathWorkWitness::new([7, 353, 0, 0, 6]),
+                &CoreOutcome::Accepted,
+                Some(accepted.id()),
+                HotPathWorkWitness::new([9, 566, 0, 1, 17])
+            )
+        );
+        let result = core
+            .request_description_input()
+            .unwrap()
+            .bound_result(facts);
+        let completed = core.handle(CoreEvent::request_description_result(
+            EventSequence::new(11).unwrap(),
+            OperationId::new(3).unwrap(),
+            result,
+        ));
+        assert_eq!(
+            (
+                completed.outcome(),
+                completed.effects().len(),
+                completed.request_acceptance(),
+                completed.work()
+            ),
+            (
+                &CoreOutcome::Accepted,
+                0,
+                None,
+                HotPathWorkWitness::new([9, 28_049, 0, 0, 35])
+            )
+        );
     }
     #[rustfmt::skip] #[test]
     fn post_load_refresh_is_stable_and_defers_unrelated_warming() {
