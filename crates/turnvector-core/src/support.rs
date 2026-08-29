@@ -1482,9 +1482,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     pub(crate) fn prepare_withdraw<'work>(
         &self,
         entitlement: FutureTurnSupportEntitlementId,
+        expected_request_owner: RequestId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedWithdrawal<'work, H>, SupportLedgerError> {
-        work.charge(bundle_target_work::<H>(1_296)?)?;
+        work.charge(bundle_target_work::<H>(1_344)?)?;
         self.generation
             .next()
             .map_err(|_| SupportLedgerError::Generation)?;
@@ -1508,6 +1509,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             work,
             nonce: self.instance_nonce,
             snapshot: self.capacity_snapshot(),
+            expected_request_owner,
             record_index,
             leaves,
             record,
@@ -1537,15 +1539,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         if change.nonce != self.instance_nonce
             || change.snapshot != self.capacity_snapshot()
             || self.bundles.get_record(change.record_index) != Some(&change.record)
-            || change.record.state != BundleState::LivePristine
-            || change.record.linked_claims != 0
-            || !change.record.initial.iter().all(|item| {
-                item.state == Conditional && item.state_time == MonotonicTime::from_micros(0)
-            })
         {
             return Err(stale);
         }
-        if !change.record.complete_semantic_envelope_is_valid(true) {
+        if !terminal_semantic_envelope_is_valid(
+            &change.record,
+            change.expected_request_owner,
+            TerminalValidationMode::WithdrawPristine,
+        ) {
             return Err(SupportLedgerError::InvalidTransition);
         }
         for (slot, key) in change.leaves.iter_mut().zip(change.record.tagged_keys()) {
@@ -1567,9 +1568,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     pub(crate) fn prepare_tombstone<'work>(
         &self,
         entitlement: FutureTurnSupportEntitlementId,
+        expected_request_owner: RequestId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedTombstone<'work, H>, SupportLedgerError> {
-        work.charge(bundle_target_work::<H>(1_248)?)?;
+        work.charge(bundle_target_work::<H>(1_296)?)?;
         self.generation
             .next()
             .map_err(|_| SupportLedgerError::Generation)?;
@@ -1591,6 +1593,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             work,
             nonce: self.instance_nonce,
             snapshot: self.capacity_snapshot(),
+            expected_request_owner,
             record_index,
             record,
         })
@@ -1606,14 +1609,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         if change.nonce != self.instance_nonce
             || change.snapshot != self.capacity_snapshot()
             || self.bundles.get_record(change.record_index) != Some(&change.record)
-            || !matches!(
-                change.record.state,
-                BundleState::LivePristine | BundleState::LiveConsumed
-            )
         {
             return Err(stale);
         }
-        if !change.record.complete_semantic_envelope_is_valid(false) {
+        if !terminal_semantic_envelope_is_valid(
+            &change.record,
+            change.expected_request_owner,
+            TerminalValidationMode::RetainTombstone,
+        ) {
             return Err(SupportLedgerError::InvalidTransition);
         }
         for key in change.record.tagged_keys() {
@@ -1990,11 +1993,11 @@ fn withdraw_remainder_work<const H: usize>(
     let visits = snapshot
         .checked_add(key_routes.checked_mul(2).ok_or(invalid)?)
         .and_then(|value| value.checked_add(v.checked_mul(3)?))
-        .and_then(|value| value.checked_add(K as u64 + b + 10))
+        .and_then(|value| value.checked_add(K as u64 + b + 17))
         .ok_or(invalid)?;
     let copied = h
         .checked_mul(336)
-        .and_then(|value| value.checked_add(1_312))
+        .and_then(|value| value.checked_add(1_360))
         .and_then(|value| value.checked_add(bundle_mutation_bytes(v, b)?))
         .ok_or(invalid)?;
     let checks = snapshot
@@ -2002,7 +2005,7 @@ fn withdraw_remainder_work<const H: usize>(
         .and_then(|value| value.checked_add((K as u64).checked_mul(u64::from(IDENTITY_BITS) + 4)?))
         .and_then(|value| value.checked_add(v.checked_mul(7)?))
         .and_then(|value| value.checked_add(3 * (K as u64 + b)))
-        .and_then(|value| value.checked_add(30))
+        .and_then(|value| value.checked_add(86))
         .ok_or(invalid)?;
     Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
 }
@@ -2021,17 +2024,17 @@ fn tombstone_remainder_work<const H: usize>(
         .ok_or(invalid)?;
     let visits = snapshot
         .checked_add(key_routes)
-        .and_then(|value| value.checked_add(v + 10))
+        .and_then(|value| value.checked_add(v + 17))
         .ok_or(invalid)?;
     let copied = h
         .checked_mul(336)
-        .and_then(|value| value.checked_add(1_273))
+        .and_then(|value| value.checked_add(1_321))
         .ok_or(invalid)?;
     let checks = snapshot
         .checked_add(2)
         .and_then(|value| value.checked_add((K as u64).checked_mul(u64::from(IDENTITY_BITS) + 4)?))
         .and_then(|value| value.checked_add(v.checked_mul(6)?))
-        .and_then(|value| value.checked_add(30))
+        .and_then(|value| value.checked_add(89))
         .ok_or(invalid)?;
     Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
 }
@@ -2255,6 +2258,7 @@ pub(crate) struct PreparedWithdrawal<'work, const H: usize> {
     work: &'work mut WorkMeter,
     nonce: u64,
     snapshot: SupportCapacitySnapshot<H>,
+    expected_request_owner: RequestId,
     record_index: u32,
     leaves: [u32; K],
     record: BundleRecord,
@@ -2293,6 +2297,7 @@ pub(crate) struct PreparedTombstone<'work, const H: usize> {
     work: &'work mut WorkMeter,
     nonce: u64,
     snapshot: SupportCapacitySnapshot<H>,
+    expected_request_owner: RequestId,
     record_index: u32,
     record: BundleRecord,
 }
@@ -3372,58 +3377,73 @@ struct BundleRecord {
     linked_claims: u32,
     state: BundleState,
 }
-impl BundleRecord {
-    fn complete_semantic_envelope_is_valid(&self, pristine: bool) -> bool {
-        let ordered =
-            |identities: [[u8; 32]; 3]| identities.windows(2).all(|pair| pair[0] < pair[1]);
-        let initial_is_valid = self.initial.into_iter().enumerate().all(|(ordinal, item)| {
-            initial_semantic_envelope_is_valid(self.state, ordinal as u8, item)
-        });
-        let identities_are_ordered = ordered(self.initial.map(|item| item.obligation.get()))
-            && ordered(self.initial.map(|item| item.credit.get()))
-            && ordered(self.initial.map(|item| item.claim.get()));
-        let branch_shapes = [
-            SupportOperation::ObserveTurnReceipt,
-            SupportOperation::FormCandidates,
-            SupportOperation::FormCandidates,
-            SupportOperation::FormCandidates,
-        ];
-        let branches_are_valid =
-            self.branches
-                .into_iter()
-                .zip(branch_shapes)
-                .all(|(branch, operation)| {
-                    branch.operation == operation
-                        && branch.pool == MandatoryCompletion
-                        && branch.input_bucket.get() != 0
-                        && branch.prospective_bound.as_micros() != 0
-                        && branch.operation as usize * POOLS + (branch.pool as usize) < 21
-                });
-        let fixed_identities_are_valid = self.timing_commitment.get() != [0; 32]
-            && self.request_closure.get() != [0; 32]
-            && self.support_budget.get() != [0; 32]
-            && self.bound_set.get() != [0; 32]
-            && self.entitlement.get() != [0; 32]
-            && self.vector.get() != [0; 32];
-        let terminal_state_is_valid = if pristine {
-            self.state == BundleState::LivePristine
-                && self.linked_claims == 0
-                && self.initial.iter().all(|item| {
-                    item.state == Conditional && item.state_time == MonotonicTime::from_micros(0)
-                })
-        } else {
-            matches!(
-                self.state,
-                BundleState::LivePristine | BundleState::LiveConsumed
-            )
-        };
-        initial_is_valid
-            && identities_are_ordered
-            && branches_are_valid
-            && fixed_identities_are_valid
-            && terminal_state_is_valid
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalValidationMode {
+    WithdrawPristine,
+    RetainTombstone,
+}
+fn terminal_semantic_envelope_is_valid(
+    record: &BundleRecord,
+    expected_request_owner: RequestId,
+    mode: TerminalValidationMode,
+) -> bool {
+    if record.request_owner != expected_request_owner {
+        return false;
     }
-
+    let ordered = |identities: [[u8; 32]; 3]| identities.windows(2).all(|pair| pair[0] < pair[1]);
+    let initial_is_valid = record
+        .initial
+        .into_iter()
+        .enumerate()
+        .all(|(ordinal, item)| {
+            initial_semantic_envelope_is_valid(record.state, ordinal as u8, item)
+        });
+    let identities_are_ordered = ordered(record.initial.map(|item| item.obligation.get()))
+        && ordered(record.initial.map(|item| item.credit.get()))
+        && ordered(record.initial.map(|item| item.claim.get()));
+    let branch_shapes = [
+        SupportOperation::ObserveTurnReceipt,
+        SupportOperation::FormCandidates,
+        SupportOperation::FormCandidates,
+        SupportOperation::FormCandidates,
+    ];
+    let branches_are_valid =
+        record
+            .branches
+            .into_iter()
+            .zip(branch_shapes)
+            .all(|(branch, operation)| {
+                branch.operation == operation
+                    && branch.pool == MandatoryCompletion
+                    && branch.input_bucket.get() != 0
+                    && branch.prospective_bound.as_micros() != 0
+                    && branch.operation as usize * POOLS + (branch.pool as usize) < 21
+            });
+    let fixed_identities_are_valid = record.timing_commitment.get() != [0; 32]
+        && record.request_closure.get() != [0; 32]
+        && record.support_budget.get() != [0; 32]
+        && record.bound_set.get() != [0; 32]
+        && record.entitlement.get() != [0; 32]
+        && record.vector.get() != [0; 32];
+    let terminal_state_is_valid = if mode == TerminalValidationMode::WithdrawPristine {
+        record.state == BundleState::LivePristine
+            && record.linked_claims == 0
+            && record.initial.iter().all(|item| {
+                item.state == Conditional && item.state_time == MonotonicTime::from_micros(0)
+            })
+    } else {
+        matches!(
+            record.state,
+            BundleState::LivePristine | BundleState::LiveConsumed
+        )
+    };
+    initial_is_valid
+        && identities_are_ordered
+        && branches_are_valid
+        && fixed_identities_are_valid
+        && terminal_state_is_valid
+}
+impl BundleRecord {
     fn from_input(input: &RequestSupportBundleInput<'_>, vector_len: u32) -> Self {
         Self {
             initial: input
@@ -4124,7 +4144,7 @@ mod tests {
         stable(&ledger);
         let mut meter = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut meter)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         stable(&ledger);
@@ -4807,6 +4827,13 @@ mod tests {
         );
     }
 
+    fn request_owner(n: u8) -> RequestId {
+        RequestId::new(
+            crate::DaemonInstanceId::new(u128::from(n)).unwrap(),
+            crate::ConnectionId::new(1).unwrap(),
+            crate::RequestSequence::new(1).unwrap(),
+        )
+    }
     /// Test-only complete bundle input over `n`-derived canonical identities.
     fn bundle_input<'a>(
         n: u8,
@@ -4836,11 +4863,7 @@ mod tests {
             prospective_bound: Duration::from_micros(u64::from(offset)),
         };
         RequestSupportBundleInput {
-            request_owner: RequestId::new(
-                crate::DaemonInstanceId::new(u128::from(n)).unwrap(),
-                crate::ConnectionId::new(1).unwrap(),
-                crate::RequestSequence::new(1).unwrap(),
-            ),
+            request_owner: request_owner(n),
             timing: SupportTimingFacts {
                 timing_commitment: TimingCommitmentId::new(identity(70)).unwrap(),
                 request_closure: RequestClosureId::new(identity(71)).unwrap(),
@@ -4980,11 +5003,11 @@ mod tests {
         ledger.generation = SupportLedgerGeneration::new(u64::MAX).unwrap();
         let before = bundle_snapshot(&ledger);
         assert!(matches!(
-            ledger.prepare_withdraw(bundle_entitlement(1), &mut work()),
+            ledger.prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut work()),
             Err(SupportLedgerError::Generation)
         ));
         assert!(matches!(
-            ledger.prepare_tombstone(bundle_entitlement(1), &mut work()),
+            ledger.prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut work()),
             Err(SupportLedgerError::Generation)
         ));
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -5041,10 +5064,10 @@ mod tests {
         assert_eq!(change.record.support_budget, input.timing.support_budget);
         assert_eq!(change.record.bound_set, input.timing.bound_set);
         assert_eq!(change.record.linked_claims, 0);
-        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 1>>(), 1_584);
+        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 1>>(), 1_632);
         assert_eq!(
             std::mem::size_of::<ValidatedTombstone<'static, 'static, 64, 64, 1>>(),
-            1_600
+            1_648
         );
         assert_eq!(std::mem::size_of::<BundleRecord>(), 1_008);
         assert_eq!(
@@ -5070,38 +5093,62 @@ mod tests {
     #[test]
     fn c16_terminal_phase_formulas_and_layouts_are_exact() {
         assert_eq!(
+            bundle_target_work::<8>(1_344).unwrap(),
+            witness([267, 4_032, 0, 0, 274])
+        );
+        assert_eq!(
+            withdraw_remainder_work::<8>(168, 11).unwrap(),
+            witness([6_776, 14_240, 0, 0, 4_659])
+        );
+        assert_eq!(
             bundle_target_work::<8>(1_296).unwrap(),
             witness([267, 3_984, 0, 0, 274])
         );
         assert_eq!(
-            withdraw_remainder_work::<8>(168, 11).unwrap(),
-            witness([6_769, 14_192, 0, 0, 4_603])
-        );
-        assert_eq!(
-            bundle_target_work::<8>(1_248).unwrap(),
-            witness([267, 3_936, 0, 0, 274])
-        );
-        assert_eq!(
             tombstone_remainder_work::<8>(168).unwrap(),
-            witness([3_485, 3_961, 0, 0, 4_369])
+            witness([3_492, 4_009, 0, 0, 4_428])
         );
-        assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 8>>(), 3_984);
+        assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 8>>(), 4_032);
         assert_eq!(
             std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 8>>(),
-            4_000
+            4_048
         );
-        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 8>>(), 3_936);
+        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 8>>(), 3_984);
         assert_eq!(
             std::mem::size_of::<ValidatedTombstone<'static, 'static, 12, 12, 8>>(),
-            3_952
+            4_000
+        );
+        assert_eq!(
+            bundle_target_work::<3>(1_344).unwrap(),
+            witness([267, 2_352, 0, 0, 274])
+        );
+        assert_eq!(
+            withdraw_remainder_work::<3>(1, 10).unwrap(),
+            witness([6_064, 3_856, 0, 0, 3_277])
+        );
+        assert_eq!(
+            withdraw_remainder_work::<3>(6, 11).unwrap(),
+            witness([6_080, 4_136, 0, 0, 3_315])
+        );
+        assert_eq!(
+            bundle_target_work::<3>(1_296).unwrap(),
+            witness([267, 2_304, 0, 0, 274])
+        );
+        assert_eq!(
+            tombstone_remainder_work::<3>(1).unwrap(),
+            witness([3_115, 2_329, 0, 0, 3_216])
+        );
+        assert_eq!(
+            tombstone_remainder_work::<3>(6).unwrap(),
+            witness([3_120, 2_329, 0, 0, 3_246])
         );
     }
 
     #[test]
     fn c16_terminal_phase_charges_are_atomic_one_under() {
         for (prepared, target) in [
+            (1_344, bundle_target_work::<1>(1_344).unwrap()),
             (1_296, bundle_target_work::<1>(1_296).unwrap()),
-            (1_248, bundle_target_work::<1>(1_248).unwrap()),
         ] {
             for (dimension, maximum) in [
                 (WorkDimension::VisitedEntities, 1_704_575),
@@ -5113,13 +5160,13 @@ mod tests {
                 let entry = maximum - target.value(dimension) + 1;
                 meter.record(dimension, entry).unwrap();
                 let before = meter.witness();
-                let result = if prepared == 1_296 {
+                let result = if prepared == 1_344 {
                     ledger
-                        .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                        .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
                         .map(|_| ())
                 } else {
                     ledger
-                        .prepare_tombstone(bundle_entitlement(1), &mut meter)
+                        .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
                         .map(|_| ())
                 };
                 assert_eq!(
@@ -5141,7 +5188,7 @@ mod tests {
                 let mut ledger = bundle_ledger(4, 8);
                 reserve_bundle(&mut ledger, 1, 3);
                 let target =
-                    bundle_target_work::<1>(if tombstone { 1_248 } else { 1_296 }).unwrap();
+                    bundle_target_work::<1>(if tombstone { 1_296 } else { 1_344 }).unwrap();
                 let remainder = if tombstone {
                     tombstone_remainder_work::<1>(3).unwrap()
                 } else {
@@ -5152,14 +5199,14 @@ mod tests {
                 meter.record(dimension, entry).unwrap();
                 if tombstone {
                     let change = ledger
-                        .prepare_tombstone(bundle_entitlement(1), &mut meter)
+                        .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
                         .unwrap();
                     let after_target = change.work.witness();
                     assert!(ledger.validate_tombstone(change).is_err());
                     assert_eq!(meter.witness(), after_target);
                 } else {
                     let change = ledger
-                        .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                        .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
                         .unwrap();
                     let after_target = change.work.witness();
                     assert!(ledger.validate_withdraw(change).is_err());
@@ -6036,7 +6083,7 @@ mod tests {
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(n), &mut meter)
+            .prepare_tombstone(bundle_entitlement(n), request_owner(n), &mut meter)
             .unwrap();
         ledger
             .validate_tombstone(change)
@@ -6050,7 +6097,7 @@ mod tests {
         let before = bundle_snapshot(&ledger);
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
             .unwrap();
         ledger.validate_tombstone(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -6059,7 +6106,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
             .unwrap();
         add(&mut ledger, 9, 9).unwrap();
         assert_eq!(
@@ -6075,23 +6122,23 @@ mod tests {
         let before = ledger.generation();
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
             .unwrap();
         assert_eq!(
             change.work.witness(),
-            HotPathWorkWitness::new([267, 1_632, 0, 0, 274])
+            HotPathWorkWitness::new([267, 1_680, 0, 0, 274])
         );
         let validated = ledger
             .validate_withdraw(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([6_246, 4_872, 0, 0, 3_425])
+            HotPathWorkWitness::new([6_253, 4_968, 0, 0, 3_481])
         );
-        assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_632);
+        assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_680);
         assert_eq!(
             std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 1>>(),
-            1_648
+            1_696
         );
         let next = validated.commit_withdraw();
         assert_eq!(next, before.next().unwrap());
@@ -6124,7 +6171,7 @@ mod tests {
         let first = reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let reused = reserve_bundle(&mut ledger, 1, 3);
@@ -6139,7 +6186,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
             .unwrap();
         add(&mut ledger, 9, 9).unwrap();
         assert_eq!(
@@ -6151,7 +6198,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let before = bundle_snapshot(&ledger);
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
             .unwrap();
         ledger.validate_withdraw(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -6160,6 +6207,7 @@ mod tests {
             ledger
                 .prepare_withdraw(
                     FutureTurnSupportEntitlementId::new([200; 32]).unwrap(),
+                    request_owner(1),
                     &mut measured,
                 )
                 .unwrap_err(),
@@ -6176,20 +6224,24 @@ mod tests {
             "tombstone retains every logical and vector delta"
         );
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
             .unwrap();
         assert_eq!(
             ledger.validate_withdraw(change).unwrap_err(),
-            SupportLedgerError::Generation
+            SupportLedgerError::InvalidTransition
         );
         // Double close rejects during the remainder validation phase.
         let mut tombstone_meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), &mut tombstone_meter)
+            .prepare_tombstone(
+                bundle_entitlement(1),
+                request_owner(1),
+                &mut tombstone_meter,
+            )
             .unwrap();
         assert_eq!(
             ledger.validate_tombstone(change).unwrap_err(),
-            SupportLedgerError::Generation
+            SupportLedgerError::InvalidTransition
         );
         // The tombstone keeps every identity and cell occupied.
         assert_eq!(ledger.bundles.free_record_len(), 3);
@@ -6215,7 +6267,7 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut measured = work();
         let change = ledger
-            .prepare_withdraw(bundle_entitlement(1), &mut measured)
+            .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut measured)
             .unwrap();
         ledger.validate_withdraw(change).unwrap().commit_withdraw();
         let tombstone = reserve_bundle(&mut ledger, 2, 3);
@@ -6232,6 +6284,36 @@ mod tests {
             BundleState::RetainedTombstone
         );
     }
+    #[test]
+    fn c16_terminal_validation_binds_authoritative_request_owner() {
+        for tombstone in [false, true] {
+            let mut ledger = bundle_ledger(4, 8);
+            reserve_bundle(&mut ledger, 1, 3);
+            let before = bundle_snapshot(&ledger);
+            let target = bundle_target_work::<1>(if tombstone { 1_296 } else { 1_344 }).unwrap();
+            let remainder = if tombstone {
+                tombstone_remainder_work::<1>(3).unwrap()
+            } else {
+                withdraw_remainder_work::<1>(3, K - 1).unwrap()
+            };
+            let mut meter = work();
+            let error = if tombstone {
+                let change = ledger
+                    .prepare_tombstone(bundle_entitlement(1), request_owner(2), &mut meter)
+                    .unwrap();
+                ledger.validate_tombstone(change).unwrap_err()
+            } else {
+                let change = ledger
+                    .prepare_withdraw(bundle_entitlement(1), request_owner(2), &mut meter)
+                    .unwrap();
+                ledger.validate_withdraw(change).unwrap_err()
+            };
+            assert_eq!(error, SupportLedgerError::InvalidTransition);
+            assert_eq!(meter.witness(), target.checked_add(remainder).unwrap());
+            assert_eq!(bundle_snapshot(&ledger), before);
+        }
+    }
+
     #[test]
     fn c16_terminal_validation_rejects_complete_semantic_corruption_matrix() {
         let corrupt = |record: &mut BundleRecord, corruption: usize| match corruption {
@@ -6275,22 +6357,18 @@ mod tests {
                 let before_reserved = ledger.reserved;
                 let before_vector_usage = ledger.vector_usage;
                 let target =
-                    bundle_target_work::<1>(if tombstone { 1_248 } else { 1_296 }).unwrap();
+                    bundle_target_work::<1>(if tombstone { 1_296 } else { 1_344 }).unwrap();
                 let remainder = if tombstone {
                     tombstone_remainder_work::<1>(3).unwrap()
                 } else {
                     withdraw_remainder_work::<1>(3, K - 1).unwrap()
                 };
                 let expected_work = target.checked_add(remainder).unwrap();
-                let expected_error = if !tombstone && matches!(corruption, 11 | 12) {
-                    SupportLedgerError::Generation
-                } else {
-                    SupportLedgerError::InvalidTransition
-                };
+                let expected_error = SupportLedgerError::InvalidTransition;
                 let mut meter = work();
                 let error = if tombstone {
                     let change = ledger
-                        .prepare_tombstone(bundle_entitlement(1), &mut meter)
+                        .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
                         .unwrap();
                     ledger
                         .validate_tombstone(change)
@@ -6298,7 +6376,7 @@ mod tests {
                         .unwrap_or_else(|| panic!("accepted tombstone corruption {corruption}"))
                 } else {
                     let change = ledger
-                        .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                        .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
                         .unwrap();
                     ledger
                         .validate_withdraw(change)
@@ -6337,13 +6415,13 @@ mod tests {
         let reject = |ledger: &mut Ledger| {
             let before = bundle_snapshot(ledger);
             let len = ledger.bundles.get_record(0).unwrap().vector_len as usize;
-            let expected = bundle_target_work::<1>(1_296)
+            let expected = bundle_target_work::<1>(1_344)
                 .unwrap()
                 .checked_add(withdraw_remainder_work::<1>(len, K - 1).unwrap())
                 .unwrap();
             let mut meter = work();
             let change = ledger
-                .prepare_withdraw(bundle_entitlement(1), &mut meter)
+                .prepare_withdraw(bundle_entitlement(1), request_owner(1), &mut meter)
                 .unwrap();
             assert!(ledger.validate_withdraw(change).is_err());
             assert_eq!(
@@ -6456,7 +6534,7 @@ mod tests {
         };
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(bundle_entitlement(1), request_owner(1), &mut meter)
             .unwrap();
         assert!(ledger.validate_tombstone(change).is_err());
     }
@@ -7241,7 +7319,7 @@ mod tests {
             let before = bundle_snapshot(ledger);
             assert_eq!(
                 ledger
-                    .prepare_withdraw(entitlement, &mut work())
+                    .prepare_withdraw(entitlement, request_owner(1), &mut work())
                     .unwrap_err(),
                 SupportLedgerError::Storage(FixedStorageError::NonCanonical)
             );
