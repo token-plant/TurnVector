@@ -860,6 +860,33 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         self.generation = next;
         Ok(next)
     }
+    #[allow(dead_code, reason = "C17 consumes the closed C16 claim lookup")]
+    fn find_initial_claim_precharged(
+        &self,
+        claim: AdmissionInitialClaimId,
+        expected_owner: RequestId,
+    ) -> Result<(u32, u8), SupportLedgerError> {
+        let invalid = SupportLedgerError::InvalidTransition;
+        let (leaf, owner) = self
+            .bundles
+            .route_precharged(TAG_ADMISSION_CLAIM, &claim.get())?;
+        let record_index = owner.ok_or(invalid)?;
+        let (leaf_owner, key_ordinal) = self
+            .bundles
+            .identities
+            .leaf(leaf)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        let ordinal = key_ordinal.checked_sub(6).filter(|ordinal| *ordinal < 3);
+        let ordinal = ordinal.ok_or(FixedStorageError::NonCanonical)?;
+        let record = self.bundles.get_record(record_index).ok_or(invalid)?;
+        if leaf_owner != record_index
+            || record.request_owner != expected_owner
+            || record.initial[usize::from(ordinal)].claim != claim
+        {
+            return Err(invalid);
+        }
+        Ok((record_index, ordinal))
+    }
     fn find_obligation(
         &self,
         id: SupportOperationObligationId,
@@ -5206,6 +5233,71 @@ mod tests {
         );
         assert_eq!(missing.witness(), witness([274, 65, 0, 0, 286]));
         assert_eq!(bundle_snapshot(&ledger), snapshot);
+    }
+
+    #[test]
+    fn c16_initial_claim_lookup_binds_request_owner_and_compact_leaf() {
+        let facts = bundle_input(1, &[]);
+        let claims = facts.initial.values().map(|requirement| requirement.claim);
+        let owner = facts.request_owner;
+        let wrong_owner = bundle_input(2, &[]).request_owner;
+        let make = || {
+            let mut ledger = bundle_ledger(4, 8);
+            reserve_bundle(&mut ledger, 1, 3);
+            ledger
+        };
+
+        let ledger = make();
+        for (ordinal, claim) in claims.into_iter().enumerate() {
+            assert_eq!(
+                ledger.find_initial_claim_precharged(claim, owner),
+                Ok((0, ordinal as u8))
+            );
+        }
+        let before = bundle_snapshot(&ledger);
+        assert_eq!(
+            ledger.find_initial_claim_precharged(claims[0], wrong_owner),
+            Err(SupportLedgerError::InvalidTransition)
+        );
+        assert_eq!(bundle_snapshot(&ledger), before);
+
+        let mut ledger = make();
+        let (leaf, _) = ledger
+            .bundles
+            .route_precharged(TAG_ADMISSION_CLAIM, &claims[0].get())
+            .unwrap();
+        ledger.bundles.identities.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record: u32::MAX,
+            key_ordinal: 6,
+        };
+        assert_eq!(
+            ledger.find_initial_claim_precharged(claims[0], owner),
+            Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+        );
+
+        let mut ledger = make();
+        let (leaf, _) = ledger
+            .bundles
+            .route_precharged(TAG_ADMISSION_CLAIM, &claims[0].get())
+            .unwrap();
+        ledger.bundles.identities.leaf_slots[leaf as usize] = LeafSlot::Occupied {
+            owner_record: 0,
+            key_ordinal: K as u8,
+        };
+        assert_eq!(
+            ledger.find_initial_claim_precharged(claims[0], owner),
+            Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+        );
+
+        let mut ledger = make();
+        let RecordSlot::Occupied(record) = &mut ledger.bundles.records[0] else {
+            unreachable!("fixture bundle occupies record zero")
+        };
+        record.initial[0].claim = AdmissionInitialClaimId::new([201; 32]).unwrap();
+        assert_eq!(
+            ledger.find_initial_claim_precharged(claims[0], owner),
+            Err(SupportLedgerError::InvalidTransition)
+        );
     }
 
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
