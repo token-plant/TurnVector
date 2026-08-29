@@ -80,6 +80,24 @@ impl WorkMeter {
         self.1.0[dimension as usize] = attempted;
         Ok(())
     }
+    #[allow(
+        dead_code,
+        reason = "C16 transaction phases atomically charge full witnesses"
+    )]
+    pub(crate) fn charge(&mut self, witness: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
+        let next = self.1.checked_add(witness)?;
+        for dimension in DIMENSIONS {
+            let attempted = next.value(dimension);
+            let maximum = self.0.0.value(dimension);
+            if attempted > maximum {
+                return Err(WorkBudgetError::BudgetExceeded(
+                    dimension, maximum, attempted,
+                ));
+            }
+        }
+        self.1 = next;
+        Ok(())
+    }
     pub(crate) fn ensure(&self, required: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
         for dimension in DIMENSIONS {
             let current = self.1.value(dimension);
@@ -97,5 +115,49 @@ impl WorkMeter {
     }
     pub const fn witness(&self) -> HotPathWorkWitness {
         self.1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_witness_charge_is_atomic_and_reports_the_complete_attempt() {
+        let mut meter = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        meter
+            .record(WorkDimension::VisitedEntities, 1_704_575)
+            .unwrap();
+        let before = meter.witness();
+        assert_eq!(
+            meter.charge(HotPathWorkWitness::new([75, 366, 0, 0, 20])),
+            Err(WorkBudgetError::BudgetExceeded(
+                WorkDimension::VisitedEntities,
+                1_704_575,
+                1_704_650,
+            ))
+        );
+        assert_eq!(meter.witness(), before);
+    }
+
+    #[test]
+    fn full_witness_charge_assigns_once_and_overflow_is_atomic() {
+        let mut meter = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        let witness = HotPathWorkWitness::new([75, 366, 0, 0, 20]);
+        meter.charge(witness).unwrap();
+        assert_eq!(meter.witness(), witness);
+
+        let mut overflow = WorkMeter(
+            HotPathWorkBudget(HotPathWorkWitness::new([u64::MAX; 5])),
+            HotPathWorkWitness::new([u64::MAX, 1, 2, 3, 4]),
+        );
+        let before = overflow.witness();
+        assert_eq!(
+            overflow.charge(HotPathWorkWitness::new([1, 1, 1, 1, 1])),
+            Err(WorkBudgetError::CounterOverflow(
+                WorkDimension::VisitedEntities
+            ))
+        );
+        assert_eq!(overflow.witness(), before);
     }
 }

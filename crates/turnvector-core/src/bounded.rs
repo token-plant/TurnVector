@@ -375,6 +375,9 @@ fn reserved_index<T>(capacity: usize) -> Result<Vec<T>, FixedIndexError> {
     values
         .try_reserve_exact(capacity)
         .map_err(|_| FixedIndexError::Allocation)?;
+    if values.capacity() != capacity {
+        return Err(FixedIndexError::Capacity);
+    }
     Ok(values)
 }
 
@@ -401,6 +404,206 @@ fn first_difference(left: &[u8; 33], right: &[u8; 33]) -> (u16, u64) {
         }
     }
     unreachable!("distinct fixed identities have distinct bytes")
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AvlNode {
+    key: [u8; 33],
+    record: u32,
+    left: u32,
+    right: u32,
+    parent: u32,
+    height: u8,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AvlIndex {
+    nodes: Vec<AvlNode>,
+    root: u32,
+    capacity: usize,
+}
+
+impl AvlIndex {
+    fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
+        if capacity >= u32::MAX as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        Ok(Self {
+            nodes: reserved_index(capacity)?,
+            root: NO_NODE,
+            capacity,
+        })
+    }
+
+    pub(crate) fn height_bound(capacity: usize) -> Result<u8, FixedStorageError> {
+        let mut prior = 0usize;
+        let mut current = 1usize;
+        let mut height = 1u8;
+        while current <= capacity {
+            let next = 1usize
+                .checked_add(current)
+                .and_then(|value| value.checked_add(prior))
+                .ok_or(FixedStorageError::Capacity)?;
+            prior = current;
+            current = next;
+            height = height.checked_add(1).ok_or(FixedStorageError::Capacity)?;
+        }
+        Ok(height - 1)
+    }
+
+    fn find(&self, key: [u8; 33], work: &mut WorkMeter) -> Result<Option<u32>, FixedStorageError> {
+        let mut node = self.root;
+        while node != NO_NODE {
+            work.record(WorkDimension::VisitedEntities, 1)?;
+            let current = self
+                .nodes
+                .get(node as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            match key.cmp(&current.key) {
+                std::cmp::Ordering::Less => node = current.left,
+                std::cmp::Ordering::Greater => node = current.right,
+                std::cmp::Ordering::Equal => return Ok(Some(current.record)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_precharged(&self, key: [u8; 33]) -> Result<Option<u32>, FixedStorageError> {
+        let mut node = self.root;
+        while node != NO_NODE {
+            let current = self
+                .nodes
+                .get(node as usize)
+                .ok_or(FixedStorageError::NonCanonical)?;
+            match key.cmp(&current.key) {
+                std::cmp::Ordering::Less => node = current.left,
+                std::cmp::Ordering::Greater => node = current.right,
+                std::cmp::Ordering::Equal => return Ok(Some(current.record)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn insert_prevalidated(&mut self, key: [u8; 33], record: u32) {
+        let index = u32::try_from(self.nodes.len()).expect("constructor-bounded AVL index");
+        let mut parent = NO_NODE;
+        let mut node = self.root;
+        while node != NO_NODE {
+            parent = node;
+            let current = &self.nodes[node as usize];
+            node = if key < current.key {
+                current.left
+            } else {
+                current.right
+            };
+        }
+        self.nodes.push(AvlNode {
+            key,
+            record,
+            left: NO_NODE,
+            right: NO_NODE,
+            parent,
+            height: 1,
+        });
+        if parent == NO_NODE {
+            self.root = index;
+            return;
+        }
+        if key < self.nodes[parent as usize].key {
+            self.nodes[parent as usize].left = index;
+        } else {
+            self.nodes[parent as usize].right = index;
+        }
+        self.rebalance_after_insert(parent);
+    }
+
+    fn height(&self, node: u32) -> u8 {
+        if node == NO_NODE {
+            0
+        } else {
+            self.nodes[node as usize].height
+        }
+    }
+
+    fn refresh(&mut self, node: u32) {
+        let value = self.nodes[node as usize];
+        self.nodes[node as usize].height =
+            1 + self.height(value.left).max(self.height(value.right));
+    }
+
+    fn balance(&self, node: u32) -> i16 {
+        let value = self.nodes[node as usize];
+        i16::from(self.height(value.left)) - i16::from(self.height(value.right))
+    }
+
+    fn rebalance_after_insert(&mut self, mut node: u32) {
+        while node != NO_NODE {
+            let old_height = self.nodes[node as usize].height;
+            self.refresh(node);
+            let balance = self.balance(node);
+            if balance == 2 {
+                let left = self.nodes[node as usize].left;
+                if self.balance(left) < 0 {
+                    self.rotate_left(left);
+                }
+                self.rotate_right(node);
+                break;
+            } else if balance == -2 {
+                let right = self.nodes[node as usize].right;
+                if self.balance(right) > 0 {
+                    self.rotate_right(right);
+                }
+                self.rotate_left(node);
+                break;
+            } else if self.nodes[node as usize].height == old_height {
+                break;
+            }
+            node = self.nodes[node as usize].parent;
+        }
+    }
+
+    fn rotate_left(&mut self, node: u32) -> u32 {
+        let promoted = self.nodes[node as usize].right;
+        let displaced = self.nodes[promoted as usize].left;
+        self.replace_parent(node, promoted);
+        self.nodes[promoted as usize].left = node;
+        self.nodes[node as usize].parent = promoted;
+        self.nodes[node as usize].right = displaced;
+        if displaced != NO_NODE {
+            self.nodes[displaced as usize].parent = node;
+        }
+        self.refresh(node);
+        self.refresh(promoted);
+        promoted
+    }
+
+    fn rotate_right(&mut self, node: u32) -> u32 {
+        let promoted = self.nodes[node as usize].left;
+        let displaced = self.nodes[promoted as usize].right;
+        self.replace_parent(node, promoted);
+        self.nodes[promoted as usize].right = node;
+        self.nodes[node as usize].parent = promoted;
+        self.nodes[node as usize].left = displaced;
+        if displaced != NO_NODE {
+            self.nodes[displaced as usize].parent = node;
+        }
+        self.refresh(node);
+        self.refresh(promoted);
+        promoted
+    }
+
+    fn replace_parent(&mut self, old: u32, new: u32) {
+        let parent = self.nodes[old as usize].parent;
+        self.nodes[new as usize].parent = parent;
+        if parent == NO_NODE {
+            self.root = new;
+        } else if self.nodes[parent as usize].left == old {
+            self.nodes[parent as usize].left = new;
+        } else {
+            self.nodes[parent as usize].right = new;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,7 +640,7 @@ pub struct FixedRecordArena<V, C, const KEYS: usize> {
     records: Vec<V>,
     claims: Vec<C>,
     claim_ends: Vec<u32>,
-    identities: FixedIdentityIndex<u32>,
+    identities: AvlIndex,
     record_capacity: usize,
     claim_capacity: usize,
 }
@@ -454,7 +657,7 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
             records: reserved_index(record_capacity)?,
             claims: reserved_index(claim_capacity)?,
             claim_ends: reserved_index(record_capacity)?,
-            identities: FixedIdentityIndex::try_new(
+            identities: AvlIndex::try_new(
                 record_capacity
                     .checked_mul(KEYS)
                     .ok_or(FixedStorageError::Capacity)?,
@@ -472,30 +675,62 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         work: &mut WorkMeter,
     ) -> Result<usize, FixedStorageError> {
         work.record(WorkDimension::InvariantChecks, 2)?;
+        self.validate_capacity(claims.len())?;
+        for key in keys {
+            work.record(WorkDimension::InvariantChecks, 1)?;
+            if self.identities.find(key, work)?.is_some() {
+                return Err(FixedStorageError::Duplicate);
+            }
+        }
+        let height = u64::from(AvlIndex::height_bound(self.identities.capacity)?);
+        let copied = size_of::<V>()
+            .checked_add(size_of::<u32>())
+            .and_then(|value| value.checked_add(size_of_val(claims)))
+            .and_then(|value| value.checked_add(KEYS.checked_mul(size_of::<AvlNode>())?))
+            .ok_or(FixedStorageError::Capacity)?;
+        work.charge(crate::HotPathWorkWitness::new([
+            KEYS as u64 * (4 * height + 17),
+            u64::try_from(copied).map_err(|_| FixedStorageError::Capacity)?,
+            0,
+            0,
+            0,
+        ]))?;
+        Ok(self.push_prevalidated(keys, record, claims))
+    }
+
+    pub(crate) fn validate_capacity(&self, claims: usize) -> Result<(), FixedStorageError> {
         if self.records.len() == self.record_capacity
             || self
                 .claims
                 .len()
-                .checked_add(claims.len())
+                .checked_add(claims)
                 .is_none_or(|end| end > self.claim_capacity)
+            || self
+                .identities
+                .nodes
+                .len()
+                .checked_add(KEYS)
+                .is_none_or(|end| end > self.identities.capacity)
         {
             return Err(FixedStorageError::Capacity);
         }
+        Ok(())
+    }
+
+    pub(crate) fn push_prevalidated(
+        &mut self,
+        keys: [[u8; 33]; KEYS],
+        record: V,
+        claims: &[C],
+    ) -> usize {
         let index = self.records.len();
-        let claim_start = self.claims.len();
-        let copied = size_of::<V>() + size_of::<u32>() + size_of_val(claims);
-        work.record(WorkDimension::CopiedBytes, copied as u64)?;
         self.records.push(record);
         self.claims.extend_from_slice(claims);
         self.claim_ends.push(self.claims.len() as u32);
-        let entries = keys.map(|key| (key, index as u32));
-        if let Err(error) = self.identities.try_insert_sorted(&entries, work) {
-            self.records.pop();
-            self.claims.truncate(claim_start);
-            self.claim_ends.pop();
-            return Err(error.into());
+        for key in keys {
+            self.identities.insert_prevalidated(key, index as u32);
         }
-        Ok(index)
+        index
     }
 
     pub fn find(
@@ -504,6 +739,20 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         work: &mut WorkMeter,
     ) -> Result<Option<usize>, FixedStorageError> {
         Ok(self.identities.find(key, work)?.map(|index| index as usize))
+    }
+
+    pub(crate) fn find_precharged(
+        &self,
+        key: [u8; 33],
+    ) -> Result<Option<usize>, FixedStorageError> {
+        Ok(self
+            .identities
+            .find_precharged(key)?
+            .map(|index| index as usize))
+    }
+
+    pub(crate) fn maximum_identity_height(&self) -> Result<u8, FixedStorageError> {
+        AvlIndex::height_bound(self.identities.capacity)
     }
 
     pub fn get(&self, index: usize) -> Option<&V> {
@@ -520,6 +769,31 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
             .checked_sub(1)
             .map_or(0, |prior| self.claim_ends[prior] as usize);
         Some(&self.claims[start..end])
+    }
+
+    pub(crate) fn backing_capacities(&self) -> [usize; 4] {
+        [
+            self.records.capacity(),
+            self.claims.capacity(),
+            self.claim_ends.capacity(),
+            self.identities.nodes.capacity(),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_facts(&self) -> [(usize, usize); 4] {
+        [
+            (self.records.as_ptr() as usize, self.records.capacity()),
+            (self.claims.as_ptr() as usize, self.claims.capacity()),
+            (
+                self.claim_ends.as_ptr() as usize,
+                self.claim_ends.capacity(),
+            ),
+            (
+                self.identities.nodes.as_ptr() as usize,
+                self.identities.nodes.capacity(),
+            ),
+        ]
     }
 
     pub fn len(&self) -> usize {
@@ -560,11 +834,23 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         }
         let mut history = std::array::from_fn(|_| VecDeque::new());
         for (queue, cell) in history.iter_mut().zip(&bounds) {
+            let capacity = cell[H - 1].1 as usize;
             queue
-                .try_reserve_exact(cell[H - 1].1 as usize)
+                .try_reserve_exact(capacity)
                 .map_err(|_| FixedStorageError::Allocation)?;
+            if queue.capacity() != capacity {
+                return Err(FixedStorageError::Capacity);
+            }
         }
         Ok(Self { bounds, history })
+    }
+
+    pub(crate) fn backing_capacities(&self) -> [usize; CELLS] {
+        self.history.each_ref().map(VecDeque::capacity)
+    }
+
+    pub(crate) fn bounds(&self, cell: usize) -> Option<&[FixedStartCountBound; H]> {
+        self.bounds.get(cell)
     }
 
     pub fn try_start(
@@ -611,6 +897,33 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
             WorkDimension::CopiedBytes,
             size_of::<MonotonicTime>() as u64,
         )?;
+        Ok(FixedWindowStart(cell, at))
+    }
+
+    pub(crate) fn prepare_start_precharged(
+        &self,
+        cell: usize,
+        at: MonotonicTime,
+    ) -> Result<FixedWindowStart, FixedStorageError> {
+        let (bounds, history) = self
+            .bounds
+            .get(cell)
+            .zip(self.history.get(cell))
+            .ok_or(FixedStorageError::Capacity)?;
+        if history.back().is_some_and(|prior| at < *prior) {
+            return Err(FixedStorageError::InvalidTime);
+        }
+        for bound in bounds {
+            if history.len() >= bound.1 as usize {
+                let prior = history[history.len() - bound.1 as usize];
+                let elapsed = at
+                    .checked_duration_since(prior)
+                    .map_err(|_| FixedStorageError::InvalidTime)?;
+                if elapsed < bound.0 {
+                    return Err(FixedStorageError::WindowExceeded);
+                }
+            }
+        }
         Ok(FixedWindowStart(cell, at))
     }
 
@@ -762,6 +1075,84 @@ mod fixed_index_tests {
             zero_meter.witness().value(WorkDimension::InvariantChecks),
             1
         );
+    }
+
+    #[test]
+    fn avl_layout_height_recurrence_and_structure_are_exact() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        assert_eq!((size_of::<AvlNode>(), align_of::<AvlNode>()), (56, 4));
+        assert_eq!(
+            (
+                offset_of!(AvlNode, key),
+                offset_of!(AvlNode, record),
+                offset_of!(AvlNode, left),
+                offset_of!(AvlNode, right),
+                offset_of!(AvlNode, parent),
+                offset_of!(AvlNode, height),
+            ),
+            (0, 36, 40, 44, 48, 52)
+        );
+        assert_eq!(AvlIndex::height_bound(2_050), Ok(15));
+        assert_eq!(AvlIndex::height_bound(16_130), Ok(19));
+
+        fn key(value: u32) -> [u8; 33] {
+            let mut key = [0; 33];
+            key[29..].copy_from_slice(&value.to_be_bytes());
+            key
+        }
+        fn oracle(index: &AvlIndex, node: u32, parent: u32, seen: &mut usize) -> u8 {
+            if node == NO_NODE {
+                return 0;
+            }
+            let value = &index.nodes[node as usize];
+            assert_eq!(value.parent, parent);
+            if value.left != NO_NODE {
+                assert!(index.nodes[value.left as usize].key < value.key);
+            }
+            if value.right != NO_NODE {
+                assert!(index.nodes[value.right as usize].key > value.key);
+            }
+            let left = oracle(index, value.left, node, seen);
+            let right = oracle(index, value.right, node, seen);
+            assert!((i16::from(left) - i16::from(right)).abs() <= 1);
+            assert_eq!(value.height, 1 + left.max(right));
+            *seen += 1;
+            value.height
+        }
+        let rotations = [
+            vec![3, 2, 1],
+            vec![1, 2, 3],
+            vec![3, 1, 2],
+            vec![1, 3, 2],
+            (0..128).collect(),
+            (0..128).rev().collect(),
+        ];
+        for values in rotations {
+            let mut index = AvlIndex::try_new(values.len()).unwrap();
+            let pointer = index.nodes.as_ptr();
+            let capacity = index.nodes.capacity();
+            for value in values {
+                index.insert_prevalidated(key(value), value);
+            }
+            assert_eq!(
+                (index.nodes.as_ptr(), index.nodes.capacity()),
+                (pointer, capacity)
+            );
+            let mut seen = 0;
+            let height = oracle(&index, index.root, NO_NODE, &mut seen);
+            assert_eq!(seen, index.nodes.len());
+            assert!(height <= AvlIndex::height_bound(index.capacity).unwrap());
+            for node in &index.nodes {
+                assert_eq!(
+                    index.find(
+                        node.key,
+                        &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())
+                    ),
+                    Ok(Some(node.record))
+                );
+            }
+        }
     }
 
     #[test]
