@@ -1062,3 +1062,345 @@ impl PreparedMergeInitialTopology {
         self.funders[formation * PLAN_MEMBERS_MAX + ordinal]
     }
 }
+
+fn validate_merge_initial_event(
+    preview: &MergeInitialPreview,
+    event: &MembershipEventRecord,
+) -> Result<(), SupportLedgerError> {
+    let count = preview.source_count;
+    if event.kind != MembershipEventKind::MergeInitial
+        || usize::from(event.source_count) != count
+        || usize::from(event.member_count) != count
+        || !event.consumed_by_support
+        || event.occurred_at != preview.occurred_at
+        || event.cancellation_fact != 0
+        || event.affected[count..].iter().any(Option::is_some)
+        || event.before[count..].iter().any(Option::is_some)
+        || event.after[count..].iter().any(Option::is_some)
+    {
+        return Err(SupportLedgerError::InvalidTransition);
+    }
+    for index in 0..count {
+        let source = preview.sources[index].expect("active source");
+        let address = event.affected[index].ok_or(SupportLedgerError::InvalidTransition)?;
+        let before = event.before[index].ok_or(SupportLedgerError::InvalidTransition)?;
+        let after = event.after[index].ok_or(SupportLedgerError::InvalidTransition)?;
+        if address.key != source.members[0].request_key
+            || before.tag != MembershipTag::Bound
+            || before.anchor.authority_key() != source.authority_key
+            || before.anchor.group() != source.group
+            || before.anchor.root() != source.group
+            || after.tag != MembershipTag::Bound
+            || after.anchor != preview.destination
+            || after.epoch != before.epoch.checked_add(1).unwrap_or(0)
+            || after.initial != before.initial
+            || !after.pending.is_absent()
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+    }
+    Ok(())
+}
+
+fn materialize_pending_delta(member_count: usize) -> Result<AggregateDelta, SupportLedgerError> {
+    let members = i32::try_from(member_count).map_err(|_| capacity_error())?;
+    let attached = members.checked_sub(1).ok_or_else(noncanonical_error)?;
+    let mut delta = AggregateDelta::ZERO;
+    let pool = 1usize;
+    for class in [1usize, 3usize] {
+        delta.usage[class][pool] = 1;
+        delta.reserved[class][pool] = -members;
+        delta.attached[class][pool] = attached;
+    }
+    delta.usage[4][pool] = members;
+    delta.reserved[4][pool] = -members;
+    Ok(delta)
+}
+
+fn membership_funding(member: RootMemberSnapshot) -> Result<MembershipFunding, SupportLedgerError> {
+    if !member.active {
+        return Err(SupportLedgerError::InvalidInput);
+    }
+    Ok(MembershipFunding {
+        request: request_id_from_key_for_support(member.request_key)?,
+        request_key: member.request_key,
+        record_slot: member.owner.slot,
+        owner_header: member.owner,
+        entitlement: member.entitlement,
+        vector: member.vector,
+        branch_limit: member.branch_limit,
+    })
+}
+
+fn encode_topology_formation(
+    before: RootSnapshot,
+    after: RootState,
+    cause: FormationCause,
+    operation: SemanticOperation,
+    event_id: u64,
+    fact_id: u64,
+    request_generation: u64,
+    source_ordinal: usize,
+    occurred_at: u64,
+    locator: ArenaRef,
+) -> [u8; FORMATION_BYTES] {
+    let mut image = FormationImage::ZERO.0;
+    encode_arena_ref(&mut image[8..16], before.initial_formation);
+    encode_arena_ref(&mut image[16..24], before.formation);
+    write_u64(&mut image, 24, event_id);
+    write_u64(&mut image, 32, fact_id);
+    image[40] = 0;
+    image[41] = operation as u8;
+    image[42] = source_ordinal as u8;
+    write_u64(&mut image, 64, request_generation);
+    image[104..121].copy_from_slice(&before.authority_key);
+    image[220] = before.branch;
+    image[221] = after as u8;
+    image[222] = cause as u8;
+    image[223] = 1;
+    write_u64(&mut image, 224, before.version + 1);
+    write_u64(&mut image, 232, occurred_at);
+    encode_arena_ref(&mut image[240..248], before.group);
+    encode_arena_ref(&mut image[248..256], locator);
+    image
+}
+
+fn encode_merge_initial_destination_formation(
+    preview: &MergeInitialPreview,
+    event: &MembershipEventRecord,
+    group: ArenaRef,
+    wrapper: ArenaRef,
+) -> [u8; FORMATION_BYTES] {
+    let mut image = FormationImage::ZERO.0;
+    write_u64(&mut image, 8, event.id);
+    image[16] = event.source_count;
+    for index in 0..preview.source_count {
+        encode_arena_ref(
+            &mut image[24 + index * 8..32 + index * 8],
+            preview.sources[index].expect("source").group,
+        );
+    }
+    image[104..121].copy_from_slice(&preview.destination.authority_key());
+    image[220] = STANDALONE_BRANCH;
+    image[221] = RootState::Pending as u8;
+    image[222] = FormationCause::InitialReady as u8;
+    image[223] = event.source_count;
+    write_u64(&mut image, 224, 1);
+    write_u64(&mut image, 232, preview.occurred_at);
+    encode_arena_ref(&mut image[240..248], group);
+    encode_arena_ref(&mut image[248..256], wrapper);
+    image
+}
+
+fn encode_topology_mutation(
+    operation: SemanticOperation,
+    event_id: u64,
+    ordinal: usize,
+    group: ArenaRef,
+    before: ArenaRef,
+    after: ArenaRef,
+    occurred_at: u64,
+    generation: u64,
+) -> [u8; MUTATION_BYTES] {
+    let mut image = MutationImage::ZERO.0;
+    image[8] = operation as u8;
+    image[9] = ordinal as u8;
+    write_u64(&mut image, 16, generation);
+    write_u64(&mut image, 24, occurred_at);
+    write_u64(&mut image, 32, event_id);
+    encode_arena_ref(&mut image[40..48], group);
+    encode_arena_ref(&mut image[48..56], before);
+    encode_arena_ref(&mut image[56..64], after);
+    image
+}
+
+fn push_local(
+    entries: &mut [([u8; 17], [u8; 8]); LOCAL_MAX],
+    count: &mut usize,
+    kind: LocalKind,
+    reference: ArenaRef,
+) -> Result<(), SupportLedgerError> {
+    if *count >= entries.len() {
+        return Err(capacity_error());
+    }
+    entries[*count] = (
+        local_key(kind, reference),
+        encode_arena_ref_value(reference),
+    );
+    *count += 1;
+    Ok(())
+}
+
+const SURGERY_DESTINATION_MAX: usize = 4;
+const SURGERY_FORMATION_MAX: usize = SOURCE_MAX + SURGERY_DESTINATION_MAX;
+const SURGERY_FUNDER_MAX: usize = SURGERY_FORMATION_MAX * PLAN_MEMBERS_MAX;
+const SURGERY_MEMBER_MAX: usize = SURGERY_DESTINATION_MAX * PLAN_MEMBERS_MAX;
+const SURGERY_WRAPPER_MAX: usize = SOURCE_MAX + 1;
+const SURGERY_HEAD_MAX: usize = 3;
+const SURGERY_LINK_MAX: usize = PLAN_MEMBERS_MAX;
+const SURGERY_MUTATION_MAX: usize = SOURCE_MAX + 1;
+const SURGERY_RAW_MAX: usize = SURGERY_HEAD_MAX * 2;
+const SURGERY_AUTHORITY_MAX: usize = SURGERY_DESTINATION_MAX;
+const SURGERY_LOCAL_MAX: usize = 48;
+const SURGERY_LIFECYCLE_MAX: usize = 4;
+const SURGERY_LIFECYCLE_RAW_MAX: usize = SURGERY_LIFECYCLE_MAX * 2;
+const SURGERY_LIFECYCLE_PUBLICATION_MAX: usize = SURGERY_LIFECYCLE_MAX * PLAN_MEMBERS_MAX;
+const LIFECYCLE_CLOSE_ACTION: u8 = 1;
+const MEMBERSHIP_CLOSED_LIFECYCLE: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyLifecycleSnapshot {
+    reference: ArenaRef,
+    record: LifecycleRecordInput,
+    image: [u8; LIFECYCLE_BYTES],
+    destination: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyLifecycleJournal {
+    snapshot: TopologyLifecycleSnapshot,
+    after: [u8; LIFECYCLE_BYTES],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyLifecycleRawUpdate {
+    key: [u8; 32],
+    handle: NodeHandle,
+    before: [u8; 8],
+    after: [u8; 8],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyDestination {
+    anchor: SupportMembershipAnchor,
+    locator_kind: u8,
+    member_count: usize,
+    members: [RootMemberSnapshot; PLAN_MEMBERS_MAX],
+    obligation: [u8; 32],
+    credit: [u8; 32],
+}
+
+impl TopologyDestination {
+    const ZERO: Self = Self {
+        anchor: SupportMembershipAnchor::ABSENT,
+        locator_kind: 0,
+        member_count: 0,
+        members: [RootMemberSnapshot::ZERO; PLAN_MEMBERS_MAX],
+        obligation: [0; 32],
+        credit: [0; 32],
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MembershipTopologyPreview {
+    expected_c17: u64,
+    operation: SemanticOperation,
+    sources: [Option<RootSnapshot>; SOURCE_MAX],
+    source_count: usize,
+    destinations: [TopologyDestination; SURGERY_DESTINATION_MAX],
+    destination_count: usize,
+    terminal_destination: bool,
+    member_destinations: [u8; PLAN_MEMBERS_MAX],
+    member_count: usize,
+    aggregate: AggregateDelta,
+    owners: [TopologyOwner; PLAN_MEMBERS_MAX],
+    owner_count: usize,
+    lifecycle_records: [Option<TopologyLifecycleSnapshot>; SURGERY_LIFECYCLE_MAX],
+    lifecycle_record_count: usize,
+    lifecycle_before: LifecycleAggregate,
+    lifecycle_after: LifecycleAggregate,
+    retractions: [LifecyclePublication; SURGERY_LIFECYCLE_PUBLICATION_MAX],
+    retraction_count: usize,
+    event_id: u64,
+    request_generation: u64,
+    occurred_at: u64,
+}
+
+impl MembershipTopologyPreview {
+    pub(crate) fn destination_anchors(&self) -> [SupportMembershipAnchor; 4] {
+        let mut anchors = [SupportMembershipAnchor::ABSENT; 4];
+        for (index, destination) in self.destinations[..self.destination_count]
+            .iter()
+            .enumerate()
+        {
+            anchors[index] = destination.anchor;
+        }
+        anchors
+    }
+
+    pub(crate) const fn destination_count(&self) -> u8 {
+        self.destination_count as u8
+    }
+
+    pub(crate) const fn terminal_destination(&self) -> bool {
+        self.terminal_destination
+    }
+
+    pub(crate) fn source_member_keys(&self) -> [[u8; 40]; PLAN_MEMBERS_MAX] {
+        let mut keys = [[0; 40]; PLAN_MEMBERS_MAX];
+        for (index, owner) in self.owners[..self.owner_count].iter().enumerate() {
+            keys[index] = owner.request_key;
+        }
+        keys
+    }
+
+    pub(crate) const fn source_member_count(&self) -> u8 {
+        self.member_count as u8
+    }
+
+    pub(crate) const fn cancellation_survivor(&self) -> SupportMembershipAnchor {
+        if self.terminal_destination || self.destination_count == 0 {
+            SupportMembershipAnchor::ABSENT
+        } else {
+            self.destinations[0].anchor
+        }
+    }
+
+    fn owner_has_resolver(&self, index: usize) -> bool {
+        index < self.owner_count
+            && !self.terminal_destination
+            && self.destination_count > 0
+            && usize::from(self.member_destinations[index]) < self.destination_count
+    }
+
+    fn replacement_link_count(&self) -> usize {
+        (0..self.owner_count)
+            .filter(|index| self.owner_has_resolver(*index))
+            .count()
+    }
+
+    pub(crate) const fn aggregate_delta(&self) -> AggregateDelta {
+        self.aggregate
+    }
+
+    pub(crate) const fn owner_count(&self) -> usize {
+        self.owner_count
+    }
+
+    pub(crate) fn owner_slots(&self) -> [u32; PLAN_MEMBERS_MAX] {
+        let mut slots = [0; PLAN_MEMBERS_MAX];
+        for (index, owner) in self.owners[..self.owner_count].iter().enumerate() {
+            slots[index] = owner.slot;
+        }
+        slots
+    }
+
+    pub(crate) fn owner_branch_delta(&self, index: usize) -> Option<[i32; 4]> {
+        (index < self.owner_count).then_some(self.owners[index].vector_delta)
+    }
+
+    pub(in crate::support) const fn lifecycle_before(&self) -> LifecycleAggregate {
+        self.lifecycle_before
+    }
+
+    pub(in crate::support) const fn lifecycle_after(&self) -> LifecycleAggregate {
+        self.lifecycle_after
+    }
+
+    pub(in crate::support) fn retractions(&self) -> &[LifecyclePublication] {
+        &self.retractions[..self.retraction_count]
+    }
+}
+
+impl SupportC17 {
+}
