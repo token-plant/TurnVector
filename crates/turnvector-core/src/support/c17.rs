@@ -746,4 +746,376 @@ impl SupportC17 {
         );
         self.advance_generation();
     }
+
+    pub(super) fn prepare_legacy_update_stream<F>(
+        &self,
+        record_count: usize,
+        record: F,
+    ) -> Result<PreparedLegacyUpdateStream, SupportLedgerError>
+    where
+        F: Fn(usize) -> (usize, [u8; 32], [u8; 32], bool) + Copy,
+    {
+        if !(1..=LIFECYCLE_BATCH_MAX).contains(&record_count) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut prior_obligation = None;
+        let mut prior_credit = None;
+        for ordinal in 0..record_count {
+            let (slot, obligation, credit, retained) = record(ordinal);
+            if obligation == [0; 32]
+                || credit == [0; 32]
+                || obligation == credit
+                || prior_obligation.is_some_and(|prior| prior >= obligation)
+                || prior_credit.is_some_and(|prior| prior >= credit)
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            let expected_owner = ArenaRef {
+                slot: u32::try_from(slot).map_err(|_| capacity_error())?,
+                generation: 1,
+            };
+            for (key, expected_kind) in [
+                (obligation, RawOwnerKind::LegacyObligation),
+                (credit, RawOwnerKind::LegacyCredit),
+            ] {
+                let value = self
+                    .raw
+                    .find(&key)?
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let (kind, state, owner) = decode_raw_owner(value)?;
+                if kind != expected_kind
+                    || owner != expected_owner
+                    || !matches!(state, RawOwnerState::Committed | RawOwnerState::Retained)
+                    || state == RawOwnerState::Retained && !retained
+                {
+                    return Err(noncanonical_error());
+                }
+            }
+            prior_obligation = Some(obligation);
+            prior_credit = Some(credit);
+        }
+        let edit_count = record_count.checked_mul(2).ok_or_else(capacity_error)?;
+        self.raw
+            .validate_update_stream(legacy_update_stream(record_count, record), edit_count)?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedLegacyUpdateStream {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            record_count,
+        })
+    }
+
+    pub(super) fn commit_legacy_update_stream<F>(
+        &mut self,
+        change: PreparedLegacyUpdateStream,
+        record: F,
+    ) where
+        F: Fn(usize) -> (usize, [u8; 32], [u8; 32], bool) + Copy,
+    {
+        assert_eq!(self.generation(), change.expected_c17);
+        assert_eq!(self.raw.generation(), change.expected_raw);
+        let edit_count = change.record_count * 2;
+        self.raw.update_stream_prevalidated(
+            legacy_update_stream(change.record_count, record),
+            edit_count,
+        );
+        self.advance_generation();
+    }
+
+    pub(super) fn validate_legacy_raw(
+        &self,
+        record_slot: usize,
+        obligation: [u8; 32],
+        credit: [u8; 32],
+    ) -> Result<(), SupportLedgerError> {
+        let owner = ArenaRef {
+            slot: u32::try_from(record_slot).map_err(|_| capacity_error())?,
+            generation: 1,
+        };
+        for (key, expected_kind) in [
+            (obligation, RawOwnerKind::LegacyObligation),
+            (credit, RawOwnerKind::LegacyCredit),
+        ] {
+            let value = self
+                .raw
+                .find(&key)?
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+            let (kind, _, actual_owner) = decode_raw_owner(value)?;
+            if kind != expected_kind || actual_owner != owner {
+                return Err(noncanonical_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn c16_owner_header_ref(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<ArenaRef, SupportLedgerError> {
+        let references = [
+            self.owner_headers.reference_at(record_slot, &[1])?,
+            self.owner_rows.reference_at(record_slot, &[1])?,
+            self.owner_indices.reference_at(record_slot, &[1])?,
+            self.owners.reference_at(record_slot, &[1])?,
+        ];
+        validate_c16_owner_set(
+            [
+                self.owner_headers.image(references[0], &[1])?.as_slice(),
+                self.owner_rows.image(references[1], &[1])?.as_slice(),
+                self.owner_indices.image(references[2], &[1])?.as_slice(),
+                self.owners.image(references[3], &[1])?.as_slice(),
+            ],
+            references,
+            record_slot,
+            record,
+            OWNER_STATE_LIVE,
+        )?;
+        Ok(references[0])
+    }
+
+    pub(super) fn prepare_c16_bundle(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+        cells: &[OutstandingCreditCell],
+    ) -> Result<PreparedC16Bundle, SupportLedgerError> {
+        if cells.is_empty()
+            || cells.len() != record.vector_len as usize
+            || u16::try_from(cells.len()).is_err()
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let owner_headers = self.owner_headers.prepare_reserve::<1>(1)?;
+        let owner_rows = self.owner_rows.prepare_reserve::<1>(1)?;
+        let owner_indices = self.owner_indices.prepare_reserve::<1>(1)?;
+        let owners = self.owners.prepare_reserve::<1>(1)?;
+        let references = [owner_headers[0], owner_rows[0], owner_indices[0], owners[0]];
+        if references
+            .iter()
+            .any(|reference| reference.slot != record_slot)
+        {
+            return Err(noncanonical_error());
+        }
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        read_u64(&self.header.0, 80)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+
+        let tagged = record.tagged_keys();
+        let mut raw_entries = [([0; 32], [0; 8]); C16_RAW_OWNERS];
+        for (ordinal, key) in tagged.into_iter().enumerate() {
+            raw_entries[ordinal] = (
+                key.identity,
+                encode_raw_owner_at(
+                    c16_raw_kind(ordinal)?,
+                    RawOwnerState::Committed,
+                    ordinal as u8,
+                    owner_headers[0],
+                )?,
+            );
+        }
+        raw_entries.sort_unstable_by_key(|entry| entry.0);
+        if raw_entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.raw.validate_insert_batch(&raw_entries)?;
+        let images =
+            encode_c16_owner_set(record_slot, self.generation(), references, record, cells)?;
+        Ok(PreparedC16Bundle {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            expected_owner_arenas: [
+                self.owner_headers.generation(),
+                self.owner_rows.generation(),
+                self.owner_indices.generation(),
+                self.owners.generation(),
+            ],
+            record_slot,
+            owner_headers,
+            owner_rows,
+            owner_indices,
+            owners,
+            raw_entries,
+            images,
+        })
+    }
+
+    pub(super) fn validate_c16_bundle(
+        &self,
+        change: &PreparedC16Bundle,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || [
+                self.owner_headers.generation(),
+                self.owner_rows.generation(),
+                self.owner_indices.generation(),
+                self.owners.generation(),
+            ] != change.expected_owner_arenas
+            || self.owner_headers.prepare_reserve::<1>(1)?.as_slice()
+                != change.owner_headers.as_slice()
+            || self.owner_rows.prepare_reserve::<1>(1)?.as_slice() != change.owner_rows.as_slice()
+            || self.owner_indices.prepare_reserve::<1>(1)?.as_slice()
+                != change.owner_indices.as_slice()
+            || self.owners.prepare_reserve::<1>(1)?.as_slice() != change.owners.as_slice()
+            || [
+                change.owner_headers[0].slot,
+                change.owner_rows[0].slot,
+                change.owner_indices[0].slot,
+                change.owners[0].slot,
+            ] != [change.record_slot; 4]
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw.validate_insert_batch(&change.raw_entries)?;
+        Ok(())
+    }
+
+    pub(super) fn commit_c16_bundle(&mut self, change: PreparedC16Bundle) {
+        self.validate_c16_bundle(&change)
+            .expect("validated C16 unified-owner migration");
+        self.owner_headers
+            .commit_reserve(&change.owner_headers)
+            .expect("validated OwnerHeader selection");
+        self.owner_rows
+            .commit_reserve(&change.owner_rows)
+            .expect("validated OwnerRow selection");
+        self.owner_indices
+            .commit_reserve(&change.owner_indices)
+            .expect("validated OwnerIndex selection");
+        self.owners
+            .commit_reserve(&change.owners)
+            .expect("validated Owner selection");
+        self.owner_headers
+            .install_reserved(change.owner_headers[0], change.images.header, 1)
+            .expect("validated OwnerHeader image");
+        self.owner_rows
+            .install_reserved(change.owner_rows[0], change.images.row, 1)
+            .expect("validated OwnerRow image");
+        self.owner_indices
+            .install_reserved(change.owner_indices[0], change.images.index, 1)
+            .expect("validated OwnerIndex image");
+        self.owners
+            .install_reserved(change.owners[0], change.images.owner, 1)
+            .expect("validated Owner image");
+        self.raw.insert_batch_prevalidated(&change.raw_entries);
+        self.increment_header_generation(80);
+        self.advance_generation();
+    }
+
+    pub(super) fn prepare_c16_withdrawal(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
+        let references = [
+            self.owner_headers.reference_at(record_slot, &[1])?,
+            self.owner_rows.reference_at(record_slot, &[1])?,
+            self.owner_indices.reference_at(record_slot, &[1])?,
+            self.owners.reference_at(record_slot, &[1])?,
+        ];
+        let images = [
+            self.owner_headers.image(references[0], &[1])?.as_slice(),
+            self.owner_rows.image(references[1], &[1])?.as_slice(),
+            self.owner_indices.image(references[2], &[1])?.as_slice(),
+            self.owners.image(references[3], &[1])?.as_slice(),
+        ];
+        validate_c16_owner_set(images, references, record_slot, record, OWNER_STATE_LIVE)?;
+        validate_withdrawable_owner_row(images[1])?;
+        let mut raw_keys = [[0; 32]; C16_RAW_OWNERS];
+        for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
+            let value = self
+                .raw
+                .find(&key.identity)?
+                .ok_or_else(noncanonical_error)?;
+            let (kind, state, stored_ordinal, owner) = decode_raw_owner_at(value)?;
+            if kind != c16_raw_kind(ordinal)?
+                || state != RawOwnerState::Committed
+                || usize::from(stored_ordinal) != ordinal
+                || owner != references[0]
+            {
+                return Err(noncanonical_error());
+            }
+            raw_keys[ordinal] = key.identity;
+        }
+        raw_keys.sort_unstable();
+        self.raw.validate_remove_batch(&raw_keys)?;
+        self.owner_headers
+            .validate_release_batch(&references[..1])?;
+        self.owner_rows.validate_release_batch(&references[1..2])?;
+        self.owner_indices
+            .validate_release_batch(&references[2..3])?;
+        self.owners.validate_release_batch(&references[3..4])?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        read_u64(&self.header.0, 80)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedC16Withdrawal {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            expected_owner_arenas: [
+                self.owner_headers.generation(),
+                self.owner_rows.generation(),
+                self.owner_indices.generation(),
+                self.owners.generation(),
+            ],
+            record_slot,
+            references,
+            raw_keys,
+        })
+    }
+
+    pub(super) fn validate_c16_withdrawal(
+        &self,
+        change: &PreparedC16Withdrawal,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || [
+                self.owner_headers.generation(),
+                self.owner_rows.generation(),
+                self.owner_indices.generation(),
+                self.owners.generation(),
+            ] != change.expected_owner_arenas
+            || change
+                .references
+                .iter()
+                .any(|reference| reference.slot != change.record_slot)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw.validate_remove_batch(&change.raw_keys)?;
+        self.owner_headers
+            .validate_release_batch(&change.references[..1])?;
+        self.owner_rows
+            .validate_release_batch(&change.references[1..2])?;
+        self.owner_indices
+            .validate_release_batch(&change.references[2..3])?;
+        self.owners
+            .validate_release_batch(&change.references[3..4])?;
+        Ok(())
+    }
+
+    pub(super) fn commit_c16_withdrawal(&mut self, change: PreparedC16Withdrawal) {
+        self.validate_c16_withdrawal(&change)
+            .expect("validated C16 unified-owner withdrawal");
+        self.raw.remove_batch_prevalidated(&change.raw_keys);
+        self.owner_headers
+            .release_batch_prevalidated(&change.references[..1]);
+        self.owner_rows
+            .release_batch_prevalidated(&change.references[1..2]);
+        self.owner_indices
+            .release_batch_prevalidated(&change.references[2..3]);
+        self.owners
+            .release_batch_prevalidated(&change.references[3..4]);
+        self.increment_header_generation(80);
+        self.advance_generation();
+    }
 }
