@@ -3157,6 +3157,395 @@ impl SupportC17 {
             lifecycle_raw_update_count,
             raw_plan,
             authority_plan,
+            local_plan,
+        })
+    }
+
+    fn validate_membership_topology_preview(
+        &self,
+        preview: &MembershipTopologyPreview,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != preview.expected_c17
+            || !(1..=SOURCE_MAX).contains(&preview.source_count)
+            || preview.sources[..preview.source_count]
+                .iter()
+                .any(Option::is_none)
+            || preview.sources[preview.source_count..]
+                .iter()
+                .any(Option::is_some)
+            || preview.destination_count > SURGERY_DESTINATION_MAX
+            || preview.destinations[..preview.destination_count]
+                .iter()
+                .any(|destination| {
+                    destination.anchor.is_absent()
+                        || destination.member_count == 0
+                        || !matches!(destination.locator_kind, 1 | 2)
+                })
+            || preview.destinations[preview.destination_count..]
+                .iter()
+                .any(|destination| *destination != TopologyDestination::ZERO)
+            || preview.owner_count != preview.member_count
+            || preview.owner_count == 0
+            || preview.event_id == 0
+            || preview.request_generation == 0
+            || preview.occurred_at == 0
+        {
+            return Err(SupportLedgerError::Generation);
         }
+        for index in 0..preview.source_count {
+            let source = preview.sources[index].expect("active topology source");
+            let current = self.root_at_group(source.group, source.authority_key, source.branch)?;
+            if current != source
+                || source.state != RootState::Pending
+                || preview.occurred_at <= source.occurred_at
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        if preview.destination_count > 0 {
+            let groups = self
+                .groups
+                .prepare_reserve::<SURGERY_DESTINATION_MAX>(preview.destination_count)?;
+            for index in 0..preview.destination_count {
+                if groups[index] != preview.destinations[index].anchor.group() {
+                    return Err(SupportLedgerError::Generation);
+                }
+            }
+        }
+        let cancellation = matches!(
+            preview.operation,
+            SemanticOperation::CancellationRemoveBound
+                | SemanticOperation::CancellationRemoveEligibleUnbound
+        );
+        if (preview.terminal_destination
+            && (!cancellation
+                || preview.source_count != 1
+                || preview.destination_count != 1
+                || preview.member_count != 1
+                || preview.destinations[0].anchor.branch() != 4
+                || preview.destinations[0].locator_kind != 2
+                || preview.member_destinations[0] != u8::MAX))
+            || (!preview.terminal_destination
+                && cancellation
+                && (preview.source_count != 1
+                    || preview.destination_count != 1
+                    || preview.member_count < 2
+                    || preview.destinations[0].anchor.branch()
+                        != preview.sources[0].expect("cancellation source").branch
+                    || preview.destinations[0].locator_kind != 2
+                    || preview.member_destinations[..preview.member_count]
+                        .iter()
+                        .filter(|destination| **destination == u8::MAX)
+                        .count()
+                        != 1))
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if cancellation {
+            let source = preview.sources[0].expect("cancellation source");
+            let destination = preview.destinations[0];
+            let removed = preview.member_destinations[..preview.member_count]
+                .iter()
+                .position(|destination| *destination == u8::MAX)
+                .ok_or(SupportLedgerError::Generation)?;
+            let authority = self.authority.find(&source.authority_key)?;
+            let authority_matches = if source.authority_key[0] == 0x32 {
+                authority.is_none()
+            } else {
+                authority
+                    .map(|value| decode_arena_ref(&value))
+                    .transpose()?
+                    .is_some_and(|current| current == source.group)
+            };
+            if destination.anchor.authority_key() != source.authority_key
+                || destination.anchor.group() != destination.anchor.root()
+                || destination.anchor.root_version() != 1
+                || !authority_matches
+                || destination.member_count
+                    != if preview.terminal_destination {
+                        1
+                    } else {
+                        preview.member_count - 1
+                    }
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+            let mut expected_members = [RootMemberSnapshot::ZERO; PLAN_MEMBERS_MAX];
+            if preview.terminal_destination {
+                expected_members[0] = source.members[removed];
+            } else {
+                let mut destination_index = 0usize;
+                for (source_index, member) in source.members[..source.member_count]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    if source_index != removed {
+                        expected_members[destination_index] = member;
+                        destination_index += 1;
+                    }
+                }
+            }
+            if destination.members != expected_members {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        let mut expected_owners = preview.owners;
+        for (index, owner) in expected_owners[..preview.owner_count]
+            .iter_mut()
+            .enumerate()
+        {
+            let loses_root = preview.destination_count == 0
+                || cancellation
+                    && !preview.terminal_destination
+                    && preview.member_destinations[index] == u8::MAX;
+            owner.linked_delta = if loses_root { -1 } else { 0 };
+            owner.branch_delta = [0; 4];
+            owner.vector_delta = [0; 4];
+            if loses_root {
+                let source = preview.sources[owner.source].ok_or(SupportLedgerError::Generation)?;
+                let branch = usize::from(funding_branch(source.branch)?);
+                owner.branch_delta[branch] = -1;
+                owner.vector_delta[branch] = -1;
+            }
+        }
+        let (
+            lifecycle_records,
+            lifecycle_record_count,
+            lifecycle_before,
+            lifecycle_after,
+            retractions,
+            retraction_count,
+        ) = self.inspect_topology_lifecycle(
+            &preview.sources,
+            preview.source_count,
+            preview.destination_count,
+            preview.terminal_destination,
+            &preview.member_destinations,
+            &mut expected_owners,
+        )?;
+        let mut aggregate = AggregateDelta::ZERO;
+        for source in preview.sources[..preview.source_count]
+            .iter()
+            .copied()
+            .flatten()
+        {
+            aggregate.add(transition_aggregate(
+                RootState::Pending,
+                RootState::ClosedPending,
+                source.member_count,
+            )?)?;
+        }
+        for destination in &preview.destinations[..preview.destination_count] {
+            aggregate.add(materialize_pending_delta(destination.member_count)?)?;
+        }
+        add_topology_lifecycle_aggregate_delta(&mut aggregate, lifecycle_before, lifecycle_after)?;
+        if expected_owners != preview.owners
+            || aggregate != preview.aggregate
+            || lifecycle_records != preview.lifecycle_records
+            || lifecycle_record_count != preview.lifecycle_record_count
+            || lifecycle_before != preview.lifecycle_before
+            || lifecycle_after != preview.lifecycle_after
+            || retractions != preview.retractions
+            || retraction_count != preview.retraction_count
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    fn prepare_topology_lifecycle(
+        &self,
+        preview: &MembershipTopologyPreview,
+        generation_after: u64,
+        formations: &ArenaSelection<SURGERY_FORMATION_MAX>,
+        members: &ArenaSelection<SURGERY_MEMBER_MAX>,
+        links: &ArenaSelection<SURGERY_LINK_MAX>,
+        replacement_link_indices: &[u8; PLAN_MEMBERS_MAX],
+        source_journals: &mut [Option<SourceJournal>; SOURCE_MAX],
+        destination_journals: &mut [Option<TopologyDestinationJournal>; SURGERY_DESTINATION_MAX],
+    ) -> Result<
+        (
+            [Option<TopologyLifecycleJournal>; SURGERY_LIFECYCLE_MAX],
+            [Option<TopologyLifecycleRawUpdate>; SURGERY_LIFECYCLE_RAW_MAX],
+            usize,
+        ),
+        SupportLedgerError,
+    > {
+        if preview.lifecycle_records[..preview.lifecycle_record_count]
+            .iter()
+            .any(Option::is_none)
+            || preview.lifecycle_records[preview.lifecycle_record_count..]
+                .iter()
+                .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut journals = [None; SURGERY_LIFECYCLE_MAX];
+        let mut raw_updates = [None; SURGERY_LIFECYCLE_RAW_MAX];
+        let mut raw_update_count = 0usize;
+        for record_index in 0..preview.lifecycle_record_count {
+            let snapshot =
+                preview.lifecycle_records[record_index].ok_or(SupportLedgerError::InvalidInput)?;
+            if self.lifecycle.image(snapshot.reference, &[1])? != &snapshot.image
+                || snapshot.image[488] != 0
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+            let owner_count = snapshot
+                .record
+                .owners
+                .iter()
+                .position(|owner| *owner == LifecycleOwnerRow::ZERO)
+                .unwrap_or(PLAN_MEMBERS_MAX);
+            let mut transferred = snapshot.record;
+            for lifecycle_owner in &mut transferred.owners[..owner_count] {
+                let owner_ref = decode_arena_ref(&lifecycle_owner.owner.to_le_bytes())?;
+                let owner_index = preview.owners[..preview.owner_count]
+                    .iter()
+                    .position(|owner| owner.owner == owner_ref)
+                    .ok_or_else(noncanonical_error)?;
+                let source_index = preview.owners[owner_index].source;
+                let source =
+                    preview.sources[source_index].ok_or(SupportLedgerError::InvalidInput)?;
+                let source_ordinal = source.members[..source.member_count]
+                    .iter()
+                    .position(|member| member.owner == owner_ref)
+                    .ok_or_else(noncanonical_error)?;
+                let source_journal = source_journals[source_index]
+                    .as_mut()
+                    .ok_or(SupportLedgerError::InvalidInput)?;
+                adjust_topology_funder_current(
+                    &mut source_journal.funder_after[source_ordinal],
+                    -1,
+                )?;
+                if snapshot.destination != u8::MAX {
+                    let destination_index = usize::from(snapshot.destination);
+                    if destination_index >= preview.destination_count
+                        || usize::from(preview.member_destinations[owner_index])
+                            != destination_index
+                    {
+                        return Err(SupportLedgerError::InvalidTransition);
+                    }
+                    let destination = preview.destinations[destination_index];
+                    let destination_ordinal = destination.members[..destination.member_count]
+                        .iter()
+                        .position(|member| member.owner == owner_ref)
+                        .ok_or_else(noncanonical_error)?;
+                    let destination_journal = destination_journals[destination_index]
+                        .as_mut()
+                        .ok_or(SupportLedgerError::InvalidInput)?;
+                    adjust_topology_funder_current(
+                        &mut destination_journal.funder_images[destination_ordinal],
+                        1,
+                    )?;
+                    lifecycle_owner.source = arena_ref_word(
+                        members[destination_index * PLAN_MEMBERS_MAX + destination_ordinal],
+                    );
+                    lifecycle_owner.group = arena_ref_word(destination_journal.group);
+                    lifecycle_owner.root = arena_ref_word(destination_journal.locator);
+                    lifecycle_owner.formation =
+                        arena_ref_word(formations[preview.source_count + destination_index]);
+                    let link_index = usize::from(replacement_link_indices[owner_index]);
+                    if link_index >= links.len() {
+                        return Err(SupportLedgerError::InvalidTransition);
+                    }
+                    lifecycle_owner.link = arena_ref_word(links[link_index]);
+                    lifecycle_owner.class = RootState::Pending as u64 - 1;
+                }
+            }
+            let mut after_image = snapshot.image;
+            if snapshot.destination != u8::MAX {
+                let destination_index = usize::from(snapshot.destination);
+                let destination = preview.destinations[destination_index];
+                let destination_journal = destination_journals[destination_index]
+                    .ok_or(SupportLedgerError::InvalidInput)?;
+                let mut final_owner = [0; 64];
+                final_owner[..17].copy_from_slice(&destination.anchor.authority_key());
+                final_owner[17] = destination.anchor.branch();
+                final_owner[18] = RootState::Pending as u8;
+                final_owner[19] = destination.member_count as u8;
+                encode_arena_ref(&mut final_owner[24..32], destination_journal.group);
+                encode_arena_ref(&mut final_owner[32..40], destination_journal.locator);
+                encode_arena_ref(
+                    &mut final_owner[40..48],
+                    formations[preview.source_count + destination_index],
+                );
+                write_u64(&mut final_owner, 48, 1);
+                write_u64(&mut final_owner, 56, preview.occurred_at);
+                transferred.final_owner = final_owner;
+                transferred.owner_set_ref = encode_arena_ref_value(decode_arena_ref(
+                    &transferred.owners[0].owner.to_le_bytes(),
+                )?);
+                let batch = read_u64(&snapshot.image, 8);
+                let ordinal = usize::from(read_u16(&snapshot.image, 16));
+                after_image = transferred.encode(snapshot.reference, batch, ordinal)?;
+                after_image[..24].copy_from_slice(&snapshot.image[..24]);
+                after_image[480..488].copy_from_slice(&snapshot.image[480..488]);
+            } else {
+                after_image[488..512].fill(0);
+                after_image[488] = LIFECYCLE_CLOSE_ACTION;
+                after_image[489] = MEMBERSHIP_CLOSED_LIFECYCLE;
+                write_u64(&mut after_image, 496, preview.occurred_at);
+                write_u64(&mut after_image, 504, generation_after);
+                validate_topology_closed_lifecycle_image(&after_image)?;
+                for (kind, key) in [
+                    (
+                        RawOwnerKind::LifecycleObligation,
+                        snapshot.record.obligation_raw,
+                    ),
+                    (RawOwnerKind::LifecycleCredit, snapshot.record.credit_raw),
+                ] {
+                    if raw_update_count == raw_updates.len() {
+                        return Err(capacity_error());
+                    }
+                    let handle = self.raw.find_handle(&key)?.ok_or_else(noncanonical_error)?;
+                    let before = self.raw.value_at(handle)?;
+                    let (actual_kind, state, owner) = decode_raw_owner(before)?;
+                    if actual_kind != kind
+                        || state != RawOwnerState::Committed
+                        || owner != snapshot.reference
+                    {
+                        return Err(noncanonical_error());
+                    }
+                    raw_updates[raw_update_count] = Some(TopologyLifecycleRawUpdate {
+                        key,
+                        handle,
+                        before,
+                        after: encode_raw_owner(kind, RawOwnerState::Retained, snapshot.reference)?,
+                    });
+                    raw_update_count += 1;
+                }
+            }
+            journals[record_index] = Some(TopologyLifecycleJournal {
+                snapshot,
+                after: after_image,
+            });
+        }
+        raw_updates[..raw_update_count]
+            .sort_unstable_by_key(|update| update.expect("active lifecycle Raw update").key);
+        if raw_updates[..raw_update_count].windows(2).any(|pair| {
+            pair[0].expect("active lifecycle Raw update").key
+                >= pair[1].expect("active lifecycle Raw update").key
+        }) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        if raw_update_count > 0 {
+            let mut updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); SURGERY_LIFECYCLE_RAW_MAX];
+            for (index, update) in raw_updates[..raw_update_count]
+                .iter()
+                .copied()
+                .flatten()
+                .enumerate()
+            {
+                updates[index] = (update.key, update.handle, update.after);
+            }
+            self.raw
+                .validate_update_batch(&updates[..raw_update_count])?;
+        }
+        if preview.lifecycle_record_count > 0 {
+            self.lifecycle.validate_advance_generation()?;
+        }
+        Ok((journals, raw_updates, raw_update_count))
     }
 }
