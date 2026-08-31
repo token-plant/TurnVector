@@ -1118,4 +1118,300 @@ impl SupportC17 {
         self.increment_header_generation(80);
         self.advance_generation();
     }
+
+    pub(super) fn prepare_c16_tombstone(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<PreparedC16Tombstone, SupportLedgerError> {
+        let references = [
+            self.owner_headers.reference_at(record_slot, &[1])?,
+            self.owner_rows.reference_at(record_slot, &[1])?,
+            self.owner_indices.reference_at(record_slot, &[1])?,
+            self.owners.reference_at(record_slot, &[1])?,
+        ];
+        let current = C16OwnerSetImages {
+            header: *self.owner_headers.image(references[0], &[1])?,
+            row: *self.owner_rows.image(references[1], &[1])?,
+            index: *self.owner_indices.image(references[2], &[1])?,
+            owner: *self.owners.image(references[3], &[1])?,
+        };
+        validate_c16_owner_set(
+            [
+                current.header.as_slice(),
+                current.row.as_slice(),
+                current.index.as_slice(),
+                current.owner.as_slice(),
+            ],
+            references,
+            record_slot,
+            record,
+            OWNER_STATE_LIVE,
+        )?;
+        let mut raw_updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); C16_RAW_OWNERS];
+        for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
+            let handle = self
+                .raw
+                .find_handle(&key.identity)?
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+            let (kind, state, stored_ordinal, owner) =
+                decode_raw_owner_at(self.raw.value_at(handle)?)?;
+            if kind != c16_raw_kind(ordinal)?
+                || state != RawOwnerState::Committed
+                || usize::from(stored_ordinal) != ordinal
+                || owner != references[0]
+            {
+                return Err(noncanonical_error());
+            }
+            raw_updates[ordinal] = (
+                key.identity,
+                handle,
+                encode_raw_owner_at(
+                    kind,
+                    RawOwnerState::Tombstone,
+                    stored_ordinal,
+                    references[0],
+                )?,
+            );
+        }
+        raw_updates.sort_unstable_by_key(|entry| entry.0);
+        self.raw.validate_update_batch(&raw_updates)?;
+        self.owner_headers.validate_advance_generation()?;
+        self.owner_rows.validate_advance_generation()?;
+        self.owner_indices.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        read_u64(&self.header.0, 80)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedC16Tombstone {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            expected_owner_arenas: [
+                self.owner_headers.generation(),
+                self.owner_rows.generation(),
+                self.owner_indices.generation(),
+                self.owners.generation(),
+            ],
+            record_slot,
+            references,
+            raw_updates,
+            images: tombstone_owner_images(current),
+        })
+    }
+
+    pub(super) fn validate_c16_tombstone(
+        &self,
+        change: &PreparedC16Tombstone,
+        record: &BundleRecord,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || [
+                self.owner_headers.generation(),
+                self.owner_rows.generation(),
+                self.owner_indices.generation(),
+                self.owners.generation(),
+            ] != change.expected_owner_arenas
+            || change
+                .references
+                .iter()
+                .any(|reference| reference.slot != change.record_slot)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let current = C16OwnerSetImages {
+            header: *self.owner_headers.image(change.references[0], &[1])?,
+            row: *self.owner_rows.image(change.references[1], &[1])?,
+            index: *self.owner_indices.image(change.references[2], &[1])?,
+            owner: *self.owners.image(change.references[3], &[1])?,
+        };
+        validate_c16_owner_set(
+            [
+                current.header.as_slice(),
+                current.row.as_slice(),
+                current.index.as_slice(),
+                current.owner.as_slice(),
+            ],
+            change.references,
+            change.record_slot,
+            record,
+            OWNER_STATE_LIVE,
+        )?;
+        if tombstone_owner_images(current) != change.images {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw.validate_update_batch(&change.raw_updates)?;
+        self.owner_headers.validate_advance_generation()?;
+        self.owner_rows.validate_advance_generation()?;
+        self.owner_indices.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        Ok(())
+    }
+
+    pub(super) fn commit_c16_tombstone(
+        &mut self,
+        change: PreparedC16Tombstone,
+        record: &BundleRecord,
+    ) {
+        self.validate_c16_tombstone(&change, record)
+            .expect("validated C16 unified-owner tombstone");
+        *self
+            .owner_headers
+            .image_mut(change.references[0], &[1])
+            .expect("validated OwnerHeader") = change.images.header;
+        *self
+            .owner_rows
+            .image_mut(change.references[1], &[1])
+            .expect("validated OwnerRow") = change.images.row;
+        *self
+            .owner_indices
+            .image_mut(change.references[2], &[1])
+            .expect("validated OwnerIndex") = change.images.index;
+        *self
+            .owners
+            .image_mut(change.references[3], &[1])
+            .expect("validated Owner") = change.images.owner;
+        self.owner_headers.advance_generation_prevalidated();
+        self.owner_rows.advance_generation_prevalidated();
+        self.owner_indices.advance_generation_prevalidated();
+        self.owners.advance_generation_prevalidated();
+        self.raw.update_batch_prevalidated(&change.raw_updates);
+        self.increment_header_generation(80);
+        self.advance_generation();
+    }
+
+    pub(super) fn prepare_c16_touch(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<PreparedC16Touch, SupportLedgerError> {
+        let owner = self.owner_headers.reference_at(record_slot, &[1])?;
+        let references = [
+            owner,
+            self.owner_rows.reference_at(record_slot, &[1])?,
+            self.owner_indices.reference_at(record_slot, &[1])?,
+            self.owners.reference_at(record_slot, &[1])?,
+        ];
+        validate_c16_owner_set(
+            [
+                self.owner_headers.image(references[0], &[1])?.as_slice(),
+                self.owner_rows.image(references[1], &[1])?.as_slice(),
+                self.owner_indices.image(references[2], &[1])?.as_slice(),
+                self.owners.image(references[3], &[1])?.as_slice(),
+            ],
+            references,
+            record_slot,
+            record,
+            OWNER_STATE_LIVE,
+        )?;
+        let mut raw_updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); C16_RAW_OWNERS];
+        for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
+            let handle = self
+                .raw
+                .find_handle(&key.identity)?
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+            let value = self.raw.value_at(handle)?;
+            let (kind, state, stored_ordinal, actual_owner) = decode_raw_owner_at(value)?;
+            if kind != c16_raw_kind(ordinal)?
+                || state != RawOwnerState::Committed
+                || usize::from(stored_ordinal) != ordinal
+                || actual_owner != owner
+            {
+                return Err(noncanonical_error());
+            }
+            raw_updates[ordinal] = (key.identity, handle, value);
+        }
+        raw_updates.sort_unstable_by_key(|entry| entry.0);
+        self.raw.validate_update_batch(&raw_updates)?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedC16Touch {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            record_slot,
+            owner,
+            raw_updates,
+        })
+    }
+
+    pub(super) fn validate_c16_touch(
+        &self,
+        change: &PreparedC16Touch,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || self.owner_headers.reference_at(change.record_slot, &[1])? != change.owner
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw.validate_update_batch(&change.raw_updates)?;
+        Ok(())
+    }
+
+    pub(super) fn commit_c16_touch(&mut self, change: PreparedC16Touch) {
+        self.validate_c16_touch(&change)
+            .expect("validated C16 owner touch");
+        self.raw.update_batch_prevalidated(&change.raw_updates);
+        self.advance_generation();
+    }
+
+    pub(super) fn validate_c16_raw_reciprocity(
+        &self,
+        raw: [u8; 32],
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<(), SupportLedgerError> {
+        let value = self
+            .raw
+            .find(&raw)?
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        let (kind, state, ordinal, owner) = decode_raw_owner_at(value)?;
+        let expected_state = match record.state {
+            BundleState::LivePristine | BundleState::LiveConsumed => RawOwnerState::Committed,
+            BundleState::RetainedTombstone => RawOwnerState::Tombstone,
+        };
+        let expected_owner_state = match record.state {
+            BundleState::LivePristine | BundleState::LiveConsumed => OWNER_STATE_LIVE,
+            BundleState::RetainedTombstone => OWNER_STATE_TOMBSTONE,
+        };
+        if state != expected_state
+            || owner.slot != record_slot
+            || owner != self.owner_headers.reference_at(record_slot, &[1])?
+            || c16_raw_kind(usize::from(ordinal))? != kind
+            || record
+                .tagged_key(ordinal)
+                .is_none_or(|key| key.identity != raw)
+        {
+            return Err(noncanonical_error());
+        }
+        let references = [
+            owner,
+            self.owner_rows.reference_at(record_slot, &[1])?,
+            self.owner_indices.reference_at(record_slot, &[1])?,
+            self.owners.reference_at(record_slot, &[1])?,
+        ];
+        validate_c16_owner_set(
+            [
+                self.owner_headers.image(references[0], &[1])?.as_slice(),
+                self.owner_rows.image(references[1], &[1])?.as_slice(),
+                self.owner_indices.image(references[2], &[1])?.as_slice(),
+                self.owners.image(references[3], &[1])?.as_slice(),
+            ],
+            references,
+            record_slot,
+            record,
+            expected_owner_state,
+        )
+    }
+
+    fn increment_header_generation(&mut self, offset: usize) {
+        let next = read_u64(&self.header.0, offset)
+            .checked_add(1)
+            .expect("prepared C17 owner generation");
+        write_u64(&mut self.header.0, offset, next);
+    }
 }
