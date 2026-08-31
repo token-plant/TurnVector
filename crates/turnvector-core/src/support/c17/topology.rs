@@ -3548,4 +3548,394 @@ impl SupportC17 {
         }
         Ok((journals, raw_updates, raw_update_count))
     }
+
+    fn prepare_membership_topology_arena_headers_after(
+        &self,
+        preview: &MembershipTopologyPreview,
+        groups: &ArenaSelection<SURGERY_DESTINATION_MAX>,
+        external_heads: &ArenaSelection<SURGERY_HEAD_MAX>,
+        formations: &ArenaSelection<SURGERY_FORMATION_MAX>,
+        funders: &ArenaSelection<SURGERY_FUNDER_MAX>,
+        members: &ArenaSelection<SURGERY_MEMBER_MAX>,
+        wrappers: &ArenaSelection<SURGERY_WRAPPER_MAX>,
+        links: &ArenaSelection<SURGERY_LINK_MAX>,
+        memberships: &ArenaSelection<1>,
+        mutations: &ArenaSelection<SURGERY_MUTATION_MAX>,
+    ) -> Result<[ByteArenaHeaderImage; 12], SupportLedgerError> {
+        let has_destinations = preview.destination_count > 0;
+        let has_external_source = preview.sources[..preview.source_count]
+            .iter()
+            .flatten()
+            .any(|source| source.locator_kind == 1);
+        let groups_after = if has_destinations {
+            self.groups
+                .prepare_reserve_header_after_advances(groups, groups.len(), 0, 2)?
+        } else {
+            self.groups.prepare_generation_header_after()?
+        };
+        let external_heads_after = match (external_heads.len() > 0, has_external_source) {
+            (true, true) => self.external_heads.prepare_reserve_header_after_advances(
+                external_heads,
+                external_heads.len(),
+                0,
+                2,
+            )?,
+            (true, false) => self.external_heads.prepare_reserve_header_after(
+                external_heads,
+                external_heads.len(),
+                0,
+            )?,
+            (false, true) => self.external_heads.prepare_generation_header_after()?,
+            (false, false) => self.external_heads.header_image(),
+        };
+        let members_after = if has_destinations {
+            self.members
+                .prepare_reserve_header_after_advances(members, members.len(), 0, 2)?
+        } else {
+            self.members.prepare_generation_header_after()?
+        };
+        let wrappers_after = if wrappers.len() > 0 {
+            self.wrappers
+                .prepare_reserve_header_after(wrappers, wrappers.len(), 0)?
+        } else {
+            self.wrappers.header_image()
+        };
+        let links_after = if links.len() > 0 {
+            self.links
+                .prepare_reserve_header_after(links, links.len(), 0)?
+        } else {
+            self.links.prepare_generation_header_after()?
+        };
+        let lifecycle_after = if preview.lifecycle_record_count > 0 {
+            self.lifecycle.prepare_generation_header_after()?
+        } else {
+            self.lifecycle.header_image()
+        };
+        Ok([
+            groups_after,
+            external_heads_after,
+            self.formations
+                .prepare_reserve_header_after(formations, formations.len(), 0)?,
+            self.funders
+                .prepare_reserve_header_after(funders, funders.len(), 0)?,
+            members_after,
+            wrappers_after,
+            links_after,
+            self.memberships
+                .prepare_reserve_header_after(memberships, memberships.len(), 0)?,
+            self.mutations
+                .prepare_reserve_header_after(mutations, mutations.len(), 0)?,
+            self.owner_rows.prepare_generation_header_after()?,
+            self.owners.prepare_generation_header_after()?,
+            lifecycle_after,
+        ])
+    }
+
+    fn assign_membership_topology_arena_headers(&mut self, headers: [ByteArenaHeaderImage; 12]) {
+        self.groups.assign_header_direct(headers[0]);
+        self.external_heads.assign_header_direct(headers[1]);
+        self.formations.assign_header_direct(headers[2]);
+        self.funders.assign_header_direct(headers[3]);
+        self.members.assign_header_direct(headers[4]);
+        self.wrappers.assign_header_direct(headers[5]);
+        self.links.assign_header_direct(headers[6]);
+        self.memberships.assign_header_direct(headers[7]);
+        self.mutations.assign_header_direct(headers[8]);
+        self.owner_rows.assign_header_direct(headers[9]);
+        self.owners.assign_header_direct(headers[10]);
+        self.lifecycle.assign_header_direct(headers[11]);
+    }
+
+    fn membership_topology_arena_headers(&self) -> [ByteArenaHeaderImage; 12] {
+        [
+            self.groups.header_image(),
+            self.external_heads.header_image(),
+            self.formations.header_image(),
+            self.funders.header_image(),
+            self.members.header_image(),
+            self.wrappers.header_image(),
+            self.links.header_image(),
+            self.memberships.header_image(),
+            self.mutations.header_image(),
+            self.owner_rows.header_image(),
+            self.owners.header_image(),
+            self.lifecycle.header_image(),
+        ]
+    }
+}
+
+fn validate_membership_topology_event(
+    preview: &MembershipTopologyPreview,
+    event: &MembershipEventRecord,
+) -> Result<(), SupportLedgerError> {
+    let (expected_kind, expected_source_count, cancellation) = match preview.operation {
+        SemanticOperation::NewlyEligibleJoin => (MembershipEventKind::Join, 1, false),
+        SemanticOperation::SourceFreeRebind => (MembershipEventKind::Rebind, 0, false),
+        SemanticOperation::NewlyEligibleRebind => (MembershipEventKind::Rebind, 1, false),
+        SemanticOperation::Split => (MembershipEventKind::Split, 0, false),
+        SemanticOperation::Merge => (MembershipEventKind::Merge, 0, false),
+        SemanticOperation::CancellationRemoveBound => {
+            (MembershipEventKind::CancellationRemove, 1, true)
+        }
+        SemanticOperation::CancellationRemoveEligibleUnbound => {
+            (MembershipEventKind::CancellationRemove, 2, true)
+        }
+        SemanticOperation::MembershipClose => (MembershipEventKind::Close, 0, false),
+        _ => return Err(SupportLedgerError::InvalidInput),
+    };
+    if event.kind != expected_kind
+        || event.source_count != expected_source_count
+        || event.id != preview.event_id
+        || event.generation_after != preview.request_generation
+        || event.generation_after != event.generation_before.checked_add(1).unwrap_or(0)
+        || event.occurred_at != preview.occurred_at
+        || usize::from(event.member_count) != preview.member_count
+        || !event.consumed_by_support
+        || cancellation != (event.cancellation_fact != 0)
+        || event.affected[preview.member_count..]
+            .iter()
+            .any(Option::is_some)
+        || event.before[preview.member_count..]
+            .iter()
+            .any(Option::is_some)
+        || event.after[preview.member_count..]
+            .iter()
+            .any(Option::is_some)
+    {
+        return Err(SupportLedgerError::InvalidTransition);
+    }
+    let mut cancelled_count = 0usize;
+    for index in 0..preview.member_count {
+        let address = event.affected[index].ok_or(SupportLedgerError::InvalidTransition)?;
+        let before = event.before[index].ok_or(SupportLedgerError::InvalidTransition)?;
+        let after = event.after[index].ok_or(SupportLedgerError::InvalidTransition)?;
+        let owner = preview.owners[index];
+        let source = preview.sources[owner.source].expect("owner source");
+        if address.key != owner.request_key
+            || index > 0 && event.affected[index - 1].is_none_or(|prior| prior.key >= address.key)
+            || before.anchor.authority_key() != source.authority_key
+            || before.anchor.branch() != source.branch
+            || before.anchor.group() != source.group
+            || before.anchor.root() != source.group
+            || before.anchor.root_version() > source.version
+            || after.initial != before.initial
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        if cancellation {
+            let removed = preview.member_destinations[index] == u8::MAX;
+            if removed {
+                cancelled_count += 1;
+                let expected_before = match preview.operation {
+                    SemanticOperation::CancellationRemoveBound => MembershipTag::Bound,
+                    SemanticOperation::CancellationRemoveEligibleUnbound => {
+                        MembershipTag::EligibleUnbound
+                    }
+                    _ => unreachable!("cancellation operation"),
+                };
+                if before.tag != expected_before
+                    || after.tag != MembershipTag::Cancelled
+                    || after.epoch != before.epoch
+                    || !after.anchor.is_absent()
+                    || !after.pending.is_absent()
+                    || after.cancellation.is_absent()
+                    || after.cancellation_fact != event.cancellation_fact
+                    || after.cancellation_at != event.occurred_at
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+            } else {
+                if before.tag != MembershipTag::Bound
+                    || after.tag != MembershipTag::Bound
+                    || preview.terminal_destination
+                    || preview.member_destinations[index] != 0
+                    || after.anchor != preview.destinations[0].anchor
+                    || after.epoch != before.epoch.checked_add(1).unwrap_or(0)
+                    || !after.pending.is_absent()
+                    || !after.cancellation.is_absent()
+                    || after.cancellation_fact != 0
+                    || after.cancellation_at != 0
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+            }
+        } else {
+            if !matches!(
+                before.tag,
+                MembershipTag::Bound | MembershipTag::EligibleUnbound
+            ) || !after.pending.is_absent()
+                || !after.cancellation.is_absent()
+                || after.cancellation_fact != 0
+                || after.cancellation_at != 0
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            if preview.destination_count == 0 {
+                if after.tag != MembershipTag::Closed
+                    || !after.anchor.is_absent()
+                    || after.epoch != before.epoch
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+            } else {
+                let destination_index = usize::from(preview.member_destinations[index]);
+                if destination_index >= preview.destination_count
+                    || after.tag != MembershipTag::Bound
+                    || after.anchor != preview.destinations[destination_index].anchor
+                    || after.epoch != before.epoch.checked_add(1).unwrap_or(0)
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+            }
+        }
+        if event.before[..index]
+            .iter()
+            .flatten()
+            .any(|prior| prior.initial == before.initial)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+    }
+    if cancellation && cancelled_count != 1 {
+        return Err(SupportLedgerError::InvalidTransition);
+    }
+    Ok(())
+}
+
+fn encode_membership_destination_formation(
+    preview: &MembershipTopologyPreview,
+    event: &MembershipEventRecord,
+    destination_index: usize,
+    group: ArenaRef,
+    _formation: ArenaRef,
+    locator: ArenaRef,
+) -> [u8; FORMATION_BYTES] {
+    let destination = preview.destinations[destination_index];
+    let mut image = FormationImage::ZERO.0;
+    let cancellation = matches!(
+        preview.operation,
+        SemanticOperation::CancellationRemoveBound
+            | SemanticOperation::CancellationRemoveEligibleUnbound
+    );
+    write_u64(&mut image, 8, event.id);
+    if cancellation {
+        write_u64(&mut image, 16, event.cancellation_fact);
+        write_u64(&mut image, 24, event.generation_after);
+        encode_arena_ref(
+            &mut image[32..40],
+            preview.sources[0]
+                .expect("cancellation destination parent")
+                .group,
+        );
+        image[40] = preview.source_count as u8;
+    } else {
+        image[16] = preview.source_count as u8;
+        for source_index in 0..preview.source_count {
+            encode_arena_ref(
+                &mut image[24 + source_index * 8..32 + source_index * 8],
+                preview.sources[source_index]
+                    .expect("active destination parent")
+                    .group,
+            );
+        }
+        write_u64(&mut image, 64, event.generation_after);
+    }
+    image[41] = preview.operation as u8;
+    image[42] = destination_index as u8;
+    image[104..121].copy_from_slice(&destination.anchor.authority_key());
+    image[220] = destination.anchor.branch();
+    image[221] = RootState::Pending as u8;
+    image[222] = if cancellation {
+        FormationCause::CancellationMembership as u8
+    } else {
+        FormationCause::MembershipConsumed as u8
+    };
+    image[223] = preview.source_count as u8;
+    write_u64(&mut image, 224, 1);
+    write_u64(&mut image, 232, preview.occurred_at);
+    encode_arena_ref(&mut image[240..248], group);
+    encode_arena_ref(&mut image[248..256], locator);
+    image
+}
+
+fn encode_membership_external_head(
+    destination: TopologyDestination,
+    group: ArenaRef,
+    formation: ArenaRef,
+) -> [u8; EXTERNAL_HEAD_BYTES] {
+    let mut image = ExternalHeadImage::ZERO.0;
+    image[8] = destination.anchor.branch();
+    image[9] = RootState::Pending as u8;
+    image[10] = destination.member_count as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], formation);
+    image[32..64].copy_from_slice(&destination.obligation);
+    image[64..96].copy_from_slice(&destination.credit);
+    image[96..113].copy_from_slice(&destination.anchor.authority_key());
+    write_u64(&mut image, 120, 1);
+    image
+}
+
+fn encode_topology_membership_image(
+    preview: &MembershipTopologyPreview,
+    event: &MembershipEventRecord,
+) -> [u8; MEMBERSHIP_BYTES] {
+    let mut image = MembershipImage::ZERO.0;
+    image[8] = preview.operation as u8;
+    image[9] = preview.source_count as u8;
+    image[10] = preview.destination_count as u8;
+    image[11] = preview.member_count as u8;
+    write_u64(&mut image, 16, event.id);
+    for index in 0..preview.source_count {
+        encode_arena_ref(
+            &mut image[24 + index * 8..32 + index * 8],
+            preview.sources[index].expect("membership source").group,
+        );
+    }
+    image[48..88].copy_from_slice(&event.affected[0].expect("membership affected member").key);
+    if preview.destination_count > 0 {
+        image[88..105].copy_from_slice(&preview.destinations[0].anchor.authority_key());
+    }
+    write_u64(&mut image, 112, event.generation_after ^ event.occurred_at);
+    image
+}
+
+fn validate_topology_initial_and_raw_identity(
+    records: &[Option<BundleRecord>],
+) -> Result<(), SupportLedgerError> {
+    for (index, record) in records.iter().copied().enumerate() {
+        let record = record.ok_or(SupportLedgerError::InvalidTransition)?;
+        for prior in records[..index].iter().copied().flatten() {
+            if record.initial.iter().any(|item| {
+                prior.initial.iter().any(|candidate| {
+                    item.obligation == candidate.obligation
+                        || item.credit == candidate.credit
+                        || item.claim == candidate.claim
+                })
+            }) {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_surgery_local(
+    entries: &mut [([u8; 17], [u8; 8]); SURGERY_LOCAL_MAX],
+    count: &mut usize,
+    kind: LocalKind,
+    reference: ArenaRef,
+) -> Result<(), SupportLedgerError> {
+    if *count == entries.len() {
+        return Err(capacity_error());
+    }
+    entries[*count] = (
+        local_key(kind, reference),
+        encode_arena_ref_value(reference),
+    );
+    *count += 1;
+    Ok(())
+}
+
+impl SupportC17 {
 }
