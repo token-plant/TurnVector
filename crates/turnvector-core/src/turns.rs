@@ -1,8 +1,10 @@
 use crate::{
-    BoundedVec, CandidateCoordinates, CandidateId, CapabilityKey, DomainValueError, Duration,
-    GenerationVector, RequestId, RuntimeOverheadBoundSetId, SchedulingSnapshot, TokenCount,
-    TurnPlanId,
+    BoundedVec, CancellationFactId, CandidateCoordinates, CandidateId, CapabilityKey,
+    DomainValueError, Duration, FormationDomainId, GenerationVector, MembershipEventId,
+    MonotonicTime, PlanCausalEventId, RequestId, RuntimeOverheadBoundSetId, SchedulingSnapshot,
+    TokenCount, TurnPlanId,
 };
+use std::mem::{align_of, offset_of, size_of};
 
 macro_rules! digest_identity {
     ($name:ident) => {
@@ -35,19 +37,192 @@ digest_identity!(PhysicalStartCreditId);
 digest_identity!(StalePlanDispositionBoundId);
 digest_identity!(PersistentStateIsolationEvidenceId);
 
+/// One generation-checked retained RequestBook source record.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(C)]
+pub struct SourceRecordRef {
+    pub(crate) slot: u16,
+    pub(crate) reserved: u16,
+    pub(crate) generation: u32,
+}
+
+impl SourceRecordRef {
+    pub(crate) const ABSENT: Self = Self {
+        slot: 0,
+        reserved: 0,
+        generation: 0,
+    };
+
+    pub(crate) const fn from_canonical_parts(slot: u16, generation: u32) -> Self {
+        Self {
+            slot,
+            reserved: 0,
+            generation,
+        }
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> u16 {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+
+    pub(crate) const fn is_absent(self) -> bool {
+        self.slot == 0 && self.reserved == 0 && self.generation == 0
+    }
+}
+
+/// One of the five C17 root families.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum PlanBranch {
+    Observation = 0,
+    Continuation = 1,
+    Rejection = 2,
+    Standalone = 3,
+    Terminal = 4,
+}
+
+impl PlanBranch {
+    #[must_use]
+    pub const fn ordinal(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A generation- and version-bearing reference to one current root.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(C)]
+pub struct RootRef {
+    slot: u32,
+    generation: u32,
+    version: u64,
+}
+
+impl RootRef {
+    pub fn new(slot: u32, generation: u32, version: u64) -> Result<Self, DomainValueError> {
+        if generation == 0 || version == 0 {
+            return Err(DomainValueError::Zero);
+        }
+        Ok(Self {
+            slot,
+            generation,
+            version,
+        })
+    }
+
+    #[must_use]
+    pub const fn slot(self) -> u32 {
+        self.slot
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn version(self) -> u64 {
+        self.version
+    }
+}
+
+/// A typed, nonzero impossibility reason retained in a close Formation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct TypedImpossible(u8);
+
+impl TypedImpossible {
+    pub const CAUSAL_CALL: Self = Self(1);
+    pub const NO_CONTINUATION_AFTER_OBSERVATION: Self = Self(2);
+    pub const TERMINAL_MEMBERSHIP: Self = Self(3);
+
+    pub fn new(value: u8) -> Result<Self, DomainValueError> {
+        (value != 0)
+            .then_some(Self(value))
+            .ok_or(DomainValueError::Zero)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+/// The exact causal authority accepted by a typed root close.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CloseAuthority {
+    Plan {
+        identity: TurnPlanIdentity,
+        event: PlanCausalEventId,
+    },
+    Standalone {
+        domain: FormationDomainId,
+        source: SourceRecordRef,
+        event: MembershipEventId,
+    },
+    Cancellation {
+        fact: CancellationFactId,
+        event: MembershipEventId,
+        request_generation: crate::request_book::RequestBookGeneration,
+    },
+}
+
+/// A complete typed-close request over one exact current root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedCloseInput {
+    pub group: u32,
+    pub branch: PlanBranch,
+    pub root: RootRef,
+    pub occurred_at: MonotonicTime,
+    pub reason: TypedImpossible,
+    pub authority: CloseAuthority,
+}
+
+#[cfg(turnvector_c17_probe)]
+pub(crate) fn b03_probe_rows() -> Vec<(&'static str, usize)> {
+    vec![
+        ("abi.close_authority.align", align_of::<CloseAuthority>()),
+        ("abi.close_authority.size", size_of::<CloseAuthority>()),
+        ("abi.root_ref.align", align_of::<RootRef>()),
+        ("abi.root_ref.generation", offset_of!(RootRef, generation)),
+        ("abi.root_ref.size", size_of::<RootRef>()),
+        ("abi.root_ref.slot", offset_of!(RootRef, slot)),
+        ("abi.root_ref.version", offset_of!(RootRef, version)),
+        ("abi.typed_impossible.align", align_of::<TypedImpossible>()),
+        ("abi.typed_impossible.size", size_of::<TypedImpossible>()),
+    ]
+}
+
+const _: () = {
+    assert!(size_of::<RootRef>() == 16);
+    assert!(align_of::<RootRef>() == 8);
+    assert!(offset_of!(RootRef, slot) == 0);
+    assert!(offset_of!(RootRef, generation) == 4);
+    assert!(offset_of!(RootRef, version) == 8);
+    assert!(size_of::<TypedImpossible>() == 1);
+    assert!(align_of::<TypedImpossible>() == 1);
+    assert!(size_of::<CloseAuthority>() == 240);
+    assert!(align_of::<CloseAuthority>() == 16);
+};
+
 copy_record!(PlanMemberFunding {
     request_id => RequestId, entitlement => FutureTurnSupportEntitlementId,
     credit_vector => SupportOutstandingCreditVectorId,
 });
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanSupportObligation<const MEMBERS: usize> {
     pub id: SupportOperationObligationId,
     pub physical_credit: PhysicalStartCreditId,
     pub funders: BoundedVec<PlanMemberFunding, MEMBERS>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanSupportObligations<const MEMBERS: usize> {
     pub receipt_observation: PlanSupportObligation<MEMBERS>,
     pub conditional_continuation_formation: PlanSupportObligation<MEMBERS>,
@@ -83,7 +258,7 @@ pub enum ReceiptValidationError {
     ProgressMismatch,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TurnPlan<const MEMBERS: usize> {
     identity: TurnPlanIdentity,
     members: BoundedVec<PlanMemberFunding, MEMBERS>,
@@ -255,6 +430,19 @@ impl<const MEMBERS: usize> TurnReceipt<MEMBERS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c17_public_close_abi_is_exact() {
+        assert_eq!(size_of::<RootRef>(), 16);
+        assert_eq!(align_of::<RootRef>(), 8);
+        assert_eq!(offset_of!(RootRef, slot), 0);
+        assert_eq!(offset_of!(RootRef, generation), 4);
+        assert_eq!(offset_of!(RootRef, version), 8);
+        assert_eq!(size_of::<TypedImpossible>(), 1);
+        assert_eq!(align_of::<TypedImpossible>(), 1);
+        assert_eq!(size_of::<CloseAuthority>(), 240);
+        assert_eq!(align_of::<CloseAuthority>(), 16);
+    }
 
     #[test]
     fn digest_identities_reject_zero_and_round_trip_nonzero() {

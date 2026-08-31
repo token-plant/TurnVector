@@ -32,6 +32,8 @@ use std::num::{NonZeroU64, NonZeroU128};
 
 mod admission;
 mod bounded;
+mod c17_generated;
+mod c17_layout;
 mod certification;
 mod closure_control;
 mod core;
@@ -39,6 +41,7 @@ mod model_descriptor;
 mod model_registry;
 mod request_book;
 mod resource_ledger;
+mod reusable;
 mod scheduler;
 mod scheduling;
 #[expect(
@@ -58,17 +61,28 @@ pub use bounded::{
 pub use core::{
     Core, CoreEvent, CoreFault, CoreOutcome, CoreState, CoreTransition, DomainRejection, Effect,
 };
+/// Monotonic generation of the RequestBook causal owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestBookGeneration(pub(crate) u64);
+
+#[rustfmt::skip]
+impl RequestBookGeneration {
+    pub(crate) fn new(value: u64) -> Result<Self, request_book::RequestError> { (value != 0).then_some(Self(value)).ok_or(request_book::RequestError::InvalidGeneration) }
+    pub const fn get(self) -> u64 { self.0 }
+    pub(crate) fn next(self) -> Result<Self, request_book::RequestError> { self.0.checked_add(1).map(Self).ok_or(request_book::RequestError::GenerationOverflow) }
+}
 pub use scheduling::{
     AuthorizedCapabilitySet, BatchBucket, CandidateCoordinates, CandidateExclusion,
     CandidateExclusionReason, CandidateMember, CandidateValidationError, CapabilityKey,
     ExecutionPhase, RuntimeOverheadBoundSetId, SchedulingSnapshot, ServiceClass, WorkCandidate,
 };
 pub use turns::{
-    FutureTurnSupportEntitlementId, MemberOutcome, PersistentStateIsolationEvidenceId,
-    PhysicalStartCreditId, PlanMemberFunding, PlanSupportObligation, PlanSupportObligations,
-    PlanValidationError, ReceiptValidationError, StalePlanDispositionBoundId,
-    SupportOperationObligationId, SupportOutstandingCreditVectorId, TurnBudget, TurnPlan,
-    TurnPlanIdentity, TurnProgress, TurnReceipt, TurnReceiptIdentity, TurnReceiptMember,
+    CloseAuthority, FutureTurnSupportEntitlementId, MemberOutcome,
+    PersistentStateIsolationEvidenceId, PhysicalStartCreditId, PlanBranch, PlanMemberFunding,
+    PlanSupportObligation, PlanSupportObligations, PlanValidationError, ReceiptValidationError,
+    RootRef, SourceRecordRef, StalePlanDispositionBoundId, SupportOperationObligationId,
+    SupportOutstandingCreditVectorId, TurnBudget, TurnPlan, TurnPlanIdentity, TurnProgress,
+    TurnReceipt, TurnReceiptIdentity, TurnReceiptMember, TypedCloseInput, TypedImpossible,
     YieldReason,
 };
 pub use work::{HotPathWorkBudget, HotPathWorkWitness, WorkBudgetError, WorkDimension, WorkMeter};
@@ -188,6 +202,8 @@ nonzero_id!(/// One stable opaque schedulable choice.
 CandidateId);
 nonzero_id!(/// One authorization for a bounded Turn.
 TurnPlanId);
+nonzero_id!(/// One immutable standalone-formation authority domain.
+FormationDomainId);
 
 nonzero_sequence!(/// A client command position within one connection.
 CommandId);
@@ -209,6 +225,12 @@ nonzero_sequence!(/// The version of applicable daemon runtime-overhead evidence
 RuntimeOverheadGeneration);
 nonzero_sequence!(/// The version of the Core-owned Support Charge Ledger.
 SupportLedgerGeneration);
+nonzero_sequence!(/// One immutable Plan-causal event ordinal.
+PlanCausalEventId);
+nonzero_sequence!(/// One retained membership-event ordinal.
+MembershipEventId);
+nonzero_sequence!(/// One retained cancellation-fact ordinal.
+CancellationFactId);
 
 checked_unit!(/// A count of bytes.
 ByteCount);
@@ -336,6 +358,15 @@ impl GenerationVector {
             safety,
             runtime_overhead,
         }
+    }
+
+    pub(crate) const fn components(self) -> [u64; 4] {
+        [
+            self.scheduler.get(),
+            self.backend.get(),
+            self.safety.get(),
+            self.runtime_overhead.get(),
+        ]
     }
 
     pub fn validate_current(self, current: Self) -> Result<(), GenerationMismatch> {

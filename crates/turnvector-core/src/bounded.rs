@@ -1,4 +1,4 @@
-use crate::work::WorkMeter;
+use crate::work::{WorkMeter, WorkRecorder};
 use crate::{Duration, MonotonicTime, WorkBudgetError, WorkDimension};
 use std::{
     collections::VecDeque,
@@ -245,6 +245,14 @@ impl<V: Copy> FixedIdentityIndex<V> {
     }
 
     pub fn find(&self, key: [u8; 33], work: &mut WorkMeter) -> Result<Option<V>, FixedIndexError> {
+        self.find_with(key, work)
+    }
+
+    fn find_with<W: WorkRecorder + ?Sized>(
+        &self,
+        key: [u8; 33],
+        work: &mut W,
+    ) -> Result<Option<V>, FixedIndexError> {
         if self.root == NO_NODE {
             return Ok(None);
         }
@@ -263,6 +271,14 @@ impl<V: Copy> FixedIdentityIndex<V> {
         &mut self,
         entries: &[([u8; 33], V)],
         work: &mut WorkMeter,
+    ) -> Result<(), FixedIndexError> {
+        self.try_insert_sorted_with(entries, work)
+    }
+
+    fn try_insert_sorted_with<W: WorkRecorder + ?Sized>(
+        &mut self,
+        entries: &[([u8; 33], V)],
+        work: &mut W,
     ) -> Result<(), FixedIndexError> {
         work.record(WorkDimension::InvariantChecks, 1)?;
         let count = entries.len();
@@ -307,7 +323,7 @@ impl<V: Copy> FixedIdentityIndex<V> {
                     return Err(FixedIndexError::NonCanonical);
                 }
             }
-            if self.find(key, work)?.is_some() {
+            if self.find_with(key, work)?.is_some() {
                 return Err(FixedIndexError::Duplicate);
             }
             previous = Some(key);
@@ -452,7 +468,11 @@ impl AvlIndex {
         Ok(height - 1)
     }
 
-    fn find(&self, key: [u8; 33], work: &mut WorkMeter) -> Result<Option<u32>, FixedStorageError> {
+    fn find<W: WorkRecorder + ?Sized>(
+        &self,
+        key: [u8; 33],
+        work: &mut W,
+    ) -> Result<Option<u32>, FixedStorageError> {
         let mut node = self.root;
         while node != NO_NODE {
             work.record(WorkDimension::VisitedEntities, 1)?;
@@ -674,6 +694,16 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         claims: &[C],
         work: &mut WorkMeter,
     ) -> Result<usize, FixedStorageError> {
+        self.try_push_with(keys, record, claims, work)
+    }
+
+    fn try_push_with<W: WorkRecorder + ?Sized>(
+        &mut self,
+        keys: [[u8; 33]; KEYS],
+        record: V,
+        claims: &[C],
+        work: &mut W,
+    ) -> Result<usize, FixedStorageError> {
         work.record(WorkDimension::InvariantChecks, 2)?;
         self.validate_capacity(claims.len())?;
         for key in keys {
@@ -737,6 +767,14 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         &self,
         key: [u8; 33],
         work: &mut WorkMeter,
+    ) -> Result<Option<usize>, FixedStorageError> {
+        self.find_with(key, work)
+    }
+
+    pub(crate) fn find_with<W: WorkRecorder + ?Sized>(
+        &self,
+        key: [u8; 33],
+        work: &mut W,
     ) -> Result<Option<usize>, FixedStorageError> {
         Ok(self.identities.find(key, work)?.map(|index| index as usize))
     }
@@ -864,11 +902,11 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         Ok(())
     }
 
-    pub(crate) fn prepare_start(
+    pub(crate) fn prepare_start<W: WorkRecorder + ?Sized>(
         &self,
         cell: usize,
         at: MonotonicTime,
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<FixedWindowStart, FixedStorageError> {
         work.record(WorkDimension::InvariantChecks, 1)?;
         let (bounds, history) = self
