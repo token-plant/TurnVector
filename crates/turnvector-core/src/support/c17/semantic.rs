@@ -374,3 +374,394 @@ struct ResolutionRawUpdate {
     before: [u8; 8],
     after: [u8; 8],
 }
+
+#[derive(Eq, PartialEq)]
+pub(crate) struct PreparedRootBatch {
+    expected_c17: u64,
+    expected_raw: u64,
+    expected_local: u64,
+    expected_lifecycle: u64,
+    expected_arena_headers: [ByteArenaHeaderImage; 11],
+    arena_headers_after: [ByteArenaHeaderImage; 11],
+    preview: RootBatchPreview,
+    formations: ArenaSelection<ROOT_BATCH_MAX>,
+    funders: ArenaSelection<ROOT_BATCH_FUNDER_MAX>,
+    wrappers: ArenaSelection<ROOT_BATCH_MAX>,
+    wrapper_count: usize,
+    mutations: ArenaSelection<ROOT_BATCH_MAX>,
+    links: ArenaSelection<PLAN_MEMBERS_MAX>,
+    link_count: usize,
+    local_entries: [([u8; 17], [u8; 8]); ROOT_BATCH_LOCAL_MAX],
+    local_count: usize,
+    journals: [Option<RootJournal>; ROOT_BATCH_MAX],
+    owner_records_before: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    owner_records_after: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    owner_references: [[ArenaRef; 4]; PLAN_MEMBERS_MAX],
+    owner_rows_after: [[u8; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX],
+    owners_after: [[u8; OWNER_BYTES]; PLAN_MEMBERS_MAX],
+    retired_links: [ArenaRef; PLAN_MEMBERS_MAX],
+    retired_link_before: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    retired_link_after: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    new_link_images: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    resolution_journals: [Option<ResolutionRecordJournal>; RESOLUTION_RECORD_MAX],
+    raw_updates: [Option<ResolutionRawUpdate>; RESOLUTION_RAW_MAX],
+    raw_update_count: usize,
+    header_after: C17HeaderImage,
+    raw_plan: Option<PatriciaAssignmentPlan<ROOT_RAW_ASSIGNMENT_MAX>>,
+    local_plan: PatriciaAssignmentPlan<ROOT_LOCAL_ASSIGNMENT_MAX>,
+}
+
+impl std::fmt::Debug for PreparedRootBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedRootBatch")
+            .field("operation", &self.preview.operation)
+            .field("transition_count", &self.preview.transition_count)
+            .field("owner_count", &self.preview.owner_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedRootBatch {
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(crate::reusable::AssignmentOrderKey, crate::c17_layout::Assignment),
+    ) {
+        if let Some(plan) = &self.raw_plan {
+            plan.visit_assignments(visitor);
+        }
+        self.local_plan.visit_assignments(visitor);
+    }
+
+    pub(crate) const fn aggregate_delta(&self) -> AggregateDelta {
+        self.preview.aggregate
+    }
+
+    pub(crate) const fn owner_count(&self) -> usize {
+        self.preview.owner_count
+    }
+
+    pub(crate) fn owner_slots(&self) -> [u32; PLAN_MEMBERS_MAX] {
+        self.preview.owner_slots()
+    }
+
+    pub(crate) fn owner_branch_delta(&self, index: usize) -> Option<[i32; 4]> {
+        self.preview.owner_branch_delta(index)
+    }
+
+    pub(in crate::support) const fn owner_records_after(
+        &self,
+    ) -> [Option<BundleRecord>; PLAN_MEMBERS_MAX] {
+        self.owner_records_after
+    }
+
+    pub(in crate::support) const fn lifecycle_before(&self) -> LifecycleAggregate {
+        self.preview.lifecycle_before
+    }
+
+    pub(in crate::support) const fn lifecycle_after(&self) -> LifecycleAggregate {
+        self.preview.lifecycle_after
+    }
+
+    pub(in crate::support) fn retractions(&self) -> &[LifecyclePublication] {
+        self.preview.retractions()
+    }
+}
+
+impl SupportC17 {
+    pub(crate) fn inspect_plan_disposition(
+        &self,
+        authority_key: [u8; 17],
+        identity: [u8; PLAN_IDENTITY_BYTES],
+        disposition: PlanDisposition,
+        occurred_at: u64,
+    ) -> Result<RootBatchPreview, SupportLedgerError> {
+        if occurred_at == 0 {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let roots = [
+            self.plan_root(authority_key, identity, 0)?,
+            self.plan_root(authority_key, identity, 1)?,
+            self.plan_root(authority_key, identity, 2)?,
+        ];
+        if roots
+            .iter()
+            .any(|root| root.state != RootState::Conditional)
+            || roots.iter().any(|root| occurred_at <= root.occurred_at)
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let (operation, cause, transitions, resolver) = match disposition {
+            PlanDisposition::Receipt => (
+                SemanticOperation::ReceiptDisposition,
+                FormationCause::Receipt,
+                [
+                    Some((roots[0], RootState::Pending, 0)),
+                    Some((roots[2], RootState::ClosedConditional, 1)),
+                    None,
+                    None,
+                    None,
+                ],
+                ResolverChange::Keep,
+            ),
+            PlanDisposition::Rejection => (
+                SemanticOperation::RejectionResult,
+                FormationCause::Rejection,
+                [
+                    Some((roots[0], RootState::ClosedConditional, 2)),
+                    Some((roots[1], RootState::ClosedConditional, 2)),
+                    Some((roots[2], RootState::Pending, 0)),
+                    None,
+                    None,
+                ],
+                ResolverChange::MoveTo(2),
+            ),
+            PlanDisposition::LocalStale => (
+                SemanticOperation::LocalStaleResult,
+                FormationCause::LocalStale,
+                [
+                    Some((roots[0], RootState::ClosedConditional, 3)),
+                    Some((roots[1], RootState::ClosedConditional, 3)),
+                    Some((roots[2], RootState::Pending, 0)),
+                    None,
+                    None,
+                ],
+                ResolverChange::MoveTo(2),
+            ),
+        };
+        self.preview_root_batch(operation, cause, transitions, resolver, occurred_at)
+    }
+
+    pub(crate) fn inspect_observation_resolution(
+        &self,
+        authority_key: [u8; 17],
+        identity: [u8; PLAN_IDENTITY_BYTES],
+        resolution: ObservationResolution,
+        occurred_at: u64,
+    ) -> Result<RootBatchPreview, SupportLedgerError> {
+        if occurred_at == 0 {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let observation = self.plan_root(authority_key, identity, 0)?;
+        let continuation = self.plan_root(authority_key, identity, 1)?;
+        let rejection = self.plan_root(authority_key, identity, 2)?;
+        if observation.state != RootState::Active
+            || continuation.state != RootState::Conditional
+            || rejection.state != RootState::ClosedConditional
+            || occurred_at <= observation.occurred_at
+            || occurred_at <= continuation.occurred_at
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let (operation, continuation_after, reason, resolver) = match resolution {
+            ObservationResolution::DescriptionsRequired => (
+                SemanticOperation::ResolveObservationDescriptions,
+                RootState::Pending,
+                0,
+                ResolverChange::MoveTo(1),
+            ),
+            ObservationResolution::Other => (
+                SemanticOperation::ResolveObservationOther,
+                RootState::ClosedConditional,
+                4,
+                ResolverChange::Retire,
+            ),
+        };
+        let mut preview = self.preview_root_batch(
+            operation,
+            FormationCause::ObservationCompleted,
+            [
+                Some((observation, RootState::Retained, 0)),
+                Some((continuation, continuation_after, reason)),
+                None,
+                None,
+                None,
+            ],
+            resolver,
+            occurred_at,
+        )?;
+        let (records, record_count, before, after, retractions, retraction_count) =
+            self.inspect_observation_lifecycle(observation, continuation, resolution)?;
+        add_lifecycle_aggregate_delta(&mut preview.aggregate, before, after)?;
+        preview.resolution_records = records;
+        preview.resolution_record_count = record_count;
+        preview.lifecycle_before = before;
+        preview.lifecycle_after = after;
+        preview.retractions = retractions;
+        preview.retraction_count = retraction_count;
+        Ok(preview)
+    }
+
+    fn inspect_observation_lifecycle(
+        &self,
+        observation: RootSnapshot,
+        continuation: RootSnapshot,
+        resolution: ObservationResolution,
+    ) -> Result<
+        (
+            [Option<ResolutionRecordSnapshot>; RESOLUTION_RECORD_MAX],
+            usize,
+            LifecycleAggregate,
+            LifecycleAggregate,
+            [LifecyclePublication; RESOLUTION_PUBLICATION_MAX],
+            usize,
+        ),
+        SupportLedgerError,
+    > {
+        if self.pending_state()? != PendingState::Empty
+            || observation.member_count != continuation.member_count
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let mut resolver_links = [ArenaRef::default(); PLAN_MEMBERS_MAX];
+        for (index, member) in observation.members[..observation.member_count]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let row_ref = self.owner_rows.reference_at(member.owner.slot, &[1])?;
+            let row = self.owner_rows.image(row_ref, &[1])?;
+            let link =
+                decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8])?
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+            let link_image = self.links.image(link, &[1])?;
+            if link_image[8] != 1
+                || decode_arena_ref(&link_image[16..24])? != member.owner
+                || decode_arena_ref(&link_image[24..32])? != observation.group
+                || decode_arena_ref(&link_image[32..40])? != observation.initial_formation
+            {
+                return Err(noncanonical_error());
+            }
+            resolver_links[index] = link;
+        }
+
+        let mut records = [None; RESOLUTION_RECORD_MAX];
+        let mut record_count = 0usize;
+        let mut before = LifecycleAggregate::ZERO;
+        let mut after = LifecycleAggregate::ZERO;
+        let mut retractions = [LifecyclePublication::ZERO; RESOLUTION_PUBLICATION_MAX];
+        let mut retraction_count = 0usize;
+        for slot in 0..self.lifecycle.capacity() {
+            let Some(reference) = self.lifecycle.reference_if_occupied(slot as u32)? else {
+                continue;
+            };
+            let image = *self.lifecycle.image(reference, &[1])?;
+            if image[488] != 0 {
+                validate_closed_lifecycle_image(&image)?;
+                continue;
+            }
+            let record = LifecycleRecordInput::decode(&image)?;
+            self.validate_lifecycle_record_owner_set(record, reference)?;
+            let owner_count = record
+                .owners
+                .iter()
+                .position(|owner| *owner == LifecycleOwnerRow::ZERO)
+                .unwrap_or(PLAN_MEMBERS_MAX);
+            let linked = record.owners[..owner_count].iter().any(|owner| {
+                decode_arena_ref(&owner.link.to_le_bytes())
+                    .is_ok_and(|link| resolver_links[..observation.member_count].contains(&link))
+            });
+            if !linked {
+                continue;
+            }
+            if record_count == RESOLUTION_RECORD_MAX
+                || owner_count == 0
+                || owner_count != observation.member_count
+                || record.owners[..owner_count].iter().any(|owner| {
+                    decode_arena_ref(&owner.link.to_le_bytes()).map_or(true, |link| {
+                        !resolver_links[..observation.member_count].contains(&link)
+                    })
+                })
+                || record.final_owner[..17] != observation.authority_key
+                || !matches!(record.final_owner[17], 0 | 1)
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            for (kind, key) in [
+                (RawOwnerKind::LifecycleObligation, record.obligation_raw),
+                (RawOwnerKind::LifecycleCredit, record.credit_raw),
+            ] {
+                let value = self.raw.find(&key)?.ok_or_else(noncanonical_error)?;
+                let (actual_kind, state, owner) = decode_raw_owner(value)?;
+                if actual_kind != kind || state != RawOwnerState::Committed || owner != reference {
+                    return Err(noncanonical_error());
+                }
+            }
+            before.accrue(record)?;
+            if resolution == ObservationResolution::DescriptionsRequired {
+                let mut transferred = record;
+                transferred.aggregate[0] = RootState::Pending as u64 - 1;
+                for owner in &mut transferred.owners[..owner_count] {
+                    owner.class = RootState::Pending as u64 - 1;
+                }
+                after.accrue(transferred)?;
+            } else {
+                let axis = u8::try_from(record.aggregate[2]).map_err(|_| noncanonical_error())?;
+                let horizon =
+                    u8::try_from(record.aggregate[3]).map_err(|_| noncanonical_error())?;
+                for owner in record.owners[..owner_count].iter().copied() {
+                    if retraction_count == retractions.len() {
+                        return Err(capacity_error());
+                    }
+                    let owner_ref = decode_arena_ref(&owner.owner.to_le_bytes())?;
+                    let member = decode_arena_ref(&owner.source.to_le_bytes())?;
+                    let member_image = self.members.image(member, &[1])?;
+                    retractions[retraction_count] = LifecyclePublication {
+                        owner_slot: owner_ref.slot,
+                        funder: decode_arena_ref(&member_image[24..32])?,
+                        branch: record.final_owner[17],
+                        axis,
+                        horizon,
+                        zero: 0,
+                    };
+                    retraction_count += 1;
+                }
+            }
+            records[record_count] = Some(ResolutionRecordSnapshot {
+                reference,
+                record,
+                image,
+            });
+            record_count += 1;
+        }
+        Ok((
+            records,
+            record_count,
+            before,
+            after,
+            retractions,
+            retraction_count,
+        ))
+    }
+
+    pub(crate) fn plan_root_anchor(
+        &self,
+        authority_key: [u8; 17],
+        identity: [u8; PLAN_IDENTITY_BYTES],
+        branch: u8,
+    ) -> Result<RootAnchor, SupportLedgerError> {
+        let root = self.plan_root(authority_key, identity, branch)?;
+        Ok(RootAnchor {
+            authority_key,
+            branch,
+            group: root.group,
+            root: root.group,
+            version: root.version,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::support) fn root_facts_for_test(
+        &self,
+        anchor: RootAnchor,
+    ) -> Result<(RootState, usize, ArenaRef, ArenaRef, ArenaRef), SupportLedgerError> {
+        let root = self.root_from_anchor(anchor)?;
+        Ok((
+            root.state,
+            root.member_count,
+            root.formation,
+            root.initial_formation,
+            root.locator,
+        ))
+    }
+}
