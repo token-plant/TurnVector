@@ -5235,4 +5235,202 @@ mod tests {
             );
         }
     }
+
+    #[inline(never)]
+    fn assert_production_formation_backing_boundary() {
+        let mut ledger = SupportC17::try_new(SupportC17Capacities::production()).unwrap();
+        let selection: ArenaSelection<FORMATION_CAPACITY> = ledger
+            .formations
+            .prepare_reserve(FORMATION_CAPACITY)
+            .unwrap();
+        ledger.formations.commit_reserve(&selection).unwrap();
+        for reference in selection.as_slice().iter().copied() {
+            ledger
+                .formations
+                .install_reserved(reference, FormationImage::ZERO.0, 1)
+                .unwrap();
+        }
+        assert_eq!(
+            (
+                ledger.formations.occupied(),
+                ledger.formations.free_len(),
+                ledger.formations.reserved_count(),
+            ),
+            (FORMATION_CAPACITY, 0, 0)
+        );
+        let before = (
+            ledger.formations.generation(),
+            ledger.formations.occupied(),
+            ledger.formations.free_len(),
+            ledger.formations.reserved_count(),
+        );
+        assert!(matches!(
+            ledger.formations.prepare_reserve::<1>(1),
+            Err(FixedStorageError::Capacity)
+        ));
+        assert_eq!(
+            (
+                ledger.formations.generation(),
+                ledger.formations.occupied(),
+                ledger.formations.free_len(),
+                ledger.formations.reserved_count(),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn production_formation_backing_accepts_exact_capacity_and_rejects_first_one_over() {
+        assert_production_formation_backing_boundary();
+    }
+
+    #[test]
+    fn operation_inventory_is_closed_and_each_row_charges_atomically() {
+        let expected = [
+            SemanticOperation::PlanCreateO,
+            SemanticOperation::PlanCreateC,
+            SemanticOperation::PlanCreateR,
+            SemanticOperation::CreateStandalone,
+            SemanticOperation::MergeInitial,
+            SemanticOperation::NewlyEligibleNotify,
+            SemanticOperation::ReceiptDisposition,
+            SemanticOperation::RejectionResult,
+            SemanticOperation::LocalStaleResult,
+            SemanticOperation::ResolveObservationDescriptions,
+            SemanticOperation::ResolveObservationOther,
+            SemanticOperation::MarkPredecessorEnded,
+            SemanticOperation::Begin,
+            SemanticOperation::Finish,
+            SemanticOperation::Join,
+            SemanticOperation::SourceFreeRebind,
+            SemanticOperation::NewlyEligibleJoin,
+            SemanticOperation::NewlyEligibleRebind,
+            SemanticOperation::Split,
+            SemanticOperation::Merge,
+            SemanticOperation::CancellationRemoveBound,
+            SemanticOperation::CancellationRemoveEligibleUnbound,
+            SemanticOperation::MembershipClose,
+            SemanticOperation::TypedCloseStandalone,
+            SemanticOperation::TypedCloseC,
+            SemanticOperation::TypedCloseR,
+            SemanticOperation::TypedCloseTerminal,
+            SemanticOperation::Tombstone,
+            SemanticOperation::Withdraw,
+            SemanticOperation::ExpiryCurrentUse,
+        ];
+        assert_eq!(SemanticOperation::ALL, expected);
+        for operation in SemanticOperation::ALL {
+            let mut work = meter();
+            work.charge(HotPathWorkWitness::new(operation.work()))
+                .unwrap();
+            assert_eq!(work.witness(), HotPathWorkWitness::new(operation.work()));
+            for dimension in [
+                WorkDimension::VisitedEntities,
+                WorkDimension::CopiedBytes,
+                WorkDimension::Allocations,
+                WorkDimension::CandidateWork,
+                WorkDimension::InvariantChecks,
+            ] {
+                let mut row = operation.work();
+                if row[dimension as usize] == 0 {
+                    continue;
+                }
+                row[dimension as usize] -= 1;
+                let mut limited =
+                    WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(row)));
+                assert!(matches!(
+                    limited.charge(HotPathWorkWitness::new(operation.work())),
+                    Err(WorkBudgetError::BudgetExceeded(actual, _, _)) if actual == dimension
+                ));
+                assert_eq!(limited.witness(), HotPathWorkWitness::new([0; 5]));
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_stage_rejects_noncanonical_owner_set_without_mutation() {
+        let capacities = SupportC17Capacities::lifecycle_testing(16);
+        let mut ledger = SupportC17::try_new(capacities).unwrap();
+        let support = SupportLedgerGeneration::new(1).unwrap();
+        let records: Vec<_> = (1..=9).map(record).collect();
+        let aggregate = LifecycleAggregate::from_records(&records).unwrap();
+        let begin_work = meter();
+        let begin = ledger
+            .prepare_begin_batch(records.len(), aggregate, support)
+            .unwrap();
+        assert_eq!(begin_work.witness(), HotPathWorkWitness::default());
+        ledger.commit_begin_batch(begin);
+        let snapshot = (
+            ledger.generation(),
+            ledger.raw.generation(),
+            ledger.lifecycle.generation(),
+            ledger.current_counts_for_test(),
+            ledger.pending_header_for_test(),
+        );
+        let stage_work = meter();
+        assert_eq!(
+            ledger.prepare_stage_chunk(&records[..1]).unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(stage_work.witness(), HotPathWorkWitness::default());
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.raw.generation(),
+                ledger.lifecycle.generation(),
+                ledger.current_counts_for_test(),
+                ledger.pending_header_for_test(),
+            ),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn lifecycle_header_reuse_invalidates_old_direct_slot_reference() {
+        let capacities = SupportC17Capacities::lifecycle_testing(1);
+        let mut ledger = SupportC17::try_new(capacities).unwrap();
+        let support = SupportLedgerGeneration::new(1).unwrap();
+        let aggregate = LifecycleAggregate::from_records(&[record(1)]).unwrap();
+
+        let first = ledger.prepare_begin_batch(1, aggregate, support).unwrap();
+        let old = first.selection.as_slice()[0];
+        ledger.commit_begin_batch(first);
+        let abort = ledger.prepare_abort_chunk().unwrap();
+        assert!(ledger.commit_abort_chunk(abort));
+
+        let second = ledger.prepare_begin_batch(1, aggregate, support).unwrap();
+        let current = second.selection.as_slice()[0];
+        assert_eq!(current.slot, old.slot);
+        assert_eq!(current.generation, old.generation + 1);
+        ledger.commit_begin_batch(second);
+
+        assert_eq!(
+            ledger.lifecycle.image(old, &[0, 1, 2, 3]),
+            Err(FixedStorageError::NonCanonical)
+        );
+        assert!(ledger.lifecycle.image(current, &[0, 1, 2, 3]).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_abort_reverses_unstaged_slots_in_chunks() {
+        let capacities = SupportC17Capacities::lifecycle_testing(16);
+        let mut ledger = SupportC17::try_new(capacities).unwrap();
+        let support = SupportLedgerGeneration::new(1).unwrap();
+        let records: Vec<_> = (1..=9).map(record).collect();
+        let aggregate = LifecycleAggregate::from_records(&records).unwrap();
+        let begin = ledger
+            .prepare_begin_batch(records.len(), aggregate, support)
+            .unwrap();
+        ledger.commit_begin_batch(begin);
+        let mut terminal = false;
+        let mut chunks = 0;
+        while !terminal {
+            let abort = ledger.prepare_abort_chunk().unwrap();
+            terminal = ledger.commit_abort_chunk(abort);
+            chunks += 1;
+        }
+        assert_eq!(chunks, 2);
+        assert_eq!(ledger.pending_state().unwrap(), PendingState::Empty);
+        assert_eq!((ledger.lifecycle.free_len(), ledger.raw.len()), (16, 0));
+    }
 }
