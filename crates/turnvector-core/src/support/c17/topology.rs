@@ -2149,3 +2149,213 @@ impl SupportC17 {
 fn arena_ref_word(reference: ArenaRef) -> u64 {
     u64::from_le_bytes(encode_arena_ref_value(reference))
 }
+
+fn adjust_topology_funder_current(
+    image: &mut [u8; FUNDER_BYTES],
+    delta: i32,
+) -> Result<(), SupportLedgerError> {
+    let after = apply_i32_u64(read_u64(image, 112), delta)?;
+    if after > read_u64(image, 120) {
+        return Err(capacity_error());
+    }
+    write_u64(image, 112, after);
+    Ok(())
+}
+
+fn add_topology_lifecycle_aggregate_delta(
+    aggregate: &mut AggregateDelta,
+    before: LifecycleAggregate,
+    after: LifecycleAggregate,
+) -> Result<(), SupportLedgerError> {
+    let mut delta = AggregateDelta::ZERO;
+    for class in 0..5 {
+        for pool in 0..3 {
+            let usage = i64::from(after.usage[class][pool])
+                .checked_sub(i64::from(before.usage[class][pool]))
+                .ok_or_else(capacity_error)?;
+            let reserved = i64::from(before.reserved[class][pool])
+                .checked_sub(i64::from(after.reserved[class][pool]))
+                .ok_or_else(capacity_error)?;
+            delta.usage[class][pool] = i32::try_from(usage).map_err(|_| capacity_error())?;
+            delta.reserved[class][pool] = i32::try_from(reserved).map_err(|_| capacity_error())?;
+            if class < 4 {
+                let attached = i64::from(after.attached[class][pool])
+                    .checked_sub(i64::from(before.attached[class][pool]))
+                    .ok_or_else(capacity_error)?;
+                delta.attached[class][pool] =
+                    i32::try_from(attached).map_err(|_| capacity_error())?;
+            }
+        }
+    }
+    aggregate.add(delta)
+}
+
+fn validate_topology_closed_lifecycle_image(
+    image: &[u8; LIFECYCLE_BYTES],
+) -> Result<(), SupportLedgerError> {
+    (image[488] == LIFECYCLE_CLOSE_ACTION
+        && matches!(image[489], 1 | MEMBERSHIP_CLOSED_LIFECYCLE)
+        && image[490..496].iter().all(|byte| *byte == 0)
+        && read_u64(image, 496) != 0
+        && read_u64(image, 504) != 0
+        && image[1_024..].iter().all(|byte| *byte == 0))
+    .then_some(())
+    .ok_or_else(noncanonical_error)
+}
+
+fn topology_external_authority(
+    event: &MembershipEventRecord,
+    destination: usize,
+) -> Result<[u8; 17], SupportLedgerError> {
+    let ordinal = u8::try_from(destination).map_err(|_| SupportLedgerError::InvalidInput)?;
+    let mut key = [0; 17];
+    key[0] = 0x32;
+    key[1..9].copy_from_slice(&event.id.to_be_bytes());
+    key[9] = ordinal.checked_add(1).ok_or_else(capacity_error)?;
+    key[10] = event.kind as u8;
+    key[11..17].copy_from_slice(&event.generation_after.to_be_bytes()[2..]);
+    Ok(key)
+}
+
+fn topology_external_raw(
+    event: &MembershipEventRecord,
+    destination: usize,
+) -> Result<([u8; 32], [u8; 32]), SupportLedgerError> {
+    let ordinal = u8::try_from(destination).map_err(|_| SupportLedgerError::InvalidInput)?;
+    let mut obligation = [0; 32];
+    obligation[0] = 0x71;
+    obligation[1..9].copy_from_slice(&event.id.to_be_bytes());
+    obligation[9] = ordinal.checked_add(1).ok_or_else(capacity_error)?;
+    obligation[10] = event.kind as u8;
+    obligation[11..19].copy_from_slice(&event.generation_after.to_be_bytes());
+    let mut credit = obligation;
+    credit[0] = 0x72;
+    Ok((obligation, credit))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyDestinationJournal {
+    group: ArenaRef,
+    formation: ArenaRef,
+    locator: ArenaRef,
+    locator_kind: u8,
+    group_image: [u8; GROUP_BYTES],
+    formation_image: [u8; FORMATION_BYTES],
+    locator_image: [u8; EXTERNAL_HEAD_BYTES],
+    funder_images: [[u8; FUNDER_BYTES]; PLAN_MEMBERS_MAX],
+    member_images: [[u8; MEMBER_BYTES]; PLAN_MEMBERS_MAX],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopologyAuthorityUpdate {
+    key: [u8; 17],
+    before: [u8; 8],
+    handle: NodeHandle,
+    after: [u8; 8],
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparedMembershipTopology {
+    expected_c17: u64,
+    expected_raw: u64,
+    expected_authority: u64,
+    expected_local: u64,
+    expected_lifecycle: u64,
+    expected_arena_headers: [ByteArenaHeaderImage; 12],
+    arena_headers_after: [ByteArenaHeaderImage; 12],
+    preview: MembershipTopologyPreview,
+    event: MembershipEventRecord,
+    groups: ArenaSelection<SURGERY_DESTINATION_MAX>,
+    external_heads: ArenaSelection<SURGERY_HEAD_MAX>,
+    external_head_count: usize,
+    formations: ArenaSelection<SURGERY_FORMATION_MAX>,
+    funders: ArenaSelection<SURGERY_FUNDER_MAX>,
+    members: ArenaSelection<SURGERY_MEMBER_MAX>,
+    wrappers: ArenaSelection<SURGERY_WRAPPER_MAX>,
+    wrapper_count: usize,
+    links: ArenaSelection<SURGERY_LINK_MAX>,
+    link_count: usize,
+    replacement_link_indices: [u8; PLAN_MEMBERS_MAX],
+    memberships: ArenaSelection<1>,
+    mutations: ArenaSelection<SURGERY_MUTATION_MAX>,
+    source_journals: [Option<SourceJournal>; SOURCE_MAX],
+    destination_journals: [Option<TopologyDestinationJournal>; SURGERY_DESTINATION_MAX],
+    membership_image: [u8; MEMBERSHIP_BYTES],
+    membership_mutation: [u8; MUTATION_BYTES],
+    raw_entries: [([u8; 32], [u8; 8]); SURGERY_RAW_MAX],
+    raw_count: usize,
+    authority_inserts: [([u8; 17], [u8; 8]); SURGERY_AUTHORITY_MAX],
+    authority_insert_count: usize,
+    authority_updates: [Option<TopologyAuthorityUpdate>; 1],
+    authority_update_count: usize,
+    local_entries: [([u8; 17], [u8; 8]); SURGERY_LOCAL_MAX],
+    local_count: usize,
+    owner_records_before: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    owner_records_after: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    owner_references: [[ArenaRef; 4]; PLAN_MEMBERS_MAX],
+    owner_rows_after: [[u8; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX],
+    owners_after: [[u8; OWNER_BYTES]; PLAN_MEMBERS_MAX],
+    retired_links: [ArenaRef; PLAN_MEMBERS_MAX],
+    retired_link_before: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    retired_link_after: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    replacement_links: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    header_after: C17HeaderImage,
+    lifecycle_journals: [Option<TopologyLifecycleJournal>; SURGERY_LIFECYCLE_MAX],
+    lifecycle_raw_updates: [Option<TopologyLifecycleRawUpdate>; SURGERY_LIFECYCLE_RAW_MAX],
+    lifecycle_raw_update_count: usize,
+    raw_plan: Option<PatriciaAssignmentPlan<RAW_ASSIGNMENT_MAX>>,
+    authority_plan: Option<PatriciaAssignmentPlan<AUTHORITY_ASSIGNMENT_MAX>>,
+    local_plan: PatriciaAssignmentPlan<LOCAL_ASSIGNMENT_MAX>,
+}
+
+impl PreparedMembershipTopology {
+    pub(crate) const fn aggregate_delta(&self) -> AggregateDelta {
+        self.preview.aggregate
+    }
+
+    pub(crate) const fn owner_count(&self) -> usize {
+        self.preview.owner_count
+    }
+
+    pub(crate) fn owner_slots(&self) -> [u32; PLAN_MEMBERS_MAX] {
+        self.preview.owner_slots()
+    }
+
+    pub(crate) fn owner_branch_delta(&self, index: usize) -> Option<[i32; 4]> {
+        self.preview.owner_branch_delta(index)
+    }
+
+    pub(in crate::support) const fn owner_records_after(
+        &self,
+    ) -> [Option<BundleRecord>; PLAN_MEMBERS_MAX] {
+        self.owner_records_after
+    }
+
+    pub(in crate::support) const fn lifecycle_before(&self) -> LifecycleAggregate {
+        self.preview.lifecycle_before
+    }
+
+    pub(in crate::support) const fn lifecycle_after(&self) -> LifecycleAggregate {
+        self.preview.lifecycle_after
+    }
+
+    pub(in crate::support) fn retractions(&self) -> &[LifecyclePublication] {
+        self.preview.retractions()
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        if let Some(plan) = &self.raw_plan {
+            plan.visit_assignments(visitor);
+        }
+        if let Some(plan) = &self.authority_plan {
+            plan.visit_assignments(visitor);
+        }
+        self.local_plan.visit_assignments(visitor);
+    }
+}
+
+impl SupportC17 {
+}
