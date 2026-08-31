@@ -2093,4 +2093,384 @@ impl SupportC17 {
             retraction_count: 0,
         })
     }
+
+    fn validate_preview(&self, preview: &RootBatchPreview) -> Result<(), SupportLedgerError> {
+        if self.generation() != preview.expected_c17
+            || preview.transition_count == 0
+            || preview.transition_count > ROOT_BATCH_MAX
+            || preview.transitions[..preview.transition_count]
+                .iter()
+                .any(Option::is_none)
+            || preview.transitions[preview.transition_count..]
+                .iter()
+                .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        match preview.plan_event {
+            Some((before, after)) => {
+                if !matches!(
+                    preview.operation,
+                    SemanticOperation::TypedCloseC | SemanticOperation::TypedCloseR
+                ) || read_u64(&self.header.0, NEXT_PLAN_CAUSAL_EVENT) != before
+                    || before.checked_add(1) != Some(after)
+                {
+                    return Err(SupportLedgerError::Generation);
+                }
+            }
+            None if matches!(
+                preview.operation,
+                SemanticOperation::TypedCloseC | SemanticOperation::TypedCloseR
+            ) =>
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            None => {}
+        }
+        let resolution = match preview.operation {
+            SemanticOperation::ResolveObservationDescriptions => {
+                Some(ObservationResolution::DescriptionsRequired)
+            }
+            SemanticOperation::ResolveObservationOther => Some(ObservationResolution::Other),
+            _ => None,
+        };
+        if let Some(resolution) = resolution {
+            let observation = preview.transitions[0]
+                .ok_or(SupportLedgerError::InvalidInput)?
+                .before;
+            let continuation = preview.transitions[1]
+                .ok_or(SupportLedgerError::InvalidInput)?
+                .before;
+            let (records, count, before, after, retractions, retraction_count) =
+                self.inspect_observation_lifecycle(observation, continuation, resolution)?;
+            if preview.resolution_records != records
+                || preview.resolution_record_count != count
+                || preview.lifecycle_before != before
+                || preview.lifecycle_after != after
+                || preview.retractions != retractions
+                || preview.retraction_count != retraction_count
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        } else if preview.resolution_record_count != 0
+            || preview.resolution_records.iter().any(Option::is_some)
+            || preview.lifecycle_before != LifecycleAggregate::ZERO
+            || preview.lifecycle_after != LifecycleAggregate::ZERO
+            || preview.retraction_count != 0
+            || preview
+                .retractions
+                .iter()
+                .any(|publication| *publication != LifecyclePublication::ZERO)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        for (index, transition) in preview.transitions[..preview.transition_count]
+            .iter()
+            .flatten()
+            .enumerate()
+        {
+            if !validate_close_authority_image(preview.operation, index, transition.close_authority)
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            let current = self.root_at_group(
+                transition.before.group,
+                transition.before.authority_key,
+                transition.before.branch,
+            )?;
+            if current != transition.before {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        Ok(())
+    }
+
+    fn plan_root(
+        &self,
+        authority_key: [u8; 17],
+        identity: [u8; PLAN_IDENTITY_BYTES],
+        branch: u8,
+    ) -> Result<RootSnapshot, SupportLedgerError> {
+        if authority_key[0] != 0x30 || branch >= PLAN_BRANCHES as u8 {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let value = self
+            .authority
+            .find(&authority_key)?
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        let first = decode_arena_ref(&value)?;
+        let first_image = self.groups.image(first, &[1])?;
+        if first_image[8] != 0 || first_image[40..57] != authority_key {
+            return Err(noncanonical_error());
+        }
+        let group = decode_arena_ref(
+            &first_image[96 + usize::from(branch) * 8..104 + usize::from(branch) * 8],
+        )?;
+        let snapshot = self.root_at_group(group, authority_key, branch)?;
+        let initial = self.formations.image(snapshot.initial_formation, &[1])?;
+        if read_u64(initial, 224) != 1
+            || initial[222] != FormationCause::Plan as u8
+            || initial[8..8 + PLAN_IDENTITY_BYTES] != identity
+        {
+            return Err(noncanonical_error());
+        }
+        Ok(snapshot)
+    }
+
+    pub(super) fn root_from_anchor(
+        &self,
+        anchor: RootAnchor,
+    ) -> Result<RootSnapshot, SupportLedgerError> {
+        if anchor.authority_key == [0; 17]
+            || anchor.branch > 4
+            || anchor.group.generation == 0
+            || anchor.root.generation == 0
+            || anchor.version == 0
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let snapshot = self.root_at_group(anchor.group, anchor.authority_key, anchor.branch)?;
+        if anchor.root != anchor.group || snapshot.version != anchor.version {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(snapshot)
+    }
+
+    pub(super) fn root_at_group(
+        &self,
+        group: ArenaRef,
+        authority_key: [u8; 17],
+        branch: u8,
+    ) -> Result<RootSnapshot, SupportLedgerError> {
+        let group_image = *self.groups.image(group, &[1])?;
+        let state = decode_root_state(group_image[9])?;
+        let member_count = usize::from(group_image[10]);
+        let locator_kind = group_image[11];
+        if group_image[8] != branch
+            || !(1..=PLAN_MEMBERS_MAX).contains(&member_count)
+            || !matches!(locator_kind, 1 | 2)
+            || group_image[12..16].iter().any(|byte| *byte != 0)
+            || group_image[40..57] != authority_key
+            || group_image[57..64].iter().any(|byte| *byte != 0)
+        {
+            return Err(noncanonical_error());
+        }
+        let formation = decode_arena_ref(&group_image[16..24])?;
+        let locator = decode_arena_ref(&group_image[24..32])?;
+        let version = read_u64(&group_image, 32);
+        if version == 0 || version > 4 {
+            return Err(noncanonical_error());
+        }
+        let formation_image = *self.formations.image(formation, &[1])?;
+        if formation_image[220] != branch
+            || decode_root_state(formation_image[221])? != state
+            || read_u64(&formation_image, 224) != version
+            || decode_arena_ref(&formation_image[240..248])? != group
+            || decode_arena_ref(&formation_image[248..256])? != locator
+        {
+            return Err(noncanonical_error());
+        }
+        let occurred_at = read_u64(&formation_image, 232);
+        if occurred_at == 0 {
+            return Err(noncanonical_error());
+        }
+        let initial_formation = if version == 1 {
+            formation
+        } else {
+            decode_arena_ref(&formation_image[8..16])?
+        };
+        let locator_image = if locator_kind == 1 {
+            *self.external_heads.image(locator, &[1])?
+        } else {
+            *self.wrappers.image(locator, &[1])?
+        };
+        let locator_version = if locator_kind == 1 { 120 } else { 56 };
+        if locator_image[8] != branch
+            || decode_root_state(locator_image[9])? != state
+            || decode_arena_ref(&locator_image[16..24])? != group
+            || decode_arena_ref(&locator_image[24..32])? != formation
+            || read_u64(&locator_image, locator_version) != version
+        {
+            return Err(noncanonical_error());
+        }
+        let mut members = [RootMemberSnapshot::ZERO; PLAN_MEMBERS_MAX];
+        for ordinal in 0..PLAN_MEMBERS_MAX {
+            let member = decode_arena_ref(&group_image[64 + ordinal * 8..72 + ordinal * 8])?;
+            let member_image = self.members.image(member, &[1])?;
+            let active = ordinal < member_count;
+            if member_image[8] != u8::from(active)
+                || member_image[9] != branch
+                || usize::from(member_image[10]) != ordinal
+                || member_image[11..16].iter().any(|byte| *byte != 0)
+                || decode_arena_ref(&member_image[16..24])? != group
+            {
+                return Err(noncanonical_error());
+            }
+            let funder = decode_arena_ref(&member_image[24..32])?;
+            let funder_image = self.funders.image(funder, &[1])?;
+            if funder_image[8] != u8::from(active)
+                || funder_image[9] != branch
+                || u64::from(funder_image[10]) != version
+                || usize::from(funder_image[11]) != ordinal
+                || decode_arena_ref(&funder_image[16..24])? != group
+                || decode_arena_ref(&funder_image[24..32])? != formation
+                || decode_arena_ref(&funder_image[32..40])? != member
+            {
+                return Err(noncanonical_error());
+            }
+            let mut request_key = [0; 40];
+            request_key.copy_from_slice(&member_image[32..72]);
+            let owner = if active {
+                decode_arena_ref(&member_image[72..80])?
+            } else {
+                ArenaRef::default()
+            };
+            let mut entitlement = [0; 32];
+            entitlement.copy_from_slice(&member_image[80..112]);
+            let mut vector = [0; 32];
+            vector.copy_from_slice(&funder_image[80..112]);
+            if active {
+                if request_key == [0; 40]
+                    || entitlement == [0; 32]
+                    || vector == [0; 32]
+                    || decode_arena_ref(&funder_image[40..48])? != owner
+                    || funder_image[48..80] != entitlement
+                    || read_u64(funder_image, 112) == 0
+                    || read_u64(funder_image, 120) == 0
+                {
+                    return Err(noncanonical_error());
+                }
+            } else if request_key != [0; 40]
+                || owner != ArenaRef::default()
+                || entitlement != [0; 32]
+                || vector != [0; 32]
+                || funder_image[40..].iter().any(|byte| *byte != 0)
+            {
+                return Err(noncanonical_error());
+            }
+            members[ordinal] = RootMemberSnapshot {
+                member,
+                funder,
+                owner,
+                request_key,
+                entitlement,
+                vector,
+                branch_limit: read_u64(funder_image, 120),
+                active,
+            };
+        }
+        Ok(RootSnapshot {
+            authority_key,
+            branch,
+            group,
+            formation,
+            initial_formation,
+            locator,
+            locator_kind,
+            state,
+            version,
+            occurred_at,
+            member_count,
+            members,
+            group_image,
+            formation_image,
+            locator_image,
+        })
+    }
+
+    pub(crate) fn current_membership_root_anchor(
+        &self,
+        anchor: crate::request_book::c17::SupportMembershipAnchor,
+    ) -> Result<RootAnchor, SupportLedgerError> {
+        if anchor.is_absent() || anchor.group() != anchor.root() {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let root = self.root_at_group(anchor.group(), anchor.authority_key(), anchor.branch())?;
+        Ok(RootAnchor {
+            authority_key: root.authority_key,
+            branch: root.branch,
+            group: root.group,
+            root: root.group,
+            version: root.version,
+        })
+    }
+
+    pub(crate) fn bind_lifecycle_record_spec(
+        &self,
+        anchor: RootAnchor,
+        ordinal: usize,
+        spec: crate::core::C17LifecycleRecordSpec,
+    ) -> Result<LifecycleRecordInput, SupportLedgerError> {
+        let root = self.root_from_anchor(anchor)?;
+        let class = match root.state {
+            RootState::Conditional => 0,
+            RootState::Pending => 1,
+            RootState::Active => 2,
+            _ => return Err(SupportLedgerError::InvalidTransition),
+        };
+        let pool = spec.pool as usize;
+        let horizon = usize::from(spec.horizon);
+        if horizon >= 3
+            || spec.claim == [0; 32]
+            || spec.occurred_at.as_micros() == 0
+            || spec
+                .expires_at
+                .is_some_and(|expiry| expiry <= spec.occurred_at)
+            || spec.obligation.get() >= spec.credit.get()
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let axis = spec.operation as usize * 3 + pool;
+        let mut aggregate = [0; 21];
+        aggregate[..6].copy_from_slice(&[
+            class as u64,
+            pool as u64,
+            axis as u64,
+            horizon as u64,
+            root.member_count as u64,
+            1,
+        ]);
+        self.bind_lifecycle_record(
+            anchor,
+            ordinal,
+            LifecycleRecordInput {
+                final_owner: [0; 64],
+                owner_set_ref: [0; 8],
+                obligation_raw: spec.obligation.get(),
+                credit_raw: spec.credit.get(),
+                predecessor: spec.predecessor.0,
+                scope: spec.scope.0,
+                claim: spec.claim,
+                physical_credit: spec.credit.get(),
+                kind: spec.kind as u8 + 1,
+                occurred_at: spec.occurred_at.as_micros(),
+                expires_at: spec.expires_at.map(|time| time.as_micros()),
+                aggregate,
+                owners: [LifecycleOwnerRow::ZERO; PLAN_MEMBERS_MAX],
+            },
+        )
+    }
+
+    pub(crate) fn bind_lifecycle_record(
+        &self,
+        anchor: RootAnchor,
+        ordinal: usize,
+        mut record: LifecycleRecordInput,
+    ) -> Result<LifecycleRecordInput, SupportLedgerError> {
+        let root = self.root_from_anchor(anchor)?;
+        let reserve = self.reserved_reference(ordinal)?;
+        let amount = usize::try_from(record.aggregate[4]).map_err(|_| capacity_error())?;
+        if amount != root.member_count || !(1..=PLAN_MEMBERS_MAX).contains(&amount) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        record.final_owner = encode_lifecycle_final_owner(root);
+        record.owner_set_ref = encode_arena_ref_value(root.members[0].owner);
+        record.owners = [LifecycleOwnerRow::ZERO; PLAN_MEMBERS_MAX];
+        for index in 0..root.member_count {
+            record.owners[index] =
+                self.canonical_lifecycle_owner_row(root, root.members[index], reserve, record)?;
+        }
+        record.validate()?;
+        Ok(record)
+    }
 }
