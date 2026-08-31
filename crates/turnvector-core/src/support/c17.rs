@@ -2200,4 +2200,385 @@ impl SupportC17 {
         }
         Ok(pending)
     }
+
+    pub(crate) fn prepare_begin_batch(
+        &self,
+        total: usize,
+        aggregate: LifecycleAggregate,
+        before_support: SupportLedgerGeneration,
+    ) -> Result<PreparedLifecycleBegin, SupportLedgerError> {
+        if self.pending_state()? != PendingState::Empty
+            || !(1..=LIFECYCLE_BATCH_MAX).contains(&total)
+            || aggregate == LifecycleAggregate::ZERO
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let batch = read_u64(&self.pending.0, PENDING_BATCH)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let selection = self
+            .lifecycle
+            .prepare_reserve::<LIFECYCLE_BATCH_MAX>(total)?;
+        let expected_arena_header = self.lifecycle.header_image();
+        let arena_header_after = self
+            .lifecycle
+            .prepare_reserve_header_after(&selection, 0, 0)?;
+        let pending_after =
+            self.prepare_begin_pending_image(batch, aggregate, before_support, &selection)?;
+        Ok(PreparedLifecycleBegin {
+            expected_c17: self.generation(),
+            generation_after,
+            expected_arena_header,
+            arena_header_after,
+            before_support,
+            batch,
+            aggregate,
+            selection,
+            pending_before: self.pending,
+            pending_after,
+        })
+    }
+
+    pub(crate) fn validate_begin_batch(
+        &self,
+        change: &PreparedLifecycleBegin,
+    ) -> Result<(), SupportLedgerError> {
+        if self.pending_state()? != PendingState::Empty
+            || self.pending != change.pending_before
+            || self.generation() != change.expected_c17
+            || change.expected_c17.checked_add(1) != Some(change.generation_after)
+            || self.lifecycle.header_image() != change.expected_arena_header
+            || self
+                .lifecycle
+                .prepare_reserve_header_after(&change.selection, 0, 0)?
+                != change.arena_header_after
+            || change.aggregate == LifecycleAggregate::ZERO
+            || self
+                .lifecycle
+                .prepare_reserve::<LIFECYCLE_BATCH_MAX>(change.selection.len())?
+                .as_slice()
+                != change.selection.as_slice()
+            || self.prepare_begin_pending_image(
+                change.batch,
+                change.aggregate,
+                change.before_support,
+                &change.selection,
+            )? != change.pending_after
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_begin_batch(&mut self, change: PreparedLifecycleBegin) {
+        self.lifecycle.reserve_selection_direct(&change.selection);
+        self.lifecycle
+            .assign_header_direct(change.arena_header_after);
+        self.pending = change.pending_after;
+        write_u64(&mut self.header.0, 48, change.generation_after);
+    }
+
+    pub(crate) fn next_lifecycle_ordinal(&self) -> Result<usize, SupportLedgerError> {
+        if self.pending_state()? != PendingState::Staging {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        Ok(usize::from(read_u16(&self.pending.0, PENDING_STAGED)))
+    }
+
+    pub(crate) fn prepare_stage_chunk(
+        &self,
+        records: &[LifecycleRecordInput],
+    ) -> Result<PreparedLifecycleStage, SupportLedgerError> {
+        if self.pending_state()? != PendingState::Staging
+            || records.is_empty()
+            || records.len() > LIFECYCLE_CHUNK_MAX
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let staged = usize::from(read_u16(&self.pending.0, PENDING_STAGED));
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        if staged + records.len() > total {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let batch = read_u64(&self.pending.0, PENDING_BATCH);
+        let mut retained = [LifecycleRecordInput::ZERO; LIFECYCLE_CHUNK_MAX];
+        let mut record_images = [[0; LIFECYCLE_BYTES]; LIFECYCLE_CHUNK_MAX];
+        let mut references = [ArenaRef::default(); LIFECYCLE_CHUNK_MAX];
+        let expected_arena_header = self.lifecycle.header_image();
+        let mut raw_entries = [([0; 32], [0; 8]); 2 * LIFECYCLE_CHUNK_MAX];
+        let mut raw_count = 0;
+        for (offset, record) in records.iter().copied().enumerate() {
+            record.validate()?;
+            let ordinal = staged + offset;
+            let reference = self.reserved_reference(ordinal)?;
+            self.validate_lifecycle_record_owner_set(record, reference)?;
+            retained[offset] = record;
+            references[offset] = reference;
+            record_images[offset] = self.lifecycle.prepare_reserved_image_after(
+                reference,
+                record.encode(reference, batch, ordinal)?,
+                3,
+            )?;
+            for (kind, key) in [
+                (RawOwnerKind::LifecycleObligation, record.obligation_raw),
+                (RawOwnerKind::LifecycleCredit, record.credit_raw),
+            ] {
+                raw_entries[raw_count] = (
+                    key,
+                    encode_raw_owner(kind, RawOwnerState::Inactive, reference)?,
+                );
+                raw_count += 1;
+            }
+        }
+        raw_entries[..raw_count].sort_unstable_by_key(|entry| entry.0);
+        for index in 1..raw_count {
+            if raw_entries[index - 1].0 >= raw_entries[index].0 {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+        }
+        let raw_plan = self.raw.prepare_insert_assignment_plan(
+            RAW_INDEX_ASSIGNMENT_ARENA,
+            &raw_entries[..raw_count],
+        )?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let raw_generation_after = self
+            .raw
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let mut pending_after = self.pending;
+        write_u16(
+            &mut pending_after.0,
+            PENDING_STAGED,
+            (staged + records.len()) as u16,
+        );
+        write_u64(
+            &mut pending_after.0,
+            PENDING_EXPECTED_RAW,
+            raw_generation_after,
+        );
+        let arena_header_after = self.lifecycle.prepare_install_reserved_header_after(
+            &references[..records.len()],
+            0,
+            records.len(),
+        )?;
+        Ok(PreparedLifecycleStage {
+            expected_c17: self.generation(),
+            generation_after,
+            expected_raw: self.raw.generation(),
+            expected_arena_header,
+            arena_header_after,
+            batch,
+            first: staged,
+            len: records.len(),
+            records: retained,
+            record_images,
+            references,
+            raw_entries,
+            raw_count,
+            pending_after,
+            raw_plan,
+        })
+    }
+
+    pub(crate) fn validate_stage_chunk(
+        &self,
+        change: &PreparedLifecycleStage,
+    ) -> Result<(), SupportLedgerError> {
+        let staged_after = change
+            .first
+            .checked_add(change.len)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or(SupportLedgerError::Generation)?;
+        let raw_generation_after = change
+            .expected_raw
+            .checked_add(1)
+            .ok_or(SupportLedgerError::Generation)?;
+        let mut pending_after = self.pending;
+        write_u16(&mut pending_after.0, PENDING_STAGED, staged_after);
+        write_u64(
+            &mut pending_after.0,
+            PENDING_EXPECTED_RAW,
+            raw_generation_after,
+        );
+        if self.pending_state()? != PendingState::Staging
+            || self.generation() != change.expected_c17
+            || change.expected_c17.checked_add(1) != Some(change.generation_after)
+            || self.raw.generation() != change.expected_raw
+            || self.lifecycle.header_image() != change.expected_arena_header
+            || self.lifecycle.prepare_install_reserved_header_after(
+                &change.references[..change.len],
+                0,
+                change.len,
+            )? != change.arena_header_after
+            || pending_after != change.pending_after
+            || read_u64(&self.pending.0, PENDING_BATCH) != change.batch
+            || usize::from(read_u16(&self.pending.0, PENDING_STAGED)) != change.first
+            || !(1..=LIFECYCLE_CHUNK_MAX).contains(&change.len)
+            || change.raw_count != change.len * 2
+            || change.records[change.len..]
+                .iter()
+                .any(|record| *record != LifecycleRecordInput::ZERO)
+            || change.record_images[change.len..]
+                .iter()
+                .flatten()
+                .any(|byte| *byte != 0)
+            || change.references[change.len..]
+                .iter()
+                .any(|reference| *reference != ArenaRef::default())
+            || change.raw_entries[change.raw_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 32], [0; 8]))
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        for offset in 0..change.len {
+            let ordinal = change.first + offset;
+            if self.reserved_reference(ordinal)? != change.references[offset] {
+                return Err(SupportLedgerError::Generation);
+            }
+            change.records[offset].validate()?;
+            self.validate_lifecycle_record_owner_set(
+                change.records[offset],
+                change.references[offset],
+            )?;
+            if self.lifecycle.prepare_reserved_image_after(
+                change.references[offset],
+                change.records[offset].encode(change.references[offset], change.batch, ordinal)?,
+                3,
+            )? != change.record_images[offset]
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        self.raw
+            .validate_insert_batch(&change.raw_entries[..change.raw_count])?;
+        if !self.raw.validates_assignment_plan(&change.raw_plan) {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_stage_chunk(&mut self, change: PreparedLifecycleStage) {
+        for offset in 0..change.len {
+            self.lifecycle.install_reserved_image_direct(
+                change.references[offset],
+                change.record_images[offset],
+            );
+        }
+        self.lifecycle
+            .assign_header_direct(change.arena_header_after);
+        self.raw
+            .commit_assignment_plan_prevalidated(change.raw_plan);
+        self.pending = change.pending_after;
+        write_u64(&mut self.header.0, 48, change.generation_after);
+    }
+
+    fn prepare_finalize_raw_update(
+        &self,
+        reference: ArenaRef,
+        image: &[u8; LIFECYCLE_BYTES],
+        key_offset: usize,
+    ) -> Result<LifecycleRawUpdate, SupportLedgerError> {
+        let mut key = [0; 32];
+        key.copy_from_slice(&image[key_offset..key_offset + 32]);
+        let handle = self
+            .raw
+            .find_handle(&key)?
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        let before = self.raw.value_at(handle)?;
+        let (kind, state, owner) = decode_raw_owner(before)?;
+        if state != RawOwnerState::Inactive || owner != reference {
+            return Err(noncanonical_error());
+        }
+        Ok(LifecycleRawUpdate {
+            handle,
+            after: encode_raw_owner(kind, RawOwnerState::Committed, reference)?,
+        })
+    }
+
+    fn prepare_finalize_owner_outcome(
+        &self,
+        publications: &[LifecyclePublication],
+        index: usize,
+    ) -> Result<LifecycleOwnerOutcome, SupportLedgerError> {
+        let publication = publications[index];
+        let owner_row = self.owner_rows.reference_at(publication.owner_slot, &[1])?;
+        let owner = self.owners.reference_at(publication.owner_slot, &[1])?;
+        let row = self.owner_rows.image(owner_row, &[1])?;
+        let owner_image = self.owners.image(owner, &[1])?;
+        let owner_delta = u64::try_from(
+            publications
+                .iter()
+                .filter(|candidate| candidate.owner_slot == publication.owner_slot)
+                .count(),
+        )
+        .map_err(|_| capacity_error())?;
+        let linked_base = read_u32(row, OWNER_ROW_LINKED_CLAIMS);
+        if read_u32(owner_image, OWNER_IMAGE_LINKED_CLAIMS) != linked_base {
+            return Err(noncanonical_error());
+        }
+        let linked_after = u64::from(linked_base)
+            .checked_add(owner_delta)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(capacity_error)?;
+        let current_after = read_u64(row, OWNER_ROW_CURRENT)
+            .checked_add(owner_delta)
+            .ok_or_else(capacity_error)?;
+        let mut branches_after = [0; OWNER_FUNDING_BRANCHES];
+        for (branch, after) in branches_after.iter_mut().enumerate() {
+            let delta = u64::try_from(
+                publications
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.owner_slot == publication.owner_slot
+                            && usize::from(candidate.branch) == branch
+                    })
+                    .count(),
+            )
+            .map_err(|_| capacity_error())?;
+            *after = read_u64(row, OWNER_ROW_BRANCH_CURRENT + branch * 8)
+                .checked_add(delta)
+                .ok_or_else(capacity_error)?;
+        }
+        Ok(LifecycleOwnerOutcome {
+            owner_slot: publication.owner_slot,
+            linked_after,
+            current_after,
+            branches_after,
+        })
+    }
+
+    fn prepare_finalize_funder_outcome(
+        &self,
+        publications: &[LifecyclePublication],
+        index: usize,
+    ) -> Result<LifecycleFunderOutcome, SupportLedgerError> {
+        let reference = publications[index].funder;
+        let image = self.funders.image(reference, &[1])?;
+        let delta = u64::try_from(
+            publications
+                .iter()
+                .filter(|candidate| candidate.funder == reference)
+                .count(),
+        )
+        .map_err(|_| capacity_error())?;
+        let current_after = read_u64(image, 112)
+            .checked_add(delta)
+            .ok_or_else(capacity_error)?;
+        if current_after > read_u64(image, 120) {
+            return Err(capacity_error());
+        }
+        Ok(LifecycleFunderOutcome {
+            reference,
+            current_after,
+        })
+    }
 }
