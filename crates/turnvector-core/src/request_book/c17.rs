@@ -1731,4 +1731,353 @@ impl RequestBookC17 {
             MembershipStateRow::decode(&image[64..64 + MEMBERSHIP_BYTES])?,
         ))
     }
+
+    pub(crate) fn prepare_newly_eligible<const I: usize, const S: usize, const T: usize>(
+        &self,
+        accepted: &AcceptedRequest<I, S, T>,
+        marker: EligibilityMarker,
+    ) -> Result<PreparedNewlyEligible, RequestError> {
+        marker.validate()?;
+        if marker.request != accepted.id() {
+            return Err(RequestError::InvalidTransition);
+        }
+        let (request, before) = self.membership(accepted.id(), accepted.status())?;
+        let key = source_key(SourceKind::NewlyEligible, marker.identity);
+        let candidate = SourceRecord {
+            key,
+            kind: SourceKind::NewlyEligible,
+            initial_kind: 0,
+            cancellation_kind: 0,
+            state: SourceStateTag::Pending,
+            request,
+            accepted_identity: marker.identity,
+            domain: [0; 16],
+            previous_anchor: marker.previous_anchor,
+            occurred_at: marker.occurred_at.as_micros(),
+            cancellation_fact: 0,
+            create_event: EventRecordRef::ABSENT,
+            consumed_event: EventRecordRef::ABSENT,
+        };
+        candidate.encode()?;
+        if let Some(reference) = self.source_index.find(&key)? {
+            let stored = self.source_record(decode_source_value(reference)?)?;
+            if !stored.normalized_eq(&candidate) {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            return Err(RequestError::InvalidTransition);
+        }
+        if before.tag != MembershipTag::Bound
+            || before.anchor != marker.previous_anchor
+            || !before.pending.is_absent()
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        let source_selection = self.sources.prepare_reserve::<1>(1)?;
+        self.source_index.validate_insert(&key)?;
+        let after_status = request
+            .status
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        let next_generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        for offset in [48, 56] {
+            read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+        }
+        read_u32(&self.header.0, 104)
+            .checked_add(1)
+            .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+        let source_ref = SourceRecordRef::from_arena(source_selection[0])?;
+        let source_index_plan = self.source_index.prepare_insert_assignment_plan(
+            SOURCE_INDEX_ASSIGNMENT_ARENA,
+            &[(candidate.key, encode_source_value(source_ref))],
+        )?;
+        let mut after_address = request;
+        after_address.status = after_status;
+        let request_handle = self
+            .request_index
+            .find_handle(&request.key)?
+            .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+        let request_index_plan = self.request_index.prepare_update_assignment_plan(
+            REQUEST_INDEX_ASSIGNMENT_ARENA,
+            &[(request.key, request_handle, after_address.encode())],
+        )?;
+        let mut after = before;
+        after.tag = MembershipTag::EligibleUnbound;
+        after.pending = source_ref;
+        let direct = self.prepare_request_direct_images(
+            next_generation,
+            None,
+            Some((source_selection[0], candidate)),
+            None,
+            [Some((request, after, after_status)), None, None, None],
+        )?;
+        Ok(PreparedNewlyEligible {
+            expected_generation: self.generation(),
+            request,
+            before,
+            after_status,
+            source: candidate,
+            source_selection,
+            source_index_plan,
+            request_index_plan,
+            direct,
+        })
+    }
+
+    pub(crate) fn validate_newly_eligible(
+        &self,
+        change: &PreparedNewlyEligible,
+    ) -> Result<(), RequestError> {
+        if self.generation() != change.expected_generation {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let (_, before) = self.membership(
+            request_id_from_key(change.request.key)?,
+            RequestStatusVersion::new(change.request.status)
+                .map_err(|_| RequestError::InvalidTransition)?,
+        )?;
+        if before != change.before
+            || self.sources.prepare_reserve::<1>(1)?.as_slice()
+                != change.source_selection.as_slice()
+            || self.source_index.find(&change.source.key)?.is_some()
+            || !self
+                .source_index
+                .validates_assignment_plan(&change.source_index_plan)
+            || !self
+                .request_index
+                .validates_assignment_plan(&change.request_index_plan)
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let source_ref = SourceRecordRef::from_arena(change.source_selection[0])?;
+        let mut after = change.before;
+        after.tag = MembershipTag::EligibleUnbound;
+        after.pending = source_ref;
+        let direct = self.prepare_request_direct_images(
+            change.direct.generation_after.get(),
+            None,
+            Some((change.source_selection[0], change.source)),
+            None,
+            [
+                Some((change.request, after, change.after_status)),
+                None,
+                None,
+                None,
+            ],
+        )?;
+        (direct == change.direct)
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_newly_eligible<const I: usize, const S: usize, const T: usize>(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedNewlyEligible,
+    ) {
+        self.validate_newly_eligible(&change)
+            .expect("validated NewlyEligible change");
+        self.commit_newly_eligible_prevalidated(accepted, change, true);
+    }
+
+    pub(crate) fn commit_newly_eligible_prevalidated<
+        const I: usize,
+        const S: usize,
+        const T: usize,
+    >(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedNewlyEligible,
+        apply_index_plans: bool,
+    ) {
+        if apply_index_plans {
+            self.source_index
+                .commit_assignment_plan_prevalidated(change.source_index_plan);
+            self.request_index
+                .commit_assignment_plan_prevalidated(change.request_index_plan);
+        }
+        self.commit_request_direct_images(accepted, change.direct);
+    }
+
+    pub(crate) fn prepare_cancellation<const I: usize, const S: usize, const T: usize>(
+        &self,
+        accepted: &AcceptedRequest<I, S, T>,
+        marker: CancellationMarker,
+    ) -> Result<PreparedCancellation, RequestError> {
+        marker.validate()?;
+        if marker.request != accepted.id() {
+            return Err(RequestError::InvalidTransition);
+        }
+        let (request, before) = self.membership(accepted.id(), accepted.status())?;
+        let key = source_key(SourceKind::Cancellation, marker.identity);
+        let mut candidate = SourceRecord {
+            key,
+            kind: SourceKind::Cancellation,
+            initial_kind: 0,
+            cancellation_kind: marker.kind as u8,
+            state: SourceStateTag::Consumed,
+            request,
+            accepted_identity: marker.identity,
+            domain: [0; 16],
+            previous_anchor: marker.previous_anchor,
+            occurred_at: marker.occurred_at.as_micros(),
+            cancellation_fact: 0,
+            create_event: EventRecordRef::ABSENT,
+            consumed_event: EventRecordRef::ABSENT,
+        };
+        if let Some(reference) = self.source_index.find(&key)? {
+            let stored = self.source_record(decode_source_value(reference)?)?;
+            candidate.cancellation_fact = stored.cancellation_fact;
+            if !stored.normalized_eq(&candidate) {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            return Err(RequestError::InvalidTransition);
+        }
+        if !matches!(
+            before.tag,
+            MembershipTag::Bound | MembershipTag::EligibleUnbound
+        ) || before.anchor != marker.previous_anchor
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        let fact_id = read_u64(&self.header.0, 16);
+        let event_id = read_u64(&self.header.0, 8);
+        let next_fact = fact_id
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        let next_event = event_id
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        candidate.cancellation_fact = fact_id;
+        let pending_before = if before.tag == MembershipTag::EligibleUnbound {
+            let record = self.source_record(before.pending)?;
+            if record.kind != SourceKind::NewlyEligible
+                || record.state != SourceStateTag::Pending
+                || record.request.key != request.key
+                || record.request.slot != request.slot
+                || record.request.slot_generation != request.slot_generation
+                || record.request.status.checked_add(1) != Some(request.status)
+                || record.previous_anchor != before.anchor
+            {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            Some((before.pending, record))
+        } else {
+            None
+        };
+        let source_selection = self.sources.prepare_reserve::<1>(1)?;
+        let event_selection = self.events.prepare_reserve::<1>(1)?;
+        let cancellation_ref = SourceRecordRef::from_arena(source_selection[0])?;
+        let event_ref = EventRecordRef::from_arena(event_selection[0])?;
+        candidate.consumed_event = event_ref;
+        candidate.encode()?;
+        self.source_index.validate_insert(&key)?;
+        self.event_index.validate_insert(&event_id.to_be_bytes())?;
+        let after_status = request
+            .status
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        let next_generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        for offset in [40, 48, 56] {
+            read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+        }
+        for offset in [104, 100] {
+            read_u32(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+        }
+
+        let pending = pending_before.map(|(reference, before_record)| {
+            let mut after_record = before_record;
+            after_record.state = SourceStateTag::Consumed;
+            after_record.consumed_event = event_ref;
+            (reference, before_record, after_record)
+        });
+        if let Some((_, _, after_record)) = pending {
+            after_record.encode()?;
+        }
+        let mut sources = [SourceRecordRef::ABSENT; 3];
+        sources[0] = cancellation_ref;
+        if let Some((reference, before_record, _)) = pending {
+            if before_record.key < candidate.key {
+                sources[0] = reference;
+                sources[1] = cancellation_ref;
+            } else {
+                sources[1] = reference;
+            }
+        }
+        let mut after = before;
+        after.tag = MembershipTag::Cancelled;
+        after.anchor = SupportMembershipAnchor::ABSENT;
+        after.pending = SourceRecordRef::ABSENT;
+        after.cancellation = cancellation_ref;
+        after.cancellation_fact = fact_id;
+        after.cancellation_at = candidate.occurred_at;
+        let mut affected = [None; 4];
+        affected[0] = Some(request);
+        let mut before_rows = [None; 4];
+        before_rows[0] = Some(before);
+        let mut after_rows = [None; 4];
+        after_rows[0] = Some(after);
+        let event = MembershipEventRecord {
+            id: event_id,
+            kind: MembershipEventKind::CancellationRemove,
+            source_count: if pending.is_some() { 2 } else { 1 },
+            member_count: 1,
+            consumed_by_support: true,
+            sources,
+            affected,
+            before: before_rows,
+            after: after_rows,
+            generation_before: self.generation(),
+            generation_after: next_generation,
+            occurred_at: candidate.occurred_at,
+            cancellation_fact: fact_id,
+        };
+        event.encode()?;
+        self.validate_membership_updates(&event, &[after_status, 0, 0, 0])?;
+        let source_index_plan = self.source_index.prepare_insert_assignment_plan(
+            SOURCE_INDEX_ASSIGNMENT_ARENA,
+            &[(candidate.key, encode_source_value(cancellation_ref))],
+        )?;
+        let event_index_plan = self.event_index.prepare_insert_assignment_plan(
+            EVENT_INDEX_ASSIGNMENT_ARENA,
+            &[(event.id.to_be_bytes(), encode_event_value(event_ref))],
+        )?;
+        let request_index_plan =
+            self.prepare_request_index_plan(&event, &[after_status, 0, 0, 0])?;
+        let statuses = [after_status, 0, 0, 0];
+        let direct = self.prepare_request_direct_images(
+            next_generation,
+            pending.map(|(reference, _, after)| (reference, after)),
+            Some((source_selection[0], candidate)),
+            Some((event_selection[0], event)),
+            Self::request_updates(&event, &statuses)?,
+        )?;
+        let _ = (next_fact, next_event);
+        Ok(PreparedCancellation {
+            expected_generation: self.generation(),
+            request,
+            before,
+            after_status: [after_status, 0, 0, 0],
+            cancellation: candidate,
+            pending,
+            source_selection,
+            event_selection,
+            event,
+            source_index_plan,
+            event_index_plan,
+            request_index_plan,
+            direct,
+        })
+    }
 }
