@@ -2863,3 +2863,217 @@ fn encode_lifecycle_final_owner(root: RootSnapshot) -> [u8; 64] {
     write_u64(&mut image, 56, root.occurred_at);
     image
 }
+
+fn adjust_resolution_funder(
+    journals: &mut [Option<RootJournal>; ROOT_BATCH_MAX],
+    transition: usize,
+    owner: ArenaRef,
+    delta: i32,
+) -> Result<(), SupportLedgerError> {
+    let journal = journals
+        .get_mut(transition)
+        .and_then(Option::as_mut)
+        .ok_or(SupportLedgerError::InvalidInput)?;
+    let ordinal = journal.before.members[..journal.before.member_count]
+        .iter()
+        .position(|member| member.owner == owner)
+        .ok_or_else(noncanonical_error)?;
+    let image = &mut journal.funder_after[ordinal];
+    let current = read_u64(image, 112);
+    let after = apply_i32_u64(current, delta)?;
+    if after > read_u64(image, 120) {
+        return Err(capacity_error());
+    }
+    write_u64(image, 112, after);
+    Ok(())
+}
+
+fn add_lifecycle_aggregate_delta(
+    aggregate: &mut AggregateDelta,
+    before: LifecycleAggregate,
+    after: LifecycleAggregate,
+) -> Result<(), SupportLedgerError> {
+    let mut delta = AggregateDelta::ZERO;
+    for class in 0..5 {
+        for pool in 0..3 {
+            let usage = i64::from(after.usage[class][pool])
+                .checked_sub(i64::from(before.usage[class][pool]))
+                .ok_or_else(capacity_error)?;
+            let reserved = i64::from(before.reserved[class][pool])
+                .checked_sub(i64::from(after.reserved[class][pool]))
+                .ok_or_else(capacity_error)?;
+            delta.usage[class][pool] = i32::try_from(usage).map_err(|_| capacity_error())?;
+            delta.reserved[class][pool] = i32::try_from(reserved).map_err(|_| capacity_error())?;
+            if class < 4 {
+                let attached = i64::from(after.attached[class][pool])
+                    .checked_sub(i64::from(before.attached[class][pool]))
+                    .ok_or_else(capacity_error)?;
+                delta.attached[class][pool] =
+                    i32::try_from(attached).map_err(|_| capacity_error())?;
+            }
+        }
+    }
+    aggregate.add(delta)
+}
+
+fn validate_closed_lifecycle_image(
+    image: &[u8; LIFECYCLE_BYTES],
+) -> Result<(), SupportLedgerError> {
+    (image[488] == LIFECYCLE_CLOSE_ACTION
+        && matches!(
+            image[489],
+            NO_CONTINUATION_AFTER_OBSERVATION | MEMBERSHIP_CLOSED_LIFECYCLE
+        )
+        && image[490..496].iter().all(|byte| *byte == 0)
+        && read_u64(image, 496) != 0
+        && read_u64(image, 504) != 0
+        && image[1_024..].iter().all(|byte| *byte == 0))
+    .then_some(())
+    .ok_or_else(noncanonical_error)
+}
+
+pub(super) fn transition_aggregate(
+    before: RootState,
+    after: RootState,
+    member_count: usize,
+) -> Result<AggregateDelta, SupportLedgerError> {
+    let mut delta = AggregateDelta::ZERO;
+    let pool = 1usize;
+    let heads = 1i32;
+    let attached = i32::try_from(member_count.checked_sub(1).ok_or_else(noncanonical_error)?)
+        .map_err(|_| capacity_error())?;
+    let members = i32::try_from(member_count).map_err(|_| capacity_error())?;
+    let before_class = root_class(before);
+    let after_class = root_class(after);
+    match (before_class, after_class) {
+        (Some(left), Some(right)) if left != right => {
+            delta.usage[left][pool] -= heads;
+            delta.usage[right][pool] += heads;
+            delta.attached[left][pool] -= attached;
+            delta.attached[right][pool] += attached;
+        }
+        (Some(class), None)
+            if matches!(
+                after,
+                RootState::ClosedConditional | RootState::ClosedPending
+            ) =>
+        {
+            delta.usage[class][pool] -= heads;
+            delta.reserved[class][pool] += members;
+            delta.attached[class][pool] -= attached;
+            delta.usage[3][pool] -= heads;
+            delta.reserved[3][pool] += members;
+            delta.attached[3][pool] -= attached;
+            delta.usage[4][pool] -= members;
+            delta.reserved[4][pool] += members;
+        }
+        (Some(left), Some(right)) if left == right => {}
+        _ => return Err(SupportLedgerError::InvalidTransition),
+    }
+    Ok(delta)
+}
+
+fn root_class(state: RootState) -> Option<usize> {
+    match state {
+        RootState::Conditional => Some(0),
+        RootState::Pending => Some(1),
+        RootState::Active | RootState::Retained => Some(2),
+        RootState::ClosedConditional | RootState::ClosedPending => None,
+    }
+}
+
+fn decode_root_state(value: u8) -> Result<RootState, SupportLedgerError> {
+    match value {
+        1 => Ok(RootState::Conditional),
+        2 => Ok(RootState::Pending),
+        3 => Ok(RootState::Active),
+        4 => Ok(RootState::Retained),
+        5 => Ok(RootState::ClosedConditional),
+        6 => Ok(RootState::ClosedPending),
+        _ => Err(noncanonical_error()),
+    }
+}
+
+fn encode_successor_formation(
+    spec: RootTransitionSpec,
+    formation: ArenaRef,
+    locator: ArenaRef,
+    operation: SemanticOperation,
+    transition_index: usize,
+) -> [u8; FORMATION_BYTES] {
+    let mut image = FormationImage::ZERO.0;
+    encode_arena_ref(&mut image[8..16], spec.before.initial_formation);
+    encode_arena_ref(&mut image[16..24], spec.before.formation);
+    image[40] = spec.close_reason;
+    image[41] = operation as u8;
+    image[42] = transition_index as u8;
+    image[48..65].copy_from_slice(&spec.before.authority_key);
+    image[72..104].copy_from_slice(&spec.close_authority);
+    image[220] = spec.before.branch;
+    image[221] = spec.after as u8;
+    image[222] = spec.cause as u8;
+    image[223] = 1;
+    write_u64(&mut image, 224, spec.before.version + 1);
+    write_u64(&mut image, 232, spec.occurred_at);
+    encode_arena_ref(&mut image[240..248], spec.before.group);
+    encode_arena_ref(&mut image[248..256], locator);
+    let _ = formation;
+    image
+}
+
+fn encode_root_mutation(
+    operation: SemanticOperation,
+    transition_index: usize,
+    spec: RootTransitionSpec,
+    formation: ArenaRef,
+    generation: u64,
+) -> [u8; MUTATION_BYTES] {
+    let mut image = MutationImage::ZERO.0;
+    image[8] = operation as u8;
+    image[9] = transition_index as u8;
+    image[10] = spec.before.branch;
+    image[11] = spec.after as u8;
+    write_u64(&mut image, 16, generation);
+    write_u64(&mut image, 24, spec.occurred_at);
+    image[32..49].copy_from_slice(&spec.before.authority_key);
+    encode_arena_ref(&mut image[56..64], spec.before.group);
+    encode_arena_ref(&mut image[64..72], spec.before.formation);
+    encode_arena_ref(&mut image[72..80], formation);
+    encode_arena_ref(&mut image[80..88], spec.before.locator);
+    image[88] = spec.cause as u8;
+    image[89] = spec.close_reason;
+    image
+}
+
+pub(super) fn apply_i32_u32(value: u32, delta: i32) -> Result<u32, SupportLedgerError> {
+    if delta >= 0 {
+        value.checked_add(delta as u32).ok_or_else(capacity_error)
+    } else {
+        value
+            .checked_sub(delta.unsigned_abs())
+            .ok_or_else(noncanonical_error)
+    }
+}
+
+pub(super) fn apply_i32_u64(value: u64, delta: i32) -> Result<u64, SupportLedgerError> {
+    if delta >= 0 {
+        value.checked_add(delta as u64).ok_or_else(capacity_error)
+    } else {
+        value
+            .checked_sub(u64::from(delta.unsigned_abs()))
+            .ok_or_else(noncanonical_error)
+    }
+}
+
+pub(super) fn request_id_from_key_for_support(
+    key: [u8; 40],
+) -> Result<RequestId, SupportLedgerError> {
+    let daemon = u128::from_be_bytes(key[..16].try_into().expect("request daemon key"));
+    let connection = u128::from_be_bytes(key[16..32].try_into().expect("request connection key"));
+    let sequence = u64::from_be_bytes(key[32..].try_into().expect("request sequence key"));
+    Ok(RequestId::new(
+        crate::DaemonInstanceId::new(daemon).map_err(|_| noncanonical_error())?,
+        crate::ConnectionId::new(connection).map_err(|_| noncanonical_error())?,
+        crate::RequestSequence::new(sequence).map_err(|_| noncanonical_error())?,
+    ))
+}
