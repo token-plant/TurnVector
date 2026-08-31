@@ -2738,4 +2738,346 @@ impl RequestBookC17 {
         self.commit_request_direct_images(accepted, change.direct);
         event
     }
+
+    pub(crate) fn prepare_membership_event(
+        &self,
+        input: MembershipEventInput,
+    ) -> Result<PreparedMembershipIntent, RequestError> {
+        input.validate()?;
+        let count = usize::from(input.member_count);
+        let source = if let Some(identity) = input.source_identity {
+            let key = source_key(SourceKind::NewlyEligible, identity);
+            let encoded = self
+                .source_index
+                .find(&key)?
+                .ok_or(RequestError::InvalidTransition)?;
+            let reference = decode_source_value(encoded)?;
+            let source = self.source_record(reference)?;
+            if source.kind != SourceKind::NewlyEligible
+                || source.state != SourceStateTag::Pending
+                || !source.create_event.is_absent()
+                || !source.consumed_event.is_absent()
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            Some((reference, source))
+        } else {
+            None
+        };
+        let mut members: [Option<(
+            RequestAddress,
+            MembershipStateRow,
+            MembershipDestination,
+            u64,
+        )>; 4] = [None; 4];
+        for index in 0..count {
+            let mutation = input.members[index].expect("validated active mutation");
+            let (address, before) = self.membership(mutation.request, mutation.expected_status)?;
+            if members[..index]
+                .iter()
+                .flatten()
+                .any(|(prior, _, _, _)| prior.key == address.key)
+                || !matches!(
+                    before.tag,
+                    MembershipTag::Bound | MembershipTag::EligibleUnbound
+                )
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            let status = address
+                .status
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            members[index] = Some((address, before, mutation.destination, status));
+        }
+        members[..count].sort_unstable_by_key(|entry| entry.expect("active member").0.key);
+        let mut eligible_count = 0usize;
+        let mut eligible_index = 0usize;
+        for (index, (_, before, _, _)) in members[..count].iter().flatten().enumerate() {
+            if before.tag == MembershipTag::EligibleUnbound {
+                eligible_count += 1;
+                eligible_index = index;
+            }
+        }
+        match source {
+            Some((reference, record)) => {
+                if eligible_count != 1 {
+                    return Err(RequestError::InvalidTransition);
+                }
+                let (address, before, _, _) = members[eligible_index].expect("eligible member");
+                if before.pending != reference
+                    || record.request.key != address.key
+                    || record.request.slot != address.slot
+                    || record.request.slot_generation != address.slot_generation
+                    || record.request.status.checked_add(1) != Some(address.status)
+                    || record.previous_anchor != before.anchor
+                {
+                    return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                }
+            }
+            None if eligible_count != 0 => return Err(RequestError::InvalidTransition),
+            None => {}
+        }
+        let mut anchors = [SupportMembershipAnchor::ABSENT; 3];
+        let mut anchor_count = 0usize;
+        for (_, before, _, _) in members[..count].iter().flatten() {
+            if !anchors[..anchor_count].contains(&before.anchor) {
+                if anchor_count == anchors.len() {
+                    return Err(RequestError::InvalidTransition);
+                }
+                anchors[anchor_count] = before.anchor;
+                anchor_count += 1;
+            }
+        }
+        let exact_private_shape = match input.kind {
+            MembershipEventKind::Join
+            | MembershipEventKind::Rebind
+            | MembershipEventKind::Split
+            | MembershipEventKind::Close => anchor_count == 1,
+            MembershipEventKind::Merge => (2..=3).contains(&anchor_count),
+            _ => false,
+        };
+        let source_free_rebind = input.kind == MembershipEventKind::Rebind && source.is_none();
+        if !exact_private_shape
+            || source_free_rebind
+                && members[..count]
+                    .iter()
+                    .flatten()
+                    .any(|(_, before, _, _)| before.tag != MembershipTag::Bound)
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        let event_selection = self.events.prepare_reserve::<1>(1)?;
+        let event_ref = EventRecordRef::from_arena(event_selection[0])?;
+        let event_id = read_u64(&self.header.0, 8);
+        event_id
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        self.event_index.validate_insert(&event_id.to_be_bytes())?;
+        let next_generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        for offset in [40, 56] {
+            read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+        }
+        if source.is_some() {
+            read_u64(&self.header.0, 48)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+        }
+        read_u32(&self.header.0, 100)
+            .checked_add(1)
+            .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+        let mut event = MembershipEventRecord {
+            id: event_id,
+            kind: input.kind,
+            source_count: u8::from(source.is_some()),
+            member_count: input.member_count,
+            consumed_by_support: true,
+            sources: [SourceRecordRef::ABSENT; 3],
+            affected: [None; 4],
+            before: [None; 4],
+            after: [None; 4],
+            generation_before: self.generation(),
+            generation_after: next_generation,
+            occurred_at: input.occurred_at.as_micros(),
+            cancellation_fact: 0,
+        };
+        let mut after_status = [0; 4];
+        let mut destinations = [MembershipDestination::Closed; 4];
+        for index in 0..count {
+            let (address, before, destination, status) = members[index].expect("active member");
+            event.affected[index] = Some(address);
+            event.before[index] = Some(before);
+            after_status[index] = status;
+            destinations[index] = destination;
+        }
+        let source_update = source.map(|(reference, before)| {
+            event.sources[0] = reference;
+            let mut after = before;
+            after.state = SourceStateTag::Consumed;
+            after.consumed_event = event_ref;
+            (reference, before, after)
+        });
+        if let Some((_, _, after)) = source_update {
+            after.encode()?;
+        }
+        let event_index_plan = self.event_index.prepare_insert_assignment_plan(
+            EVENT_INDEX_ASSIGNMENT_ARENA,
+            &[(event.id.to_be_bytes(), encode_event_value(event_ref))],
+        )?;
+        let intent = PreparedMembershipIntent {
+            expected_generation: self.generation(),
+            event_selection,
+            event,
+            after_status,
+            destinations,
+            destination_count: input.destination_count,
+            source_update,
+            event_index_plan,
+        };
+        self.validate_membership_intent(&intent)?;
+        Ok(intent)
+    }
+
+    pub(crate) fn validate_membership_intent(
+        &self,
+        change: &PreparedMembershipIntent,
+    ) -> Result<(), RequestError> {
+        if self.generation() != change.expected_generation
+            || read_u64(&self.header.0, 8) != change.event.id
+            || self.events.prepare_reserve::<1>(1)?.as_slice() != change.event_selection.as_slice()
+            || self
+                .event_index
+                .find(&change.event.id.to_be_bytes())?
+                .is_some()
+            || !self
+                .event_index
+                .validates_assignment_plan(&change.event_index_plan)
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let event = &change.event;
+        let count = usize::from(event.member_count);
+        let destination_count = usize::from(change.destination_count);
+        let expected_destination_count = match event.kind {
+            MembershipEventKind::Join
+            | MembershipEventKind::Rebind
+            | MembershipEventKind::Merge => 1,
+            MembershipEventKind::Split => 4,
+            MembershipEventKind::Close => 0,
+            _ => return Err(RequestError::Storage(FixedStorageError::NonCanonical)),
+        };
+        let valid_count = match event.kind {
+            MembershipEventKind::Join | MembershipEventKind::Merge => (2..=4).contains(&count),
+            MembershipEventKind::Rebind | MembershipEventKind::Close => (1..=4).contains(&count),
+            MembershipEventKind::Split => count == 4,
+            _ => false,
+        };
+        if !valid_count
+            || destination_count != expected_destination_count
+            || event.id == 0
+            || !event.consumed_by_support
+            || event.generation_before != change.expected_generation
+            || event.generation_after != change.expected_generation.checked_add(1).unwrap_or(0)
+            || event.occurred_at == 0
+            || event.cancellation_fact != 0
+            || event.after.iter().any(Option::is_some)
+            || event.affected[count..].iter().any(Option::is_some)
+            || event.before[count..].iter().any(Option::is_some)
+            || change.after_status[count..]
+                .iter()
+                .any(|status| *status != 0)
+            || change.destinations[count..]
+                .iter()
+                .any(|destination| *destination != MembershipDestination::Closed)
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let source_count = u8::from(change.source_update.is_some());
+        if event.source_count != source_count
+            || event.sources[usize::from(source_count)..]
+                .iter()
+                .any(|reference| !reference.is_absent())
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        if let Some((reference, before, after)) = change.source_update {
+            if event.sources[0] != reference {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            if self.source_record(reference)? != before {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            after.encode()?;
+        }
+        let mut used = [false; 4];
+        let mut anchors = [SupportMembershipAnchor::ABSENT; 3];
+        let mut anchor_count = 0usize;
+        for index in 0..count {
+            let address = event.affected[index]
+                .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+            let before = event.before[index]
+                .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+            if index > 0
+                && event.affected[index - 1].is_none_or(|previous| previous.key >= address.key)
+            {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            let (_, current) = self.membership(
+                request_id_from_key(address.key)?,
+                RequestStatusVersion::new(address.status)
+                    .map_err(|_| RequestError::InvalidTransition)?,
+            )?;
+            if current != before {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            if !matches!(
+                before.tag,
+                MembershipTag::Bound | MembershipTag::EligibleUnbound
+            ) || address.status.checked_add(1) != Some(change.after_status[index])
+            {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            if !anchors[..anchor_count].contains(&before.anchor) {
+                if anchor_count == anchors.len() {
+                    return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                }
+                anchors[anchor_count] = before.anchor;
+                anchor_count += 1;
+            }
+            match change.destinations[index] {
+                MembershipDestination::Destination(ordinal) => {
+                    let ordinal = usize::from(ordinal);
+                    if event.kind == MembershipEventKind::Close || ordinal >= destination_count {
+                        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                    }
+                    used[ordinal] = true;
+                }
+                MembershipDestination::Closed => {
+                    if event.kind != MembershipEventKind::Close
+                        || before.tag != MembershipTag::Bound
+                    {
+                        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                    }
+                }
+            }
+        }
+        if used[..destination_count].iter().any(|used| !used)
+            || used[destination_count..].iter().any(|used| *used)
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let eligible = event.before[..count]
+            .iter()
+            .flatten()
+            .filter(|row| row.tag == MembershipTag::EligibleUnbound)
+            .count();
+        let source_present = change.source_update.is_some();
+        let exact_private_shape = match event.kind {
+            MembershipEventKind::Join => source_present && anchor_count == 1,
+            MembershipEventKind::Rebind => anchor_count == 1,
+            MembershipEventKind::Split | MembershipEventKind::Close => {
+                !source_present && anchor_count == 1
+            }
+            MembershipEventKind::Merge => !source_present && (2..=3).contains(&anchor_count),
+            _ => false,
+        };
+        let source_free_rebind = event.kind == MembershipEventKind::Rebind && !source_present;
+        if source_present != (eligible == 1)
+            || eligible > 1
+            || !exact_private_shape
+            || source_free_rebind
+                && event.before[..count]
+                    .iter()
+                    .flatten()
+                    .any(|row| row.tag != MembershipTag::Bound)
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        Ok(())
+    }
 }
