@@ -675,6 +675,390 @@ impl SupportC17 {
             .iter()
             .any(Option::is_some)
         {
+            return Err(SupportLedgerError::InvalidInput);
         }
+
+        local_entries[..local_count].sort_unstable_by_key(|entry| entry.0);
+        if local_entries[..local_count]
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.local
+            .validate_insert_batch(&local_entries[..local_count])?;
+        let authority_plan = self.authority.prepare_update_assignment_plan(
+            AUTHORITY_INDEX_ASSIGNMENT_ARENA,
+            &[(authority_key, authority_handle, authority_after)],
+        )?;
+        let local_plan = self.local.prepare_insert_assignment_plan(
+            LOCAL_INDEX_ASSIGNMENT_ARENA,
+            &local_entries[..local_count],
+        )?;
+        let arena_headers_after = self.prepare_topology_arena_headers_after(
+            &groups,
+            &formations,
+            &funders,
+            &members,
+            &wrappers,
+            &links,
+            &memberships,
+            &mutations,
+        )?;
+        let next_merge_initial = read_u32(&self.header.0, 92)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let mut header_after = self.header;
+        write_u32(&mut header_after.0, 92, next_merge_initial);
+        write_u64(&mut header_after.0, 48, generation_after);
+        work.charge(HotPathWorkWitness::new(WORK_MERGE_INITIAL))?;
+        Ok(PreparedMergeInitialTopology {
+            expected_c17: self.generation(),
+            expected_authority: self.authority.generation(),
+            expected_local: self.local.generation(),
+            expected_arena_headers,
+            arena_headers_after,
+            preview,
+            event,
+            groups,
+            formations,
+            funders,
+            members,
+            wrappers,
+            links,
+            memberships,
+            mutations,
+            source_journals,
+            destination_group,
+            destination_formation,
+            destination_funders,
+            destination_members,
+            destination_wrapper,
+            membership_image,
+            membership_mutation,
+            local_entries,
+            local_count,
+            authority_key,
+            authority_before,
+            authority_handle,
+            authority_after,
+            owner_records_before: owner_records,
+            owner_records_after,
+            owner_references,
+            owner_rows_after,
+            owners_after,
+            retired_links,
+            retired_link_before,
+            retired_link_after,
+            replacement_links,
+            header_after,
+            authority_plan,
+            local_plan,
+        })
+    }
+
+    pub(in crate::support) fn validate_merge_initial_topology(
+        &self,
+        change: &PreparedMergeInitialTopology,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) -> Result<(), SupportLedgerError> {
+        self.validate_merge_initial_preview(&change.preview)?;
+        validate_merge_initial_event(&change.preview, &change.event)?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let next_merge_initial = read_u32(&self.header.0, 92)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let mut header_after = self.header;
+        write_u32(&mut header_after.0, 92, next_merge_initial);
+        write_u64(&mut header_after.0, 48, generation_after);
+        let expected_arena_headers = self.topology_arena_headers();
+        let count = change.preview.source_count;
+        let arena_headers_after = self.prepare_topology_arena_headers_after(
+            &change.groups,
+            &change.formations,
+            &change.funders,
+            &change.members,
+            &change.wrappers,
+            &change.links,
+            &change.memberships,
+            &change.mutations,
+        )?;
+        if self.generation() != change.expected_c17
+            || self.authority.generation() != change.expected_authority
+            || self.local.generation() != change.expected_local
+            || expected_arena_headers != change.expected_arena_headers
+            || arena_headers_after != change.arena_headers_after
+            || header_after != change.header_after
+            || owner_records != change.owner_records_before
+            || read_u32(&self.header.0, 92) >= MERGE_INITIAL_BUDGET as u32
+            || self.groups.prepare_reserve::<1>(1)?.as_slice() != change.groups.as_slice()
+            || self
+                .formations
+                .prepare_reserve::<FORMATION_MAX>(count + 1)?
+                .as_slice()
+                != change.formations.as_slice()
+            || self
+                .funders
+                .prepare_reserve::<FUNDER_MAX>((count + 1) * PLAN_MEMBERS_MAX)?
+                .as_slice()
+                != change.funders.as_slice()
+            || self
+                .members
+                .prepare_reserve::<MEMBER_MAX>(PLAN_MEMBERS_MAX)?
+                .as_slice()
+                != change.members.as_slice()
+            || self
+                .wrappers
+                .prepare_reserve::<WRAPPER_MAX>(count + 1)?
+                .as_slice()
+                != change.wrappers.as_slice()
+            || self
+                .links
+                .prepare_reserve::<LINK_MAX>(change.preview.owner_count)?
+                .as_slice()
+                != change.links.as_slice()
+            || self.memberships.prepare_reserve::<1>(1)?.as_slice() != change.memberships.as_slice()
+            || self
+                .mutations
+                .prepare_reserve::<MUTATION_MAX>(count + 1)?
+                .as_slice()
+                != change.mutations.as_slice()
+            || self.authority.find(&change.authority_key)? != Some(change.authority_before)
+            || change.local_entries[change.local_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 17], [0; 8]))
+            || !self
+                .authority
+                .validates_assignment_plan(&change.authority_plan)
+            || !self.local.validates_assignment_plan(&change.local_plan)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.authority.validate_update_batch(&[(
+            change.authority_key,
+            change.authority_handle,
+            change.authority_after,
+        )])?;
+        self.local
+            .validate_insert_batch(&change.local_entries[..change.local_count])?;
+        for index in 0..change.preview.owner_count {
+            let references = change.owner_references[index];
+            validate_c16_owner_set(
+                [
+                    self.owner_headers.image(references[0], &[1])?.as_slice(),
+                    self.owner_rows.image(references[1], &[1])?.as_slice(),
+                    self.owner_indices.image(references[2], &[1])?.as_slice(),
+                    self.owners.image(references[3], &[1])?.as_slice(),
+                ],
+                references,
+                change.preview.owners[index].slot,
+                &owner_records[index].ok_or(SupportLedgerError::Generation)?,
+                OWNER_STATE_LIVE,
+            )?;
+            if self.links.image(change.retired_links[index], &[1])?
+                != &change.retired_link_before[index]
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        let mut census = crate::work::ExactWorkCensus::new();
+        let reconstructed = self.prepare_merge_initial_topology(
+            change.preview,
+            change.event,
+            owner_records,
+            &mut census,
+        )?;
+        if &reconstructed != change {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(in crate::support) fn commit_merge_initial_topology(
+        &mut self,
+        change: PreparedMergeInitialTopology,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) {
+        self.validate_merge_initial_topology(&change, owner_records)
+            .expect("validated MergeInitial topology");
+        self.commit_merge_initial_topology_prevalidated(change, true);
+    }
+
+    pub(in crate::support) fn commit_merge_initial_topology_prevalidated(
+        &mut self,
+        change: PreparedMergeInitialTopology,
+        apply_index_plans: bool,
+    ) {
+        let count = change.preview.source_count;
+        for index in 0..count {
+            let journal = change.source_journals[index].expect("active source journal");
+            self.formations
+                .install_reserved_image_direct(change.formations[index], journal.formation_after);
+            self.mutations
+                .install_reserved_image_direct(change.mutations[index], journal.mutation_after);
+            self.groups
+                .replace_image_prevalidated(journal.before.group, journal.group_after);
+            self.wrappers
+                .install_reserved_image_direct(journal.locator_after_ref, journal.locator_after);
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                self.funders.install_reserved_image_direct(
+                    change.formations_indexed_funder(index, ordinal),
+                    journal.funder_after[ordinal],
+                );
+                self.members.replace_image_prevalidated(
+                    journal.before.members[ordinal].member,
+                    journal.member_after[ordinal],
+                );
+            }
+        }
+        let destination_group = change.groups[0];
+        let destination_formation = change.formations[count];
+        self.groups
+            .install_reserved_image_direct(destination_group, change.destination_group);
+        self.formations
+            .install_reserved_image_direct(destination_formation, change.destination_formation);
+        self.wrappers
+            .install_reserved_image_direct(change.wrappers[count], change.destination_wrapper);
+        for ordinal in 0..PLAN_MEMBERS_MAX {
+            self.funders.install_reserved_image_direct(
+                change.formations_indexed_funder(count, ordinal),
+                change.destination_funders[ordinal],
+            );
+            self.members.install_reserved_image_direct(
+                change.members[ordinal],
+                change.destination_members[ordinal],
+            );
+        }
+        self.memberships
+            .install_reserved_image_direct(change.memberships[0], change.membership_image);
+        self.mutations
+            .install_reserved_image_direct(change.mutations[count], change.membership_mutation);
+        for index in 0..change.preview.owner_count {
+            let references = change.owner_references[index];
+            self.owner_rows
+                .replace_image_prevalidated(references[1], change.owner_rows_after[index]);
+            self.owners
+                .replace_image_prevalidated(references[3], change.owners_after[index]);
+            self.links.replace_image_prevalidated(
+                change.retired_links[index],
+                change.retired_link_after[index],
+            );
+            self.links.install_reserved_image_direct(
+                change.links[index],
+                change.replacement_links[index],
+            );
+        }
+        if apply_index_plans {
+            self.authority
+                .commit_assignment_plan_prevalidated(change.authority_plan);
+            self.local
+                .commit_assignment_plan_prevalidated(change.local_plan);
+        }
+        self.assign_topology_arena_headers(change.arena_headers_after);
+        self.header = change.header_after;
+    }
+
+    fn prepare_topology_arena_headers_after(
+        &self,
+        groups: &ArenaSelection<1>,
+        formations: &ArenaSelection<FORMATION_MAX>,
+        funders: &ArenaSelection<FUNDER_MAX>,
+        members: &ArenaSelection<MEMBER_MAX>,
+        wrappers: &ArenaSelection<WRAPPER_MAX>,
+        links: &ArenaSelection<LINK_MAX>,
+        memberships: &ArenaSelection<1>,
+        mutations: &ArenaSelection<MUTATION_MAX>,
+    ) -> Result<[ByteArenaHeaderImage; 11], SupportLedgerError> {
+        Ok([
+            self.groups
+                .prepare_reserve_header_after(groups, groups.len(), 0)?,
+            self.formations
+                .prepare_reserve_header_after(formations, formations.len(), 0)?,
+            self.funders
+                .prepare_reserve_header_after(funders, funders.len(), 0)?,
+            self.members
+                .prepare_reserve_header_after(members, members.len(), 0)?,
+            self.wrappers
+                .prepare_reserve_header_after(wrappers, wrappers.len(), 0)?,
+            self.links
+                .prepare_reserve_header_after(links, links.len(), 0)?,
+            self.memberships
+                .prepare_reserve_header_after(memberships, memberships.len(), 0)?,
+            self.mutations
+                .prepare_reserve_header_after(mutations, mutations.len(), 0)?,
+            self.owner_rows.prepare_generation_header_after()?,
+            self.owners.prepare_generation_header_after()?,
+            self.external_heads.header_image(),
+        ])
+    }
+
+    fn assign_topology_arena_headers(&mut self, headers: [ByteArenaHeaderImage; 11]) {
+        self.groups.assign_header_direct(headers[0]);
+        self.formations.assign_header_direct(headers[1]);
+        self.funders.assign_header_direct(headers[2]);
+        self.members.assign_header_direct(headers[3]);
+        self.wrappers.assign_header_direct(headers[4]);
+        self.links.assign_header_direct(headers[5]);
+        self.memberships.assign_header_direct(headers[6]);
+        self.mutations.assign_header_direct(headers[7]);
+        self.owner_rows.assign_header_direct(headers[8]);
+        self.owners.assign_header_direct(headers[9]);
+        self.external_heads.assign_header_direct(headers[10]);
+    }
+
+    fn validate_merge_initial_preview(
+        &self,
+        preview: &MergeInitialPreview,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != preview.expected_c17
+            || !(2..=SOURCE_MAX).contains(&preview.source_count)
+            || preview.sources[..preview.source_count]
+                .iter()
+                .any(Option::is_none)
+            || preview.sources[preview.source_count..]
+                .iter()
+                .any(Option::is_some)
+            || preview.owner_count != preview.source_count
+            || self.groups.prepare_reserve::<1>(1)?[0] != preview.destination.group()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        for index in 0..preview.source_count {
+            let before = preview.sources[index].expect("active source");
+            let current = self.root_at_group(before.group, before.authority_key, before.branch)?;
+            if current != before
+                || preview.owners[index].request_key != before.members[0].request_key
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        Ok(())
+    }
+
+    fn topology_arena_headers(&self) -> [ByteArenaHeaderImage; 11] {
+        [
+            self.groups.header_image(),
+            self.formations.header_image(),
+            self.funders.header_image(),
+            self.members.header_image(),
+            self.wrappers.header_image(),
+            self.links.header_image(),
+            self.memberships.header_image(),
+            self.mutations.header_image(),
+            self.owner_rows.header_image(),
+            self.owners.header_image(),
+            self.external_heads.header_image(),
+        ]
+    }
+}
+
+impl PreparedMergeInitialTopology {
+    fn formations_indexed_funder(&self, formation: usize, ordinal: usize) -> ArenaRef {
+        self.funders[formation * PLAN_MEMBERS_MAX + ordinal]
     }
 }
