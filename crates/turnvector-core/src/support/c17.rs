@@ -4064,3 +4064,397 @@ pub(crate) struct PreparedLifecycleBegin {
     pending_before: PendingLifecycleHeaderImage,
     pending_after: PendingLifecycleHeaderImage,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LifecycleOwnerRow {
+    pub(crate) owner: u64,
+    pub(crate) request: u64,
+    pub(crate) entitlement: u64,
+    pub(crate) vector: u64,
+    pub(crate) source: u64,
+    pub(crate) group: u64,
+    pub(crate) root: u64,
+    pub(crate) formation: u64,
+    pub(crate) link: u64,
+    pub(crate) reserve: u64,
+    pub(crate) class: u64,
+    pub(crate) pool: u64,
+    pub(crate) amount: u64,
+    pub(crate) generation: u64,
+    pub(crate) state: u64,
+    pub(crate) zero: u64,
+}
+
+impl LifecycleOwnerRow {
+    pub(crate) const ZERO: Self = Self {
+        owner: 0,
+        request: 0,
+        entitlement: 0,
+        vector: 0,
+        source: 0,
+        group: 0,
+        root: 0,
+        formation: 0,
+        link: 0,
+        reserve: 0,
+        class: 0,
+        pool: 0,
+        amount: 0,
+        generation: 0,
+        state: 0,
+        zero: 0,
+    };
+
+    const fn fields(self) -> [u64; 16] {
+        [
+            self.owner,
+            self.request,
+            self.entitlement,
+            self.vector,
+            self.source,
+            self.group,
+            self.root,
+            self.formation,
+            self.link,
+            self.reserve,
+            self.class,
+            self.pool,
+            self.amount,
+            self.generation,
+            self.state,
+            self.zero,
+        ]
+    }
+
+    const fn from_fields(fields: [u64; 16]) -> Self {
+        Self {
+            owner: fields[0],
+            request: fields[1],
+            entitlement: fields[2],
+            vector: fields[3],
+            source: fields[4],
+            group: fields[5],
+            root: fields[6],
+            formation: fields[7],
+            link: fields[8],
+            reserve: fields[9],
+            class: fields[10],
+            pool: fields[11],
+            amount: fields[12],
+            generation: fields[13],
+            state: fields[14],
+            zero: fields[15],
+        }
+    }
+
+    fn encode(self) -> [u8; 128] {
+        let mut image = [0; 128];
+        for (index, field) in self.fields().into_iter().enumerate() {
+            write_u64(&mut image, index * 8, field);
+        }
+        image
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LifecycleRecordInput {
+    pub(crate) final_owner: [u8; 64],
+    pub(crate) owner_set_ref: [u8; 8],
+    pub(crate) obligation_raw: [u8; 32],
+    pub(crate) credit_raw: [u8; 32],
+    pub(crate) predecessor: [u8; 32],
+    pub(crate) scope: [u8; 32],
+    pub(crate) claim: [u8; 32],
+    pub(crate) physical_credit: [u8; 32],
+    pub(crate) kind: u8,
+    pub(crate) occurred_at: u64,
+    pub(crate) expires_at: Option<u64>,
+    pub(crate) aggregate: [u64; 21],
+    pub(crate) owners: [LifecycleOwnerRow; 4],
+}
+
+impl LifecycleRecordInput {
+    pub(crate) const ZERO: Self = Self {
+        final_owner: [0; 64],
+        owner_set_ref: [0; 8],
+        obligation_raw: [0; 32],
+        credit_raw: [0; 32],
+        predecessor: [0; 32],
+        scope: [0; 32],
+        claim: [0; 32],
+        physical_credit: [0; 32],
+        kind: 0,
+        occurred_at: 0,
+        expires_at: None,
+        aggregate: [0; 21],
+        owners: [LifecycleOwnerRow::ZERO; 4],
+    };
+
+    fn validate(self) -> Result<(), SupportLedgerError> {
+        let class = usize::try_from(self.aggregate[0]).map_err(|_| capacity_error())?;
+        let pool = usize::try_from(self.aggregate[1]).map_err(|_| capacity_error())?;
+        let axis = usize::try_from(self.aggregate[2]).map_err(|_| capacity_error())?;
+        let horizon = usize::try_from(self.aggregate[3]).map_err(|_| capacity_error())?;
+        let amount = self.aggregate[4];
+        if self.final_owner == [0; 64]
+            || self.owner_set_ref == [0; 8]
+            || self.obligation_raw == [0; 32]
+            || self.credit_raw == [0; 32]
+            || self.obligation_raw >= self.credit_raw
+            || [
+                self.predecessor,
+                self.scope,
+                self.claim,
+                self.physical_credit,
+            ]
+            .contains(&[0; 32])
+            || self.kind == 0
+            || self.occurred_at == 0
+            || self
+                .expires_at
+                .is_some_and(|expiry| expiry <= self.occurred_at)
+            || class >= 3
+            || pool >= 3
+            || axis >= 21
+            || horizon >= 3
+            || amount == 0
+            || u32::try_from(amount).is_err()
+            || self.aggregate[5] != 1
+            || self.aggregate[6..].iter().any(|field| *field != 0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut owner_count = 0usize;
+        let mut owner_amount = 0u64;
+        let mut inactive = false;
+        for owner in self.owners {
+            if owner == LifecycleOwnerRow::ZERO {
+                inactive = true;
+                continue;
+            }
+            let fields = owner.fields();
+            if inactive
+                || fields[..10].contains(&0)
+                || owner.class != class as u64
+                || owner.pool != pool as u64
+                || owner.amount != 1
+                || owner.generation == 0
+                || owner.state == 0
+                || owner.zero != 0
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            owner_amount = owner_amount
+                .checked_add(owner.amount)
+                .ok_or_else(capacity_error)?;
+            owner_count += 1;
+        }
+        if !(1..=4).contains(&owner_count) || owner_count as u64 != amount || owner_amount != amount
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    fn decode(image: &[u8; LIFECYCLE_BYTES]) -> Result<Self, SupportLedgerError> {
+        if image[18..24].iter().any(|byte| *byte != 0)
+            || image[488..512].iter().any(|byte| *byte != 0)
+            || image[1_024..].iter().any(|byte| *byte != 0)
+        {
+            return Err(noncanonical_error());
+        }
+        let mut final_owner = [0; 64];
+        final_owner.copy_from_slice(&image[24..88]);
+        let mut owner_set_ref = [0; 8];
+        owner_set_ref.copy_from_slice(&image[88..96]);
+        let mut obligation_raw = [0; 32];
+        obligation_raw.copy_from_slice(&image[96..128]);
+        let mut credit_raw = [0; 32];
+        credit_raw.copy_from_slice(&image[128..160]);
+        let mut identities = [[0; 32]; 4];
+        for (index, value) in identities.iter_mut().enumerate() {
+            value.copy_from_slice(&image[160 + index * 32..192 + index * 32]);
+        }
+        let kind = u8::try_from(read_u64(image, 288)).map_err(|_| noncanonical_error())?;
+        let expiry = read_u64(image, 304);
+        let mut aggregate = [0; 21];
+        for (index, value) in aggregate.iter_mut().enumerate() {
+            *value = read_u64(image, 312 + index * 8);
+        }
+        let mut owners = [LifecycleOwnerRow::ZERO; 4];
+        for (owner_index, owner) in owners.iter_mut().enumerate() {
+            let mut fields = [0; 16];
+            for (field_index, field) in fields.iter_mut().enumerate() {
+                *field = read_u64(image, 512 + owner_index * 128 + field_index * 8);
+            }
+            *owner = LifecycleOwnerRow::from_fields(fields);
+        }
+        let value = Self {
+            final_owner,
+            owner_set_ref,
+            obligation_raw,
+            credit_raw,
+            predecessor: identities[0],
+            scope: identities[1],
+            claim: identities[2],
+            physical_credit: identities[3],
+            kind,
+            occurred_at: read_u64(image, 296),
+            expires_at: (expiry != 0).then_some(expiry),
+            aggregate,
+            owners,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn encode(
+        self,
+        reference: ArenaRef,
+        batch: u64,
+        ordinal: usize,
+    ) -> Result<[u8; LIFECYCLE_BYTES], SupportLedgerError> {
+        self.validate()?;
+        let mut image = LifecycleRecordSlotImage::ZERO.0;
+        write_u64(&mut image, 8, batch);
+        write_u16(&mut image, 16, ordinal as u16);
+        image[24..88].copy_from_slice(&self.final_owner);
+        image[88..96].copy_from_slice(&self.owner_set_ref);
+        image[96..128].copy_from_slice(&self.obligation_raw);
+        image[128..160].copy_from_slice(&self.credit_raw);
+        for (offset, value) in [
+            (160, self.predecessor),
+            (192, self.scope),
+            (224, self.claim),
+            (256, self.physical_credit),
+        ] {
+            image[offset..offset + 32].copy_from_slice(&value);
+        }
+        write_u64(&mut image, 288, u64::from(self.kind));
+        write_u64(&mut image, 296, self.occurred_at);
+        write_u64(&mut image, 304, self.expires_at.unwrap_or(0));
+        for (index, value) in self.aggregate.into_iter().enumerate() {
+            write_u64(&mut image, 312 + index * 8, value);
+        }
+        for (index, owner) in self.owners.into_iter().enumerate() {
+            image[512 + index * 128..640 + index * 128].copy_from_slice(&owner.encode());
+        }
+        let encoded = encode_raw_owner(
+            RawOwnerKind::LifecycleObligation,
+            RawOwnerState::Inactive,
+            reference,
+        )?;
+        image[480..488].copy_from_slice(&encoded);
+        Ok(image)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedLifecycleStage {
+    expected_c17: u64,
+    generation_after: u64,
+    expected_raw: u64,
+    expected_arena_header: ByteArenaHeaderImage,
+    arena_header_after: ByteArenaHeaderImage,
+    batch: u64,
+    first: usize,
+    len: usize,
+    records: [LifecycleRecordInput; LIFECYCLE_CHUNK_MAX],
+    record_images: [[u8; LIFECYCLE_BYTES]; LIFECYCLE_CHUNK_MAX],
+    references: [ArenaRef; LIFECYCLE_CHUNK_MAX],
+    raw_entries: [([u8; 32], [u8; 8]); 2 * LIFECYCLE_CHUNK_MAX],
+    raw_count: usize,
+    pending_after: PendingLifecycleHeaderImage,
+    raw_plan: PatriciaAssignmentPlan<RAW_ASSIGNMENT_MAX>,
+}
+
+impl PreparedLifecycleStage {
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.raw_plan.visit_assignments(visitor);
+    }
+}
+
+pub(super) const LIFECYCLE_PUBLICATION_MAX: usize = LIFECYCLE_BATCH_MAX * PLAN_MEMBERS_MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LifecyclePublication {
+    owner_slot: u32,
+    funder: ArenaRef,
+    branch: u8,
+    axis: u8,
+    horizon: u8,
+    zero: u8,
+}
+
+impl LifecyclePublication {
+    const ZERO: Self = Self {
+        owner_slot: 0,
+        funder: ArenaRef {
+            slot: 0,
+            generation: 0,
+        },
+        branch: 0,
+        axis: 0,
+        horizon: 0,
+        zero: 0,
+    };
+
+    pub(super) const fn owner_slot(self) -> u32 {
+        self.owner_slot
+    }
+
+    pub(super) const fn funder(self) -> ArenaRef {
+        self.funder
+    }
+
+    pub(super) const fn branch(self) -> usize {
+        self.branch as usize
+    }
+
+    pub(super) const fn axis(self) -> usize {
+        self.axis as usize
+    }
+
+    pub(super) const fn horizon(self) -> usize {
+        self.horizon as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LifecycleRawUpdate {
+    handle: NodeHandle,
+    after: [u8; 8],
+}
+
+impl LifecycleRawUpdate {
+    const ZERO: Self = Self {
+        handle: NodeHandle::SENTINEL,
+        after: [0; 8],
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LifecycleOwnerOutcome {
+    owner_slot: u32,
+    linked_after: u32,
+    current_after: u64,
+    branches_after: [u64; OWNER_FUNDING_BRANCHES],
+}
+
+impl LifecycleOwnerOutcome {
+    pub(super) const ZERO: Self = Self {
+        owner_slot: 0,
+        linked_after: 0,
+        current_after: 0,
+        branches_after: [0; OWNER_FUNDING_BRANCHES],
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LifecycleFunderOutcome {
+    reference: ArenaRef,
+    current_after: u64,
+}
