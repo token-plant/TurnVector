@@ -764,4 +764,324 @@ impl SupportC17 {
             root.locator,
         ))
     }
+
+    #[cfg(test)]
+    pub(in crate::support) fn owner_active_link_for_test(
+        &self,
+        slot: u32,
+    ) -> Result<(ArenaRef, ArenaRef, ArenaRef), SupportLedgerError> {
+        let row_ref = self.owner_rows.reference_at(slot, &[1])?;
+        let row = self.owner_rows.image(row_ref, &[1])?;
+        let link =
+            decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8])?
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+        let image = self.links.image(link, &[1])?;
+        if image[8] != 1 {
+            return Err(noncanonical_error());
+        }
+        Ok((
+            link,
+            decode_arena_ref(&image[24..32])?,
+            decode_arena_ref(&image[32..40])?,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(in crate::support) fn root_formation_for_test(
+        &self,
+        anchor: RootAnchor,
+    ) -> Result<[u8; FORMATION_BYTES], SupportLedgerError> {
+        let root = self.root_from_anchor(anchor)?;
+        Ok(*self.formations.image(root.formation, &[1])?)
+    }
+
+    #[cfg(test)]
+    pub(in crate::support) fn owner_currents_for_test(
+        &self,
+        slot: u32,
+    ) -> Result<(u64, [u64; 4], bool), SupportLedgerError> {
+        let reference = self.owner_rows.reference_at(slot, &[1])?;
+        let row = self.owner_rows.image(reference, &[1])?;
+        let branches =
+            std::array::from_fn(|branch| read_u64(row, OWNER_ROW_BRANCH_CURRENT + branch * 8));
+        let active =
+            decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8])?
+                .is_some();
+        Ok((read_u64(row, OWNER_ROW_CURRENT), branches, active))
+    }
+
+    pub(crate) fn inspect_membership_root_action(
+        &self,
+        anchor: crate::request_book::c17::SupportMembershipAnchor,
+        action: RootAction,
+        occurred_at: u64,
+    ) -> Result<RootBatchPreview, SupportLedgerError> {
+        if anchor.is_absent()
+            || anchor.group() != anchor.root()
+            || !matches!(anchor.branch(), 0..=3)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let current =
+            self.root_at_group(anchor.group(), anchor.authority_key(), anchor.branch())?;
+        self.inspect_root_action(
+            RootAnchor {
+                authority_key: current.authority_key,
+                branch: current.branch,
+                group: current.group,
+                root: current.group,
+                version: current.version,
+            },
+            action,
+            occurred_at,
+        )
+    }
+
+    pub(crate) fn inspect_root_action(
+        &self,
+        anchor: RootAnchor,
+        action: RootAction,
+        occurred_at: u64,
+    ) -> Result<RootBatchPreview, SupportLedgerError> {
+        if occurred_at == 0 || anchor.group != anchor.root {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let root = self.root_from_anchor(anchor)?;
+        if occurred_at <= root.occurred_at {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let (operation, after, cause, reason, resolver) = match action {
+            RootAction::MarkPredecessorEnded => {
+                if root.authority_key[0] != 0x31
+                    || root.branch != 3
+                    || root.state != RootState::Conditional
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                (
+                    SemanticOperation::MarkPredecessorEnded,
+                    RootState::Pending,
+                    FormationCause::PredecessorEnded,
+                    0,
+                    ResolverChange::Keep,
+                )
+            }
+            RootAction::Begin => {
+                if root.state != RootState::Pending {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                (
+                    SemanticOperation::Begin,
+                    RootState::Active,
+                    FormationCause::BeganSupport,
+                    0,
+                    ResolverChange::Keep,
+                )
+            }
+            RootAction::Finish => {
+                if root.state != RootState::Active
+                    || (root.authority_key[0] == 0x30 && root.branch == 0)
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                (
+                    SemanticOperation::Finish,
+                    RootState::Retained,
+                    FormationCause::FinishedSupport,
+                    0,
+                    ResolverChange::Retire,
+                )
+            }
+        };
+        self.preview_root_batch(
+            operation,
+            cause,
+            [Some((root, after, reason)), None, None, None, None],
+            resolver,
+            occurred_at,
+        )
+    }
+
+    pub(crate) fn inspect_typed_close(
+        &self,
+        input: crate::TypedCloseInput,
+    ) -> Result<RootBatchPreview, SupportLedgerError> {
+        let occurred_at = input.occurred_at.as_micros();
+        if occurred_at == 0 || input.group != input.root.slot() {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        if matches!(
+            input.authority,
+            crate::CloseAuthority::Standalone { source, .. }
+                if source.reserved != 0 || source.generation() == 0
+        ) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let branch = input.branch.ordinal();
+        let group = ArenaRef {
+            slot: input.root.slot(),
+            generation: input.root.generation(),
+        };
+        let (root, operation, authority_image, plan_event) = match input.authority {
+            crate::CloseAuthority::Plan { identity, event } => {
+                let operation = match input.branch {
+                    crate::PlanBranch::Continuation => SemanticOperation::TypedCloseC,
+                    crate::PlanBranch::Rejection => SemanticOperation::TypedCloseR,
+                    _ => return Err(SupportLedgerError::InvalidTransition),
+                };
+                let authority_key = plan_authority_key_for_semantic(identity.id.get());
+                let root = self.plan_root(
+                    authority_key,
+                    crate::support::encode_plan_identity(identity),
+                    branch,
+                )?;
+                validate_typed_close_root(input.root, group, root)?;
+                if root.state != RootState::Pending {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let expected_event = read_u64(&self.header.0, NEXT_PLAN_CAUSAL_EVENT);
+                if event.get() != expected_event {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let next_event = expected_event.checked_add(1).ok_or_else(capacity_error)?;
+                (
+                    root,
+                    operation,
+                    encode_close_authority(CLOSE_AUTHORITY_PLAN, event.get(), 0, 0),
+                    Some((expected_event, next_event)),
+                )
+            }
+            crate::CloseAuthority::Standalone {
+                domain,
+                source,
+                event,
+            } => {
+                if input.branch != crate::PlanBranch::Standalone {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let authority_key = standalone_authority_key_for_semantic(domain.get());
+                let group_image = self.groups.image(group, &[1])?;
+                let mut stored_authority_key = [0; 17];
+                stored_authority_key.copy_from_slice(&group_image[40..57]);
+                if stored_authority_key == [0; 17] {
+                    return Err(noncanonical_error());
+                }
+                let root = self.root_from_anchor(RootAnchor {
+                    authority_key: stored_authority_key,
+                    branch,
+                    group,
+                    root: group,
+                    version: input.root.version(),
+                })?;
+                validate_typed_close_root(input.root, group, root)?;
+                if stored_authority_key != authority_key {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                if !matches!(root.state, RootState::Conditional | RootState::Pending) {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let initial = self.formations.image(root.initial_formation, &[1])?;
+                if initial[220] != branch
+                    || initial[221] != RootState::Conditional as u8
+                    || initial[222] != FormationCause::InitialReady as u8
+                    || initial[8..16] != encode_source_record_ref(source)
+                    || read_u64(initial, 16) != event.get()
+                    || initial[24..40] != domain.get().to_be_bytes()
+                    || initial[104..121] != authority_key
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                (
+                    root,
+                    SemanticOperation::TypedCloseStandalone,
+                    encode_close_authority(
+                        CLOSE_AUTHORITY_STANDALONE,
+                        event.get(),
+                        u64::from_le_bytes(encode_source_record_ref(source)),
+                        0,
+                    ),
+                    None,
+                )
+            }
+            crate::CloseAuthority::Cancellation {
+                fact,
+                event,
+                request_generation,
+            } => {
+                if input.branch != crate::PlanBranch::Terminal {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let group_image = self.groups.image(group, &[1])?;
+                let mut authority_key = [0; 17];
+                authority_key.copy_from_slice(&group_image[40..57]);
+                if authority_key == [0; 17] {
+                    return Err(noncanonical_error());
+                }
+                let root = self.root_from_anchor(RootAnchor {
+                    authority_key,
+                    branch,
+                    group,
+                    root: group,
+                    version: input.root.version(),
+                })?;
+                validate_typed_close_root(input.root, group, root)?;
+                if root.state != RootState::Pending {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let initial = self.formations.image(root.initial_formation, &[1])?;
+                if initial[220] != branch
+                    || initial[221] != RootState::Pending as u8
+                    || initial[222] != FormationCause::CancellationMembership as u8
+                    || read_u64(initial, 8) != event.get()
+                    || read_u64(initial, 16) != fact.get()
+                    || read_u64(initial, 24) != request_generation.get()
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                (
+                    root,
+                    SemanticOperation::TypedCloseTerminal,
+                    encode_close_authority(
+                        CLOSE_AUTHORITY_CANCELLATION,
+                        event.get(),
+                        fact.get(),
+                        request_generation.get(),
+                    ),
+                    None,
+                )
+            }
+        };
+        if occurred_at <= root.occurred_at {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let after = match root.state {
+            RootState::Conditional => RootState::ClosedConditional,
+            RootState::Pending => RootState::ClosedPending,
+            _ => return Err(SupportLedgerError::InvalidTransition),
+        };
+        let resolver = if operation == SemanticOperation::TypedCloseTerminal {
+            ResolverChange::Keep
+        } else {
+            ResolverChange::Retire
+        };
+        let mut preview = self.preview_root_batch(
+            operation,
+            FormationCause::TypedImpossible,
+            [
+                Some((root, after, input.reason.get())),
+                None,
+                None,
+                None,
+                None,
+            ],
+            resolver,
+            occurred_at,
+        )?;
+        preview.transitions[0]
+            .as_mut()
+            .expect("typed close transition")
+            .close_authority = authority_image;
+        preview.plan_event = plan_event;
+        Ok(preview)
+    }
 }
