@@ -3480,4 +3480,295 @@ impl RequestBookC17 {
         });
         image[8..].copy_from_slice(&encoded[8..]);
     }
+    fn increment_owner_generation(&mut self, offset: usize) {
+        let next = read_u64(&self.header.0, offset)
+            .checked_add(1)
+            .expect("prepared RequestBook owner generation");
+        write_u64(&mut self.header.0, offset, next);
+    }
+
+    fn increment_count(&mut self, offset: usize) {
+        let next = read_u32(&self.header.0, offset)
+            .checked_add(1)
+            .expect("prepared RequestBook count");
+        write_u32(&mut self.header.0, offset, next);
+    }
+
+    fn advance_generation(&mut self) {
+        let next = self
+            .generation()
+            .checked_add(1)
+            .expect("prepared RequestBook generation");
+        write_u64(&mut self.header.0, 24, next);
+    }
+}
+
+fn single_member_event(
+    id: u64,
+    kind: MembershipEventKind,
+    source: SourceRecordRef,
+    request: RequestAddress,
+    before: MembershipStateRow,
+    after: MembershipStateRow,
+    generation_before: u64,
+    generation_after: u64,
+    occurred_at: u64,
+) -> MembershipEventRecord {
+    let mut sources = [SourceRecordRef::ABSENT; 3];
+    sources[0] = source;
+    let mut affected = [None; 4];
+    affected[0] = Some(request);
+    let mut before_rows = [None; 4];
+    before_rows[0] = Some(before);
+    let mut after_rows = [None; 4];
+    after_rows[0] = Some(after);
+    MembershipEventRecord {
+        id,
+        kind,
+        source_count: 1,
+        member_count: 1,
+        consumed_by_support: true,
+        sources,
+        affected,
+        before: before_rows,
+        after: after_rows,
+        generation_before,
+        generation_after,
+        occurred_at,
+        cancellation_fact: 0,
+    }
+}
+
+pub(crate) fn request_key(id: RequestId) -> [u8; 40] {
+    let mut key = [0; 40];
+    key[..16].copy_from_slice(&id.daemon_instance().get().to_be_bytes());
+    key[16..32].copy_from_slice(&id.connection().get().to_be_bytes());
+    key[32..].copy_from_slice(&id.sequence().get().to_be_bytes());
+    key
+}
+
+fn request_id_from_key(key: [u8; 40]) -> Result<RequestId, RequestError> {
+    use crate::{ConnectionId, DaemonInstanceId, RequestSequence};
+    let daemon = u128::from_be_bytes(key[..16].try_into().expect("request daemon key"));
+    let connection = u128::from_be_bytes(key[16..32].try_into().expect("request connection key"));
+    let sequence = u64::from_be_bytes(key[32..].try_into().expect("request sequence key"));
+    Ok(RequestId::new(
+        DaemonInstanceId::new(daemon).map_err(|_| RequestError::InvalidTransition)?,
+        ConnectionId::new(connection).map_err(|_| RequestError::InvalidTransition)?,
+        RequestSequence::new(sequence).map_err(|_| RequestError::InvalidTransition)?,
+    ))
+}
+
+fn source_key(kind: SourceKind, identity: [u8; 32]) -> [u8; 33] {
+    let mut key = [0; 33];
+    key[0] = kind as u8;
+    key[1..].copy_from_slice(&identity);
+    key
+}
+
+fn encode_source_value(reference: SourceRecordRef) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    encode_source_ref(&mut bytes, reference);
+    bytes
+}
+
+fn decode_source_value(bytes: [u8; 8]) -> Result<SourceRecordRef, RequestError> {
+    decode_source_ref(&bytes)
+}
+
+fn encode_event_value(reference: EventRecordRef) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    encode_event_ref(&mut bytes, reference);
+    bytes
+}
+
+fn source_ref_canonical(reference: SourceRecordRef) -> bool {
+    reference.reserved == 0
+        && (reference.is_absent()
+            || (reference.generation != 0 && usize::from(reference.slot) < SOURCE_CAPACITY))
+}
+
+fn encode_source_ref(bytes: &mut [u8], reference: SourceRecordRef) {
+    write_u16(bytes, 0, reference.slot);
+    write_u16(bytes, 2, reference.reserved);
+    write_u32(bytes, 4, reference.generation);
+}
+
+fn decode_source_ref(bytes: &[u8]) -> Result<SourceRecordRef, RequestError> {
+    let reference = SourceRecordRef {
+        slot: read_u16(bytes, 0),
+        reserved: read_u16(bytes, 2),
+        generation: read_u32(bytes, 4),
+    };
+    if !source_ref_canonical(reference) {
+        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+    }
+    Ok(reference)
+}
+
+fn event_ref_canonical(reference: EventRecordRef) -> bool {
+    reference.reserved == 0
+        && (reference.is_absent()
+            || (reference.generation != 0 && usize::from(reference.slot) < EVENT_CAPACITY))
+}
+
+fn encode_event_ref(bytes: &mut [u8], reference: EventRecordRef) {
+    write_u16(bytes, 0, reference.slot);
+    write_u16(bytes, 2, reference.reserved);
+    write_u32(bytes, 4, reference.generation);
+}
+
+fn decode_event_ref(bytes: &[u8]) -> Result<EventRecordRef, RequestError> {
+    let reference = EventRecordRef {
+        slot: read_u16(bytes, 0),
+        reserved: read_u16(bytes, 2),
+        generation: read_u32(bytes, 4),
+    };
+    if !event_ref_canonical(reference) {
+        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+    }
+    Ok(reference)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("fixed u16 image"),
+    )
+}
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("fixed u32 image"),
+    )
+}
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed u64 image"),
+    )
+}
+const fn read_u64_const(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+impl From<FixedStorageError> for RequestError {
+    fn from(error: FixedStorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+const _: () = {
+    assert!(size_of::<SourceRecordRef>() == 8);
+    assert!(size_of::<EventRecordRef>() == 8);
+    assert!(size_of::<RequestAddress>() == 56);
+    assert!(size_of::<SupportMembershipAnchor>() == 64);
+    assert!(MEMBERSHIP_BYTES == 112);
+};
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    #[test]
+    fn request_book_production_backings_and_every_first_one_over_are_exact() {
+        let generation = RequestBookGeneration::new(1).unwrap();
+        let exact =
+            RequestBookC17::try_new(RequestBookC17Capacities::production(), generation).unwrap();
+        assert_eq!(
+            [
+                exact.requests.capacity(),
+                exact.request_index.capacity(),
+                exact.events.capacity(),
+                exact.event_index.capacity(),
+                exact.sources.capacity(),
+                exact.source_index.capacity(),
+            ],
+            [
+                REQUEST_CAPACITY,
+                REQUEST_CAPACITY,
+                EVENT_CAPACITY,
+                EVENT_CAPACITY,
+                SOURCE_CAPACITY,
+                SOURCE_CAPACITY,
+            ]
+        );
+        drop(exact);
+
+        let increments: [fn(&mut RequestBookC17Capacities); 3] = [
+            |value| value.requests += 1,
+            |value| value.events += 1,
+            |value| value.sources += 1,
+        ];
+        for increment in increments {
+            let mut over = RequestBookC17Capacities::production();
+            increment(&mut over);
+            assert_eq!(
+                RequestBookC17::try_new(over, generation),
+                Err(RequestError::Storage(FixedStorageError::Capacity))
+            );
+        }
+    }
+
+    #[test]
+    fn source_and_event_refs_reject_first_one_over_and_zero_generation() {
+        for (capacity, source) in [(SOURCE_CAPACITY, true), (EVENT_CAPACITY, false)] {
+            let last = ArenaRef {
+                slot: u32::try_from(capacity - 1).unwrap(),
+                generation: u32::MAX,
+            };
+            let first_over = ArenaRef {
+                slot: u32::try_from(capacity).unwrap(),
+                generation: 1,
+            };
+            let zero_generation = ArenaRef {
+                slot: 0,
+                generation: 0,
+            };
+            if source {
+                let reference = SourceRecordRef::from_arena(last).unwrap();
+                assert_eq!(reference.arena().unwrap(), last);
+                assert_eq!(
+                    SourceRecordRef::from_arena(first_over),
+                    Err(RequestError::Storage(FixedStorageError::NonCanonical))
+                );
+                assert_eq!(
+                    SourceRecordRef::from_arena(zero_generation),
+                    Err(RequestError::Storage(FixedStorageError::NonCanonical))
+                );
+            } else {
+                let reference = EventRecordRef::from_arena(last).unwrap();
+                assert_eq!(reference.arena().unwrap(), last);
+                assert_eq!(
+                    EventRecordRef::from_arena(first_over),
+                    Err(RequestError::Storage(FixedStorageError::NonCanonical))
+                );
+                assert_eq!(
+                    EventRecordRef::from_arena(zero_generation),
+                    Err(RequestError::Storage(FixedStorageError::NonCanonical))
+                );
+            }
+        }
+    }
 }
