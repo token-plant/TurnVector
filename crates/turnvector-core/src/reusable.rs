@@ -260,3 +260,400 @@ pub(crate) struct PatriciaAssignmentPlan<const N: usize> {
     has_prior_edit: bool,
     next_ordinal: u16,
 }
+
+impl<const N: usize> PatriciaAssignmentPlan<N> {
+    fn new(
+        arena: u16,
+        expected_generation: u64,
+        after_header: ReusableIndexHeader,
+    ) -> Result<Self, FixedStorageError> {
+        if arena == 0 || N == 0 {
+            return Err(FixedStorageError::Capacity);
+        }
+        Ok(Self {
+            arena,
+            expected_generation,
+            after_header,
+            assignments: [Assignment::NOOP; N],
+            order_refs: [AssignmentOrderRef::ZERO; N],
+            edits: [AssignmentOrderKey::ZERO; ASSIGNMENT_EDIT_MAX],
+            len: 0,
+            edit_len: 0,
+            current_edit: 0,
+            current_is_generation: false,
+            prior_edit: AssignmentOrderKey::ZERO,
+            has_current_edit: false,
+            has_prior_edit: false,
+            next_ordinal: 0,
+        })
+    }
+
+    pub(crate) fn assignments(&self) -> &[Assignment] {
+        &self.assignments[..self.len]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_first_assignment_payload_for_test(&mut self) {
+        self.assignments[0].payload[0] ^= 1;
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        for index in 0..self.len {
+            visitor(
+                self.resolve_order_ref(self.order_refs[index])
+                    .expect("sealed assignment order reference"),
+                self.assignments[index],
+            );
+        }
+    }
+
+    fn append_edit(
+        &mut self,
+        edit: AssignmentOrderKey,
+        generation: bool,
+    ) -> Result<(), FixedStorageError> {
+        if self.edit_len == ASSIGNMENT_EDIT_MAX {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.current_edit = u8::try_from(self.edit_len).map_err(|_| FixedStorageError::Capacity)?;
+        self.current_is_generation = generation;
+        self.edits[self.edit_len] = edit;
+        self.edit_len += 1;
+        self.has_current_edit = true;
+        self.next_ordinal = 0;
+        Ok(())
+    }
+
+    fn finish_current_envelope(&mut self) -> Result<(), FixedStorageError> {
+        if !self.has_current_edit || self.current_is_generation {
+            return Ok(());
+        }
+        if self.next_ordinal > 9 {
+            return Err(FixedStorageError::Capacity);
+        }
+        while self.next_ordinal < 9 {
+            if self.len == N {
+                return Err(FixedStorageError::Capacity);
+            }
+            self.order_refs[self.len] = self.next_order_ref()?;
+            self.assignments[self.len] = Assignment::NOOP;
+            self.len += 1;
+        }
+        Ok(())
+    }
+
+    fn begin_edit(
+        &mut self,
+        key: &[u8],
+        kind: PatriciaEditKind,
+        value: &[u8],
+    ) -> Result<(), FixedStorageError> {
+        let current = AssignmentOrderKey::edit(self.arena, key, kind, value)?;
+        if self.has_prior_edit && self.prior_edit.semantic_cmp(&current) != Ordering::Less {
+            return Err(FixedStorageError::Duplicate);
+        }
+        self.finish_current_envelope()?;
+        self.append_edit(current, false)?;
+        self.prior_edit = current;
+        self.has_prior_edit = true;
+        Ok(())
+    }
+
+    fn begin_generation(&mut self) -> Result<(), FixedStorageError> {
+        self.finish_current_envelope()?;
+        self.append_edit(AssignmentOrderKey::generation(self.arena)?, true)
+    }
+
+    fn next_order_ref(&mut self) -> Result<AssignmentOrderRef, FixedStorageError> {
+        if !self.has_current_edit
+            || (!self.current_is_generation && self.next_ordinal >= 9)
+            || (self.current_is_generation && self.next_ordinal >= 1)
+        {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(AssignmentOrderRef {
+            edit: self.current_edit,
+            ordinal,
+        })
+    }
+
+    fn resolve_order_ref(&self, reference: AssignmentOrderRef) -> Option<AssignmentOrderKey> {
+        let mut key = *self.edits.get(usize::from(reference.edit))?;
+        (usize::from(reference.edit) < self.edit_len).then(|| {
+            key.ordinal = reference.ordinal;
+            key
+        })
+    }
+
+    fn find_destination(&self, kind: DestinationKind, slot: u32) -> Option<usize> {
+        self.assignments().iter().rposition(|assignment| {
+            assignment.destination_kind == kind as u8 && assignment.destination_slot == slot
+        })
+    }
+
+    fn image(&self, kind: DestinationKind, slot: u32) -> Option<&[u8]> {
+        let assignment = &self.assignments[self.find_destination(kind, slot)?];
+        Some(&assignment.payload[..usize::from(assignment.image_len)])
+    }
+
+    fn set(
+        &mut self,
+        kind: DestinationKind,
+        slot: u32,
+        expected_generation: u64,
+        image: &[u8],
+    ) -> Result<(), FixedStorageError> {
+        if !matches!(image.len(), 4 | 8 | 40 | 48 | 56 | 64 | 112) {
+            return Err(FixedStorageError::Capacity);
+        }
+        let order_ref = self.next_order_ref()?;
+        let mut payload = [0; 112];
+        payload[..image.len()].copy_from_slice(image);
+        let assignment = Assignment {
+            destination_arena: self.arena,
+            destination_kind: kind as u8,
+            image_len: image.len() as u8,
+            destination_slot: slot,
+            expected_generation,
+            payload,
+        };
+        if !assignment.validate() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        if self.len == N {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.assignments[self.len] = assignment;
+        self.order_refs[self.len] = order_ref;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), FixedStorageError> {
+        for index in 1..self.len {
+            let mut cursor = index;
+            while cursor > 0 {
+                let current = self
+                    .resolve_order_ref(self.order_refs[cursor])
+                    .ok_or(FixedStorageError::NonCanonical)?;
+                let prior = self
+                    .resolve_order_ref(self.order_refs[cursor - 1])
+                    .ok_or(FixedStorageError::NonCanonical)?;
+                if current >= prior {
+                    break;
+                }
+                self.order_refs.swap(cursor - 1, cursor);
+                self.assignments.swap(cursor - 1, cursor);
+                cursor -= 1;
+            }
+        }
+        if self.edit_len == 0
+            || !self.current_is_generation
+            || self.next_ordinal != 1
+            || self.len != (self.edit_len - 1) * 9 + 1
+            || !self.assignments().iter().all(Assignment::validate)
+            || (0..self.len).any(|index| {
+                self.resolve_order_ref(self.order_refs[index]).is_none()
+                    || index > 0
+                        && self
+                            .resolve_order_ref(self.order_refs[index - 1])
+                            .zip(self.resolve_order_ref(self.order_refs[index]))
+                            .is_none_or(|(prior, current)| prior >= current)
+            })
+            || self.edits[..self.edit_len]
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self.edits[..self.edit_len]
+                .iter()
+                .any(|edit| edit.arena != self.arena)
+            || self.assignments[self.len..]
+                .iter()
+                .any(|assignment| *assignment != Assignment::NOOP)
+            || self.order_refs[self.len..]
+                .iter()
+                .any(|reference| *reference != AssignmentOrderRef::ZERO)
+            || self.edits[self.edit_len..]
+                .iter()
+                .any(|edit| *edit != AssignmentOrderKey::ZERO)
+        {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        Ok(())
+    }
+}
+
+/// One fixed-capacity, generation-bearing Patricia over an exact-width key and
+/// canonical byte value. Every persistent node is a manual byte image; Rust
+/// enum layout and native padding never participate in persistence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct ReusablePatricia<const K: usize, const V: usize> {
+    header: ReusableIndexHeader,
+    leaves: Box<[u8]>,
+    branches: Box<[u8]>,
+    free_leaves: Box<[u8]>,
+    free_branches: Box<[u8]>,
+}
+
+impl<const K: usize, const V: usize> ReusablePatricia<K, V> {
+    pub(crate) fn storage_bytes(capacity: usize) -> Option<u64> {
+        if capacity == 0 || capacity >= (1 << NODE_TAG_SHIFT) {
+            return None;
+        }
+        let leaf = u64::try_from(leaf_bytes(K, V)?).ok()?;
+        let leaves = u64::try_from(capacity).ok()?;
+        let branches = leaves.checked_sub(1)?;
+        u64::try_from(INDEX_HEADER_BYTES + BOX_SLICE_DESCRIPTORS * size_of::<Box<[u8]>>())
+            .ok()?
+            .checked_add(leaves.checked_mul(leaf)?)?
+            .checked_add(branches.checked_mul(BRANCH_SLOT_BYTES as u64)?)?
+            .checked_add(leaves.checked_mul(size_of::<u32>() as u64)?)?
+            .checked_add(branches.checked_mul(size_of::<u32>() as u64)?)
+    }
+
+    pub(crate) fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
+        let leaf_width = leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)?;
+        let branch_capacity = capacity.checked_sub(1).ok_or(FixedStorageError::Capacity)?;
+        if capacity >= (1 << NODE_TAG_SHIFT)
+            || branch_capacity >= (1 << NODE_TAG_SHIFT)
+            || K == 0
+            || V == 0
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        let leaf_backing = capacity
+            .checked_mul(leaf_width)
+            .ok_or(FixedStorageError::Capacity)?;
+        let branch_backing = branch_capacity
+            .checked_mul(BRANCH_SLOT_BYTES)
+            .ok_or(FixedStorageError::Capacity)?;
+        let free_leaf_backing = capacity
+            .checked_mul(size_of::<u32>())
+            .ok_or(FixedStorageError::Capacity)?;
+        let free_branch_backing = branch_capacity
+            .checked_mul(size_of::<u32>())
+            .ok_or(FixedStorageError::Capacity)?;
+        if [
+            leaf_backing,
+            branch_backing,
+            free_leaf_backing,
+            free_branch_backing,
+        ]
+        .into_iter()
+        .any(|bytes| bytes > isize::MAX as usize)
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        let mut value = Self {
+            header: ReusableIndexHeader {
+                generation: 0,
+                root: NodeHandle::SENTINEL,
+                occupied: 0,
+                leaf_capacity: u32::try_from(capacity).map_err(|_| FixedStorageError::Capacity)?,
+                branch_capacity: u32::try_from(branch_capacity)
+                    .map_err(|_| FixedStorageError::Capacity)?,
+                free_leaf_len: u32::try_from(capacity).map_err(|_| FixedStorageError::Capacity)?,
+                free_branch_len: u32::try_from(branch_capacity)
+                    .map_err(|_| FixedStorageError::Capacity)?,
+                reserved: 0,
+            },
+            leaves: zeroed(leaf_backing)?,
+            branches: zeroed(branch_backing)?,
+            free_leaves: zeroed(free_leaf_backing)?,
+            free_branches: zeroed(free_branch_backing)?,
+        };
+        for index in 0..capacity {
+            let position = capacity - 1 - index;
+            value.write_leaf_vacant(index, 0, position as u32);
+            write_u32(&mut value.free_leaves, position * 4, index as u32);
+        }
+        for index in 0..branch_capacity {
+            let position = branch_capacity - 1 - index;
+            value.write_branch_vacant(index, 0, position as u32);
+            write_u32(&mut value.free_branches, position * 4, index as u32);
+        }
+        value.validate_header()?;
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    fn try_new_with_backing_lengths(
+        capacity: usize,
+        lengths: [usize; 4],
+    ) -> Result<Self, FixedStorageError> {
+        let expected = [
+            capacity
+                .checked_mul(leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)?)
+                .ok_or(FixedStorageError::Capacity)?,
+            capacity
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(BRANCH_SLOT_BYTES))
+                .ok_or(FixedStorageError::Capacity)?,
+            capacity
+                .checked_mul(size_of::<u32>())
+                .ok_or(FixedStorageError::Capacity)?,
+            capacity
+                .checked_sub(1)
+                .and_then(|value| value.checked_mul(size_of::<u32>()))
+                .ok_or(FixedStorageError::Capacity)?,
+        ];
+        if lengths != expected {
+            return Err(FixedStorageError::Capacity);
+        }
+        Self::try_new(capacity)
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.header.generation
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn len(&self) -> usize {
+        self.header.occupied as usize
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn capacity(&self) -> usize {
+        self.header.leaf_capacity as usize
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn free_leaf_len(&self) -> usize {
+        self.header.free_leaf_len as usize
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn free_branch_len(&self) -> usize {
+        self.header.free_branch_len as usize
+    }
+
+    pub(crate) fn find(&self, key: &[u8; K]) -> Result<Option<[u8; V]>, FixedStorageError> {
+        let Some(handle) = self.find_handle(key)? else {
+            return Ok(None);
+        };
+        let slot = self.leaf_slot(handle)?;
+        let mut value = [0; V];
+        value.copy_from_slice(&slot[16 + K..16 + K + V]);
+        Ok(Some(value))
+    }
+}
