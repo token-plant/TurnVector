@@ -3399,3 +3399,400 @@ const _: () = {
     assert!(align_of::<ByteArenaHeader>() == 8);
     assert!(INVALID_TAG == 2 << NODE_TAG_SHIFT);
 };
+
+#[cfg(turnvector_c17_probe)]
+pub(crate) fn b03_probe_rows() -> Vec<(&'static str, usize)> {
+    vec![
+        ("arena.header_size", size_of::<ByteArenaHeader>()),
+        (
+            "arena.header.generation",
+            offset_of!(ByteArenaHeader, generation),
+        ),
+        (
+            "arena.header.occupied",
+            offset_of!(ByteArenaHeader, occupied),
+        ),
+        (
+            "arena.header.capacity",
+            offset_of!(ByteArenaHeader, capacity),
+        ),
+        (
+            "arena.header.free_len",
+            offset_of!(ByteArenaHeader, free_len),
+        ),
+        (
+            "arena.header.reserved_count",
+            offset_of!(ByteArenaHeader, reserved_count),
+        ),
+        (
+            "arena.header.inactive_count",
+            offset_of!(ByteArenaHeader, inactive_count),
+        ),
+        (
+            "arena.header.reserved",
+            offset_of!(ByteArenaHeader, reserved),
+        ),
+        ("arena.inline_size", size_of::<FixedByteArena<128>>()),
+        (
+            "arena.inline.header",
+            offset_of!(FixedByteArena<128>, header),
+        ),
+        ("arena.inline.slots", offset_of!(FixedByteArena<128>, slots)),
+        ("arena.inline.free", offset_of!(FixedByteArena<128>, free)),
+        ("index.header_size", size_of::<ReusableIndexHeader>()),
+        (
+            "index.header.generation",
+            offset_of!(ReusableIndexHeader, generation),
+        ),
+        ("index.header.root", offset_of!(ReusableIndexHeader, root)),
+        (
+            "index.header.occupied",
+            offset_of!(ReusableIndexHeader, occupied),
+        ),
+        (
+            "index.header.leaf_capacity",
+            offset_of!(ReusableIndexHeader, leaf_capacity),
+        ),
+        (
+            "index.header.branch_capacity",
+            offset_of!(ReusableIndexHeader, branch_capacity),
+        ),
+        (
+            "index.header.free_leaf_len",
+            offset_of!(ReusableIndexHeader, free_leaf_len),
+        ),
+        (
+            "index.header.free_branch_len",
+            offset_of!(ReusableIndexHeader, free_branch_len),
+        ),
+        (
+            "index.header.reserved",
+            offset_of!(ReusableIndexHeader, reserved),
+        ),
+        ("index.inline_size", size_of::<ReusablePatricia<32, 8>>()),
+        (
+            "index.inline.header",
+            offset_of!(ReusablePatricia<32, 8>, header),
+        ),
+        (
+            "index.inline.leaves",
+            offset_of!(ReusablePatricia<32, 8>, leaves),
+        ),
+        (
+            "index.inline.branches",
+            offset_of!(ReusablePatricia<32, 8>, branches),
+        ),
+        (
+            "index.inline.free_leaves",
+            offset_of!(ReusablePatricia<32, 8>, free_leaves),
+        ),
+        (
+            "index.inline.free_branches",
+            offset_of!(ReusablePatricia<32, 8>, free_branches),
+        ),
+        ("leaf.40_56", leaf_bytes(40, 56).unwrap()),
+        ("leaf.33_8", leaf_bytes(33, 8).unwrap()),
+        ("leaf.32_8", leaf_bytes(32, 8).unwrap()),
+        ("leaf.17_8", leaf_bytes(17, 8).unwrap()),
+        ("leaf.8_8", leaf_bytes(8, 8).unwrap()),
+        ("node_handle.align", align_of::<NodeHandle>()),
+        ("node_handle.size", size_of::<NodeHandle>()),
+        ("node_tag.leaf", LEAF_TAG as usize),
+        ("node_tag.branch", BRANCH_TAG as usize),
+        ("node_tag.invalid", INVALID_TAG as usize),
+        ("node_tag.sentinel", SENTINEL_NODE as usize),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key<const N: usize>(value: u64) -> [u8; N] {
+        let mut key = [0; N];
+        key[N - 8..].copy_from_slice(&value.to_be_bytes());
+        key
+    }
+
+    #[test]
+    fn exact_layout_equations_cover_every_key_width() {
+        assert_eq!(size_of::<NodeHandle>(), 8);
+        assert_eq!(size_of::<ReusableIndexHeader>(), 40);
+        assert_eq!(size_of::<Box<[u8]>>(), 16);
+        assert_eq!(size_of::<ReusablePatricia<32, 8>>(), 104);
+        assert_eq!(align_of::<ReusablePatricia<32, 8>>(), 8);
+        assert_eq!(size_of::<FixedByteArena<64>>(), 64);
+        assert_eq!(align_of::<FixedByteArena<64>>(), 8);
+        assert_eq!(leaf_bytes(40, 56), Some(112));
+        assert_eq!(leaf_bytes(33, 8), Some(64));
+        assert_eq!(leaf_bytes(32, 8), Some(56));
+        assert_eq!(leaf_bytes(17, 8), Some(48));
+        assert_eq!(leaf_bytes(8, 8), Some(32));
+        assert_eq!(
+            ReusablePatricia::<32, 8>::storage_bytes(53_412),
+            Some(5_554_908)
+        );
+        assert_eq!(
+            ReusablePatricia::<17, 8>::storage_bytes(4_608),
+            Some(442_428)
+        );
+        assert_eq!(
+            ReusablePatricia::<17, 8>::storage_bytes(155_264),
+            Some(14_905_404)
+        );
+        assert_eq!(
+            ReusablePatricia::<40, 56>::storage_bytes(1_024),
+            Some(163_900)
+        );
+        assert_eq!(
+            ReusablePatricia::<8, 8>::storage_bytes(4_736),
+            Some(378_940)
+        );
+        assert_eq!(
+            ReusablePatricia::<33, 8>::storage_bytes(4_736),
+            Some(530_492)
+        );
+        assert_eq!(
+            FixedByteArena::<1_152>::storage_bytes(1_152),
+            Some(1_331_776)
+        );
+    }
+
+    #[test]
+    fn insertion_update_removal_and_lifo_reuse_are_generation_checked() {
+        let mut index = ReusablePatricia::<8, 8>::try_new(4).unwrap();
+        let first = index.insert(key(2), 20u64.to_le_bytes()).unwrap();
+        let second = index.insert(key(1), 10u64.to_le_bytes()).unwrap();
+        let third = index.insert(key(3), 30u64.to_le_bytes()).unwrap();
+        assert_eq!((first.node(), second.node(), third.node()), (0, 1, 2));
+        assert_eq!(index.find(&key(1)).unwrap(), Some(10u64.to_le_bytes()));
+        assert_eq!(index.find(&key(9)).unwrap(), None);
+        index.validate_structure().unwrap();
+        index.update(&key(2), first, 21u64.to_le_bytes()).unwrap();
+        assert_eq!(index.value_at(first).unwrap(), 21u64.to_le_bytes());
+        assert_eq!(index.remove(&key(1)).unwrap(), Some(10u64.to_le_bytes()));
+        assert_eq!(index.value_at(second), Err(FixedStorageError::NonCanonical));
+        let reused = index.insert(key(4), 40u64.to_le_bytes()).unwrap();
+        assert_eq!(reused.node(), second.node());
+        assert_eq!(reused.generation(), second.generation() + 1);
+        assert_eq!(index.value_at(second), Err(FixedStorageError::NonCanonical));
+        index.validate_structure().unwrap();
+        assert_eq!(index.remove(&key(9)).unwrap(), None);
+    }
+
+    #[test]
+    fn exact_capacity_and_backing_mismatch_fail_without_partial_mutation() {
+        let mut index = ReusablePatricia::<17, 8>::try_new(2).unwrap();
+        index.insert(key(1), [1; 8]).unwrap();
+        index.insert(key(2), [2; 8]).unwrap();
+        let before = index.clone();
+        assert_eq!(
+            index.insert(key(3), [3; 8]),
+            Err(FixedStorageError::Capacity)
+        );
+        assert_eq!(index, before);
+        let lengths = [2 * 48, 40, 8, 4];
+        assert!(ReusablePatricia::<17, 8>::try_new_with_backing_lengths(2, lengths).is_ok());
+        for position in 0..4 {
+            let mut mismatch = lengths;
+            mismatch[position] += 1;
+            assert_eq!(
+                ReusablePatricia::<17, 8>::try_new_with_backing_lengths(2, mismatch),
+                Err(FixedStorageError::Capacity)
+            );
+        }
+        assert_eq!(
+            ReusablePatricia::<8, 8>::try_new(0),
+            Err(FixedStorageError::Capacity)
+        );
+    }
+
+    #[test]
+    fn batch_edits_advance_each_index_or_arena_generation_once() {
+        let mut index = ReusablePatricia::<8, 8>::try_new(4).unwrap();
+        let inserts = [([1; 8], [11; 8]), ([2; 8], [22; 8]), ([3; 8], [33; 8])];
+        index.validate_insert_batch(&inserts).unwrap();
+        index.insert_batch_prevalidated(&inserts);
+        assert_eq!((index.generation(), index.len()), (1, 3));
+        let updates = [
+            (
+                [1; 8],
+                index.find_handle(&[1; 8]).unwrap().unwrap(),
+                [44; 8],
+            ),
+            (
+                [2; 8],
+                index.find_handle(&[2; 8]).unwrap().unwrap(),
+                [55; 8],
+            ),
+        ];
+        index.update_batch_prevalidated(&updates);
+        assert_eq!(
+            (index.generation(), index.find(&[2; 8]).unwrap()),
+            (2, Some([55; 8]))
+        );
+        index.remove_batch_prevalidated(&[[1; 8], [3; 8]]);
+        assert_eq!((index.generation(), index.len()), (3, 1));
+        index.advance_generation_prevalidated();
+        assert_eq!(index.generation(), 4);
+
+        let mut arena = FixedByteArena::<64>::try_new(3).unwrap();
+        let refs: ArenaSelection<3> = arena.reserve(3).unwrap();
+        assert_eq!(arena.generation(), 1);
+        for reference in refs.as_slice() {
+            arena.install_reserved(*reference, [0; 64], 3).unwrap();
+        }
+        arena.commit_inactive_batch_prevalidated(refs.as_slice());
+        assert_eq!((arena.generation(), arena.occupied()), (2, 3));
+        arena.release_batch_prevalidated(&[refs[2], refs[1], refs[0]]);
+        assert_eq!((arena.generation(), arena.free_len()), (3, 3));
+    }
+
+    #[test]
+    fn direct_assignment_plans_match_insert_update_remove_images() {
+        let mut direct = ReusablePatricia::<8, 8>::try_new(8).unwrap();
+        let mut reference = direct.clone();
+        let inserts = [
+            (key(1), 11u64.to_le_bytes()),
+            (key(2), 22u64.to_le_bytes()),
+            (key(3), 33u64.to_le_bytes()),
+            (key(4), 44u64.to_le_bytes()),
+        ];
+        let insert_plan = direct
+            .prepare_insert_assignment_plan::<64>(7, &inserts)
+            .unwrap();
+        assert!(direct.validates_assignment_plan(&insert_plan));
+        assert_eq!(insert_plan.assignments().len(), 9 * inserts.len() + 1);
+        direct.commit_assignment_plan(insert_plan);
+        reference.insert_batch_prevalidated(&inserts);
+        assert_eq!(direct, reference);
+        direct.validate_structure().unwrap();
+
+        let updates = [
+            (
+                key(1),
+                direct.find_handle(&key(1)).unwrap().unwrap(),
+                111u64.to_le_bytes(),
+            ),
+            (
+                key(3),
+                direct.find_handle(&key(3)).unwrap().unwrap(),
+                333u64.to_le_bytes(),
+            ),
+        ];
+        let reference_updates = [
+            (
+                key(1),
+                reference.find_handle(&key(1)).unwrap().unwrap(),
+                111u64.to_le_bytes(),
+            ),
+            (
+                key(3),
+                reference.find_handle(&key(3)).unwrap().unwrap(),
+                333u64.to_le_bytes(),
+            ),
+        ];
+        let update_plan = direct
+            .prepare_update_assignment_plan::<19>(7, &updates)
+            .unwrap();
+        assert!(direct.validates_assignment_plan(&update_plan));
+        direct.commit_assignment_plan(update_plan);
+        reference.update_batch_prevalidated(&reference_updates);
+        assert_eq!(direct, reference);
+
+        let removals = [key(1), key(3)];
+        let remove_plan = direct
+            .prepare_remove_assignment_plan::<64>(7, &removals)
+            .unwrap();
+        assert!(direct.validates_assignment_plan(&remove_plan));
+        direct.commit_assignment_plan(remove_plan);
+        reference.remove_batch_prevalidated(&removals);
+        assert_eq!(direct, reference);
+        direct.validate_structure().unwrap();
+        assert_eq!(direct.find(&key(2)).unwrap(), Some(22u64.to_le_bytes()));
+        assert_eq!(direct.find(&key(4)).unwrap(), Some(44u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn stream_edits_accept_exact_count_and_reject_order_or_count_without_mutation() {
+        let mut index = ReusablePatricia::<8, 8>::try_new(1_024).unwrap();
+        assert_eq!(
+            (
+                index.capacity(),
+                index.free_leaf_len(),
+                index.free_branch_len()
+            ),
+            (1_024, 1_024, 1_023)
+        );
+        let inserts = (0..1_024u64).map(|value| (key(value + 1), value.to_le_bytes()));
+        index
+            .validate_insert_stream(inserts.clone(), 1_024)
+            .unwrap();
+        index.insert_stream_prevalidated(inserts, 1_024);
+        assert_eq!(
+            (
+                index.generation(),
+                index.len(),
+                index.free_leaf_len(),
+                index.free_branch_len()
+            ),
+            (1, 1_024, 0, 0)
+        );
+
+        let full = index.clone();
+        assert_eq!(
+            index.validate_insert_stream(std::iter::once((key(1_025), 1_025u64.to_le_bytes())), 1),
+            Err(FixedStorageError::Capacity)
+        );
+        assert_eq!(index, full);
+
+        let updates = (0..1_024u64).map(|value| (key(value + 1), (value + 7).to_le_bytes()));
+        index
+            .validate_update_stream(updates.clone(), 1_024)
+            .unwrap();
+        index.update_stream_prevalidated(updates, 1_024);
+        assert_eq!(index.generation(), 2);
+        assert_eq!(
+            index.find(&key(1_024)).unwrap(),
+            Some(1_030u64.to_le_bytes())
+        );
+
+        let before = index.clone();
+        assert_eq!(
+            index.validate_update_stream(
+                [(key(2), 2u64.to_le_bytes()), (key(1), 1u64.to_le_bytes()),],
+                2
+            ),
+            Err(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(
+            index.validate_update_stream(std::iter::once((key(1), 1u64.to_le_bytes())), 2),
+            Err(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(index, before);
+    }
+
+    #[test]
+    fn byte_arena_reserves_installs_commits_releases_and_reuses() {
+        let mut arena = FixedByteArena::<64>::try_new(2).unwrap();
+        let refs: ArenaSelection<2> = arena.reserve(2).unwrap();
+        assert_eq!((refs[0].slot, refs[1].slot), (0, 1));
+        // Begin reserves the selected LIFO prefix in ordinal order. Its terminal
+        // rollback traverses the returned references in reverse.
+        let mut inactive = [0; 64];
+        inactive[8] = 7;
+        arena.install_reserved(refs[0], inactive, 3).unwrap();
+        arena.commit_inactive(refs[0]).unwrap();
+        let committed = arena.image(refs[0], &[1]).unwrap();
+        assert_eq!((committed[4], committed[8]), (1, 7));
+        arena.release(refs[1]).unwrap();
+        arena.release(refs[0]).unwrap();
+        let next: ArenaSelection<1> = arena.reserve(1).unwrap();
+        assert_eq!(next[0].slot, refs[0].slot);
+        assert_eq!(next[0].generation, refs[0].generation + 1);
+        assert_eq!(
+            arena.image(refs[0], &[1]),
+            Err(FixedStorageError::NonCanonical)
+        );
+    }
+}
