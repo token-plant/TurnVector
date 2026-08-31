@@ -2620,4 +2620,389 @@ impl<const T: usize> FixedByteArena<T> {
             .ok_or(FixedStorageError::Capacity)?;
         Ok(Self::encode_header(header))
     }
+
+    pub(crate) fn prepare_install_reserved_header_after(
+        &self,
+        references: &[ArenaRef],
+        installed_occupied: usize,
+        installed_inactive: usize,
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        self.validate_header()?;
+        let installed = installed_occupied
+            .checked_add(installed_inactive)
+            .ok_or(FixedStorageError::Capacity)?;
+        if references.is_empty() || installed != references.len() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        for (index, reference) in references.iter().enumerate() {
+            if references[..index].contains(reference) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.image(*reference, &[2])?;
+        }
+        let occupied =
+            u32::try_from(installed_occupied).map_err(|_| FixedStorageError::Capacity)?;
+        let inactive =
+            u32::try_from(installed_inactive).map_err(|_| FixedStorageError::Capacity)?;
+        let installed = u32::try_from(installed).map_err(|_| FixedStorageError::Capacity)?;
+        let mut header = self.header;
+        header.reserved_count = header
+            .reserved_count
+            .checked_sub(installed)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        header.occupied = header
+            .occupied
+            .checked_add(occupied)
+            .ok_or(FixedStorageError::Capacity)?;
+        header.inactive_count = header
+            .inactive_count
+            .checked_add(inactive)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(Self::encode_header(header))
+    }
+
+    pub(crate) fn prepare_commit_inactive_header_after(
+        &self,
+        references: &[ArenaRef],
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        self.validate_commit_inactive_batch(references)?;
+        let count = u32::try_from(references.len()).map_err(|_| FixedStorageError::Capacity)?;
+        let mut header = self.header;
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        header.inactive_count = header
+            .inactive_count
+            .checked_sub(count)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        header.occupied = header
+            .occupied
+            .checked_add(count)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(Self::encode_header(header))
+    }
+
+    pub(crate) fn prepare_committed_inactive_tag_after(
+        &self,
+        reference: ArenaRef,
+    ) -> Result<u8, FixedStorageError> {
+        self.image(reference, &[3])?;
+        Ok(1)
+    }
+
+    pub(crate) fn prepare_release_header_after(
+        &self,
+        references: &[ArenaRef],
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        self.validate_release_batch(references)?;
+        let count = u32::try_from(references.len()).map_err(|_| FixedStorageError::Capacity)?;
+        let mut header = self.header;
+        for reference in references {
+            match self.image(*reference, &[1, 2, 3])?[4] {
+                1 => {
+                    header.occupied = header
+                        .occupied
+                        .checked_sub(1)
+                        .ok_or(FixedStorageError::NonCanonical)?;
+                }
+                2 => {
+                    header.reserved_count = header
+                        .reserved_count
+                        .checked_sub(1)
+                        .ok_or(FixedStorageError::NonCanonical)?;
+                }
+                3 => {
+                    header.inactive_count = header
+                        .inactive_count
+                        .checked_sub(1)
+                        .ok_or(FixedStorageError::NonCanonical)?;
+                }
+                _ => unreachable!("validated fixed arena release tag"),
+            }
+        }
+        header.free_len = header
+            .free_len
+            .checked_add(count)
+            .filter(|value| *value <= header.capacity)
+            .ok_or(FixedStorageError::Capacity)?;
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(Self::encode_header(header))
+    }
+
+    pub(crate) fn prepare_release_outcome_after(
+        &self,
+        reference: ArenaRef,
+        ordinal: usize,
+    ) -> Result<(u32, [u8; T], ByteArenaFreeCellImage), FixedStorageError> {
+        self.validate_header()?;
+        self.image(reference, &[1, 2, 3])?;
+        let position = (self.header.free_len as usize)
+            .checked_add(ordinal)
+            .filter(|position| *position < self.header.capacity as usize)
+            .ok_or(FixedStorageError::Capacity)?;
+        let position = u32::try_from(position).map_err(|_| FixedStorageError::Capacity)?;
+        let mut slot = [0; T];
+        write_u32(&mut slot, 0, reference.generation);
+        write_u32(&mut slot, 8, position);
+        Ok((
+            position,
+            slot,
+            ByteArenaFreeCellImage(reference.slot.to_le_bytes()),
+        ))
+    }
+
+    pub(crate) fn prepare_reserved_image_after(
+        &self,
+        reference: ArenaRef,
+        mut image: [u8; T],
+        tag: u8,
+    ) -> Result<[u8; T], FixedStorageError> {
+        if !matches!(tag, 1 | 3)
+            || image[..8].iter().any(|byte| *byte != 0)
+            || reference.generation == 0
+        {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        image[..8].fill(0);
+        write_u32(&mut image, 0, reference.generation);
+        image[4] = tag;
+        Ok(image)
+    }
+
+    pub(crate) fn reserve_selection_direct<const N: usize>(
+        &mut self,
+        selection: &ArenaSelection<N>,
+    ) {
+        for reference in selection.as_slice() {
+            let slot = self.slot_mut_prevalidated(reference.slot as usize);
+            slot.fill(0);
+            write_u32(slot, 0, reference.generation);
+            slot[4] = 2;
+        }
+    }
+
+    pub(crate) fn install_reserved_image_direct(&mut self, reference: ArenaRef, image: [u8; T]) {
+        *self.slot_mut_prevalidated(reference.slot as usize) = image;
+    }
+
+    pub(crate) fn assign_slot_tag_direct(&mut self, reference: ArenaRef, tag: u8) {
+        self.slot_mut_prevalidated(reference.slot as usize)[4] = tag;
+    }
+
+    pub(crate) fn assign_free_cell_direct(&mut self, position: u32, image: ByteArenaFreeCellImage) {
+        let start = position as usize * 4;
+        self.free[start..start + 4].copy_from_slice(&image.0);
+    }
+
+    pub(crate) fn assign_header_direct(&mut self, image: ByteArenaHeaderImage) {
+        self.header = ByteArenaHeader {
+            generation: u64::from_le_bytes(
+                image.0[0..8].try_into().expect("fixed arena generation"),
+            ),
+            occupied: read_u32(&image.0, 8),
+            capacity: read_u32(&image.0, 12),
+            free_len: read_u32(&image.0, 16),
+            reserved_count: read_u32(&image.0, 20),
+            inactive_count: read_u32(&image.0, 24),
+            reserved: read_u32(&image.0, 28),
+        };
+    }
+
+    fn encode_header(header: ByteArenaHeader) -> ByteArenaHeaderImage {
+        let mut image = ByteArenaHeaderImage::ZERO;
+        image.0[0..8].copy_from_slice(&header.generation.to_le_bytes());
+        write_u32(&mut image.0, 8, header.occupied);
+        write_u32(&mut image.0, 12, header.capacity);
+        write_u32(&mut image.0, 16, header.free_len);
+        write_u32(&mut image.0, 20, header.reserved_count);
+        write_u32(&mut image.0, 24, header.inactive_count);
+        write_u32(&mut image.0, 28, header.reserved);
+        image
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn capacity(&self) -> usize {
+        self.header.capacity as usize
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn occupied(&self) -> usize {
+        self.header.occupied as usize
+    }
+
+    pub(crate) const fn free_len(&self) -> usize {
+        self.header.free_len as usize
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn reserved_count(&self) -> usize {
+        self.header.reserved_count as usize
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this observer")
+    )]
+    pub(crate) const fn inactive_count(&self) -> usize {
+        self.header.inactive_count as usize
+    }
+
+    pub(crate) fn prepare_reserve<const N: usize>(
+        &self,
+        count: usize,
+    ) -> Result<ArenaSelection<N>, FixedStorageError> {
+        self.validate_header()?;
+        if count == 0 || count > N || count > self.header.free_len as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let start = self.header.free_len as usize - count;
+        let mut refs = [ArenaRef::default(); N];
+        for (ordinal, position) in (start..self.header.free_len as usize).rev().enumerate() {
+            let index = read_u32(&self.free, position * 4) as usize;
+            let slot = self.slot(index)?;
+            if slot[4] != 0 || read_u32(slot, 8) as usize != position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let generation = read_u32(slot, 0)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+            refs[ordinal] = ArenaRef {
+                slot: index as u32,
+                generation,
+            };
+        }
+        Ok(ArenaSelection { refs, len: count })
+    }
+
+    pub(crate) fn commit_reserve<const N: usize>(
+        &mut self,
+        selection: &ArenaSelection<N>,
+    ) -> Result<(), FixedStorageError> {
+        let expected = self.prepare_reserve::<N>(selection.len)?;
+        if expected.as_slice() != selection.as_slice() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let next_generation = self
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        for reference in selection.as_slice() {
+            let slot = self.slot_mut(reference.slot as usize)?;
+            slot.fill(0);
+            write_u32(slot, 0, reference.generation);
+            slot[4] = 2;
+        }
+        self.header.free_len -= selection.len as u32;
+        self.header.reserved_count = self
+            .header
+            .reserved_count
+            .checked_add(selection.len as u32)
+            .ok_or(FixedStorageError::Capacity)?;
+        self.header.generation = next_generation;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve<const N: usize>(
+        &mut self,
+        count: usize,
+    ) -> Result<ArenaSelection<N>, FixedStorageError> {
+        let selection = self.prepare_reserve::<N>(count)?;
+        self.commit_reserve(&selection)?;
+        Ok(selection)
+    }
+
+    pub(crate) fn install_reserved(
+        &mut self,
+        reference: ArenaRef,
+        mut image: [u8; T],
+        tag: u8,
+    ) -> Result<(), FixedStorageError> {
+        if !matches!(tag, 1 | 3) {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let slot = self.slot(reference.slot as usize)?;
+        if slot[4] != 2 || read_u32(slot, 0) != reference.generation {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        if image[..8].iter().any(|byte| *byte != 0) {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        image[..8].fill(0);
+        write_u32(&mut image, 0, reference.generation);
+        image[4] = tag;
+        *self.slot_mut(reference.slot as usize)? = image;
+        self.header.reserved_count = self
+            .header
+            .reserved_count
+            .checked_sub(1)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        if tag == 1 {
+            self.header.occupied = self
+                .header
+                .occupied
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        } else {
+            self.header.inactive_count = self
+                .header
+                .inactive_count
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_inactive(&mut self, reference: ArenaRef) -> Result<(), FixedStorageError> {
+        let slot = self.slot_mut(reference.slot as usize)?;
+        if slot[4] != 3 || read_u32(slot, 0) != reference.generation {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        slot[4] = 1;
+        self.header.inactive_count = self
+            .header
+            .inactive_count
+            .checked_sub(1)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        self.header.occupied = self
+            .header
+            .occupied
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(())
+    }
+
+    pub(crate) fn reference_at(
+        &self,
+        slot: u32,
+        accepted_tags: &[u8],
+    ) -> Result<ArenaRef, FixedStorageError> {
+        let image = self.slot(slot as usize)?;
+        if !accepted_tags.contains(&image[4]) {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let generation = read_u32(image, 0);
+        if generation == 0 {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        Ok(ArenaRef { slot, generation })
+    }
 }
