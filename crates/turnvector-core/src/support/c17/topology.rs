@@ -2358,4 +2358,406 @@ impl PreparedMembershipTopology {
 }
 
 impl SupportC17 {
+    pub(in crate::support) fn prepare_membership_topology(
+        &self,
+        preview: MembershipTopologyPreview,
+        event: MembershipEventRecord,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedMembershipTopology, SupportLedgerError> {
+        self.validate_membership_topology_preview(&preview)?;
+        validate_membership_topology_event(&preview, &event)?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        if read_u32(&self.header.0, 96) >= POST_CREATE_BUDGET as u32 {
+            return Err(capacity_error());
+        }
+        let source_count = preview.source_count;
+        let destination_count = preview.destination_count;
+        let formation_count = source_count
+            .checked_add(destination_count)
+            .ok_or_else(capacity_error)?;
+        let groups = if destination_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.groups
+                .prepare_reserve::<SURGERY_DESTINATION_MAX>(destination_count)?
+        };
+        for index in 0..destination_count {
+            if groups[index] != preview.destinations[index].anchor.group() {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        let external_head_count = preview.destinations[..destination_count]
+            .iter()
+            .filter(|destination| destination.locator_kind == 1)
+            .count();
+        let external_heads = if external_head_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.external_heads
+                .prepare_reserve::<SURGERY_HEAD_MAX>(external_head_count)?
+        };
+        let formations = self
+            .formations
+            .prepare_reserve::<SURGERY_FORMATION_MAX>(formation_count)?;
+        let funders = self
+            .funders
+            .prepare_reserve::<SURGERY_FUNDER_MAX>(formation_count * PLAN_MEMBERS_MAX)?;
+        let members = if destination_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.members
+                .prepare_reserve::<SURGERY_MEMBER_MAX>(destination_count * PLAN_MEMBERS_MAX)?
+        };
+        let source_wrapper_count = preview.sources[..source_count]
+            .iter()
+            .flatten()
+            .filter(|source| source.locator_kind == 2)
+            .count();
+        let destination_wrapper_count = preview.destinations[..destination_count]
+            .iter()
+            .filter(|destination| destination.locator_kind == 2)
+            .count();
+        let wrapper_count = source_wrapper_count
+            .checked_add(destination_wrapper_count)
+            .ok_or_else(capacity_error)?;
+        let wrappers = if wrapper_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.wrappers
+                .prepare_reserve::<SURGERY_WRAPPER_MAX>(wrapper_count)?
+        };
+        let link_count = preview.replacement_link_count();
+        let mut replacement_link_indices = [u8::MAX; PLAN_MEMBERS_MAX];
+        let mut replacement_index = 0usize;
+        for (owner_index, slot) in replacement_link_indices
+            .iter_mut()
+            .enumerate()
+            .take(preview.owner_count)
+        {
+            if preview.owner_has_resolver(owner_index) {
+                *slot = u8::try_from(replacement_index).map_err(|_| capacity_error())?;
+                replacement_index += 1;
+            }
+        }
+        debug_assert_eq!(replacement_index, link_count);
+        let links = if link_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.links.prepare_reserve::<SURGERY_LINK_MAX>(link_count)?
+        };
+        let memberships = self.memberships.prepare_reserve::<1>(1)?;
+        let mutations = self
+            .mutations
+            .prepare_reserve::<SURGERY_MUTATION_MAX>(source_count + 1)?;
+
+        let mut raw_entries = [([0; 32], [0; 8]); SURGERY_RAW_MAX];
+        let mut raw_count = 0usize;
+        let mut authority_inserts = [([0; 17], [0; 8]); SURGERY_AUTHORITY_MAX];
+        let mut authority_insert_count = 0usize;
+        let mut authority_updates = [None; 1];
+        let mut authority_update_count = 0usize;
+        let mut external_index = 0usize;
+        for destination_index in 0..destination_count {
+            let destination = preview.destinations[destination_index];
+            let group = groups[destination_index];
+            if destination.locator_kind == 1 {
+                let head = external_heads[external_index];
+                external_index += 1;
+                if self
+                    .authority
+                    .find(&destination.anchor.authority_key())?
+                    .is_some()
+                {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::Duplicate));
+                }
+                for (kind, key) in [
+                    (RawOwnerKind::PlanRoot, destination.obligation),
+                    (RawOwnerKind::Formation, destination.credit),
+                ] {
+                    raw_entries[raw_count] = (
+                        key,
+                        encode_raw_owner_at(
+                            kind,
+                            RawOwnerState::Committed,
+                            destination.anchor.branch(),
+                            head,
+                        )?,
+                    );
+                    raw_count += 1;
+                }
+            } else {
+                let key = destination.anchor.authority_key();
+                if let Some(before) = self.authority.find(&key)? {
+                    if authority_update_count == authority_updates.len() {
+                        return Err(capacity_error());
+                    }
+                    let handle = self
+                        .authority
+                        .find_handle(&key)?
+                        .ok_or_else(noncanonical_error)?;
+                    let prior = decode_arena_ref(&before)?;
+                    let prior_image = self.groups.image(prior, &[1])?;
+                    if prior_image[40..57] != key {
+                        return Err(noncanonical_error());
+                    }
+                    authority_updates[authority_update_count] = Some(TopologyAuthorityUpdate {
+                        key,
+                        before,
+                        handle,
+                        after: encode_arena_ref_value(group),
+                    });
+                    authority_update_count += 1;
+                } else if key[0] == 0x32 {
+                    if authority_insert_count == authority_inserts.len() {
+                        return Err(capacity_error());
+                    }
+                    authority_inserts[authority_insert_count] =
+                        (key, encode_arena_ref_value(group));
+                    authority_insert_count += 1;
+                } else {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+            }
+        }
+        authority_inserts[..authority_insert_count].sort_unstable_by_key(|entry| entry.0);
+        raw_entries[..raw_count].sort_unstable_by_key(|entry| entry.0);
+        if authority_inserts[..authority_insert_count]
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+            || raw_entries[..raw_count]
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        if authority_insert_count > 0 {
+            self.authority
+                .validate_insert_batch(&authority_inserts[..authority_insert_count])?;
+        }
+        if let Some(update) = authority_updates[0] {
+            self.authority
+                .validate_update_batch(&[(update.key, update.handle, update.after)])?;
+        }
+        if raw_count > 0 {
+            self.raw.validate_insert_batch(&raw_entries[..raw_count])?;
+        }
+
+        let mut source_journals = [None; SOURCE_MAX];
+        let mut destination_journals = [None; SURGERY_DESTINATION_MAX];
+        let mut local_entries = [([0; 17], [0; 8]); SURGERY_LOCAL_MAX];
+        let mut local_count = 0usize;
+        let mut source_wrapper_index = 0usize;
+        for source_index in 0..source_count {
+            let before = preview.sources[source_index].expect("active topology source");
+            let formation = formations[source_index];
+            let locator_after_ref = if before.locator_kind == 1 {
+                before.locator
+            } else {
+                let wrapper = wrappers[source_wrapper_index];
+                source_wrapper_index += 1;
+                wrapper
+            };
+            let mut group_after = before.group_image;
+            group_after[9] = RootState::ClosedPending as u8;
+            encode_arena_ref(&mut group_after[16..24], formation);
+            encode_arena_ref(&mut group_after[24..32], locator_after_ref);
+            write_u64(&mut group_after, 32, before.version + 1);
+            let mut locator_after = before.locator_image;
+            if before.locator_kind == 2 {
+                locator_after[..8].fill(0);
+            }
+            locator_after[9] = RootState::ClosedPending as u8;
+            encode_arena_ref(&mut locator_after[24..32], formation);
+            write_u64(
+                &mut locator_after,
+                if before.locator_kind == 1 { 120 } else { 56 },
+                before.version + 1,
+            );
+            if before.locator_kind == 2 {
+                locator_after = self.wrappers.prepare_reserved_image_after(
+                    locator_after_ref,
+                    locator_after,
+                    1,
+                )?;
+            }
+            let cancellation = matches!(
+                preview.operation,
+                SemanticOperation::CancellationRemoveBound
+                    | SemanticOperation::CancellationRemoveEligibleUnbound
+            );
+            let formation_after = self.formations.prepare_reserved_image_after(
+                formation,
+                encode_topology_formation(
+                    before,
+                    RootState::ClosedPending,
+                    if cancellation {
+                        FormationCause::CancellationMembership
+                    } else {
+                        FormationCause::MembershipConsumed
+                    },
+                    preview.operation,
+                    event.id,
+                    if cancellation {
+                        event.cancellation_fact
+                    } else {
+                        0
+                    },
+                    event.generation_after,
+                    source_index,
+                    preview.occurred_at,
+                    locator_after_ref,
+                ),
+                1,
+            )?;
+            let mut funder_after = [[0; FUNDER_BYTES]; PLAN_MEMBERS_MAX];
+            let mut member_after = [[0; MEMBER_BYTES]; PLAN_MEMBERS_MAX];
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                let member = before.members[ordinal];
+                let next_funder = funders[source_index * PLAN_MEMBERS_MAX + ordinal];
+                let mut funder = *self.funders.image(member.funder, &[1])?;
+                funder[..8].fill(0);
+                funder[10] = u8::try_from(before.version + 1).map_err(|_| capacity_error())?;
+                encode_arena_ref(&mut funder[24..32], formation);
+                let mut member_image = *self.members.image(member.member, &[1])?;
+                encode_arena_ref(&mut member_image[24..32], next_funder);
+                funder_after[ordinal] =
+                    self.funders
+                        .prepare_reserved_image_after(next_funder, funder, 1)?;
+                member_after[ordinal] = member_image;
+                push_surgery_local(
+                    &mut local_entries,
+                    &mut local_count,
+                    LocalKind::Funder,
+                    next_funder,
+                )?;
+            }
+            let mutation_after = self.mutations.prepare_reserved_image_after(
+                mutations[source_index],
+                encode_topology_mutation(
+                    preview.operation,
+                    event.id,
+                    source_index,
+                    before.group,
+                    before.formation,
+                    formation,
+                    preview.occurred_at,
+                    generation_after,
+                ),
+                1,
+            )?;
+            push_surgery_local(
+                &mut local_entries,
+                &mut local_count,
+                LocalKind::Mutation,
+                mutations[source_index],
+            )?;
+            source_journals[source_index] = Some(SourceJournal {
+                before,
+                locator_after_ref,
+                group_after,
+                locator_after,
+                formation_after,
+                funder_after,
+                member_after,
+                mutation_after,
+            });
+        }
+
+        let mut destination_wrapper_index = source_wrapper_count;
+        external_index = 0;
+        for destination_index in 0..destination_count {
+            let destination = preview.destinations[destination_index];
+            let formation_index = source_count + destination_index;
+            let group = groups[destination_index];
+            let formation = formations[formation_index];
+            let locator = if destination.locator_kind == 1 {
+                let head = external_heads[external_index];
+                external_index += 1;
+                head
+            } else {
+                let wrapper = wrappers[destination_wrapper_index];
+                destination_wrapper_index += 1;
+                wrapper
+            };
+            let member_refs: [ArenaRef; PLAN_MEMBERS_MAX] = members.as_slice()
+                [destination_index * PLAN_MEMBERS_MAX..(destination_index + 1) * PLAN_MEMBERS_MAX]
+                .try_into()
+                .expect("fixed destination Member range");
+            let group_image = self.groups.prepare_reserved_image_after(
+                group,
+                encode_membership_group(
+                    destination.anchor.branch(),
+                    RootState::Pending,
+                    destination.locator_kind,
+                    destination.anchor.authority_key(),
+                    formation,
+                    locator,
+                    member_refs,
+                    destination.member_count,
+                ),
+                1,
+            )?;
+            let formation_image = self.formations.prepare_reserved_image_after(
+                formation,
+                encode_membership_destination_formation(
+                    &preview,
+                    &event,
+                    destination_index,
+                    group,
+                    formation,
+                    locator,
+                ),
+                1,
+            )?;
+            let locator_image = if destination.locator_kind == 1 {
+                self.external_heads.prepare_reserved_image_after(
+                    locator,
+                    encode_membership_external_head(destination, group, formation),
+                    1,
+                )?
+            } else {
+                self.wrappers.prepare_reserved_image_after(
+                    locator,
+                    encode_membership_wrapper(
+                        destination.anchor.branch(),
+                        RootState::Pending,
+                        group,
+                        formation,
+                        destination.anchor.authority_key(),
+                        1,
+                    ),
+                    1,
+                )?
+            };
+            let mut funder_images = [[0; FUNDER_BYTES]; PLAN_MEMBERS_MAX];
+            let mut member_images = [[0; MEMBER_BYTES]; PLAN_MEMBERS_MAX];
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                let active = ordinal < destination.member_count;
+                let member = if active {
+                    destination.members[ordinal]
+                } else {
+                    destination.members[0]
+                };
+                let funding = membership_funding(member)?;
+                let funder = funders[formation_index * PLAN_MEMBERS_MAX + ordinal];
+                let member_ref = member_refs[ordinal];
+                funder_images[ordinal] = self.funders.prepare_reserved_image_after(
+                    funder,
+                    encode_membership_funder(
+                        destination.anchor.branch(),
+                        ordinal,
+                        active,
+                        group,
+                        formation,
+                        member_ref,
+                        funding,
+                        1,
+                    ),
+            }
+        }
+    }
 }
