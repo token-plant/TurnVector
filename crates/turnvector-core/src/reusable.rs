@@ -656,4 +656,387 @@ impl<const K: usize, const V: usize> ReusablePatricia<K, V> {
         value.copy_from_slice(&slot[16 + K..16 + K + V]);
         Ok(Some(value))
     }
+
+    pub(crate) fn find_handle(
+        &self,
+        key: &[u8; K],
+    ) -> Result<Option<NodeHandle>, FixedStorageError> {
+        self.validate_header()?;
+        if self.header.root.is_sentinel() {
+            return Ok(None);
+        }
+        let (leaf, _) = self.locate(key)?;
+        let slot = self.leaf_slot(leaf)?;
+        Ok((slot[16..16 + K] == key[..]).then_some(leaf))
+    }
+
+    pub(crate) fn validate_insert(&self, key: &[u8; K]) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        self.selected_free_leaf()?;
+        if self.header.root.is_sentinel() {
+            return Ok(());
+        }
+        let (leaf, _) = self.locate(key)?;
+        let slot = self.leaf_slot(leaf)?;
+        if slot[16..16 + K] == key[..] {
+            return Err(FixedStorageError::Duplicate);
+        }
+        self.selected_free_branch()?;
+        first_difference(key, &slot[16..16 + K])?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_insert_batch(
+        &self,
+        entries: &[([u8; K], [u8; V])],
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if entries.is_empty()
+            || entries.len() > self.header.free_leaf_len as usize
+            || entries.len()
+                > self.header.free_branch_len as usize + usize::from(self.header.root.is_sentinel())
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        for (index, (key, _)) in entries.iter().enumerate() {
+            if entries[..index].iter().any(|(prior, _)| prior == key) {
+                return Err(FixedStorageError::Duplicate);
+            }
+            if self.find(key)?.is_some() {
+                return Err(FixedStorageError::Duplicate);
+            }
+            let position = self.header.free_leaf_len as usize - 1 - index;
+            let slot_index = read_u32(&self.free_leaves, position * 4) as usize;
+            let slot = self.leaf_bytes_at(slot_index);
+            if slot[0] != 0 || read_u32(slot, 8) as usize != position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            read_u32(slot, 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        }
+        let branches = entries
+            .len()
+            .checked_sub(usize::from(self.header.root.is_sentinel()))
+            .ok_or(FixedStorageError::NonCanonical)?;
+        for index in 0..branches {
+            let position = self.header.free_branch_len as usize - 1 - index;
+            let slot_index = read_u32(&self.free_branches, position * 4) as usize;
+            let slot = self.branch_bytes_at(slot_index);
+            if slot[0] != 0 || read_u32(slot, 8) as usize != position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            read_u32(slot, 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_insert_assignment_plan<const N: usize>(
+        &self,
+        arena: u16,
+        entries: &[([u8; K], [u8; V])],
+    ) -> Result<PatriciaAssignmentPlan<N>, FixedStorageError> {
+        self.validate_insert_batch(entries)?;
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(FixedStorageError::Duplicate);
+        }
+        let mut header = self.header;
+        let mut plan = PatriciaAssignmentPlan::new(arena, header.generation, header)?;
+        for (key, value) in entries.iter().copied() {
+            plan.begin_edit(&key, PatriciaEditKind::Insert, &value)?;
+            let empty = header.root.is_sentinel();
+            let terminal = if empty {
+                None
+            } else {
+                let (leaf, _) = self.shadow_locate(&plan, header.root, &key)?;
+                let slot = self.shadow_leaf(&plan, leaf)?;
+                if slot[16..16 + K] == key {
+                    return Err(FixedStorageError::Duplicate);
+                }
+                Some((leaf, slot))
+            };
+            let leaf_position = header
+                .free_leaf_len
+                .checked_sub(1)
+                .ok_or(FixedStorageError::Capacity)? as usize;
+            let leaf_index = read_u32(&self.free_leaves, leaf_position * 4) as usize;
+            let vacant_leaf = self.leaf_bytes_at(leaf_index);
+            if vacant_leaf[0] != 0 || read_u32(vacant_leaf, 8) as usize != leaf_position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let leaf_generation = read_u32(vacant_leaf, 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+            let leaf_handle = NodeHandle::new(leaf_index as u32 | LEAF_TAG, leaf_generation);
+            header.free_leaf_len -= 1;
+            if empty {
+                let image = occupied_leaf_image::<K, V>(
+                    leaf_generation,
+                    NodeHandle::SENTINEL,
+                    &key,
+                    &value,
+                )?;
+                self.shadow_set_leaf(&mut plan, leaf_index, &image)?;
+                header.root = leaf_handle;
+            } else {
+                let (terminal, peer) = terminal.expect("nonempty shadow has terminal");
+                let bit = first_difference(&key, &peer[16..16 + K])?;
+                let (parent, child) = self.shadow_insertion_point(&plan, header.root, &key, bit)?;
+                let branch_position = header
+                    .free_branch_len
+                    .checked_sub(1)
+                    .ok_or(FixedStorageError::Capacity)?
+                    as usize;
+                let branch_index = read_u32(&self.free_branches, branch_position * 4) as usize;
+                let vacant_branch = self.branch_bytes_at(branch_index);
+                if vacant_branch[0] != 0 || read_u32(vacant_branch, 8) as usize != branch_position {
+                    return Err(FixedStorageError::NonCanonical);
+                }
+                let branch_generation = read_u32(vacant_branch, 4)
+                    .checked_add(1)
+                    .ok_or(FixedStorageError::Capacity)?;
+                let branch_handle =
+                    NodeHandle::new(branch_index as u32 | BRANCH_TAG, branch_generation);
+                header.free_branch_len -= 1;
+                let children = if key_bit(&key, bit) == 0 {
+                    [leaf_handle, child]
+                } else {
+                    [child, leaf_handle]
+                };
+                let leaf_image =
+                    occupied_leaf_image::<K, V>(leaf_generation, branch_handle, &key, &value)?;
+                let branch_image = occupied_branch_image(branch_generation, parent, bit, children);
+                self.shadow_set_leaf(&mut plan, leaf_index, &leaf_image)?;
+                self.shadow_set_branch(&mut plan, branch_index, &branch_image)?;
+                self.shadow_set_parent(&mut plan, child, branch_handle)?;
+                if parent.is_sentinel() {
+                    header.root = branch_handle;
+                } else {
+                    self.shadow_replace_child(&mut plan, parent, child, branch_handle)?;
+                }
+                let _ = terminal;
+            }
+            header.occupied = header
+                .occupied
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        }
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        plan.after_header = header;
+        plan.begin_generation()?;
+        plan.set(
+            DestinationKind::Header,
+            0,
+            self.header.generation,
+            &encode_index_header(header),
+        )?;
+        plan.finish()?;
+        Ok(plan)
+    }
+
+    pub(crate) fn prepare_update_assignment_plan<const N: usize>(
+        &self,
+        arena: u16,
+        entries: &[([u8; K], NodeHandle, [u8; V])],
+    ) -> Result<PatriciaAssignmentPlan<N>, FixedStorageError> {
+        self.validate_update_batch(entries)?;
+        if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(FixedStorageError::Duplicate);
+        }
+        let mut header = self.header;
+        let mut plan = PatriciaAssignmentPlan::new(arena, header.generation, header)?;
+        for (key, handle, value) in entries.iter().copied() {
+            plan.begin_edit(&key, PatriciaEditKind::Update, &value)?;
+            let mut image = self.shadow_leaf(&plan, handle)?;
+            image[16 + K..16 + K + V].copy_from_slice(&value);
+            self.shadow_set_leaf(&mut plan, leaf_index(handle)?, &image)?;
+        }
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        plan.after_header = header;
+        plan.begin_generation()?;
+        plan.set(
+            DestinationKind::Header,
+            0,
+            self.header.generation,
+            &encode_index_header(header),
+        )?;
+        plan.finish()?;
+        Ok(plan)
+    }
+
+    pub(crate) fn prepare_generation_assignment_plan<const N: usize>(
+        &self,
+        arena: u16,
+    ) -> Result<PatriciaAssignmentPlan<N>, FixedStorageError> {
+        self.validate_advance_generation()?;
+        let mut header = self.header;
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let mut plan = PatriciaAssignmentPlan::new(arena, self.header.generation, header)?;
+        plan.begin_generation()?;
+        plan.set(
+            DestinationKind::Header,
+            0,
+            self.header.generation,
+            &encode_index_header(header),
+        )?;
+        plan.finish()?;
+        Ok(plan)
+    }
+
+    pub(crate) fn prepare_remove_assignment_plan<const N: usize>(
+        &self,
+        arena: u16,
+        keys: &[[u8; K]],
+    ) -> Result<PatriciaAssignmentPlan<N>, FixedStorageError> {
+        self.validate_remove_batch(keys)?;
+        if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(FixedStorageError::Duplicate);
+        }
+        let mut header = self.header;
+        let mut plan = PatriciaAssignmentPlan::new(arena, header.generation, header)?;
+        for key in keys {
+            plan.begin_edit(key, PatriciaEditKind::Remove, &[])?;
+            let path = self.shadow_removal_path(&plan, header.root, key)?;
+            let leaf_image = self.shadow_leaf(&plan, path.leaf)?;
+            if leaf_image[16..16 + K] != key[..] {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            if path.parent.is_sentinel() {
+                if !path.grandparent.is_sentinel() || !path.sibling.is_sentinel() {
+                    return Err(FixedStorageError::NonCanonical);
+                }
+                header.root = NodeHandle::SENTINEL;
+            } else {
+                if path.sibling.is_sentinel() {
+                    return Err(FixedStorageError::NonCanonical);
+                }
+                self.shadow_set_parent(&mut plan, path.sibling, path.grandparent)?;
+                if path.grandparent.is_sentinel() {
+                    header.root = path.sibling;
+                } else {
+                    self.shadow_replace_child(
+                        &mut plan,
+                        path.grandparent,
+                        path.parent,
+                        path.sibling,
+                    )?;
+                }
+                let branch_index = branch_index(path.parent)?;
+                let branch_image = self.shadow_branch(&plan, path.parent)?;
+                let generation = read_u32(&branch_image, 4);
+                let free_position = header.free_branch_len;
+                let vacant = vacant_branch_image(generation, free_position);
+                self.shadow_set_branch(&mut plan, branch_index, &vacant)?;
+                plan.set(
+                    DestinationKind::FreeCell,
+                    FREE_BRANCH_CELL_FLAG | free_position,
+                    self.header.generation,
+                    &(branch_index as u32).to_le_bytes(),
+                )?;
+                header.free_branch_len = header
+                    .free_branch_len
+                    .checked_add(1)
+                    .ok_or(FixedStorageError::Capacity)?;
+            }
+            let leaf_index = leaf_index(path.leaf)?;
+            let generation = read_u32(&leaf_image, 4);
+            let free_position = header.free_leaf_len;
+            let vacant = vacant_leaf_image::<K, V>(generation, free_position)?;
+            self.shadow_set_leaf(&mut plan, leaf_index, &vacant)?;
+            plan.set(
+                DestinationKind::FreeCell,
+                free_position,
+                self.header.generation,
+                &(leaf_index as u32).to_le_bytes(),
+            )?;
+            header.free_leaf_len = header
+                .free_leaf_len
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+            header.occupied = header
+                .occupied
+                .checked_sub(1)
+                .ok_or(FixedStorageError::NonCanonical)?;
+        }
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        plan.after_header = header;
+        plan.begin_generation()?;
+        plan.set(
+            DestinationKind::Header,
+            0,
+            self.header.generation,
+            &encode_index_header(header),
+        )?;
+        plan.finish()?;
+        Ok(plan)
+    }
+
+    pub(crate) fn prepare_mixed_assignment_plan<const N: usize>(
+        &self,
+        arena: u16,
+        edits: &[PatriciaEdit<K, V>],
+    ) -> Result<PatriciaAssignmentPlan<N>, FixedStorageError> {
+        self.validate_header()?;
+        if edits.is_empty() {
+            return Err(FixedStorageError::Capacity);
+        }
+        let mut header = self.header;
+        let mut plan = PatriciaAssignmentPlan::new(arena, header.generation, header)?;
+        for edit in edits.iter().copied() {
+            let value = edit.value().map_or(&[][..], |value| value.as_slice());
+            plan.begin_edit(edit.key(), edit.kind(), value)?;
+            match edit {
+                PatriciaEdit::Insert { key, value } => {
+                    self.shadow_apply_insert(&mut plan, &mut header, key, value)?;
+                }
+                PatriciaEdit::Update { key, handle, value } => {
+                    let mut image = self.shadow_leaf(&plan, handle)?;
+                    if image[16..16 + K] != key {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    image[16 + K..16 + K + V].copy_from_slice(&value);
+                    self.shadow_set_leaf(&mut plan, leaf_index(handle)?, &image)?;
+                }
+                PatriciaEdit::Remove { key } => {
+                    self.shadow_apply_remove(&mut plan, &mut header, &key)?;
+                }
+            }
+        }
+        header.generation = header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        plan.after_header = header;
+        plan.begin_generation()?;
+        plan.set(
+            DestinationKind::Header,
+            0,
+            self.header.generation,
+            &encode_index_header(header),
+        )?;
+        plan.finish()?;
+        Ok(plan)
+    }
 }
