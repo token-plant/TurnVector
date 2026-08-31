@@ -2473,4 +2473,393 @@ impl SupportC17 {
         record.validate()?;
         Ok(record)
     }
+
+    pub(super) fn validate_lifecycle_record_owner_set(
+        &self,
+        record: LifecycleRecordInput,
+        reserve: ArenaRef,
+    ) -> Result<(), SupportLedgerError> {
+        record.validate()?;
+        let root = self.lifecycle_root_from_final_owner(record.final_owner)?;
+        let amount = usize::try_from(record.aggregate[4]).map_err(|_| noncanonical_error())?;
+        let owner_count = record
+            .owners
+            .iter()
+            .position(|owner| *owner == LifecycleOwnerRow::ZERO)
+            .unwrap_or(PLAN_MEMBERS_MAX);
+        if amount != owner_count || owner_count == 0 {
+            return Err(noncanonical_error());
+        }
+        let first_owner = decode_arena_ref(&record.owners[0].owner.to_le_bytes())?;
+        if record.owner_set_ref != encode_arena_ref_value(first_owner) {
+            return Err(noncanonical_error());
+        }
+        let mut expected = [LifecycleOwnerRow::ZERO; PLAN_MEMBERS_MAX];
+        for index in 0..owner_count {
+            let owner = decode_arena_ref(&record.owners[index].owner.to_le_bytes())?;
+            if record.owners[..index].iter().any(|prior| {
+                decode_arena_ref(&prior.owner.to_le_bytes()).is_ok_and(|prior| prior == owner)
+            }) {
+                return Err(noncanonical_error());
+            }
+            let member = root.members[..root.member_count]
+                .iter()
+                .copied()
+                .find(|member| member.owner == owner)
+                .ok_or_else(noncanonical_error)?;
+            expected[index] = self.canonical_lifecycle_owner_row(root, member, reserve, record)?;
+        }
+        if record.owners != expected {
+            return Err(noncanonical_error());
+        }
+        Ok(())
+    }
+
+    fn lifecycle_root_from_final_owner(
+        &self,
+        final_owner: [u8; 64],
+    ) -> Result<RootSnapshot, SupportLedgerError> {
+        if final_owner[..17] == [0; 17] || final_owner[20..24].iter().any(|byte| *byte != 0) {
+            return Err(noncanonical_error());
+        }
+        let mut authority_key = [0; 17];
+        authority_key.copy_from_slice(&final_owner[..17]);
+        let branch = final_owner[17];
+        let group = decode_arena_ref(&final_owner[24..32])?;
+        let root = self.root_at_group(group, authority_key, branch)?;
+        if encode_lifecycle_final_owner(root) != final_owner {
+            return Err(noncanonical_error());
+        }
+        Ok(root)
+    }
+
+    fn canonical_lifecycle_owner_row(
+        &self,
+        root: RootSnapshot,
+        member: RootMemberSnapshot,
+        reserve: ArenaRef,
+        record: LifecycleRecordInput,
+    ) -> Result<LifecycleOwnerRow, SupportLedgerError> {
+        if !member.active || member.owner.generation == 0 {
+            return Err(noncanonical_error());
+        }
+        let slot = member.owner.slot;
+        let references = [
+            self.owner_headers.reference_at(slot, &[1])?,
+            self.owner_rows.reference_at(slot, &[1])?,
+            self.owner_indices.reference_at(slot, &[1])?,
+            self.owners.reference_at(slot, &[1])?,
+        ];
+        if references[0] != member.owner {
+            return Err(noncanonical_error());
+        }
+        let header = self.owner_headers.image(references[0], &[1])?;
+        let row = self.owner_rows.image(references[1], &[1])?;
+        let index = self.owner_indices.image(references[2], &[1])?;
+        let owner = self.owners.image(references[3], &[1])?;
+        let owner_generation = read_u64(header, OWNER_HEADER_GENERATION);
+        let branch_current = (0..4).try_fold(0u64, |total, branch| {
+            total.checked_add(read_u64(row, OWNER_ROW_BRANCH_CURRENT + branch * 8))
+        });
+        let index_references = [
+            decode_arena_ref(&index[8..16])?,
+            decode_arena_ref(&index[16..24])?,
+            decode_arena_ref(&index[24..32])?,
+            decode_arena_ref(&index[32..40])?,
+        ];
+        let owner_references = [
+            decode_arena_ref(&owner[32..40])?,
+            decode_arena_ref(&owner[40..48])?,
+            decode_arena_ref(&owner[48..56])?,
+            decode_arena_ref(&owner[56..64])?,
+        ];
+        if header[8] != OWNER_STATE_LIVE
+            || header[9] != C16_RAW_OWNERS as u8
+            || header[10..12].iter().any(|byte| *byte != 0)
+            || read_u32(header, OWNER_HEADER_RECORD) != slot
+            || owner_generation == 0
+            || header[OWNER_HEADER_REQUEST..OWNER_HEADER_REQUEST + 40] != member.request_key
+            || header[OWNER_HEADER_ENTITLEMENT..OWNER_HEADER_ENTITLEMENT + 32] != member.entitlement
+            || header[OWNER_HEADER_VECTOR..OWNER_HEADER_VECTOR + 32] != member.vector
+            || row[8] != OWNER_STATE_LIVE
+            || row[9] != C16_RAW_OWNERS as u8
+            || read_u16(row, OWNER_ROW_VECTOR_LEN) == 0
+            || read_u64(row, OWNER_ROW_CURRENT) != u64::from(read_u32(row, OWNER_ROW_LINKED_CLAIMS))
+            || read_u32(row, OWNER_ROW_RECORD) != slot
+            || row[44..48].iter().any(|byte| *byte != 0)
+            || read_u64(row, OWNER_ROW_GENERATION) != owner_generation
+            || read_u32(row, 56) != 0
+            || row[60..64].iter().any(|byte| *byte != 0)
+            || branch_current != Some(read_u64(row, OWNER_ROW_CURRENT))
+            || row[96..].iter().any(|byte| *byte != 0)
+            || index_references != references
+            || read_u32(index, 40) != slot
+            || read_u64(index, 48) != owner_generation
+            || read_u16(index, 56) != read_u16(row, OWNER_ROW_VECTOR_LEN)
+            || index[OWNER_INDEX_STATE] != OWNER_STATE_LIVE
+            || index[59] != C16_RAW_OWNERS as u8
+            || index[60..].iter().any(|byte| *byte != 0)
+            || owner[OWNER_IMAGE_STATE] != OWNER_STATE_LIVE
+            || owner[9] != C16_RAW_OWNERS as u8
+            || read_u16(owner, 10) != read_u16(row, OWNER_ROW_VECTOR_LEN)
+            || read_u32(owner, OWNER_IMAGE_RECORD) != slot
+            || read_u32(owner, OWNER_IMAGE_VECTOR_HEAD) != 0
+            || read_u16(owner, OWNER_IMAGE_VECTOR_LEN) != read_u16(row, OWNER_ROW_VECTOR_LEN)
+            || owner[22..24].iter().any(|byte| *byte != 0)
+            || read_u32(owner, OWNER_IMAGE_LINKED_CLAIMS) != read_u32(row, OWNER_ROW_LINKED_CLAIMS)
+            || owner[28..32].iter().any(|byte| *byte != 0)
+            || owner_references != references
+            || owner[64..96] != member.entitlement
+            || owner[96..128] != member.vector
+        {
+            return Err(noncanonical_error());
+        }
+        let link =
+            decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8])?
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+        let link_image = self.links.image(link, &[1])?;
+        let resolver_group = decode_arena_ref(&link_image[24..32])?;
+        let resolver_group_image = self.groups.image(resolver_group, &[1])?;
+        let resolver =
+            self.root_at_group(resolver_group, root.authority_key, resolver_group_image[8])?;
+        if resolver.branch == 4
+            || !resolver.members[..resolver.member_count]
+                .iter()
+                .any(|resolver_member| resolver_member.owner == member.owner)
+            || link_image[8] != 1
+            || decode_arena_ref(&link_image[16..24])? != member.owner
+            || decode_arena_ref(&link_image[32..40])? != resolver.initial_formation
+            || link_image[56..73] != root.authority_key
+        {
+            return Err(noncanonical_error());
+        }
+        let entitlement_raw = self
+            .raw
+            .find(&member.entitlement)?
+            .ok_or_else(noncanonical_error)?;
+        let vector_raw = self
+            .raw
+            .find(&member.vector)?
+            .ok_or_else(noncanonical_error)?;
+        for (value, expected_ordinal) in [(entitlement_raw, 9), (vector_raw, 10)] {
+            let (kind, state, ordinal, raw_owner) = decode_raw_owner_at(value)?;
+            if kind != RawOwnerKind::C16Entitlement
+                || state != RawOwnerState::Committed
+                || usize::from(ordinal) != expected_ordinal
+                || raw_owner != member.owner
+            {
+                return Err(noncanonical_error());
+            }
+        }
+        Ok(LifecycleOwnerRow {
+            owner: arena_ref_word(references[0]),
+            request: arena_ref_word(references[1]),
+            entitlement: u64::from_le_bytes(entitlement_raw),
+            vector: u64::from_le_bytes(vector_raw),
+            source: arena_ref_word(member.member),
+            group: arena_ref_word(root.group),
+            root: arena_ref_word(root.locator),
+            formation: arena_ref_word(root.formation),
+            link: arena_ref_word(link),
+            reserve: arena_ref_word(reserve),
+            class: record.aggregate[0],
+            pool: record.aggregate[1],
+            amount: 1,
+            generation: owner_generation,
+            state: u64::from(OWNER_STATE_LIVE),
+            zero: 0,
+        })
+    }
+
+    fn prepare_semantic_arena_headers_after(
+        &self,
+        preview: &RootBatchPreview,
+        formations: &ArenaSelection<ROOT_BATCH_MAX>,
+        funders: &ArenaSelection<ROOT_BATCH_FUNDER_MAX>,
+        wrappers: &ArenaSelection<ROOT_BATCH_MAX>,
+        mutations: &ArenaSelection<ROOT_BATCH_MAX>,
+        links: &ArenaSelection<PLAN_MEMBERS_MAX>,
+    ) -> Result<[ByteArenaHeaderImage; 11], SupportLedgerError> {
+        let touches_external = preview.transitions[..preview.transition_count]
+            .iter()
+            .flatten()
+            .any(|transition| transition.before.locator_kind == 1);
+        let external = if touches_external {
+            self.external_heads.prepare_generation_header_after()?
+        } else {
+            self.external_heads.header_image()
+        };
+        let wrappers_after = if wrappers.len() == 0 {
+            self.wrappers.header_image()
+        } else {
+            self.wrappers
+                .prepare_reserve_header_after(wrappers, wrappers.len(), 0)?
+        };
+        let owner_rows = if preview.owner_count == 0 {
+            self.owner_rows.header_image()
+        } else {
+            self.owner_rows.prepare_generation_header_after()?
+        };
+        let owners = if preview.owner_count == 0 {
+            self.owners.header_image()
+        } else {
+            self.owners.prepare_generation_header_after()?
+        };
+        let links_after = if matches!(preview.resolver, ResolverChange::Keep) {
+            self.links.header_image()
+        } else if links.len() == 0 {
+            self.links.prepare_generation_header_after()?
+        } else {
+            self.links
+                .prepare_reserve_header_after(links, links.len(), 0)?
+        };
+        let lifecycle = if preview.resolution_record_count == 0 {
+            self.lifecycle.header_image()
+        } else {
+            self.lifecycle.prepare_generation_header_after()?
+        };
+        Ok([
+            self.groups.prepare_generation_header_after()?,
+            external,
+            self.formations
+                .prepare_reserve_header_after(formations, formations.len(), 0)?,
+            self.funders
+                .prepare_reserve_header_after(funders, funders.len(), 0)?,
+            self.members.prepare_generation_header_after()?,
+            wrappers_after,
+            self.mutations
+                .prepare_reserve_header_after(mutations, mutations.len(), 0)?,
+            owner_rows,
+            owners,
+            links_after,
+            lifecycle,
+        ])
+    }
+
+    fn assign_semantic_arena_headers(&mut self, headers: [ByteArenaHeaderImage; 11]) {
+        self.groups.assign_header_direct(headers[0]);
+        self.external_heads.assign_header_direct(headers[1]);
+        self.formations.assign_header_direct(headers[2]);
+        self.funders.assign_header_direct(headers[3]);
+        self.members.assign_header_direct(headers[4]);
+        self.wrappers.assign_header_direct(headers[5]);
+        self.mutations.assign_header_direct(headers[6]);
+        self.owner_rows.assign_header_direct(headers[7]);
+        self.owners.assign_header_direct(headers[8]);
+        self.links.assign_header_direct(headers[9]);
+        self.lifecycle.assign_header_direct(headers[10]);
+    }
+
+    fn semantic_arena_headers(&self) -> [ByteArenaHeaderImage; 11] {
+        [
+            self.groups.header_image(),
+            self.external_heads.header_image(),
+            self.formations.header_image(),
+            self.funders.header_image(),
+            self.members.header_image(),
+            self.wrappers.header_image(),
+            self.mutations.header_image(),
+            self.owner_rows.header_image(),
+            self.owners.header_image(),
+            self.links.header_image(),
+            self.lifecycle.header_image(),
+        ]
+    }
+}
+
+fn validate_typed_close_root(
+    input: crate::RootRef,
+    group: ArenaRef,
+    root: RootSnapshot,
+) -> Result<(), SupportLedgerError> {
+    if root.group != group
+        || root.group.slot != input.slot()
+        || root.group.generation != input.generation()
+        || root.version != input.version()
+    {
+        return Err(SupportLedgerError::Generation);
+    }
+    Ok(())
+}
+
+fn plan_authority_key_for_semantic(plan: u128) -> [u8; 17] {
+    let mut key = [0; 17];
+    key[0] = 0x30;
+    key[1..].copy_from_slice(&plan.to_be_bytes());
+    key
+}
+
+fn standalone_authority_key_for_semantic(domain: u128) -> [u8; 17] {
+    let mut key = [0; 17];
+    key[0] = 0x31;
+    key[1..].copy_from_slice(&domain.to_be_bytes());
+    key
+}
+
+fn encode_source_record_ref(reference: crate::SourceRecordRef) -> [u8; 8] {
+    let mut image = [0; 8];
+    image[..2].copy_from_slice(&reference.slot().to_le_bytes());
+    image[2..4].copy_from_slice(&reference.reserved.to_le_bytes());
+    image[4..].copy_from_slice(&reference.generation().to_le_bytes());
+    image
+}
+
+fn encode_close_authority(tag: u8, event: u64, second: u64, third: u64) -> [u8; 32] {
+    let mut image = [0; 32];
+    image[0] = tag;
+    write_u64(&mut image, 8, event);
+    write_u64(&mut image, 16, second);
+    write_u64(&mut image, 24, third);
+    image
+}
+
+fn validate_close_authority_image(
+    operation: SemanticOperation,
+    transition_index: usize,
+    image: [u8; 32],
+) -> bool {
+    let typed_tag = match operation {
+        SemanticOperation::TypedCloseC | SemanticOperation::TypedCloseR => {
+            Some(CLOSE_AUTHORITY_PLAN)
+        }
+        SemanticOperation::TypedCloseStandalone => Some(CLOSE_AUTHORITY_STANDALONE),
+        SemanticOperation::TypedCloseTerminal => Some(CLOSE_AUTHORITY_CANCELLATION),
+        _ => None,
+    };
+    let Some(tag) = typed_tag else {
+        return image == [0; 32];
+    };
+    if transition_index != 0
+        || image[0] != tag
+        || image[1..8].iter().any(|byte| *byte != 0)
+        || read_u64(&image, 8) == 0
+    {
+        return false;
+    }
+    match tag {
+        CLOSE_AUTHORITY_PLAN => image[16..].iter().all(|byte| *byte == 0),
+        CLOSE_AUTHORITY_STANDALONE => {
+            read_u64(&image, 16) != 0 && image[24..].iter().all(|byte| *byte == 0)
+        }
+        CLOSE_AUTHORITY_CANCELLATION => read_u64(&image, 16) != 0 && read_u64(&image, 24) != 0,
+        _ => false,
+    }
+}
+
+fn arena_ref_word(reference: ArenaRef) -> u64 {
+    u64::from_le_bytes(encode_arena_ref_value(reference))
+}
+
+fn encode_lifecycle_final_owner(root: RootSnapshot) -> [u8; 64] {
+    let mut image = [0; 64];
+    image[..17].copy_from_slice(&root.authority_key);
+    image[17] = root.branch;
+    image[18] = root.state as u8;
+    image[19] = root.member_count as u8;
+    encode_arena_ref(&mut image[24..32], root.group);
+    encode_arena_ref(&mut image[32..40], root.locator);
+    encode_arena_ref(&mut image[40..48], root.formation);
+    write_u64(&mut image, 48, root.version);
+    write_u64(&mut image, 56, root.occurred_at);
+    image
 }
