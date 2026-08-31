@@ -3679,3 +3679,388 @@ fn encode_plan_group(
     }
     image
 }
+
+fn encode_plan_formation(
+    identity: [u8; PLAN_IDENTITY_BYTES],
+    branch: usize,
+    group: ArenaRef,
+    head: ArenaRef,
+    occurred_at: u64,
+) -> [u8; FORMATION_BYTES] {
+    let mut image = FormationImage::ZERO.0;
+    image[8..8 + PLAN_IDENTITY_BYTES].copy_from_slice(&identity);
+    image[220] = branch as u8;
+    image[221] = RootState::Conditional as u8;
+    image[222] = FormationCause::Plan as u8;
+    image[223] = 0;
+    write_u64(&mut image, 224, 1);
+    write_u64(&mut image, 232, occurred_at);
+    encode_arena_ref(&mut image[240..248], group);
+    encode_arena_ref(&mut image[248..256], head);
+    image
+}
+
+fn encode_plan_head(
+    branch: usize,
+    member_count: usize,
+    group: ArenaRef,
+    formation: ArenaRef,
+    obligation: [u8; 32],
+    credit: [u8; 32],
+    authority_key: [u8; 17],
+) -> [u8; EXTERNAL_HEAD_BYTES] {
+    let mut image = ExternalHeadImage::ZERO.0;
+    image[8] = branch as u8;
+    image[9] = RootState::Conditional as u8;
+    image[10] = member_count as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], formation);
+    image[32..64].copy_from_slice(&obligation);
+    image[64..96].copy_from_slice(&credit);
+    image[96..113].copy_from_slice(&authority_key);
+    write_u64(&mut image, 120, 1);
+    image
+}
+
+fn encode_plan_funder(
+    branch: usize,
+    ordinal: usize,
+    active: bool,
+    group: ArenaRef,
+    formation: ArenaRef,
+    member: ArenaRef,
+    input: PlanCreateMember,
+) -> [u8; FUNDER_BYTES] {
+    let mut image = FunderImage::ZERO.0;
+    image[8] = u8::from(active);
+    image[9] = branch as u8;
+    image[10] = 1;
+    image[11] = ordinal as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], formation);
+    encode_arena_ref(&mut image[32..40], member);
+    if active {
+        encode_arena_ref(&mut image[40..48], input.owner_header);
+        image[48..80].copy_from_slice(&input.entitlement);
+        image[80..112].copy_from_slice(&input.vector);
+        write_u64(&mut image, 112, 1);
+        write_u64(&mut image, 120, input.branch_limits[branch]);
+    }
+    image
+}
+
+fn encode_plan_member(
+    branch: usize,
+    ordinal: usize,
+    active: bool,
+    group: ArenaRef,
+    funder: ArenaRef,
+    input: PlanCreateMember,
+) -> [u8; MEMBER_BYTES] {
+    let mut image = MemberImage::ZERO.0;
+    image[8] = u8::from(active);
+    image[9] = branch as u8;
+    image[10] = ordinal as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], funder);
+    if active {
+        image[32..72].copy_from_slice(&input.request_key);
+        encode_arena_ref(&mut image[72..80], input.owner_header);
+        image[80..112].copy_from_slice(&input.entitlement);
+    }
+    image
+}
+
+fn encode_plan_link(
+    owner: ArenaRef,
+    group: ArenaRef,
+    formation: ArenaRef,
+    authority_key: [u8; 17],
+    generation: u64,
+) -> [u8; LINK_BYTES] {
+    let mut image = LinkImage::ZERO.0;
+    image[8] = 1;
+    image[9] = 1;
+    encode_arena_ref(&mut image[16..24], owner);
+    encode_arena_ref(&mut image[24..32], group);
+    encode_arena_ref(&mut image[32..40], formation);
+    write_u64(&mut image, 48, generation);
+    image[56..73].copy_from_slice(&authority_key);
+    image
+}
+
+fn encode_plan_mutation(
+    authority_key: [u8; 17],
+    groups: [ArenaRef; PLAN_BRANCHES],
+    formations: [ArenaRef; PLAN_BRANCHES],
+    generation: u64,
+    occurred_at: u64,
+) -> [u8; MUTATION_BYTES] {
+    let mut image = MutationImage::ZERO.0;
+    image[8] = SemanticOperation::PlanCreateO as u8;
+    image[9] = PLAN_BRANCHES as u8;
+    write_u64(&mut image, 16, generation);
+    write_u64(&mut image, 24, occurred_at);
+    image[32..49].copy_from_slice(&authority_key);
+    for (ordinal, reference) in groups.into_iter().enumerate() {
+        encode_arena_ref(&mut image[56 + ordinal * 8..64 + ordinal * 8], reference);
+    }
+    for (ordinal, reference) in formations.into_iter().enumerate() {
+        encode_arena_ref(&mut image[80 + ordinal * 8..88 + ordinal * 8], reference);
+    }
+    image
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum RootState {
+    Conditional = 1,
+    Pending = 2,
+    Active = 3,
+    Retained = 4,
+    ClosedConditional = 5,
+    ClosedPending = 6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum FormationCause {
+    Plan = 1,
+    InitialReady = 2,
+    MembershipConsumed = 3,
+    Receipt = 4,
+    Rejection = 5,
+    LocalStale = 6,
+    ObservationCompleted = 7,
+    PredecessorEnded = 8,
+    BeganSupport = 9,
+    FinishedSupport = 10,
+    TypedImpossible = 11,
+    CancellationMembership = 12,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct C16OwnerSetImages {
+    header: [u8; OWNER_HEADER_BYTES],
+    row: [u8; OWNER_ROW_BYTES],
+    index: [u8; OWNER_INDEX_BYTES],
+    owner: [u8; OWNER_BYTES],
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedLegacyInsert {
+    expected_c17: u64,
+    expected_raw: u64,
+    entries: [([u8; 32], [u8; 8]); LEGACY_RAW_EDIT_MAX],
+    entry_count: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedLegacyUpdate {
+    expected_c17: u64,
+    expected_raw: u64,
+    updates: [([u8; 32], NodeHandle, [u8; 8]); LEGACY_RAW_EDIT_MAX],
+    update_count: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedLegacyInsertStream {
+    expected_c17: u64,
+    expected_raw: u64,
+    record_count: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedLegacyUpdateStream {
+    expected_c17: u64,
+    expected_raw: u64,
+    record_count: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedC16Bundle {
+    expected_c17: u64,
+    expected_raw: u64,
+    expected_owner_arenas: [u64; 4],
+    record_slot: u32,
+    owner_headers: ArenaSelection<1>,
+    owner_rows: ArenaSelection<1>,
+    owner_indices: ArenaSelection<1>,
+    owners: ArenaSelection<1>,
+    raw_entries: [([u8; 32], [u8; 8]); C16_RAW_OWNERS],
+    images: C16OwnerSetImages,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedC16Withdrawal {
+    expected_c17: u64,
+    expected_raw: u64,
+    expected_owner_arenas: [u64; 4],
+    record_slot: u32,
+    references: [ArenaRef; 4],
+    raw_keys: [[u8; 32]; C16_RAW_OWNERS],
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedC16Tombstone {
+    expected_c17: u64,
+    expected_raw: u64,
+    expected_owner_arenas: [u64; 4],
+    record_slot: u32,
+    references: [ArenaRef; 4],
+    raw_updates: [([u8; 32], NodeHandle, [u8; 8]); C16_RAW_OWNERS],
+    images: C16OwnerSetImages,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedC16Touch {
+    expected_c17: u64,
+    expected_raw: u64,
+    record_slot: u32,
+    owner: ArenaRef,
+    raw_updates: [([u8; 32], NodeHandle, [u8; 8]); C16_RAW_OWNERS],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LifecycleAggregate {
+    pub(crate) usage: [[u32; 3]; 5],
+    pub(crate) reserved: [[u32; 3]; 5],
+    pub(crate) attached: [[u32; 3]; 4],
+    pub(crate) vector: [[u64; 3]; 21],
+}
+
+impl LifecycleAggregate {
+    pub(crate) const ZERO: Self = Self {
+        usage: [[0; 3]; 5],
+        reserved: [[0; 3]; 5],
+        attached: [[0; 3]; 4],
+        vector: [[0; 3]; 21],
+    };
+
+    pub(crate) fn from_records(
+        records: &[LifecycleRecordInput],
+    ) -> Result<Self, SupportLedgerError> {
+        let mut aggregate = Self::ZERO;
+        for record in records.iter().copied() {
+            aggregate.accrue(record)?;
+        }
+        Ok(aggregate)
+    }
+
+    fn accrue(&mut self, record: LifecycleRecordInput) -> Result<(), SupportLedgerError> {
+        record.validate()?;
+        let class = usize::try_from(record.aggregate[0]).map_err(|_| capacity_error())?;
+        let pool = usize::try_from(record.aggregate[1]).map_err(|_| capacity_error())?;
+        let axis = usize::try_from(record.aggregate[2]).map_err(|_| capacity_error())?;
+        let horizon = usize::try_from(record.aggregate[3]).map_err(|_| capacity_error())?;
+        let amount = u32::try_from(record.aggregate[4]).map_err(|_| capacity_error())?;
+        let attached = amount.checked_sub(1).ok_or_else(noncanonical_error)?;
+        let add = |cell: &mut u32, delta| {
+            *cell = cell.checked_add(delta).ok_or_else(capacity_error)?;
+            Ok::<(), SupportLedgerError>(())
+        };
+        add(&mut self.usage[class][pool], 1)?;
+        add(&mut self.usage[3][pool], 1)?;
+        add(&mut self.usage[4][pool], amount)?;
+        add(&mut self.reserved[class][pool], amount)?;
+        add(&mut self.reserved[3][pool], amount)?;
+        add(&mut self.reserved[4][pool], amount)?;
+        add(&mut self.attached[class][pool], attached)?;
+        add(&mut self.attached[3][pool], attached)?;
+        self.vector[axis][horizon] = self.vector[axis][horizon]
+            .checked_add(u64::from(amount))
+            .ok_or_else(capacity_error)?;
+        Ok(())
+    }
+
+    fn encode(self) -> [u8; 672] {
+        let mut image = [0; 672];
+        let mut offset = 0;
+        for rows in [self.usage, self.reserved] {
+            for row in rows {
+                for value in row {
+                    write_u32(&mut image, offset, value);
+                    offset += 4;
+                }
+            }
+        }
+        for row in self.attached {
+            for value in row {
+                write_u32(&mut image, offset, value);
+                offset += 4;
+            }
+        }
+        for row in self.vector {
+            for value in row {
+                write_u64(&mut image, offset, value);
+                offset += 8;
+            }
+        }
+        debug_assert_eq!(offset, image.len());
+        image
+    }
+
+    fn decode(image: &[u8]) -> Result<Self, SupportLedgerError> {
+        if image.len() != 672 {
+            return Err(noncanonical_error());
+        }
+        let mut value = Self::ZERO;
+        let mut offset = 0;
+        for rows in [&mut value.usage, &mut value.reserved] {
+            for row in rows {
+                for cell in row {
+                    *cell = read_u32(image, offset);
+                    offset += 4;
+                }
+            }
+        }
+        for row in &mut value.attached {
+            for cell in row {
+                *cell = read_u32(image, offset);
+                offset += 4;
+            }
+        }
+        for row in &mut value.vector {
+            for cell in row {
+                *cell = read_u64(image, offset);
+                offset += 8;
+            }
+        }
+        (offset == image.len())
+            .then_some(value)
+            .ok_or_else(noncanonical_error)
+    }
+
+    fn withholding(self) -> Result<[u64; 4], SupportLedgerError> {
+        let sum_u32 = |rows: &[[u32; 3]]| {
+            rows.iter()
+                .flatten()
+                .try_fold(0u64, |total, value| total.checked_add(u64::from(*value)))
+        };
+        let vector = self
+            .vector
+            .iter()
+            .flatten()
+            .try_fold(0u64, |total, value| total.checked_add(*value));
+        Ok([
+            sum_u32(&self.usage).ok_or_else(capacity_error)?,
+            sum_u32(&self.reserved).ok_or_else(capacity_error)?,
+            sum_u32(&self.attached).ok_or_else(capacity_error)?,
+            vector.ok_or_else(capacity_error)?,
+        ])
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedLifecycleBegin {
+    expected_c17: u64,
+    generation_after: u64,
+    expected_arena_header: ByteArenaHeaderImage,
+    arena_header_after: ByteArenaHeaderImage,
+    before_support: SupportLedgerGeneration,
+    batch: u64,
+    aggregate: LifecycleAggregate,
+    selection: ArenaSelection<LIFECYCLE_BATCH_MAX>,
+    pending_before: PendingLifecycleHeaderImage,
+    pending_after: PendingLifecycleHeaderImage,
+}
