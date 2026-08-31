@@ -3005,4 +3005,397 @@ impl<const T: usize> FixedByteArena<T> {
         }
         Ok(ArenaRef { slot, generation })
     }
+
+    pub(crate) fn reference_if_occupied(
+        &self,
+        slot: u32,
+    ) -> Result<Option<ArenaRef>, FixedStorageError> {
+        let image = self.slot(slot as usize)?;
+        if image[4] == 0 {
+            return Ok(None);
+        }
+        if image[4] != 1 {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let generation = read_u32(image, 0);
+        (generation != 0)
+            .then_some(Some(ArenaRef { slot, generation }))
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    pub(crate) fn image(
+        &self,
+        reference: ArenaRef,
+        accepted_tags: &[u8],
+    ) -> Result<&[u8; T], FixedStorageError> {
+        let slot = self.slot(reference.slot as usize)?;
+        (read_u32(slot, 0) == reference.generation && accepted_tags.contains(&slot[4]))
+            .then_some(slot)
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    pub(crate) fn image_mut(
+        &mut self,
+        reference: ArenaRef,
+        accepted_tags: &[u8],
+    ) -> Result<&mut [u8; T], FixedStorageError> {
+        let slot = self.slot_mut(reference.slot as usize)?;
+        (read_u32(slot, 0) == reference.generation && accepted_tags.contains(&slot[4]))
+            .then_some(slot)
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    pub(crate) fn replace_image_prevalidated(&mut self, reference: ArenaRef, image: [u8; T]) {
+        *self.slot_mut_prevalidated(reference.slot as usize) = image;
+    }
+
+    pub(crate) fn image_mut_prevalidated(&mut self, reference: ArenaRef) -> &mut [u8; T] {
+        self.slot_mut_prevalidated(reference.slot as usize)
+    }
+
+    pub(crate) fn image_mut_slot_direct(&mut self, slot: u32) -> &mut [u8; T] {
+        self.slot_mut_prevalidated(slot as usize)
+    }
+
+    pub(crate) fn validate_commit_inactive_batch(
+        &self,
+        references: &[ArenaRef],
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if references.is_empty() {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        self.header
+            .occupied
+            .checked_add(u32::try_from(references.len()).map_err(|_| FixedStorageError::Capacity)?)
+            .ok_or(FixedStorageError::Capacity)?;
+        for (index, reference) in references.iter().enumerate() {
+            if references[..index].contains(reference) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.image(*reference, &[3])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_inactive_batch_prevalidated(&mut self, references: &[ArenaRef]) {
+        self.validate_commit_inactive_batch(references)
+            .expect("validated inactive arena batch");
+        let next = self
+            .header
+            .generation
+            .checked_add(1)
+            .expect("validated arena generation");
+        for reference in references {
+            self.commit_inactive(*reference)
+                .expect("prevalidated inactive arena record");
+        }
+        self.header.generation = next;
+    }
+
+    pub(crate) fn validate_release_batch(
+        &self,
+        references: &[ArenaRef],
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if references.is_empty()
+            || self.header.free_len as usize + references.len() > self.header.capacity as usize
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        for (index, reference) in references.iter().enumerate() {
+            if references[..index].contains(reference) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.image(*reference, &[1, 2, 3])?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_batch_prevalidated(&mut self, references: &[ArenaRef]) {
+        self.validate_release_batch(references)
+            .expect("validated arena release batch");
+        let before = self.header.generation;
+        for reference in references {
+            self.release(*reference)
+                .expect("prevalidated arena release");
+            self.header.generation = before;
+        }
+        self.header.generation = before.checked_add(1).expect("validated arena generation");
+    }
+
+    pub(crate) fn validate_advance_generation(&self) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)
+            .map(|_| ())
+    }
+
+    pub(crate) fn advance_generation_prevalidated(&mut self) {
+        self.validate_advance_generation()
+            .expect("validated arena generation advance");
+        self.header.generation += 1;
+    }
+
+    pub(crate) fn release(&mut self, reference: ArenaRef) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        let slot = self.slot(reference.slot as usize)?;
+        let tag = slot[4];
+        if read_u32(slot, 0) != reference.generation || !matches!(tag, 1..=3) {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let next_generation = self
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let position = self.header.free_len as usize;
+        if position >= self.header.capacity as usize {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        match tag {
+            1 => self.header.occupied -= 1,
+            2 => self.header.reserved_count -= 1,
+            3 => self.header.inactive_count -= 1,
+            _ => unreachable!(),
+        }
+        self.write_vacant(
+            reference.slot as usize,
+            reference.generation,
+            position as u32,
+        );
+        write_u32(&mut self.free, position * 4, reference.slot);
+        self.header.free_len += 1;
+        self.header.generation = next_generation;
+        Ok(())
+    }
+
+    fn validate_header(&self) -> Result<(), FixedStorageError> {
+        let accounted = self
+            .header
+            .occupied
+            .checked_add(self.header.free_len)
+            .and_then(|value| value.checked_add(self.header.reserved_count))
+            .and_then(|value| value.checked_add(self.header.inactive_count));
+        (self.header.reserved == 0
+            && self.header.capacity > 0
+            && self.slots.len() == self.header.capacity as usize * T
+            && self.free.len() == self.header.capacity as usize * 4
+            && accounted == Some(self.header.capacity))
+        .then_some(())
+        .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn write_vacant(&mut self, index: usize, generation: u32, free_position: u32) {
+        let slot = self.slot_mut_prevalidated(index);
+        slot.fill(0);
+        write_u32(slot, 0, generation);
+        write_u32(slot, 8, free_position);
+    }
+
+    fn slot_mut_prevalidated(&mut self, index: usize) -> &mut [u8; T] {
+        let start = index * T;
+        (&mut self.slots[start..start + T])
+            .try_into()
+            .expect("prevalidated fixed arena slot width")
+    }
+
+    fn slot(&self, index: usize) -> Result<&[u8; T], FixedStorageError> {
+        let start = index
+            .checked_mul(T)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        self.slots
+            .get(start..start + T)
+            .and_then(|slot| slot.try_into().ok())
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn slot_mut(&mut self, index: usize) -> Result<&mut [u8; T], FixedStorageError> {
+        let start = index
+            .checked_mul(T)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        self.slots
+            .get_mut(start..start + T)
+            .and_then(|slot| slot.try_into().ok())
+            .ok_or(FixedStorageError::NonCanonical)
+    }
 }
+
+fn zeroed(length: usize) -> Result<Box<[u8]>, FixedStorageError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| FixedStorageError::Allocation)?;
+    bytes.resize(length, 0);
+    if bytes.len() != length {
+        return Err(FixedStorageError::Capacity);
+    }
+    Ok(bytes.into_boxed_slice())
+}
+
+fn node_tag(node: u32) -> u32 {
+    node & !NODE_INDEX_MASK
+}
+
+fn leaf_index(handle: NodeHandle) -> Result<usize, FixedStorageError> {
+    (node_tag(handle.node()) == LEAF_TAG && !handle.is_sentinel())
+        .then_some((handle.node() & NODE_INDEX_MASK) as usize)
+        .ok_or(FixedStorageError::NonCanonical)
+}
+
+fn branch_index(handle: NodeHandle) -> Result<usize, FixedStorageError> {
+    (node_tag(handle.node()) == BRANCH_TAG)
+        .then_some((handle.node() & NODE_INDEX_MASK) as usize)
+        .ok_or(FixedStorageError::NonCanonical)
+}
+
+fn key_bit<const K: usize>(key: &[u8; K], bit: u16) -> usize {
+    ((key[bit as usize / 8] >> (7 - bit % 8)) & 1) as usize
+}
+
+fn first_difference<const K: usize>(
+    left: &[u8; K],
+    right: &[u8],
+) -> Result<u16, FixedStorageError> {
+    for (index, (&left, &right)) in left.iter().zip(right).enumerate() {
+        let difference = left ^ right;
+        if difference != 0 {
+            return u16::try_from(index * 8 + difference.leading_zeros() as usize)
+                .map_err(|_| FixedStorageError::Capacity);
+        }
+    }
+    Err(FixedStorageError::Duplicate)
+}
+
+fn assignment_image_width(width: usize) -> Result<usize, FixedStorageError> {
+    match width {
+        4 | 8 | 40 | 48 | 56 | 64 | 112 => Ok(width),
+        32 => Ok(40),
+        _ => Err(FixedStorageError::Capacity),
+    }
+}
+
+fn encode_index_header(header: ReusableIndexHeader) -> [u8; INDEX_HEADER_BYTES] {
+    let mut image = [0; INDEX_HEADER_BYTES];
+    image[0..8].copy_from_slice(&header.generation.to_le_bytes());
+    image[8..16].copy_from_slice(&header.root.0.to_le_bytes());
+    image[16..20].copy_from_slice(&header.occupied.to_le_bytes());
+    image[20..24].copy_from_slice(&header.leaf_capacity.to_le_bytes());
+    image[24..28].copy_from_slice(&header.branch_capacity.to_le_bytes());
+    image[28..32].copy_from_slice(&header.free_leaf_len.to_le_bytes());
+    image[32..36].copy_from_slice(&header.free_branch_len.to_le_bytes());
+    image[36..40].copy_from_slice(&header.reserved.to_le_bytes());
+    image
+}
+
+fn occupied_leaf_image<const K: usize, const V: usize>(
+    generation: u32,
+    parent: NodeHandle,
+    key: &[u8; K],
+    value: &[u8; V],
+) -> Result<[u8; 112], FixedStorageError> {
+    let width = leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)?;
+    if width > 112 {
+        return Err(FixedStorageError::Capacity);
+    }
+    let mut image = [0; 112];
+    image[0] = 1;
+    write_u32(&mut image, 4, generation);
+    write_handle(&mut image, 8, parent);
+    image[16..16 + K].copy_from_slice(key);
+    image[16 + K..16 + K + V].copy_from_slice(value);
+    Ok(image)
+}
+
+fn vacant_leaf_image<const K: usize, const V: usize>(
+    generation: u32,
+    free_position: u32,
+) -> Result<[u8; 112], FixedStorageError> {
+    if leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)? > 112 {
+        return Err(FixedStorageError::Capacity);
+    }
+    let mut image = [0; 112];
+    write_u32(&mut image, 4, generation);
+    write_u32(&mut image, 8, free_position);
+    Ok(image)
+}
+
+fn occupied_branch_image(
+    generation: u32,
+    parent: NodeHandle,
+    bit: u16,
+    children: [NodeHandle; 2],
+) -> [u8; BRANCH_SLOT_BYTES] {
+    let mut image = [0; BRANCH_SLOT_BYTES];
+    image[0] = 1;
+    write_u32(&mut image, 4, generation);
+    write_handle(&mut image, 8, parent);
+    write_u16(&mut image, 16, bit);
+    write_handle(&mut image, 24, children[0]);
+    write_handle(&mut image, 32, children[1]);
+    image
+}
+
+fn vacant_branch_image(generation: u32, free_position: u32) -> [u8; BRANCH_SLOT_BYTES] {
+    let mut image = [0; BRANCH_SLOT_BYTES];
+    write_u32(&mut image, 4, generation);
+    write_u32(&mut image, 8, free_position);
+    image
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("fixed u16 image"),
+    )
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("fixed u32 image"),
+    )
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_handle(bytes: &[u8], offset: usize) -> NodeHandle {
+    NodeHandle(u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed handle image"),
+    ))
+}
+
+fn write_handle(bytes: &mut [u8], offset: usize, value: NodeHandle) {
+    bytes[offset..offset + 8].copy_from_slice(&value.0.to_le_bytes());
+}
+
+const _: () = {
+    assert!(size_of::<NodeHandle>() == 8);
+    assert!(size_of::<ReusableIndexHeader>() == INDEX_HEADER_BYTES);
+    assert!(size_of::<Box<[u8]>>() == 16);
+    assert!(size_of::<ByteArenaHeader>() == ARENA_HEADER_BYTES);
+    assert!(size_of::<ArenaRef>() == 8);
+    assert!(align_of::<ReusableIndexHeader>() == 8);
+    assert!(align_of::<ByteArenaHeader>() == 8);
+    assert!(INVALID_TAG == 2 << NODE_TAG_SHIFT);
+};
