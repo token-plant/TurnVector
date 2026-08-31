@@ -30,6 +30,9 @@ use std::error::Error;
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroU128};
 
+#[cfg(not(turnvector_c17_generated))]
+compile_error!("the authenticated C17 structural generator did not run");
+
 mod admission;
 mod bounded;
 mod c17_generated;
@@ -53,6 +56,27 @@ mod transition_coordinator;
 mod turn_plans;
 mod turns;
 mod work;
+
+#[cfg(turnvector_c17_probe)]
+fn main() {
+    use std::io::Write as _;
+
+    let mut output = c17_layout::b03_layout_probe();
+    let mut rows = reusable::b03_probe_rows();
+    rows.extend(request_book::b03_probe_rows());
+    rows.extend(support::b03_probe_rows());
+    rows.extend(turns::b03_probe_rows());
+    rows.sort_unstable_by_key(|row| row.0);
+    for (name, value) in rows {
+        output.extend_from_slice(name.as_bytes());
+        output.push(b'=');
+        output.extend_from_slice(value.to_string().as_bytes());
+        output.push(b'\n');
+    }
+    std::io::stdout()
+        .write_all(&output)
+        .expect("write C17 defining-module probe");
+}
 
 pub use bounded::{
     BoundedCollectionError, BoundedMap, BoundedSet, BoundedVec, FixedIdentityIndex,

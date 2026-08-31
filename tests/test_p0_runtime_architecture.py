@@ -7,13 +7,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "schemas/p0-runtime-architecture-v1.jsonl"
-MANIFEST_SHA256 = "fe7448d9d878c1eb407fea76a1bc0f3c08f0a6868f48024220c622c772fb789f"
+MANIFEST_SHA256 = "44e4355c37f67d69bb4393a59d2d557d2d1f5ef01731e73dae6d4f34a2c85095"
 ROW = re.compile(r"([A-Z]+)(\d+)([a-z]?)\Z")
 KIND_COUNTS = {"meta": 1, "crate": 3, "seam": 2, "adapter": 2, "schema": 9, "module": 41}
 MODULE_ORDER = """admission audit_journal backend_contract closure_control core_gate control_store control_plane certification_tooling certification daemon_custody data_plane device_executor event_loop fault_gate fake_backend lifecycle_gate model_descriptor model_registry native_build native_runtime native_turns protocol_authority qualification_core_adapters qualification_lifecycle_adapters qualification_integration qualification_system_adapters release_identity request_book resource_ledger resource_evidence resource_governor residency_coordinator runtime_carry runtime_measurement runtime_qualification scheduling_gate scheduler support_ledger transition_coordinator turn_plans volume_qualification""".split()
 MODULE_IDS = set(MODULE_ORDER)
-IMPLEMENTED = {"certification", "model_descriptor", "model_registry", "request_book", "resource_ledger", "support_ledger"}
-IMPLEMENTED_DEPENDENCIES = {"certification": ["model_registry", "request_book"], "model_descriptor": [], "model_registry": ["model_descriptor"], "request_book": ["model_registry"], "resource_ledger": [], "support_ledger": []}
+IMPLEMENTED = {"certification", "model_descriptor", "model_registry", "request_book", "resource_ledger", "support_ledger", "transition_coordinator"}
+IMPLEMENTED_DEPENDENCIES = {"certification": ["model_registry", "request_book"], "model_descriptor": [], "model_registry": ["model_descriptor"], "request_book": ["model_registry"], "resource_ledger": [], "support_ledger": [], "transition_coordinator": ["admission", "certification", "closure_control", "model_descriptor", "model_registry", "request_book", "resource_ledger", "scheduler", "support_ledger", "turn_plans"]}
 SCHEMAS = {
     "audit_journal_v1": ("S10", "module", "audit_journal"),
     "backend_owned_values_v1": ("E01", "module", "backend_contract"),
@@ -46,11 +46,11 @@ PROTOCOL_ROOT = b"//! Contract-only Protocol crate; DTO and conversion implement
 FIXTURE_ONLY_PATHS = ("crates/turnvector-protocol/Cargo.toml", "crates/turnvector-protocol/src/lib.rs", "crates/turnvector-daemon/src/release_identity.rs")
 FROZEN_TOPOLOGY_SHA256 = {
     "Cargo.toml": "d718f6f9dce78fcdebf72931b2d0f03fbfa2cf3772623cc7a544503ccfe9595a",
-    "crates/turnvector-core/Cargo.toml": "5a4a358ec3b14544dbfc3a6ee4e8cc1e56674e19d66e210e2249a7c806cd83b6",
-    "crates/turnvector-core/src/lib.rs": "ff918ad554a9c919634912d4fb7c36e84d5724e5e7ff9893df9dcc731934326d",
+    "crates/turnvector-core/Cargo.toml": "739ed9294abff199674c1d7861edeefdc679d9b5123c3257f4a228dd2d87e9e4",
+    "crates/turnvector-core/src/lib.rs": "35c1ab53c9afae00ec07f545e423ed4a0b08ce58b99a3a88ec5b2d0b4170a06a",
     "crates/turnvector-daemon/Cargo.toml": "1dec90d7c04004eaa25ab4bf3aacea7989a898a24df29629be6c93ad6d203f0a",
     "crates/turnvector-daemon/src/main.rs": "f9e7bb4b97fbe08292028ab4ada11199df3a3629a18899cfb57a46683230622e",
-    "tests/test_daemon_core_build.py": "36127c653cd5b43afc21fc6aa6ed1ea012db0b93d18a716466ea512a989a6cdd",
+    "tests/test_daemon_core_build.py": "3900edea0d5c76a1d4dd6eae15f44c2a62b197019ee53f45deaa4ce6aa5085ef",
 }
 PROTOCOL_CARGO = b'''[package]\nname = "turnvector-protocol"\nversion.workspace = true\nedition.workspace = true\nrust-version.workspace = true\nlicense.workspace = true\npublish = false\n\n[lints]\nworkspace = true\n'''
 
