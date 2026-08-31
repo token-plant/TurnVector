@@ -2581,4 +2581,325 @@ impl SupportC17 {
             current_after,
         })
     }
+
+    pub(crate) fn prepare_finalize_batch(
+        &self,
+        expected_support: SupportLedgerGeneration,
+    ) -> Result<PreparedLifecycleFinalize, SupportLedgerError> {
+        self.validate_finalizable(expected_support)?;
+        let aggregate = self.pending_aggregate()?;
+        let (_, publication_count) = self.lifecycle_publications()?;
+        let expected_arena_header = self.lifecycle.header_image();
+        let expected_publication_arena_headers = [
+            self.owner_rows.header_image(),
+            self.owners.header_image(),
+            self.funders.header_image(),
+        ];
+        let publication_arena_headers_after = [
+            self.owner_rows.prepare_generation_header_after()?,
+            self.owners.prepare_generation_header_after()?,
+            self.funders.prepare_generation_header_after()?,
+        ];
+
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        let mut references = [ArenaRef::default(); LIFECYCLE_BATCH_MAX];
+        let mut occupied_tags_after = [0; LIFECYCLE_BATCH_MAX];
+        let mut raw_updates = [LifecycleRawUpdate::ZERO; 2 * LIFECYCLE_BATCH_MAX];
+        for ordinal in 0..total {
+            let reference = self.inactive_reference(ordinal)?;
+            let image = self.lifecycle.image(reference, &[3])?;
+            references[ordinal] = reference;
+            occupied_tags_after[ordinal] = self
+                .lifecycle
+                .prepare_committed_inactive_tag_after(reference)?;
+            raw_updates[ordinal * 2] = self.prepare_finalize_raw_update(reference, image, 96)?;
+            raw_updates[ordinal * 2 + 1] =
+                self.prepare_finalize_raw_update(reference, image, 128)?;
+        }
+        let raw_generation_plan = self
+            .raw
+            .prepare_generation_assignment_plan::<RAW_GENERATION_ASSIGNMENTS>(
+                RAW_INDEX_ASSIGNMENT_ARENA,
+            )?;
+        let arena_header_after = self
+            .lifecycle
+            .prepare_commit_inactive_header_after(&references[..total])?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let batch = read_u64(&self.pending.0, PENDING_BATCH);
+        let mut pending_after = PendingLifecycleHeaderImage::ZERO;
+        write_u64(&mut pending_after.0, PENDING_BATCH, batch);
+        Ok(PreparedLifecycleFinalize {
+            expected_c17: self.generation(),
+            generation_after,
+            expected_raw: self.raw.generation(),
+            expected_arena_header,
+            arena_header_after,
+            expected_publication_arena_headers,
+            publication_arena_headers_after,
+            batch,
+            total: total as u16,
+            expected_support,
+            aggregate,
+            pending_before: self.pending,
+            pending_after,
+            references,
+            occupied_tags_after,
+            raw_updates,
+            raw_generation_plan,
+            publication_count,
+        })
+    }
+
+    pub(crate) fn validate_finalize_batch(
+        &self,
+        change: &PreparedLifecycleFinalize,
+    ) -> Result<(), SupportLedgerError> {
+        self.validate_finalizable(change.expected_support)?;
+        let (_, publication_count) = self.lifecycle_publications()?;
+        let total = usize::from(change.total);
+        if self.generation() != change.expected_c17
+            || change.expected_c17.checked_add(1) != Some(change.generation_after)
+            || self.raw.generation() != change.expected_raw
+            || !self
+                .raw
+                .validates_assignment_plan(&change.raw_generation_plan)
+            || self
+                .raw
+                .prepare_generation_assignment_plan::<RAW_GENERATION_ASSIGNMENTS>(
+                    RAW_INDEX_ASSIGNMENT_ARENA,
+                )?
+                != change.raw_generation_plan
+            || self.lifecycle.header_image() != change.expected_arena_header
+            || self
+                .lifecycle
+                .prepare_commit_inactive_header_after(&change.references[..total])?
+                != change.arena_header_after
+            || [
+                self.owner_rows.header_image(),
+                self.owners.header_image(),
+                self.funders.header_image(),
+            ] != change.expected_publication_arena_headers
+            || [
+                self.owner_rows.prepare_generation_header_after()?,
+                self.owners.prepare_generation_header_after()?,
+                self.funders.prepare_generation_header_after()?,
+            ] != change.publication_arena_headers_after
+            || self.pending != change.pending_before
+            || read_u64(&self.pending.0, PENDING_BATCH) != change.batch
+            || read_u16(&self.pending.0, PENDING_TOTAL) != change.total
+            || self.pending_aggregate()? != change.aggregate
+            || publication_count != change.publication_count
+            || change.references[total..]
+                .iter()
+                .any(|reference| *reference != ArenaRef::default())
+            || change.occupied_tags_after[total..]
+                .iter()
+                .any(|tag| *tag != 0)
+            || change.raw_updates[total * 2..]
+                .iter()
+                .any(|update| *update != LifecycleRawUpdate::ZERO)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut pending_after = PendingLifecycleHeaderImage::ZERO;
+        write_u64(&mut pending_after.0, PENDING_BATCH, change.batch);
+        if change.pending_after != pending_after {
+            return Err(SupportLedgerError::Generation);
+        }
+        for ordinal in 0..total {
+            let reference = self.inactive_reference(ordinal)?;
+            let image = self.lifecycle.image(reference, &[3])?;
+            if reference != change.references[ordinal]
+                || self
+                    .lifecycle
+                    .prepare_committed_inactive_tag_after(reference)?
+                    != change.occupied_tags_after[ordinal]
+                || self.prepare_finalize_raw_update(reference, image, 96)?
+                    != change.raw_updates[ordinal * 2]
+                || self.prepare_finalize_raw_update(reference, image, 128)?
+                    != change.raw_updates[ordinal * 2 + 1]
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        self.funders.validate_advance_generation()?;
+        Ok(())
+    }
+
+    pub(super) fn visit_finalize_publications(
+        &self,
+        change: &PreparedLifecycleFinalize,
+        visitor: &mut dyn FnMut(LifecyclePublication) -> Result<(), SupportLedgerError>,
+    ) -> Result<(), SupportLedgerError> {
+        let (publications, count) = self.lifecycle_publications()?;
+        if count != change.publication_count {
+            return Err(SupportLedgerError::Generation);
+        }
+        for publication in publications[..count].iter().copied() {
+            visitor(publication)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_finalize_owner_outcomes(
+        &self,
+        change: &PreparedLifecycleFinalize,
+        owner_outcomes: &mut [LifecycleOwnerOutcome; LIFECYCLE_CAPACITY],
+        funder_outcomes: &mut [LifecycleFunderOutcome; LIFECYCLE_CAPACITY],
+    ) -> Result<(usize, usize), SupportLedgerError> {
+        let (publications, count) = self.lifecycle_publications()?;
+        if count != change.publication_count {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut owner_count = 0usize;
+        let mut funder_count = 0usize;
+        for index in 0..count {
+            let publication = publications[index];
+            if !publications[..index]
+                .iter()
+                .any(|prior| prior.owner_slot == publication.owner_slot)
+            {
+                if owner_count == owner_outcomes.len() {
+                    return Err(capacity_error());
+                }
+                owner_outcomes[owner_count] =
+                    self.prepare_finalize_owner_outcome(&publications[..count], index)?;
+                owner_count += 1;
+            }
+            if !publications[..index]
+                .iter()
+                .any(|prior| prior.funder == publication.funder)
+            {
+                if funder_count == funder_outcomes.len() {
+                    return Err(capacity_error());
+                }
+                funder_outcomes[funder_count] =
+                    self.prepare_finalize_funder_outcome(&publications[..count], index)?;
+                funder_count += 1;
+            }
+        }
+        Ok((owner_count, funder_count))
+    }
+
+    pub(super) fn validate_finalize_owner_outcomes(
+        &self,
+        change: &PreparedLifecycleFinalize,
+        owner_outcomes: &[LifecycleOwnerOutcome; LIFECYCLE_CAPACITY],
+        owner_count: usize,
+        funder_outcomes: &[LifecycleFunderOutcome; LIFECYCLE_CAPACITY],
+        funder_count: usize,
+    ) -> Result<(), SupportLedgerError> {
+        if owner_count > owner_outcomes.len()
+            || funder_count > funder_outcomes.len()
+            || owner_outcomes[owner_count..]
+                .iter()
+                .any(|outcome| *outcome != LifecycleOwnerOutcome::ZERO)
+            || funder_outcomes[funder_count..]
+                .iter()
+                .any(|outcome| *outcome != LifecycleFunderOutcome::ZERO)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let (publications, count) = self.lifecycle_publications()?;
+        if count != change.publication_count {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut seen_owners = 0usize;
+        let mut seen_funders = 0usize;
+        for index in 0..count {
+            let publication = publications[index];
+            if !publications[..index]
+                .iter()
+                .any(|prior| prior.owner_slot == publication.owner_slot)
+            {
+                if seen_owners == owner_count
+                    || self.prepare_finalize_owner_outcome(&publications[..count], index)?
+                        != owner_outcomes[seen_owners]
+                {
+                    return Err(SupportLedgerError::Generation);
+                }
+                seen_owners += 1;
+            }
+            if !publications[..index]
+                .iter()
+                .any(|prior| prior.funder == publication.funder)
+            {
+                if seen_funders == funder_count
+                    || self.prepare_finalize_funder_outcome(&publications[..count], index)?
+                        != funder_outcomes[seen_funders]
+                {
+                    return Err(SupportLedgerError::Generation);
+                }
+                seen_funders += 1;
+            }
+        }
+        (seen_owners == owner_count && seen_funders == funder_count)
+            .then_some(())
+            .ok_or(SupportLedgerError::Generation)
+    }
+
+    pub(crate) fn commit_finalize_records(&mut self, change: &PreparedLifecycleFinalize) {
+        let total = usize::from(change.total);
+        for ordinal in 0..total {
+            self.lifecycle.assign_slot_tag_direct(
+                change.references[ordinal],
+                change.occupied_tags_after[ordinal],
+            );
+        }
+        self.lifecycle
+            .assign_header_direct(change.arena_header_after);
+        for update in &change.raw_updates[..total * 2] {
+            self.raw.replace_value_direct(update.handle, update.after);
+        }
+        let raw_header = change
+            .raw_generation_plan
+            .assignments()
+            .first()
+            .expect("sealed Raw generation assignment");
+        self.raw.commit_assignment_direct(raw_header);
+    }
+
+    pub(super) fn commit_finalize_owner_sets(
+        &mut self,
+        change: &PreparedLifecycleFinalize,
+        owner_outcomes: &[LifecycleOwnerOutcome],
+        funder_outcomes: &[LifecycleFunderOutcome],
+    ) {
+        for outcome in owner_outcomes {
+            let row = self.owner_rows.image_mut_slot_direct(outcome.owner_slot);
+            write_u32(row, OWNER_ROW_LINKED_CLAIMS, outcome.linked_after);
+            write_u64(row, OWNER_ROW_CURRENT, outcome.current_after);
+            for (branch, after) in outcome.branches_after.into_iter().enumerate() {
+                write_u64(row, OWNER_ROW_BRANCH_CURRENT + branch * 8, after);
+            }
+            write_u32(
+                self.owners.image_mut_slot_direct(outcome.owner_slot),
+                OWNER_IMAGE_LINKED_CLAIMS,
+                outcome.linked_after,
+            );
+        }
+        for outcome in funder_outcomes {
+            write_u64(
+                self.funders.image_mut_prevalidated(outcome.reference),
+                112,
+                outcome.current_after,
+            );
+        }
+        self.owner_rows
+            .assign_header_direct(change.publication_arena_headers_after[0]);
+        self.owners
+            .assign_header_direct(change.publication_arena_headers_after[1]);
+        self.funders
+            .assign_header_direct(change.publication_arena_headers_after[2]);
+    }
+
+    pub(crate) fn complete_finalize_batch(&mut self, change: PreparedLifecycleFinalize) {
+        self.pending = change.pending_after;
+        write_u64(&mut self.header.0, 48, change.generation_after);
+    }
 }
