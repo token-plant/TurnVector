@@ -1434,4 +1434,395 @@ impl<const K: usize, const V: usize> ReusablePatricia<K, V> {
             &image[..stored_width],
         )
     }
+
+    fn shadow_set_branch<const N: usize>(
+        &self,
+        plan: &mut PatriciaAssignmentPlan<N>,
+        index: usize,
+        image: &[u8; BRANCH_SLOT_BYTES],
+    ) -> Result<(), FixedStorageError> {
+        let slot = u32::try_from(index).map_err(|_| FixedStorageError::Capacity)?;
+        let expected = plan.image(DestinationKind::Branch, slot).map_or_else(
+            || read_u32(self.branch_bytes_at(index), 4) as u64,
+            |prior| read_u32(prior, 4) as u64,
+        );
+        plan.set(DestinationKind::Branch, slot, expected, image)
+    }
+
+    fn shadow_locate<const N: usize>(
+        &self,
+        plan: &PatriciaAssignmentPlan<N>,
+        root: NodeHandle,
+        key: &[u8; K],
+    ) -> Result<(NodeHandle, Option<u16>), FixedStorageError> {
+        let mut handle = root;
+        let mut parent = NodeHandle::SENTINEL;
+        let mut prior = None;
+        loop {
+            match node_tag(handle.node()) {
+                LEAF_TAG => {
+                    let slot = self.shadow_leaf(plan, handle)?;
+                    if read_handle(&slot, 8) != parent {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    return Ok((handle, prior));
+                }
+                BRANCH_TAG => {
+                    let slot = self.shadow_branch(plan, handle)?;
+                    if read_handle(&slot, 8) != parent {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    let bit = read_u16(&slot, 16);
+                    if bit as usize >= K * 8 || prior.is_some_and(|value| value >= bit) {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    let children = [read_handle(&slot, 24), read_handle(&slot, 32)];
+                    if children[0] == children[1]
+                        || children[0].is_sentinel()
+                        || children[1].is_sentinel()
+                    {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    parent = handle;
+                    prior = Some(bit);
+                    handle = children[key_bit(key, bit)];
+                }
+                _ => return Err(FixedStorageError::NonCanonical),
+            }
+        }
+    }
+
+    fn shadow_insertion_point<const N: usize>(
+        &self,
+        plan: &PatriciaAssignmentPlan<N>,
+        root: NodeHandle,
+        key: &[u8; K],
+        bit: u16,
+    ) -> Result<(NodeHandle, NodeHandle), FixedStorageError> {
+        let mut parent = NodeHandle::SENTINEL;
+        let mut child = root;
+        let mut prior = None;
+        while node_tag(child.node()) == BRANCH_TAG {
+            let slot = self.shadow_branch(plan, child)?;
+            if read_handle(&slot, 8) != parent {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let child_bit = read_u16(&slot, 16);
+            if child_bit as usize >= K * 8 || prior.is_some_and(|value| value >= child_bit) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            if child_bit >= bit {
+                break;
+            }
+            let children = [read_handle(&slot, 24), read_handle(&slot, 32)];
+            parent = child;
+            prior = Some(child_bit);
+            child = children[key_bit(key, child_bit)];
+        }
+        Ok((parent, child))
+    }
+
+    fn shadow_removal_path<const N: usize>(
+        &self,
+        plan: &PatriciaAssignmentPlan<N>,
+        root: NodeHandle,
+        key: &[u8; K],
+    ) -> Result<RemovalPath, FixedStorageError> {
+        let mut grandparent = NodeHandle::SENTINEL;
+        let mut parent = NodeHandle::SENTINEL;
+        let mut sibling = NodeHandle::SENTINEL;
+        let mut leaf = root;
+        let mut prior = None;
+        while node_tag(leaf.node()) == BRANCH_TAG {
+            let slot = self.shadow_branch(plan, leaf)?;
+            if read_handle(&slot, 8) != parent {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let bit = read_u16(&slot, 16);
+            if bit as usize >= K * 8 || prior.is_some_and(|value| value >= bit) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let children = [read_handle(&slot, 24), read_handle(&slot, 32)];
+            let selected = key_bit(key, bit);
+            grandparent = parent;
+            parent = leaf;
+            sibling = children[1 - selected];
+            leaf = children[selected];
+            prior = Some(bit);
+        }
+        self.shadow_leaf(plan, leaf)?;
+        Ok(RemovalPath {
+            grandparent,
+            parent,
+            sibling,
+            leaf,
+        })
+    }
+
+    fn shadow_set_parent<const N: usize>(
+        &self,
+        plan: &mut PatriciaAssignmentPlan<N>,
+        child: NodeHandle,
+        parent: NodeHandle,
+    ) -> Result<(), FixedStorageError> {
+        match node_tag(child.node()) {
+            LEAF_TAG => {
+                let index = leaf_index(child)?;
+                let mut image = self.shadow_leaf(plan, child)?;
+                write_handle(&mut image, 8, parent);
+                self.shadow_set_leaf(plan, index, &image)
+            }
+            BRANCH_TAG => {
+                let index = branch_index(child)?;
+                let mut image = self.shadow_branch(plan, child)?;
+                write_handle(&mut image, 8, parent);
+                self.shadow_set_branch(plan, index, &image)
+            }
+            _ => Err(FixedStorageError::NonCanonical),
+        }
+    }
+
+    fn shadow_replace_child<const N: usize>(
+        &self,
+        plan: &mut PatriciaAssignmentPlan<N>,
+        parent: NodeHandle,
+        before: NodeHandle,
+        after: NodeHandle,
+    ) -> Result<(), FixedStorageError> {
+        let index = branch_index(parent)?;
+        let mut image = self.shadow_branch(plan, parent)?;
+        let offset = if read_handle(&image, 24) == before {
+            24
+        } else if read_handle(&image, 32) == before {
+            32
+        } else {
+            return Err(FixedStorageError::NonCanonical);
+        };
+        write_handle(&mut image, offset, after);
+        self.shadow_set_branch(plan, index, &image)
+    }
+
+    pub(crate) fn insert_batch_prevalidated(&mut self, entries: &[([u8; K], [u8; V])]) {
+        self.validate_insert_batch(entries)
+            .expect("validated Patricia insertion batch");
+        let before = self.header.generation;
+        for (key, value) in entries.iter().copied() {
+            self.insert(key, value)
+                .expect("prevalidated Patricia insertion");
+            self.header.generation = before;
+        }
+        self.header.generation = before
+            .checked_add(1)
+            .expect("validated Patricia generation");
+    }
+
+    /// Validates a strictly key-sorted insertion stream without retaining a
+    /// second hot-path buffer. The exact count seals both free backings, and a
+    /// single index-generation increment covers the later batch commit.
+    pub(crate) fn validate_insert_stream(
+        &self,
+        entries: impl IntoIterator<Item = ([u8; K], [u8; V])>,
+        count: usize,
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if count == 0
+            || count > self.header.free_leaf_len as usize
+            || count
+                > self.header.free_branch_len as usize + usize::from(self.header.root.is_sentinel())
+        {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let mut previous = None;
+        let mut seen = 0usize;
+        for (key, _) in entries {
+            if seen >= count {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            if previous.is_some_and(|prior| prior >= key) {
+                return Err(FixedStorageError::Duplicate);
+            }
+            if self.find(&key)?.is_some() {
+                return Err(FixedStorageError::Duplicate);
+            }
+            let position = self.header.free_leaf_len as usize - 1 - seen;
+            let slot_index = read_u32(&self.free_leaves, position * 4) as usize;
+            let slot = self.leaf_bytes_at(slot_index);
+            if slot[0] != 0 || read_u32(slot, 8) as usize != position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            read_u32(slot, 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+            previous = Some(key);
+            seen += 1;
+        }
+        if seen != count {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let branches = count
+            .checked_sub(usize::from(self.header.root.is_sentinel()))
+            .ok_or(FixedStorageError::NonCanonical)?;
+        for index in 0..branches {
+            let position = self.header.free_branch_len as usize - 1 - index;
+            let slot_index = read_u32(&self.free_branches, position * 4) as usize;
+            let slot = self.branch_bytes_at(slot_index);
+            if slot[0] != 0 || read_u32(slot, 8) as usize != position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            read_u32(slot, 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_stream_prevalidated(
+        &mut self,
+        entries: impl IntoIterator<Item = ([u8; K], [u8; V])>,
+        count: usize,
+    ) {
+        let before = self.header.generation;
+        let mut seen = 0usize;
+        for (key, value) in entries {
+            assert!(seen < count, "prevalidated Patricia stream count");
+            self.insert(key, value)
+                .expect("prevalidated Patricia stream insertion");
+            self.header.generation = before;
+            seen += 1;
+        }
+        assert_eq!(seen, count, "prevalidated Patricia stream count");
+        self.header.generation = before
+            .checked_add(1)
+            .expect("validated Patricia generation");
+    }
+
+    pub(crate) fn value_at(&self, handle: NodeHandle) -> Result<[u8; V], FixedStorageError> {
+        let slot = self.leaf_slot(handle)?;
+        let mut value = [0; V];
+        value.copy_from_slice(&slot[16 + K..16 + K + V]);
+        Ok(value)
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: [u8; K],
+        value: [u8; V],
+    ) -> Result<NodeHandle, FixedStorageError> {
+        self.validate_header()?;
+        let next_generation = self
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let empty = self.header.root.is_sentinel();
+        let terminal = if empty {
+            None
+        } else {
+            let (leaf, _) = self.locate(&key)?;
+            let slot = self.leaf_slot(leaf)?;
+            if slot[16..16 + K] == key {
+                return Err(FixedStorageError::Duplicate);
+            }
+            Some(leaf)
+        };
+        let leaf_index = self.selected_free_leaf()?;
+        let leaf_generation = read_u32(self.leaf_bytes_at(leaf_index), 4)
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let leaf_handle = NodeHandle::new(leaf_index as u32 | LEAF_TAG, leaf_generation);
+        if empty {
+            self.pop_free_leaf(leaf_index)?;
+            self.write_leaf_occupied(
+                leaf_index,
+                leaf_generation,
+                NodeHandle::SENTINEL,
+                &key,
+                &value,
+            );
+            self.header.root = leaf_handle;
+        } else {
+            let terminal = terminal.expect("nonempty Patricia has a terminal leaf");
+            let peer = self.leaf_slot(terminal)?;
+            let bit = first_difference(&key, &peer[16..16 + K])?;
+            let (parent, child) = self.insertion_point(&key, bit)?;
+            let branch_index = self.selected_free_branch()?;
+            let branch_generation = read_u32(self.branch_bytes_at(branch_index), 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+            let branch_handle =
+                NodeHandle::new(branch_index as u32 | BRANCH_TAG, branch_generation);
+            self.pop_free_leaf(leaf_index)?;
+            self.pop_free_branch(branch_index)?;
+            let children = if key_bit(&key, bit) == 0 {
+                [leaf_handle, child]
+            } else {
+                [child, leaf_handle]
+            };
+            self.write_leaf_occupied(leaf_index, leaf_generation, branch_handle, &key, &value);
+            self.write_branch_occupied(branch_index, branch_generation, parent, bit, children);
+            self.set_parent(child, branch_handle)?;
+            if parent.is_sentinel() {
+                self.header.root = branch_handle;
+            } else {
+                self.replace_child(parent, child, branch_handle)?;
+            }
+        }
+        self.header.occupied = self
+            .header
+            .occupied
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        self.header.generation = next_generation;
+        Ok(leaf_handle)
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        key: &[u8; K],
+        expected: NodeHandle,
+        value: [u8; V],
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        let found = self
+            .find_handle(key)?
+            .ok_or(FixedStorageError::NonCanonical)?;
+        if found != expected {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let next_generation = self
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let index = leaf_index(found)?;
+        self.leaf_bytes_at_mut(index)[16 + K..16 + K + V].copy_from_slice(&value);
+        self.header.generation = next_generation;
+        Ok(())
+    }
+
+    pub(crate) fn validate_update_batch(
+        &self,
+        entries: &[([u8; K], NodeHandle, [u8; V])],
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if entries.is_empty() {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        for (index, (key, expected, _)) in entries.iter().enumerate() {
+            if entries[..index].iter().any(|(prior, _, _)| prior == key)
+                || self.find_handle(key)? != Some(*expected)
+            {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        Ok(())
+    }
 }
