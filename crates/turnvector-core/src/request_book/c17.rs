@@ -620,3 +620,399 @@ struct SourceRecord {
     create_event: EventRecordRef,
     consumed_event: EventRecordRef,
 }
+
+impl SourceRecord {
+    fn normalized_eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.kind == other.kind
+            && self.initial_kind == other.initial_kind
+            && self.cancellation_kind == other.cancellation_kind
+            && self.request.key == other.request.key
+            && self.accepted_identity == other.accepted_identity
+            && self.domain == other.domain
+            && self.previous_anchor == other.previous_anchor
+            && self.occurred_at == other.occurred_at
+            && self.cancellation_fact == other.cancellation_fact
+    }
+
+    fn canonical(&self) -> bool {
+        let lifecycle = match (self.kind, self.state) {
+            (SourceKind::InitialReady, SourceStateTag::InitialCreated) => {
+                !self.create_event.is_absent() && self.consumed_event.is_absent()
+            }
+            (SourceKind::NewlyEligible, SourceStateTag::Pending) => {
+                self.create_event.is_absent() && self.consumed_event.is_absent()
+            }
+            (SourceKind::NewlyEligible, SourceStateTag::Consumed)
+            | (SourceKind::Cancellation, SourceStateTag::Consumed) => {
+                self.create_event.is_absent() && !self.consumed_event.is_absent()
+            }
+            _ => false,
+        };
+        self.key[0] == self.kind as u8
+            && self.key[1..] == self.accepted_identity
+            && self.accepted_identity != [0; 32]
+            && self.request.canonical()
+            && self.previous_anchor.canonical()
+            && event_ref_canonical(self.create_event)
+            && event_ref_canonical(self.consumed_event)
+            && self.occurred_at > 0
+            && lifecycle
+            && match self.kind {
+                SourceKind::InitialReady => {
+                    matches!(self.initial_kind, 1 | 2)
+                        && self.cancellation_kind == 0
+                        && self.domain != [0; 16]
+                        && self.previous_anchor.is_absent()
+                        && self.cancellation_fact == 0
+                }
+                SourceKind::NewlyEligible => {
+                    self.initial_kind == 0
+                        && self.cancellation_kind == 0
+                        && self.domain == [0; 16]
+                        && !self.previous_anchor.is_absent()
+                        && self.cancellation_fact == 0
+                }
+                SourceKind::Cancellation => {
+                    self.initial_kind == 0
+                        && matches!(self.cancellation_kind, 1..=4)
+                        && self.domain == [0; 16]
+                        && !self.previous_anchor.is_absent()
+                        && self.cancellation_fact > 0
+                }
+            }
+    }
+
+    fn encode(&self) -> Result<[u8; SOURCE_IMAGE_BYTES], RequestError> {
+        if !self.canonical() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut bytes = [0; SOURCE_IMAGE_BYTES];
+        bytes[8..41].copy_from_slice(&self.key);
+        bytes[41] = self.kind as u8;
+        bytes[42] = self.initial_kind;
+        bytes[43] = self.cancellation_kind;
+        bytes[44] = self.state as u8;
+        bytes[48..104].copy_from_slice(&self.request.encode());
+        bytes[104..136].copy_from_slice(&self.accepted_identity);
+        bytes[136..152].copy_from_slice(&self.domain);
+        bytes[152..216].copy_from_slice(&self.previous_anchor.0);
+        write_u64(&mut bytes, 216, self.occurred_at);
+        write_u64(&mut bytes, 224, self.cancellation_fact);
+        encode_event_ref(&mut bytes[232..240], self.create_event);
+        encode_event_ref(&mut bytes[240..248], self.consumed_event);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8; SOURCE_IMAGE_BYTES]) -> Result<Self, RequestError> {
+        if bytes[45..48].iter().any(|byte| *byte != 0) || bytes[248..].iter().any(|byte| *byte != 0)
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut key = [0; 33];
+        key.copy_from_slice(&bytes[8..41]);
+        let kind = match bytes[41] {
+            1 => SourceKind::InitialReady,
+            2 => SourceKind::NewlyEligible,
+            3 => SourceKind::Cancellation,
+            _ => return Err(RequestError::Storage(FixedStorageError::NonCanonical)),
+        };
+        let state = match bytes[44] {
+            0 => SourceStateTag::Pending,
+            1 => SourceStateTag::InitialCreated,
+            2 => SourceStateTag::Consumed,
+            _ => return Err(RequestError::Storage(FixedStorageError::NonCanonical)),
+        };
+        let mut identity = [0; 32];
+        identity.copy_from_slice(&bytes[104..136]);
+        let mut domain = [0; 16];
+        domain.copy_from_slice(&bytes[136..152]);
+        let mut anchor = [0; 64];
+        anchor.copy_from_slice(&bytes[152..216]);
+        let value = Self {
+            key,
+            kind,
+            initial_kind: bytes[42],
+            cancellation_kind: bytes[43],
+            state,
+            request: RequestAddress::decode(&bytes[48..104])?,
+            accepted_identity: identity,
+            domain,
+            previous_anchor: SupportMembershipAnchor(anchor),
+            occurred_at: read_u64(bytes, 216),
+            cancellation_fact: read_u64(bytes, 224),
+            create_event: decode_event_ref(&bytes[232..240])?,
+            consumed_event: decode_event_ref(&bytes[240..248])?,
+        };
+        value
+            .canonical()
+            .then_some(value)
+            .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MembershipEventRecord {
+    pub(crate) id: u64,
+    pub(crate) kind: MembershipEventKind,
+    pub(crate) source_count: u8,
+    pub(crate) member_count: u8,
+    pub(crate) consumed_by_support: bool,
+    pub(crate) sources: [SourceRecordRef; 3],
+    pub(crate) affected: [Option<RequestAddress>; 4],
+    pub(crate) before: [Option<MembershipStateRow>; 4],
+    pub(crate) after: [Option<MembershipStateRow>; 4],
+    pub(crate) generation_before: u64,
+    pub(crate) generation_after: u64,
+    pub(crate) occurred_at: u64,
+    pub(crate) cancellation_fact: u64,
+}
+
+impl MembershipEventRecord {
+    fn canonical(&self) -> bool {
+        let source_count = match self.kind {
+            MembershipEventKind::CreateStandalone | MembershipEventKind::Join => {
+                self.source_count == 1
+            }
+            MembershipEventKind::MergeInitial => (2..=3).contains(&self.source_count),
+            MembershipEventKind::Rebind => self.source_count <= 1,
+            MembershipEventKind::Split
+            | MembershipEventKind::Merge
+            | MembershipEventKind::Close => self.source_count == 0,
+            MembershipEventKind::CancellationRemove => (1..=2).contains(&self.source_count),
+        };
+        let member_count = usize::from(self.member_count);
+        let member_shape = match self.kind {
+            MembershipEventKind::CreateStandalone => member_count == 1,
+            MembershipEventKind::CancellationRemove => (1..=4).contains(&member_count),
+            MembershipEventKind::MergeInitial => (2..=3).contains(&member_count),
+            MembershipEventKind::Join | MembershipEventKind::Split | MembershipEventKind::Merge => {
+                (2..=4).contains(&member_count)
+            }
+            MembershipEventKind::Rebind | MembershipEventKind::Close => {
+                (1..=4).contains(&member_count)
+            }
+        };
+        self.id > 0
+            && source_count
+            && member_shape
+            && self.sources[..usize::from(self.source_count)]
+                .iter()
+                .all(|reference| !reference.is_absent() && source_ref_canonical(*reference))
+            && self.sources[..usize::from(self.source_count)]
+                .iter()
+                .enumerate()
+                .all(|(index, reference)| {
+                    !self.sources[..index].iter().any(|prior| prior == reference)
+                })
+            && self.sources[usize::from(self.source_count)..]
+                .iter()
+                .all(|reference| reference.is_absent())
+            && self.affected[..member_count]
+                .iter()
+                .all(|address| address.is_some_and(RequestAddress::canonical))
+            && self.before[..member_count]
+                .iter()
+                .chain(&self.after[..member_count])
+                .all(|row| row.is_some_and(MembershipStateRow::canonical))
+            && self.affected[..member_count]
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && self.affected[member_count..].iter().all(Option::is_none)
+            && self.before[member_count..]
+                .iter()
+                .chain(&self.after[member_count..])
+                .all(Option::is_none)
+            && self.generation_after == self.generation_before.checked_add(1).unwrap_or(0)
+            && self.occurred_at > 0
+            && self.consumed_by_support
+            && match self.kind {
+                MembershipEventKind::CancellationRemove => self.cancellation_fact > 0,
+                _ => self.cancellation_fact == 0,
+            }
+    }
+
+    fn encode(&self) -> Result<[u8; EVENT_IMAGE_BYTES], RequestError> {
+        if !self.canonical() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut bytes = [0; EVENT_IMAGE_BYTES];
+        write_u64(&mut bytes, 8, self.id);
+        bytes[16] = self.kind as u8;
+        bytes[17] = self.source_count;
+        bytes[18] = self.member_count;
+        bytes[19] = u8::from(self.consumed_by_support);
+        for (index, reference) in self.sources.iter().copied().enumerate() {
+            encode_source_ref(&mut bytes[24 + index * 8..32 + index * 8], reference);
+        }
+        let mut offset = 48;
+        for address in self.affected {
+            if let Some(address) = address {
+                bytes[offset..offset + 56].copy_from_slice(&address.encode());
+            }
+            offset += 56;
+        }
+        for rows in [self.before, self.after] {
+            for row in rows {
+                if let Some(row) = row {
+                    bytes[offset..offset + MEMBERSHIP_BYTES].copy_from_slice(&row.encode()?);
+                }
+                offset += MEMBERSHIP_BYTES;
+            }
+        }
+        write_u64(&mut bytes, 1_168, self.generation_before);
+        write_u64(&mut bytes, 1_176, self.generation_after);
+        write_u64(&mut bytes, 1_184, self.occurred_at);
+        write_u64(&mut bytes, 1_192, self.cancellation_fact);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8; EVENT_IMAGE_BYTES]) -> Result<Self, RequestError> {
+        if bytes[20..24].iter().any(|byte| *byte != 0)
+            || bytes[1_200..].iter().any(|byte| *byte != 0)
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let kind = match bytes[16] {
+            1 => MembershipEventKind::CreateStandalone,
+            2 => MembershipEventKind::MergeInitial,
+            3 => MembershipEventKind::Join,
+            4 => MembershipEventKind::Rebind,
+            5 => MembershipEventKind::Split,
+            6 => MembershipEventKind::Merge,
+            7 => MembershipEventKind::CancellationRemove,
+            8 => MembershipEventKind::Close,
+            _ => return Err(RequestError::Storage(FixedStorageError::NonCanonical)),
+        };
+        let source_count = bytes[17];
+        let member_count = bytes[18];
+        let consumed_by_support = match bytes[19] {
+            0 => false,
+            1 => true,
+            _ => return Err(RequestError::Storage(FixedStorageError::NonCanonical)),
+        };
+        let mut sources = [SourceRecordRef::ABSENT; 3];
+        for (index, reference) in sources.iter_mut().enumerate() {
+            *reference = decode_source_ref(&bytes[24 + index * 8..32 + index * 8])?;
+        }
+        let active = usize::from(member_count);
+        if active > 4 {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut affected = [None; 4];
+        let mut offset = 48;
+        for (index, address) in affected.iter_mut().enumerate() {
+            let image = &bytes[offset..offset + REQUEST_VALUE_BYTES];
+            if index < active {
+                *address = Some(RequestAddress::decode(image)?);
+            } else if image.iter().any(|byte| *byte != 0) {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            offset += REQUEST_VALUE_BYTES;
+        }
+        let mut before = [None; 4];
+        let mut after = [None; 4];
+        for rows in [&mut before, &mut after] {
+            for (index, row) in rows.iter_mut().enumerate() {
+                let image = &bytes[offset..offset + MEMBERSHIP_BYTES];
+                if index < active {
+                    *row = Some(MembershipStateRow::decode(image)?);
+                } else if image.iter().any(|byte| *byte != 0) {
+                    return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                }
+                offset += MEMBERSHIP_BYTES;
+            }
+        }
+        debug_assert_eq!(offset, 1_168);
+        let event = Self {
+            id: read_u64(bytes, 8),
+            kind,
+            source_count,
+            member_count,
+            consumed_by_support,
+            sources,
+            affected,
+            before,
+            after,
+            generation_before: read_u64(bytes, 1_168),
+            generation_after: read_u64(bytes, 1_176),
+            occurred_at: read_u64(bytes, 1_184),
+            cancellation_fact: read_u64(bytes, 1_192),
+        };
+        event
+            .canonical()
+            .then_some(event)
+            .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct PreparedRequestInstall {
+    expected_request_header: ByteArenaHeaderImage,
+    request_header_after: ByteArenaHeaderImage,
+    selection: ArenaSelection<1>,
+    address: RequestAddress,
+    slot_image: [u8; REQUEST_IMAGE_BYTES],
+    index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    header_after: RequestBookC17HeaderImage,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PreparedRequestDirectImages {
+    generation_after: RequestBookGeneration,
+    expected_arena_headers: [ByteArenaHeaderImage; 3],
+    arena_headers_after: [ByteArenaHeaderImage; 3],
+    source_update: Option<(ArenaRef, [u8; SOURCE_IMAGE_BYTES])>,
+    source_install: Option<(ArenaRef, [u8; SOURCE_IMAGE_BYTES])>,
+    event_install: Option<(ArenaRef, [u8; EVENT_IMAGE_BYTES])>,
+    request_slots: [Option<(ArenaRef, [u8; REQUEST_IMAGE_BYTES], RequestStatusVersion)>; 4],
+    header_after: RequestBookC17HeaderImage,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedNewlyEligible {
+    expected_generation: u64,
+    request: RequestAddress,
+    before: MembershipStateRow,
+    after_status: u64,
+    source: SourceRecord,
+    source_selection: ArenaSelection<1>,
+    source_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    request_index_plan: PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>,
+    direct: PreparedRequestDirectImages,
+}
+
+impl PreparedNewlyEligible {
+    pub(crate) const fn generation_after(&self) -> RequestBookGeneration {
+        self.direct.generation_after
+    }
+
+    pub(crate) const fn request(&self) -> RequestAddress {
+        self.request
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.source_index_plan.visit_assignments(visitor);
+        self.request_index_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedCancellation {
+    expected_generation: u64,
+    request: RequestAddress,
+    before: MembershipStateRow,
+    after_status: [u64; 4],
+    cancellation: SourceRecord,
+    pending: Option<(SourceRecordRef, SourceRecord, SourceRecord)>,
+    source_selection: ArenaSelection<1>,
+    event_selection: ArenaSelection<1>,
+    event: MembershipEventRecord,
+    source_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    event_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    request_index_plan: PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>,
+    direct: PreparedRequestDirectImages,
+}
