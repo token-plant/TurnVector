@@ -4458,3 +4458,396 @@ pub(super) struct LifecycleFunderOutcome {
     reference: ArenaRef,
     current_after: u64,
 }
+
+impl LifecycleFunderOutcome {
+    pub(super) const ZERO: Self = Self {
+        reference: ArenaRef {
+            slot: 0,
+            generation: 0,
+        },
+        current_after: 0,
+    };
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedLifecycleFinalize {
+    expected_c17: u64,
+    generation_after: u64,
+    expected_raw: u64,
+    expected_arena_header: ByteArenaHeaderImage,
+    arena_header_after: ByteArenaHeaderImage,
+    expected_publication_arena_headers: [ByteArenaHeaderImage; 3],
+    publication_arena_headers_after: [ByteArenaHeaderImage; 3],
+    batch: u64,
+    total: u16,
+    expected_support: SupportLedgerGeneration,
+    aggregate: LifecycleAggregate,
+    pending_before: PendingLifecycleHeaderImage,
+    pending_after: PendingLifecycleHeaderImage,
+    references: [ArenaRef; LIFECYCLE_BATCH_MAX],
+    occupied_tags_after: [u8; LIFECYCLE_BATCH_MAX],
+    raw_updates: [LifecycleRawUpdate; 2 * LIFECYCLE_BATCH_MAX],
+    raw_generation_plan: PatriciaAssignmentPlan<RAW_GENERATION_ASSIGNMENTS>,
+    publication_count: usize,
+}
+
+impl PreparedLifecycleFinalize {
+    pub(crate) const fn aggregate(&self) -> LifecycleAggregate {
+        self.aggregate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_generation_assignment_for_test(&self) -> Assignment {
+        assert_eq!(self.raw_generation_plan.assignments().len(), 1);
+        self.raw_generation_plan.assignments()[0]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn corrupt_raw_generation_assignment_for_test(&mut self) {
+        self.raw_generation_plan
+            .corrupt_first_assignment_payload_for_test();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedLifecycleAbort {
+    expected_c17: u64,
+    generation_after: u64,
+    expected_raw: u64,
+    expected_arena_header: ByteArenaHeaderImage,
+    arena_header_after: ByteArenaHeaderImage,
+    batch: u64,
+    first: usize,
+    len: usize,
+    references: [ArenaRef; LIFECYCLE_CHUNK_MAX],
+    free_positions: [u32; LIFECYCLE_CHUNK_MAX],
+    vacant_images: [[u8; LIFECYCLE_BYTES]; LIFECYCLE_CHUNK_MAX],
+    free_cell_images: [ByteArenaFreeCellImage; LIFECYCLE_CHUNK_MAX],
+    raw_keys: [[u8; 32]; 2 * LIFECYCLE_CHUNK_MAX],
+    raw_count: usize,
+    pending_after: PendingLifecycleHeaderImage,
+    raw_plan: PatriciaAssignmentPlan<RAW_ASSIGNMENT_MAX>,
+}
+
+impl PreparedLifecycleAbort {
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.raw_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum RawOwnerKind {
+    LegacyObligation = 1,
+    LegacyCredit = 2,
+    C16Bundle = 3,
+    C16Entitlement = 4,
+    C16Claim = 5,
+    PlanRoot = 6,
+    Formation = 7,
+    Funder = 8,
+    LifecycleObligation = 9,
+    LifecycleCredit = 10,
+    Tombstone = 11,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum RawOwnerState {
+    Inactive = 1,
+    Committed = 2,
+    Retained = 3,
+    Tombstone = 4,
+}
+
+fn legacy_insert_stream<F>(
+    record_count: usize,
+    record: F,
+) -> impl Iterator<Item = ([u8; 32], [u8; 8])>
+where
+    F: Fn(usize) -> (usize, [u8; 32], [u8; 32]) + Copy,
+{
+    let mut obligation = 0usize;
+    let mut credit = 0usize;
+    std::iter::from_fn(move || {
+        if obligation == record_count && credit == record_count {
+            return None;
+        }
+        let take_obligation = if obligation == record_count {
+            false
+        } else if credit == record_count {
+            true
+        } else {
+            record(obligation).1 <= record(credit).2
+        };
+        let index = if take_obligation {
+            let index = obligation;
+            obligation += 1;
+            index
+        } else {
+            let index = credit;
+            credit += 1;
+            index
+        };
+        let (slot, obligation_key, credit_key) = record(index);
+        let owner = ArenaRef {
+            slot: u32::try_from(slot).expect("prevalidated legacy slot"),
+            generation: 1,
+        };
+        let (key, kind) = if take_obligation {
+            (obligation_key, RawOwnerKind::LegacyObligation)
+        } else {
+            (credit_key, RawOwnerKind::LegacyCredit)
+        };
+        Some((
+            key,
+            encode_raw_owner(kind, RawOwnerState::Committed, owner)
+                .expect("prevalidated legacy Raw owner"),
+        ))
+    })
+}
+
+fn legacy_update_stream<F>(
+    record_count: usize,
+    record: F,
+) -> impl Iterator<Item = ([u8; 32], [u8; 8])>
+where
+    F: Fn(usize) -> (usize, [u8; 32], [u8; 32], bool) + Copy,
+{
+    let mut obligation = 0usize;
+    let mut credit = 0usize;
+    std::iter::from_fn(move || {
+        if obligation == record_count && credit == record_count {
+            return None;
+        }
+        let take_obligation = if obligation == record_count {
+            false
+        } else if credit == record_count {
+            true
+        } else {
+            record(obligation).1 <= record(credit).2
+        };
+        let index = if take_obligation {
+            let index = obligation;
+            obligation += 1;
+            index
+        } else {
+            let index = credit;
+            credit += 1;
+            index
+        };
+        let (slot, obligation_key, credit_key, retained) = record(index);
+        let owner = ArenaRef {
+            slot: u32::try_from(slot).expect("prevalidated legacy slot"),
+            generation: 1,
+        };
+        let (key, kind) = if take_obligation {
+            (obligation_key, RawOwnerKind::LegacyObligation)
+        } else {
+            (credit_key, RawOwnerKind::LegacyCredit)
+        };
+        let state = if retained {
+            RawOwnerState::Retained
+        } else {
+            RawOwnerState::Committed
+        };
+        Some((
+            key,
+            encode_raw_owner(kind, state, owner).expect("prevalidated legacy Raw owner"),
+        ))
+    })
+}
+
+fn c16_raw_kind(ordinal: usize) -> Result<RawOwnerKind, SupportLedgerError> {
+    match ordinal {
+        0..=5 => Ok(RawOwnerKind::C16Bundle),
+        6..=8 => Ok(RawOwnerKind::C16Claim),
+        9..=10 => Ok(RawOwnerKind::C16Entitlement),
+        _ => Err(noncanonical_error()),
+    }
+}
+
+fn encode_c16_owner_set(
+    record_slot: u32,
+    owner_generation: u64,
+    references: [ArenaRef; 4],
+    record: &BundleRecord,
+    cells: &[OutstandingCreditCell],
+) -> Result<C16OwnerSetImages, SupportLedgerError> {
+    let vector_len = u16::try_from(cells.len()).map_err(|_| capacity_error())?;
+    if cells.is_empty()
+        || cells.len() != record.vector_len as usize
+        || owner_generation == 0
+        || references.iter().any(|reference| reference.generation == 0)
+    {
+        return Err(SupportLedgerError::InvalidInput);
+    }
+    let mut header = OwnerHeaderImage::ZERO.0;
+    header[8] = OWNER_STATE_LIVE;
+    header[9] = C16_RAW_OWNERS as u8;
+    write_u32(&mut header, OWNER_HEADER_RECORD, record_slot);
+    write_u64(&mut header, OWNER_HEADER_GENERATION, owner_generation);
+    header[OWNER_HEADER_REQUEST..OWNER_HEADER_REQUEST + 40]
+        .copy_from_slice(&crate::request_book::c17::request_key(record.request_owner));
+    header[OWNER_HEADER_ENTITLEMENT..OWNER_HEADER_ENTITLEMENT + 32]
+        .copy_from_slice(&record.entitlement.get());
+    header[OWNER_HEADER_VECTOR..OWNER_HEADER_VECTOR + 32].copy_from_slice(&record.vector.get());
+
+    let mut row = OwnerRowImage::ZERO.0;
+    row[8] = OWNER_STATE_LIVE;
+    row[9] = C16_RAW_OWNERS as u8;
+    write_u16(&mut row, OWNER_ROW_VECTOR_LEN, vector_len);
+    write_u32(&mut row, OWNER_ROW_RECORD, record_slot);
+    write_u64(&mut row, OWNER_ROW_GENERATION, owner_generation);
+
+    let mut index = OwnerIndexImage::ZERO.0;
+    for (ordinal, reference) in references.into_iter().enumerate() {
+        encode_arena_ref(&mut index[8 + ordinal * 8..16 + ordinal * 8], reference);
+    }
+    write_u32(&mut index, 40, record_slot);
+    write_u64(&mut index, 48, owner_generation);
+    write_u16(&mut index, 56, vector_len);
+    index[OWNER_INDEX_STATE] = OWNER_STATE_LIVE;
+    index[59] = C16_RAW_OWNERS as u8;
+
+    let mut owner = OwnerImage::ZERO.0;
+    owner[OWNER_IMAGE_STATE] = OWNER_STATE_LIVE;
+    owner[9] = C16_RAW_OWNERS as u8;
+    write_u16(&mut owner, 10, vector_len);
+    write_u32(&mut owner, OWNER_IMAGE_RECORD, record_slot);
+    write_u16(&mut owner, OWNER_IMAGE_VECTOR_LEN, vector_len);
+    for (ordinal, reference) in references.into_iter().enumerate() {
+        encode_arena_ref(&mut owner[32 + ordinal * 8..40 + ordinal * 8], reference);
+    }
+    owner[64..96].copy_from_slice(&record.entitlement.get());
+    owner[96..128].copy_from_slice(&record.vector.get());
+    Ok(C16OwnerSetImages {
+        header,
+        row,
+        index,
+        owner,
+    })
+}
+
+fn tombstone_owner_images(mut images: C16OwnerSetImages) -> C16OwnerSetImages {
+    images.header[8] = OWNER_STATE_TOMBSTONE;
+    images.row[8] = OWNER_STATE_TOMBSTONE;
+    images.index[OWNER_INDEX_STATE] = OWNER_STATE_TOMBSTONE;
+    images.owner[OWNER_IMAGE_STATE] = OWNER_STATE_TOMBSTONE;
+    images
+}
+
+fn validate_c16_owner_set(
+    images: [&[u8]; 4],
+    references: [ArenaRef; 4],
+    record_slot: u32,
+    record: &BundleRecord,
+    expected_state: u8,
+) -> Result<(), SupportLedgerError> {
+    let [header, row, index, owner] = images;
+    let vector_len = u16::try_from(record.vector_len).map_err(|_| noncanonical_error())?;
+    if !matches!(expected_state, OWNER_STATE_LIVE | OWNER_STATE_TOMBSTONE)
+        || header.len() != OWNER_HEADER_BYTES
+        || row.len() != OWNER_ROW_BYTES
+        || index.len() != OWNER_INDEX_BYTES
+        || owner.len() != OWNER_BYTES
+    {
+        return Err(noncanonical_error());
+    }
+    let owner_generation = read_u64(header, OWNER_HEADER_GENERATION);
+    let header_valid = header[8] == expected_state
+        && header[9] == C16_RAW_OWNERS as u8
+        && header[10..12].iter().all(|byte| *byte == 0)
+        && read_u32(header, OWNER_HEADER_RECORD) == record_slot
+        && owner_generation != 0
+        && header[OWNER_HEADER_REQUEST..OWNER_HEADER_REQUEST + 40]
+            == crate::request_book::c17::request_key(record.request_owner)
+        && header[OWNER_HEADER_ENTITLEMENT..OWNER_HEADER_ENTITLEMENT + 32]
+            == record.entitlement.get()
+        && header[OWNER_HEADER_VECTOR..OWNER_HEADER_VECTOR + 32] == record.vector.get();
+    let branch_current = (0..4).try_fold(0u64, |total, branch| {
+        total.checked_add(read_u64(row, OWNER_ROW_BRANCH_CURRENT + branch * 8))
+    });
+    let active_link =
+        decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8]);
+    let source = decode_optional_arena_ref(&row[OWNER_ROW_SOURCE..OWNER_ROW_SOURCE + 8]);
+    let row_valid = row[8] == expected_state
+        && row[9] == C16_RAW_OWNERS as u8
+        && read_u16(row, OWNER_ROW_VECTOR_LEN) == vector_len
+        && read_u32(row, OWNER_ROW_LINKED_CLAIMS) == record.linked_claims
+        && read_u64(row, OWNER_ROW_CURRENT) == u64::from(record.linked_claims)
+        && active_link.is_ok()
+        && source.is_ok()
+        && read_u32(row, OWNER_ROW_RECORD) == record_slot
+        && row[44..48].iter().all(|byte| *byte == 0)
+        && read_u64(row, OWNER_ROW_GENERATION) == owner_generation
+        && read_u32(row, 56) == 0
+        && row[60..64].iter().all(|byte| *byte == 0)
+        && branch_current == Some(u64::from(record.linked_claims))
+        && row[96..].iter().all(|byte| *byte == 0);
+    let index_refs = [
+        decode_arena_ref(&index[8..16])?,
+        decode_arena_ref(&index[16..24])?,
+        decode_arena_ref(&index[24..32])?,
+        decode_arena_ref(&index[32..40])?,
+    ];
+    let index_valid = index_refs == references
+        && read_u32(index, 40) == record_slot
+        && read_u64(index, 48) == owner_generation
+        && read_u16(index, 56) == vector_len
+        && index[OWNER_INDEX_STATE] == expected_state
+        && index[59] == C16_RAW_OWNERS as u8
+        && index[60..].iter().all(|byte| *byte == 0);
+    let owner_refs = [
+        decode_arena_ref(&owner[32..40])?,
+        decode_arena_ref(&owner[40..48])?,
+        decode_arena_ref(&owner[48..56])?,
+        decode_arena_ref(&owner[56..64])?,
+    ];
+    let owner_valid = owner[OWNER_IMAGE_STATE] == expected_state
+        && owner[9] == C16_RAW_OWNERS as u8
+        && read_u16(owner, 10) == vector_len
+        && read_u32(owner, OWNER_IMAGE_RECORD) == record_slot
+        && read_u32(owner, OWNER_IMAGE_VECTOR_HEAD) == 0
+        && read_u16(owner, OWNER_IMAGE_VECTOR_LEN) == vector_len
+        && owner[22..24].iter().all(|byte| *byte == 0)
+        && read_u32(owner, OWNER_IMAGE_LINKED_CLAIMS) == record.linked_claims
+        && owner[28..32].iter().all(|byte| *byte == 0)
+        && owner_refs == references
+        && owner[64..96] == record.entitlement.get()
+        && owner[96..128] == record.vector.get();
+    (header_valid && row_valid && index_valid && owner_valid)
+        .then_some(())
+        .ok_or_else(noncanonical_error)
+}
+
+fn validate_withdrawable_owner_row(image: &[u8]) -> Result<(), SupportLedgerError> {
+    let canonical = image.len() == OWNER_ROW_BYTES
+        && image[8] == OWNER_STATE_LIVE
+        && read_u16(image, OWNER_ROW_VECTOR_LEN) > 0
+        && read_u32(image, OWNER_ROW_LINKED_CLAIMS) == 0
+        && read_u64(image, OWNER_ROW_CURRENT) == 0
+        && image[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_SOURCE + 8]
+            .iter()
+            .all(|byte| *byte == 0);
+    canonical.then_some(()).ok_or_else(noncanonical_error)
+}
+
+fn encode_arena_ref(bytes: &mut [u8], reference: ArenaRef) {
+    debug_assert_eq!(bytes.len(), 8);
+    write_u32(bytes, 0, reference.slot);
+    write_u32(bytes, 4, reference.generation);
+}
+
+fn decode_optional_arena_ref(bytes: &[u8]) -> Result<Option<ArenaRef>, SupportLedgerError> {
+    if bytes.len() != 8 {
+        return Err(noncanonical_error());
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(None);
+    }
+    decode_arena_ref(bytes).map(Some)
+}
