@@ -214,3 +214,361 @@ pub(crate) const fn legacy_migrated(work: [u64; 5]) -> Option<[u64; 5]> {
         },
     ])
 }
+
+pub(crate) fn b03_layout_probe() -> Vec<u8> {
+    let mut rows = vec![
+        ("assignment.align", align_of::<Assignment>()),
+        (
+            "assignment.destination_arena",
+            offset_of!(Assignment, destination_arena),
+        ),
+        (
+            "assignment.destination_kind",
+            offset_of!(Assignment, destination_kind),
+        ),
+        (
+            "assignment.destination_slot",
+            offset_of!(Assignment, destination_slot),
+        ),
+        (
+            "assignment.expected_generation",
+            offset_of!(Assignment, expected_generation),
+        ),
+        ("assignment.image_len", offset_of!(Assignment, image_len)),
+        ("assignment.payload", offset_of!(Assignment, payload)),
+        ("assignment.size", size_of::<Assignment>()),
+        ("box_slice.align", align_of::<Box<[u8]>>()),
+        ("box_slice.size", size_of::<Box<[u8]>>()),
+        ("c17_header.size", size_of::<C17HeaderImage>()),
+        ("event_slot.size", size_of::<EventSlotImage>()),
+        ("external_head.size", size_of::<ExternalHeadImage>()),
+        ("formation.size", size_of::<FormationImage>()),
+        ("funder.size", size_of::<FunderImage>()),
+        ("group.size", size_of::<GroupImage>()),
+        ("initial_wrapper.size", size_of::<InitialWrapperImage>()),
+        (
+            "lifecycle_record.size",
+            size_of::<LifecycleRecordSlotImage>(),
+        ),
+        ("link.size", size_of::<LinkImage>()),
+        ("member.size", size_of::<MemberImage>()),
+        ("membership.size", size_of::<MembershipImage>()),
+        ("mutation.size", size_of::<MutationImage>()),
+        ("owner.size", size_of::<OwnerImage>()),
+        ("owner_header.size", size_of::<OwnerHeaderImage>()),
+        ("owner_index.size", size_of::<OwnerIndexImage>()),
+        ("owner_row.size", size_of::<OwnerRowImage>()),
+        (
+            "pending_header.size",
+            size_of::<PendingLifecycleHeaderImage>(),
+        ),
+        ("prepared_base.size", size_of::<PreparedBase>()),
+        ("prepared_split.size", size_of::<PreparedSplit>()),
+        ("request_slot.size", size_of::<RequestSlotImage>()),
+        ("scratch.align", align_of::<ScratchTopologyNode>()),
+        (
+            "scratch.assignment_ordinal",
+            offset_of!(ScratchTopologyNode, assignment_ordinal),
+        ),
+        (
+            "scratch.destination_kind",
+            offset_of!(ScratchTopologyNode, destination_kind),
+        ),
+        ("scratch.flags", offset_of!(ScratchTopologyNode, flags)),
+        (
+            "scratch.image_len",
+            offset_of!(ScratchTopologyNode, image_len),
+        ),
+        (
+            "scratch.live_handle",
+            offset_of!(ScratchTopologyNode, live_handle),
+        ),
+        ("scratch.parent", offset_of!(ScratchTopologyNode, parent)),
+        ("scratch.size", size_of::<ScratchTopologyNode>()),
+        ("source_slot.size", size_of::<SourceSlotImage>()),
+        ("validated_base.size", size_of::<ValidatedBase>()),
+        ("validated_split.size", size_of::<ValidatedSplit>()),
+        ("begin_fixed_outcome.size", size_of::<BeginFixedOutcome>()),
+        ("begin_reservation.size", size_of::<BeginReservationImage>()),
+        ("bundle_snapshot.size", size_of::<BundleSnapshot>()),
+        ("cell_snapshot.size", size_of::<CellSnapshot>()),
+        ("descriptor96.size", size_of::<Descriptor96>()),
+        ("direct_image.size", size_of::<DirectImage>()),
+        ("direct_record_pair.size", size_of::<DirectRecordPair>()),
+        ("free_selection.size", size_of::<FreeSelection>()),
+        ("funder.align", align_of::<FunderImage>()),
+        ("group.align", align_of::<GroupImage>()),
+        ("lifecycle_page.size", size_of::<LifecyclePage>()),
+        ("member.align", align_of::<MemberImage>()),
+        ("outcome_page.size", size_of::<OutcomePage>()),
+        ("owned_input_page.size", size_of::<OwnedInputPage>()),
+        (
+            "request_book_c17_header.size",
+            size_of::<RequestBookC17HeaderImage>(),
+        ),
+        ("scratch.bit", offset_of!(ScratchTopologyNode, bit)),
+        ("scratch.one", offset_of!(ScratchTopologyNode, one)),
+        ("scratch.tag", offset_of!(ScratchTopologyNode, tag)),
+        ("scratch.zero", offset_of!(ScratchTopologyNode, zero)),
+        (
+            "scratch.zero_tail",
+            offset_of!(ScratchTopologyNode, zero_tail),
+        ),
+        ("txn_header_page.size", size_of::<TxnHeaderPage>()),
+        ("visibility_outcome.size", size_of::<VisibilityOutcome>()),
+        ("wrapper.align", align_of::<InitialWrapperImage>()),
+    ];
+    rows.sort_unstable_by_key(|row| row.0);
+    let mut output = b"turnvector.c17.b03.v1\n".to_vec();
+    for (name, value) in rows {
+        output.extend_from_slice(name.as_bytes());
+        output.push(b'=');
+        output.extend_from_slice(value.to_string().as_bytes());
+        output.push(b'\n');
+    }
+    for (name, value) in [
+        ("capacity.authority", AUTHORITY_CAPACITY),
+        ("capacity.destination_root", DESTINATION_ROOT_CAPACITY),
+        ("capacity.event", EVENT_CAPACITY),
+        ("capacity.formation", FORMATION_CAPACITY),
+        ("capacity.funder", FUNDER_CAPACITY),
+        ("capacity.group", ROOT_GROUP_CAPACITY),
+        ("capacity.initial_root", INITIAL_ROOT_CAPACITY),
+        ("capacity.initial_wrapper", INITIAL_WRAPPER_CAPACITY),
+        ("capacity.lifecycle", LIFECYCLE_CAPACITY),
+        ("capacity.link", LINK_CAPACITY),
+        ("capacity.local", LOCAL_CAPACITY),
+        ("capacity.member", MEMBER_CAPACITY),
+        ("capacity.membership", MEMBERSHIP_CAPACITY),
+        ("capacity.mutation", MUTATION_CAPACITY),
+        ("capacity.raw", RAW_CAPACITY),
+        ("capacity.request", REQUEST_CAPACITY),
+        ("capacity.source", SOURCE_CAPACITY),
+        ("census.b", B_ROWS),
+        ("census.c", C_CELLS),
+        ("census.d", D_CELLS),
+        ("census.f", F_CELLS),
+        ("census.j", J_ROWS),
+        ("census.l", L_CELLS),
+        ("census.t", T_ROWS),
+        ("census.x", X_ROWS),
+        ("lifecycle.batch_max", LIFECYCLE_BATCH_MAX),
+        ("lifecycle.chunk_max", LIFECYCLE_CHUNK_MAX),
+        ("ordinary.assignments", ORDINARY_ASSIGNMENTS),
+        ("ordinary.route_positions", SPLIT_ROUTE_POSITIONS),
+        ("tag.destination.branch", DestinationKind::Branch as usize),
+        (
+            "tag.destination.free_cell",
+            DestinationKind::FreeCell as usize,
+        ),
+        (
+            "tag.destination.free_length",
+            DestinationKind::FreeLength as usize,
+        ),
+        ("tag.destination.header", DestinationKind::Header as usize),
+        (
+            "tag.destination.index_generation",
+            DestinationKind::IndexGeneration as usize,
+        ),
+        ("tag.destination.leaf", DestinationKind::Leaf as usize),
+        ("tag.destination.noop", DestinationKind::Noop as usize),
+        (
+            "tag.destination.occupied",
+            DestinationKind::Occupied as usize,
+        ),
+        ("tag.destination.root", DestinationKind::Root as usize),
+        ("tag.scratch.branch", ScratchTag::BranchRoute as usize),
+        ("tag.scratch.leaf", ScratchTag::LeafRoute as usize),
+        ("tag.scratch.terminal", ScratchTag::Terminal as usize),
+    ] {
+        output.extend_from_slice(name.as_bytes());
+        output.push(b'=');
+        output.extend_from_slice(value.to_string().as_bytes());
+        output.push(b'\n');
+    }
+    for (name, row) in [
+        ("work.begin", WORK_STATE_TRANSITION),
+        ("work.close", WORK_CLOSE),
+        ("work.create_standalone", WORK_CREATE_STANDALONE),
+        ("work.join_rebind", WORK_JOIN_REBIND),
+        ("work.lifecycle_abort", WORK_LIFECYCLE_ABORT),
+        ("work.lifecycle_begin", WORK_LIFECYCLE_BEGIN),
+        ("work.lifecycle_finalize", WORK_LIFECYCLE_FINALIZE),
+        ("work.lifecycle_stage", WORK_LIFECYCLE_STAGE),
+        ("work.merge", WORK_MERGE),
+        ("work.merge_initial", WORK_MERGE_INITIAL),
+        ("work.migrated_c16", WORK_MIGRATED_C16),
+        ("work.newly_eligible", WORK_NEWLY_ELIGIBLE),
+        ("work.plan_create", WORK_PLAN_CREATE),
+        ("work.plan_disposition", WORK_PLAN_DISPOSITION),
+        ("work.remove_bound", WORK_REMOVE_BOUND),
+        ("work.remove_eligible", WORK_REMOVE_ELIGIBLE),
+        ("work.resolve_observation", WORK_RESOLVE_OBSERVATION),
+        ("work.split", WORK_SPLIT),
+        ("work.tombstone", WORK_TOMBSTONE),
+    ] {
+        output.extend_from_slice(name.as_bytes());
+        output.push(b'=');
+        for (index, value) in row.into_iter().enumerate() {
+            if index != 0 {
+                output.push(b',');
+            }
+            output.extend_from_slice(value.to_string().as_bytes());
+        }
+        output.push(b'\n');
+    }
+    output
+}
+
+const _: () = {
+    assert!(size_of::<C17HeaderImage>() == 128);
+    assert!(size_of::<RequestBookC17HeaderImage>() == 128);
+    assert!(size_of::<Assignment>() == 128);
+    assert!(align_of::<Assignment>() == 8);
+    assert!(offset_of!(Assignment, destination_arena) == 0);
+    assert!(offset_of!(Assignment, destination_kind) == 2);
+    assert!(offset_of!(Assignment, image_len) == 3);
+    assert!(offset_of!(Assignment, destination_slot) == 4);
+    assert!(offset_of!(Assignment, expected_generation) == 8);
+    assert!(offset_of!(Assignment, payload) == 16);
+    assert!(size_of::<ScratchTopologyNode>() == 32);
+    assert!(align_of::<ScratchTopologyNode>() == 8);
+    assert!(size_of::<LifecycleRecordSlotImage>() == 1_152);
+    assert!(size_of::<PendingLifecycleHeaderImage>() == 4_096);
+    assert!(size_of::<PreparedBase>() == 239_360);
+    assert!(size_of::<ValidatedBase>() == 239_384);
+    assert!(size_of::<PreparedSplit>() == 538_960);
+    assert!(size_of::<ValidatedSplit>() == 538_984);
+    assert!(size_of::<Box<[u8]>>() == 16);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probes_are_byte_identical_and_cover_zero_tails_and_tags() {
+        assert_eq!(b03_layout_probe(), b03_layout_probe());
+        assert!(Assignment::NOOP.validate());
+        for tag in 0..=8 {
+            let mut assignment = Assignment::NOOP;
+            assignment.destination_kind = tag;
+            if tag != 0 {
+                assignment.destination_arena = 1;
+                assignment.image_len = 8;
+                assignment.payload[0] = 1;
+            }
+            assert!(assignment.validate());
+        }
+        let mut invalid = Assignment::NOOP;
+        invalid.destination_kind = 9;
+        assert!(!invalid.validate());
+        let mut tail = Assignment::NOOP;
+        tail.destination_kind = DestinationKind::Leaf as u8;
+        tail.image_len = 8;
+        tail.payload[8] = 1;
+        assert!(!tail.validate());
+        assert_eq!(ScratchTag::LeafRoute as u8, 0);
+        assert_eq!(ScratchTag::BranchRoute as u8, 1);
+        assert_eq!(ScratchTag::Terminal as u8, 2);
+    }
+
+    #[test]
+    fn cardinality_and_transient_products_are_exact() {
+        assert_eq!(4 + 4 + 2, 10);
+        assert_eq!(2 * MERGE_INITIAL_BUDGET, 2_304);
+        assert_eq!(26_496 + 11 * POST_CREATE_BUDGET, FORMATION_CAPACITY);
+        assert_eq!(ROOT_GROUP_CAPACITY * 4, MEMBER_CAPACITY);
+        assert_eq!(FORMATION_CAPACITY * 4, FUNDER_CAPACITY);
+        assert_eq!(
+            ROOT_GROUP_CAPACITY
+                + FUNDER_CAPACITY
+                + LINK_CAPACITY
+                + MEMBERSHIP_CAPACITY
+                + MUTATION_CAPACITY,
+            LOCAL_CAPACITY
+        );
+        assert_eq!(size_of::<BundleSnapshot>() * 32, 38_912);
+        assert_eq!(size_of::<CellSnapshot>() * 192, 12_288);
+        assert_eq!(size_of::<DirectRecordPair>() * 256, 163_840);
+        assert_eq!(
+            size_of::<ScratchTopologyNode>() * SPLIT_ROUTE_POSITIONS,
+            245_952
+        );
+        assert_eq!(size_of::<Assignment>() * ORDINARY_ASSIGNMENTS, 50_304);
+        assert_eq!(9 * 16 + 1, LIFECYCLE_ASSIGNMENTS);
+        assert_eq!(LIFECYCLE_ASSIGNMENTS * size_of::<Assignment>(), 18_560);
+        assert_eq!(16 * 258 * size_of::<ScratchTopologyNode>(), 132_096);
+        let lifecycle_transient = 132_096
+            + 18_560
+            + 258 * LIFECYCLE_CHUNK_MAX
+            + LIFECYCLE_CHUNK_MAX * size_of::<LifecycleRecordSlotImage>()
+            + 16 * size_of::<Descriptor96>()
+            + 3 * size_of::<LifecyclePage>();
+        assert_eq!(lifecycle_transient, 175_760);
+        assert_eq!(3 * lifecycle_transient, WORK_LIFECYCLE_STAGE[1] as usize);
+        assert_eq!(3 * lifecycle_transient, WORK_LIFECYCLE_ABORT[1] as usize);
+        assert_eq!(
+            LIFECYCLE_BATCH_MAX * size_of::<BeginReservationImage>()
+                + 3 * size_of::<LifecyclePage>()
+                + 128 * size_of::<BeginFixedOutcome>(),
+            WORK_LIFECYCLE_BEGIN[1] as usize
+        );
+        assert_eq!(
+            LIFECYCLE_BATCH_MAX * size_of::<LifecycleRecordSlotImage>()
+                + LIFECYCLE_BATCH_MAX * size_of::<VisibilityOutcome>()
+                + 16 * size_of::<LifecyclePage>(),
+            WORK_LIFECYCLE_FINALIZE[1] as usize
+        );
+        assert_eq!((LIFECYCLE_BATCH_MAX + 128) * 12, 13_824);
+        assert_eq!(
+            16 * 520 + 135 + LIFECYCLE_CHUNK_MAX * 24 + 8 * 4 * 16 + 64,
+            9_223
+        );
+        assert_eq!(2 * LIFECYCLE_BATCH_MAX + 3, 2_051);
+        assert_eq!(LIFECYCLE_ASSIGNMENTS + LIFECYCLE_CHUNK_MAX + 2, 155);
+        assert_eq!(LIFECYCLE_ASSIGNMENTS + 2 * LIFECYCLE_CHUNK_MAX + 2, 163);
+        assert_eq!(LIFECYCLE_BATCH_MAX + 128, 1_152);
+        assert_eq!(WORK_LIFECYCLE_BEGIN, [1_152 + 2_051, 64_000, 0, 0, 13_824]);
+        assert_eq!(WORK_LIFECYCLE_STAGE, [9_223 + 155, 527_280, 0, 0, 9_223]);
+        assert_eq!(
+            WORK_LIFECYCLE_FINALIZE,
+            [1_152 + 1_152, 1_269_760, 0, 0, 13_824]
+        );
+        assert_eq!(WORK_LIFECYCLE_ABORT, [9_223 + 163, 527_280, 0, 0, 9_223]);
+        assert_eq!(
+            PREPARED_SPLIT_BYTES + VALIDATED_SPLIT_BYTES + PREPARED_SPLIT_BYTES,
+            ORDINARY_COPIED_BYTES
+        );
+    }
+
+    #[test]
+    fn operation_work_rows_and_legacy_transform_are_closed() {
+        let rows = [
+            WORK_PLAN_CREATE,
+            WORK_CREATE_STANDALONE,
+            WORK_MERGE_INITIAL,
+            WORK_NEWLY_ELIGIBLE,
+            WORK_PLAN_DISPOSITION,
+            WORK_RESOLVE_OBSERVATION,
+            WORK_STATE_TRANSITION,
+            WORK_JOIN_REBIND,
+            WORK_SPLIT,
+            WORK_MERGE,
+            WORK_REMOVE_BOUND,
+            WORK_REMOVE_ELIGIBLE,
+            WORK_CLOSE,
+            WORK_TOMBSTONE,
+            WORK_MIGRATED_C16,
+        ];
+        assert!(
+            rows.iter()
+                .all(|row| row[1] == ORDINARY_COPIED_BYTES && row[2] == 0 && row[3] == 0)
+        );
+        assert_eq!(
+            legacy_migrated([75, 366, 0, 0, 20]),
+            Some([1_134, 1_616_904, 0, 0, 1_060])
+        );
+        assert_eq!(legacy_migrated([u64::MAX, 0, 0, 0, 0]), None);
+    }
+}
