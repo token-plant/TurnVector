@@ -2757,7 +2757,406 @@ impl SupportC17 {
                         funding,
                         1,
                     ),
+                    1,
+                )?;
+                member_images[ordinal] = self.members.prepare_reserved_image_after(
+                    member_ref,
+                    encode_membership_member(
+                        destination.anchor.branch(),
+                        ordinal,
+                        active,
+                        group,
+                        funder,
+                        funding,
+                    ),
+                    1,
+                )?;
+                push_surgery_local(
+                    &mut local_entries,
+                    &mut local_count,
+                    LocalKind::Funder,
+                    funder,
+                )?;
             }
+            if destination.locator_kind == 2 {
+                push_surgery_local(
+                    &mut local_entries,
+                    &mut local_count,
+                    LocalKind::Group,
+                    group,
+                )?;
+            }
+            destination_journals[destination_index] = Some(TopologyDestinationJournal {
+                group,
+                formation,
+                locator,
+                locator_kind: destination.locator_kind,
+                group_image,
+                formation_image,
+                locator_image,
+                funder_images,
+                member_images,
+            });
+        }
+        debug_assert_eq!(source_wrapper_index, source_wrapper_count);
+        debug_assert_eq!(destination_wrapper_index, wrapper_count);
+        debug_assert_eq!(external_index, external_head_count);
+
+        let membership_image = self.memberships.prepare_reserved_image_after(
+            memberships[0],
+            encode_topology_membership_image(&preview, &event),
+            1,
+        )?;
+        let membership_mutation = self.mutations.prepare_reserved_image_after(
+            mutations[source_count],
+            encode_membership_mutation(
+                preview.operation,
+                event.id,
+                preview
+                    .destinations
+                    .first()
+                    .filter(|_| destination_count > 0)
+                    .map_or(
+                        preview.sources[0].expect("topology source").group,
+                        |destination| destination.anchor.group(),
+                    ),
+                if destination_count > 0 {
+                    formations[source_count]
+                } else {
+                    formations[0]
+                },
+                generation_after,
+                preview.occurred_at,
+            ),
+            1,
+        )?;
+        push_surgery_local(
+            &mut local_entries,
+            &mut local_count,
+            LocalKind::Membership,
+            memberships[0],
+        )?;
+        push_surgery_local(
+            &mut local_entries,
+            &mut local_count,
+            LocalKind::Mutation,
+            mutations[source_count],
+        )?;
+
+        let mut owner_records_after = owner_records;
+        let mut owner_references = [[ArenaRef::default(); 4]; PLAN_MEMBERS_MAX];
+        let mut owner_rows_after = [[0; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX];
+        let mut owners_after = [[0; OWNER_BYTES]; PLAN_MEMBERS_MAX];
+        let mut retired_links = [ArenaRef::default(); PLAN_MEMBERS_MAX];
+        let mut retired_link_before = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+        let mut retired_link_after = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+        let mut replacement_links = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+        for index in 0..preview.owner_count {
+            let owner = preview.owners[index];
+            let source = preview.sources[owner.source].expect("owner topology source");
+            let before_record =
+                owner_records[index].ok_or(SupportLedgerError::InvalidTransition)?;
+            if before_record.request_owner != request_id_from_key_for_support(owner.request_key)?
+                || owner.owner.slot != owner.slot
+                || before_record.entitlement.get()
+                    != source.members[..source.member_count]
+                        .iter()
+                        .find(|member| member.owner == owner.owner)
+                        .ok_or_else(noncanonical_error)?
+                        .entitlement
+                || before_record.vector.get()
+                    != source.members[..source.member_count]
+                        .iter()
+                        .find(|member| member.owner == owner.owner)
+                        .ok_or_else(noncanonical_error)?
+                        .vector
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            let references = [
+                self.owner_headers.reference_at(owner.slot, &[1])?,
+                self.owner_rows.reference_at(owner.slot, &[1])?,
+                self.owner_indices.reference_at(owner.slot, &[1])?,
+                self.owners.reference_at(owner.slot, &[1])?,
+            ];
+            if references[0] != owner.owner {
+                return Err(noncanonical_error());
+            }
+            validate_c16_owner_set(
+                [
+                    self.owner_headers.image(references[0], &[1])?.as_slice(),
+                    self.owner_rows.image(references[1], &[1])?.as_slice(),
+                    self.owner_indices.image(references[2], &[1])?.as_slice(),
+                    self.owners.image(references[3], &[1])?.as_slice(),
+                ],
+                references,
+                owner.slot,
+                &before_record,
+                OWNER_STATE_LIVE,
+            )?;
+            let mut record_after = before_record;
+            record_after.linked_claims =
+                apply_i32_u32(record_after.linked_claims, owner.linked_delta)?;
+            let mut row = *self.owner_rows.image(references[1], &[1])?;
+            let mut owner_image = *self.owners.image(references[3], &[1])?;
+            write_u32(
+                &mut row,
+                OWNER_ROW_LINKED_CLAIMS,
+                record_after.linked_claims,
+            );
+            let current_after =
+                apply_i32_u64(read_u64(&row, OWNER_ROW_CURRENT), owner.linked_delta)?;
+            write_u64(&mut row, OWNER_ROW_CURRENT, current_after);
+            for branch_index in 0..4 {
+                let offset = OWNER_ROW_BRANCH_CURRENT + branch_index * 8;
+                let branch_after =
+                    apply_i32_u64(read_u64(&row, offset), owner.branch_delta[branch_index])?;
+                write_u64(&mut row, offset, branch_after);
+            }
+            write_u32(
+                &mut owner_image,
+                OWNER_IMAGE_LINKED_CLAIMS,
+                record_after.linked_claims,
+            );
+            let retired =
+                decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8])?
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+            let before_link = *self.links.image(retired, &[1])?;
+            if before_link[8] != 1
+                || decode_arena_ref(&before_link[16..24])? != owner.owner
+                || decode_arena_ref(&before_link[24..32])? != source.group
+                || decode_arena_ref(&before_link[32..40])? != source.initial_formation
+            {
+                return Err(noncanonical_error());
+            }
+            let mut after_link = before_link;
+            after_link[8] = 0;
+            write_u64(&mut after_link, 80, generation_after);
+            write_u64(&mut after_link, 88, preview.occurred_at);
+            if !preview.owner_has_resolver(index) {
+                row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8].fill(0);
+            } else {
+                let destination_index = usize::from(preview.member_destinations[index]);
+                let destination = destination_journals[destination_index]
+                    .ok_or(SupportLedgerError::InvalidInput)?;
+                let link_index = usize::from(replacement_link_indices[index]);
+                if link_index >= link_count {
+                    return Err(SupportLedgerError::InvalidInput);
+                }
+                encode_arena_ref(
+                    &mut row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8],
+                    links[link_index],
+                );
+                replacement_links[link_index] = self.links.prepare_reserved_image_after(
+                    links[link_index],
+                    encode_plan_link(
+                        owner.owner,
+                        destination.group,
+                        destination.formation,
+                        preview.destinations[destination_index]
+                            .anchor
+                            .authority_key(),
+                        generation_after,
+                    ),
+                    1,
+                )?;
+                push_surgery_local(
+                    &mut local_entries,
+                    &mut local_count,
+                    LocalKind::Link,
+                    links[link_index],
+                )?;
+            }
+            owner_records_after[index] = Some(record_after);
+            owner_references[index] = references;
+            owner_rows_after[index] = row;
+            owners_after[index] = owner_image;
+            retired_links[index] = retired;
+            retired_link_before[index] = before_link;
+            retired_link_after[index] = after_link;
+        }
+        if owner_records[preview.owner_count..]
+            .iter()
+            .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        validate_topology_initial_and_raw_identity(&owner_records[..preview.owner_count])?;
+        let (lifecycle_journals, lifecycle_raw_updates, lifecycle_raw_update_count) = self
+            .prepare_topology_lifecycle(
+                &preview,
+                generation_after,
+                &formations,
+                &members,
+                &links,
+                &replacement_link_indices,
+                &mut source_journals,
+                &mut destination_journals,
+            )?;
+
+        let raw_plan =
+            if raw_count + lifecycle_raw_update_count == 0 {
+                None
+            } else {
+                let mut edits = [PatriciaEdit::Remove { key: [0; 32] };
+                    SURGERY_RAW_MAX + SURGERY_LIFECYCLE_RAW_MAX];
+                let mut edit_count = 0usize;
+                for (key, value) in raw_entries[..raw_count].iter().copied() {
+                    edits[edit_count] = PatriciaEdit::Insert { key, value };
+                    edit_count += 1;
+                }
+                for update in lifecycle_raw_updates[..lifecycle_raw_update_count]
+                    .iter()
+                    .copied()
+                    .flatten()
+                {
+                    edits[edit_count] = PatriciaEdit::Update {
+                        key: update.key,
+                        handle: update.handle,
+                        value: update.after,
+                    };
+                    edit_count += 1;
+                }
+                edits[..edit_count].sort_unstable_by(|left, right| {
+                    left.key()
+                        .cmp(right.key())
+                        .then_with(|| (left.kind() as u8).cmp(&(right.kind() as u8)))
+                        .then_with(|| left.value().cmp(&right.value()))
+                });
+                Some(self.raw.prepare_mixed_assignment_plan(
+                    RAW_INDEX_ASSIGNMENT_ARENA,
+                    &edits[..edit_count],
+                )?)
+            };
+
+        let authority_plan = if authority_insert_count + authority_update_count == 0 {
+            None
+        } else {
+            let mut edits = [PatriciaEdit::Remove { key: [0; 17] }; SURGERY_AUTHORITY_MAX + 1];
+            let mut edit_count = 0usize;
+            for (key, value) in authority_inserts[..authority_insert_count].iter().copied() {
+                edits[edit_count] = PatriciaEdit::Insert { key, value };
+                edit_count += 1;
+            }
+            for update in authority_updates[..authority_update_count]
+                .iter()
+                .copied()
+                .flatten()
+            {
+                edits[edit_count] = PatriciaEdit::Update {
+                    key: update.key,
+                    handle: update.handle,
+                    value: update.after,
+                };
+                edit_count += 1;
+            }
+            edits[..edit_count].sort_unstable_by(|left, right| {
+                left.key()
+                    .cmp(right.key())
+                    .then_with(|| (left.kind() as u8).cmp(&(right.kind() as u8)))
+                    .then_with(|| left.value().cmp(&right.value()))
+            });
+            Some(self.authority.prepare_mixed_assignment_plan(
+                AUTHORITY_INDEX_ASSIGNMENT_ARENA,
+                &edits[..edit_count],
+            )?)
+        };
+
+        local_entries[..local_count].sort_unstable_by_key(|entry| entry.0);
+        if local_entries[..local_count]
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let local_plan = self.local.prepare_insert_assignment_plan(
+            LOCAL_INDEX_ASSIGNMENT_ARENA,
+            &local_entries[..local_count],
+        )?;
+        self.groups.validate_advance_generation()?;
+        self.members.validate_advance_generation()?;
+        if preview.sources[..source_count]
+            .iter()
+            .flatten()
+            .any(|source| source.locator_kind == 1)
+        {
+            self.external_heads.validate_advance_generation()?;
+        }
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        if link_count == 0 {
+            self.links.validate_advance_generation()?;
+        }
+        let expected_arena_headers = self.membership_topology_arena_headers();
+        let arena_headers_after = self.prepare_membership_topology_arena_headers_after(
+            &preview,
+            &groups,
+            &external_heads,
+            &formations,
+            &funders,
+            &members,
+            &wrappers,
+            &links,
+            &memberships,
+            &mutations,
+        )?;
+        let next_post = read_u32(&self.header.0, 96)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let mut header_after = self.header;
+        write_u32(&mut header_after.0, 96, next_post);
+        write_u64(&mut header_after.0, 48, generation_after);
+        work.charge(HotPathWorkWitness::new(preview.operation.work()))?;
+        Ok(PreparedMembershipTopology {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            expected_authority: self.authority.generation(),
+            expected_local: self.local.generation(),
+            expected_lifecycle: self.lifecycle.generation(),
+            expected_arena_headers,
+            arena_headers_after,
+            preview,
+            event,
+            groups,
+            external_heads,
+            external_head_count,
+            formations,
+            funders,
+            members,
+            wrappers,
+            wrapper_count,
+            links,
+            link_count,
+            replacement_link_indices,
+            memberships,
+            mutations,
+            source_journals,
+            destination_journals,
+            membership_image,
+            membership_mutation,
+            raw_entries,
+            raw_count,
+            authority_inserts,
+            authority_insert_count,
+            authority_updates,
+            authority_update_count,
+            local_entries,
+            local_count,
+            owner_records_before: owner_records,
+            owner_records_after,
+            owner_references,
+            owner_rows_after,
+            owners_after,
+            retired_links,
+            retired_link_before,
+            retired_link_after,
+            replacement_links,
+            header_after,
+            lifecycle_journals,
+            lifecycle_raw_updates,
+            lifecycle_raw_update_count,
+            raw_plan,
+            authority_plan,
         }
     }
 }
