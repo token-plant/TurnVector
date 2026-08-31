@@ -4851,3 +4851,388 @@ fn decode_optional_arena_ref(bytes: &[u8]) -> Result<Option<ArenaRef>, SupportLe
     }
     decode_arena_ref(bytes).map(Some)
 }
+
+fn decode_arena_ref(bytes: &[u8]) -> Result<ArenaRef, SupportLedgerError> {
+    if bytes.len() != 8 {
+        return Err(noncanonical_error());
+    }
+    let reference = ArenaRef {
+        slot: read_u32(bytes, 0),
+        generation: read_u32(bytes, 4),
+    };
+    (reference.generation != 0)
+        .then_some(reference)
+        .ok_or_else(noncanonical_error)
+}
+
+fn encode_raw_owner(
+    kind: RawOwnerKind,
+    state: RawOwnerState,
+    reference: ArenaRef,
+) -> Result<[u8; 8], SupportLedgerError> {
+    encode_raw_owner_at(kind, state, 0, reference)
+}
+
+fn encode_raw_owner_at(
+    kind: RawOwnerKind,
+    state: RawOwnerState,
+    ordinal: u8,
+    reference: ArenaRef,
+) -> Result<[u8; 8], SupportLedgerError> {
+    if reference.generation == 0 || reference.slot > RAW_OWNER_SLOT_MASK || ordinal > 15 {
+        return Err(noncanonical_error());
+    }
+    let state_bits = (state as u32)
+        .checked_sub(1)
+        .filter(|value| *value < 4)
+        .ok_or_else(noncanonical_error)?;
+    let direct = reference.slot
+        | (u32::from(ordinal) << RAW_OWNER_ORDINAL_SHIFT)
+        | (state_bits << RAW_OWNER_STATE_SHIFT)
+        | (u32::from(kind as u8) << RAW_OWNER_KIND_SHIFT);
+    let mut value = [0; 8];
+    write_u32(&mut value, 0, direct);
+    write_u32(&mut value, 4, reference.generation);
+    Ok(value)
+}
+
+fn decode_raw_owner(
+    value: [u8; 8],
+) -> Result<(RawOwnerKind, RawOwnerState, ArenaRef), SupportLedgerError> {
+    let (kind, state, ordinal, reference) = decode_raw_owner_at(value)?;
+    (ordinal == 0)
+        .then_some((kind, state, reference))
+        .ok_or_else(noncanonical_error)
+}
+
+fn decode_raw_owner_at(
+    value: [u8; 8],
+) -> Result<(RawOwnerKind, RawOwnerState, u8, ArenaRef), SupportLedgerError> {
+    let direct = read_u32(&value, 0);
+    let kind = match (direct >> RAW_OWNER_KIND_SHIFT) as u8 {
+        1 => RawOwnerKind::LegacyObligation,
+        2 => RawOwnerKind::LegacyCredit,
+        3 => RawOwnerKind::C16Bundle,
+        4 => RawOwnerKind::C16Entitlement,
+        5 => RawOwnerKind::C16Claim,
+        6 => RawOwnerKind::PlanRoot,
+        7 => RawOwnerKind::Formation,
+        8 => RawOwnerKind::Funder,
+        9 => RawOwnerKind::LifecycleObligation,
+        10 => RawOwnerKind::LifecycleCredit,
+        11 => RawOwnerKind::Tombstone,
+        _ => return Err(noncanonical_error()),
+    };
+    let ordinal = ((direct >> RAW_OWNER_ORDINAL_SHIFT) & 0x0f) as u8;
+    let state = match (direct >> RAW_OWNER_STATE_SHIFT) & 0x03 {
+        0 => RawOwnerState::Inactive,
+        1 => RawOwnerState::Committed,
+        2 => RawOwnerState::Retained,
+        3 => RawOwnerState::Tombstone,
+        _ => unreachable!("two-bit Raw owner state"),
+    };
+    let reference = ArenaRef {
+        slot: direct & RAW_OWNER_SLOT_MASK,
+        generation: read_u32(&value, 4),
+    };
+    if reference.generation == 0 {
+        return Err(noncanonical_error());
+    }
+    Ok((kind, state, ordinal, reference))
+}
+
+fn checked_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+    values
+        .into_iter()
+        .try_fold(0u64, |total, value| total.checked_add(value))
+}
+
+fn capacity_error() -> SupportLedgerError {
+    SupportLedgerError::Storage(FixedStorageError::Capacity)
+}
+
+fn noncanonical_error() -> SupportLedgerError {
+    SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(
+        bytes[offset..offset + 2]
+            .try_into()
+            .expect("fixed u16 image"),
+    )
+}
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("fixed u32 image"),
+    )
+}
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed u64 image"),
+    )
+}
+const fn read_u64_const(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+const _: () = {
+    assert!(ORDINARY_COPIED_BYTES == 1_616_904);
+    assert!(RAW_ASSIGNMENT_MAX == LIFECYCLE_ASSIGNMENTS);
+    assert!(RAW_ASSIGNMENT_MAX + LIFECYCLE_CHUNK_MAX + 2 == 155);
+    assert!(RAW_ASSIGNMENT_MAX + 2 * LIFECYCLE_CHUNK_MAX + 2 == 163);
+    assert!(C17_PHYSICAL_BYTES < SUPPORT_LEDGER_CEILING_BYTES);
+    assert!(size_of::<SupportC17>() % 8 == 0);
+    assert!(size_of::<C17HeaderImage>() == 128);
+    assert!(size_of::<PendingLifecycleHeaderImage>() == 4_096);
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{HotPathWorkBudget, WorkBudgetError, WorkDimension};
+
+    fn meter() -> WorkMeter {
+        WorkMeter::new(HotPathWorkBudget::binary_maximum())
+    }
+
+    fn record(n: u8) -> LifecycleRecordInput {
+        let mut final_owner = [n; 64];
+        final_owner[0] = n.max(1);
+        let mut aggregate = [0; 21];
+        aggregate[..6].copy_from_slice(&[0, 0, u64::from(n - 1), 0, 1, 1]);
+        let value = u64::from(n);
+        let owner = LifecycleOwnerRow {
+            owner: value,
+            request: value,
+            entitlement: value,
+            vector: value,
+            source: value,
+            group: value,
+            root: value,
+            formation: value,
+            link: value,
+            reserve: value,
+            class: 0,
+            pool: 0,
+            amount: 1,
+            generation: 1,
+            state: 1,
+            zero: 0,
+        };
+        LifecycleRecordInput {
+            final_owner,
+            owner_set_ref: [n.max(1); 8],
+            obligation_raw: [n; 32],
+            credit_raw: [n + 32; 32],
+            predecessor: [n + 1; 32],
+            scope: [n + 2; 32],
+            claim: [n + 3; 32],
+            physical_credit: [n + 4; 32],
+            kind: 1,
+            occurred_at: u64::from(n),
+            expires_at: None,
+            aggregate,
+            owners: [
+                owner,
+                LifecycleOwnerRow::ZERO,
+                LifecycleOwnerRow::ZERO,
+                LifecycleOwnerRow::ZERO,
+            ],
+        }
+    }
+
+    fn stream_record(ordinal: usize) -> (usize, [u8; 32], [u8; 32]) {
+        let mut obligation = [0; 32];
+        let mut credit = [0; 32];
+        obligation[0] = 1;
+        credit[0] = 2;
+        obligation[24..].copy_from_slice(&(ordinal as u64 + 1).to_be_bytes());
+        credit[24..].copy_from_slice(&(ordinal as u64 + 1).to_be_bytes());
+        (ordinal, obligation, credit)
+    }
+
+    #[test]
+    fn raw_owner_direct_reference_covers_every_declared_slot() {
+        let reference = ArenaRef {
+            slot: FUNDER_CAPACITY as u32 - 1,
+            generation: u32::MAX,
+        };
+        let encoded =
+            encode_raw_owner_at(RawOwnerKind::Funder, RawOwnerState::Retained, 15, reference)
+                .unwrap();
+        assert_eq!(
+            decode_raw_owner_at(encoded).unwrap(),
+            (RawOwnerKind::Funder, RawOwnerState::Retained, 15, reference)
+        );
+        assert_eq!(
+            encode_raw_owner(
+                RawOwnerKind::Funder,
+                RawOwnerState::Committed,
+                ArenaRef {
+                    slot: RAW_OWNER_SLOT_MASK + 1,
+                    generation: 1,
+                },
+            ),
+            Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+        );
+    }
+
+    #[test]
+    fn legacy_streams_accept_1024_and_reject_1025_without_state_or_generation_burn() {
+        let capacities = SupportC17Capacities::lifecycle_testing(LIFECYCLE_BATCH_MAX);
+        let mut ledger = SupportC17::try_new(capacities).unwrap();
+        assert_eq!(
+            (
+                ledger.raw.capacity(),
+                ledger.raw.free_leaf_len(),
+                ledger.raw.free_branch_len(),
+                ledger.lifecycle.capacity(),
+                ledger.lifecycle.reserved_count(),
+                ledger.lifecycle.inactive_count(),
+            ),
+            (2_176, 2_176, 2_175, 1_024, 0, 0)
+        );
+        let change = ledger
+            .prepare_legacy_insert_stream(LIFECYCLE_BATCH_MAX, stream_record)
+            .unwrap();
+        ledger.commit_legacy_insert_stream(change, stream_record);
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.raw.generation(),
+                ledger.raw.len(),
+                ledger.raw.free_leaf_len(),
+                ledger.raw.free_branch_len(),
+            ),
+            (2, 1, 2_048, 128, 128)
+        );
+
+        let update = ledger
+            .prepare_legacy_update_stream(LIFECYCLE_BATCH_MAX, |ordinal| {
+                let (slot, obligation, credit) = stream_record(ordinal);
+                (slot, obligation, credit, true)
+            })
+            .unwrap();
+        ledger.commit_legacy_update_stream(update, |ordinal| {
+            let (slot, obligation, credit) = stream_record(ordinal);
+            (slot, obligation, credit, true)
+        });
+        assert_eq!((ledger.generation(), ledger.raw.generation()), (3, 2));
+
+        let before = ledger.generation();
+        assert!(matches!(
+            ledger.prepare_legacy_insert_stream(LIFECYCLE_BATCH_MAX + 1, stream_record),
+            Err(SupportLedgerError::InvalidInput)
+        ));
+        assert_eq!(ledger.generation(), before);
+    }
+
+    #[test]
+    fn production_physical_equation_and_every_first_one_over_are_exact() {
+        assert_eq!(super::super::C17_LANDED_PREFIX_BYTES, 3_248);
+        assert_eq!(SUPPORT_LEDGER_CEILING_BYTES, 63_942_176);
+        assert_eq!(
+            SupportC17::physical_bytes(SupportC17Capacities::production()),
+            Some(C17_PHYSICAL_BYTES)
+        );
+        let exact = SupportC17::try_new(SupportC17Capacities::production()).unwrap();
+        assert_eq!(
+            [
+                exact.raw.capacity(),
+                exact.authority.capacity(),
+                exact.local.capacity(),
+                exact.groups.capacity(),
+                exact.external_heads.capacity(),
+                exact.formations.capacity(),
+                exact.funders.capacity(),
+                exact.members.capacity(),
+                exact.wrappers.capacity(),
+                exact.owner_headers.capacity(),
+                exact.owner_rows.capacity(),
+                exact.owner_indices.capacity(),
+                exact.owners.capacity(),
+                exact.links.capacity(),
+                exact.memberships.capacity(),
+                exact.mutations.capacity(),
+                exact.lifecycle.capacity(),
+            ],
+            [
+                RAW_CAPACITY,
+                AUTHORITY_CAPACITY,
+                LOCAL_CAPACITY,
+                ROOT_GROUP_CAPACITY,
+                EXTERNAL_HEAD_CAPACITY,
+                FORMATION_CAPACITY,
+                FUNDER_CAPACITY,
+                MEMBER_CAPACITY,
+                INITIAL_WRAPPER_CAPACITY,
+                SUPPORT_HISTORIES,
+                SUPPORT_HISTORIES,
+                SUPPORT_HISTORIES,
+                SUPPORT_HISTORIES,
+                LINK_CAPACITY,
+                MEMBERSHIP_CAPACITY,
+                MUTATION_CAPACITY,
+                LIFECYCLE_CAPACITY,
+            ]
+        );
+        assert_eq!(exact.raw.free_branch_len(), RAW_CAPACITY - 1);
+        assert_eq!(exact.authority.free_branch_len(), AUTHORITY_CAPACITY - 1);
+        assert_eq!(exact.local.free_branch_len(), LOCAL_CAPACITY - 1);
+        drop(exact);
+
+        type CapacityIncrement = fn(&mut SupportC17Capacities);
+        let fields: [(&str, CapacityIncrement); 17] = [
+            ("raw", |value| value.raw += 1),
+            ("authority", |value| value.authority += 1),
+            ("local", |value| value.local += 1),
+            ("groups", |value| value.groups += 1),
+            ("external_heads", |value| value.external_heads += 1),
+            ("formations", |value| value.formations += 1),
+            ("funders", |value| value.funders += 1),
+            ("members", |value| value.members += 1),
+            ("wrappers", |value| value.wrappers += 1),
+            ("owner_headers", |value| value.owner_headers += 1),
+            ("owner_rows", |value| value.owner_rows += 1),
+            ("owner_indices", |value| value.owner_indices += 1),
+            ("owners", |value| value.owners += 1),
+            ("links", |value| value.links += 1),
+            ("memberships", |value| value.memberships += 1),
+            ("mutations", |value| value.mutations += 1),
+            ("lifecycle", |value| value.lifecycle += 1),
+        ];
+        for (name, increment) in fields {
+            let mut over = SupportC17Capacities::production();
+            increment(&mut over);
+            assert_eq!(SupportC17::physical_bytes(over), None, "{name}");
+            assert_eq!(
+                SupportC17::try_new(over),
+                Err(SupportLedgerError::Storage(FixedStorageError::Capacity)),
+                "{name}"
+            );
+        }
+    }
+}
