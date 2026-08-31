@@ -320,3 +320,303 @@ pub(crate) struct MembershipStateRow {
     pub(crate) cancellation_fact: u64,
     pub(crate) cancellation_at: u64,
 }
+
+impl MembershipStateRow {
+    const fn unready() -> Self {
+        Self {
+            tag: MembershipTag::Unready,
+            epoch: 0,
+            anchor: SupportMembershipAnchor::ABSENT,
+            initial: SourceRecordRef::ABSENT,
+            pending: SourceRecordRef::ABSENT,
+            cancellation: SourceRecordRef::ABSENT,
+            cancellation_fact: 0,
+            cancellation_at: 0,
+        }
+    }
+
+    fn canonical(self) -> bool {
+        if !self.anchor.canonical()
+            || !source_ref_canonical(self.initial)
+            || !source_ref_canonical(self.pending)
+            || !source_ref_canonical(self.cancellation)
+        {
+            return false;
+        }
+        match self.tag {
+            MembershipTag::Unready => self == Self::unready(),
+            MembershipTag::Bound => {
+                self.epoch > 0
+                    && !self.anchor.is_absent()
+                    && !self.initial.is_absent()
+                    && self.pending.is_absent()
+                    && self.cancellation.is_absent()
+                    && self.cancellation_fact == 0
+                    && self.cancellation_at == 0
+            }
+            MembershipTag::EligibleUnbound => {
+                self.epoch > 0
+                    && !self.anchor.is_absent()
+                    && !self.initial.is_absent()
+                    && !self.pending.is_absent()
+                    && self.cancellation.is_absent()
+                    && self.cancellation_fact == 0
+                    && self.cancellation_at == 0
+            }
+            MembershipTag::Cancelled => {
+                self.epoch > 0
+                    && self.anchor.is_absent()
+                    && !self.initial.is_absent()
+                    && self.pending.is_absent()
+                    && !self.cancellation.is_absent()
+                    && self.cancellation_fact > 0
+                    && self.cancellation_at > 0
+            }
+            MembershipTag::Closed => {
+                self.epoch > 0
+                    && self.anchor.is_absent()
+                    && !self.initial.is_absent()
+                    && self.pending.is_absent()
+                    && self.cancellation.is_absent()
+                    && self.cancellation_fact == 0
+                    && self.cancellation_at == 0
+            }
+        }
+    }
+
+    fn encode(self) -> Result<[u8; MEMBERSHIP_BYTES], RequestError> {
+        if !self.canonical() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut bytes = [0; MEMBERSHIP_BYTES];
+        bytes[0] = self.tag as u8;
+        write_u32(&mut bytes, 4, self.epoch);
+        bytes[8..72].copy_from_slice(&self.anchor.0);
+        encode_source_ref(&mut bytes[72..80], self.initial);
+        encode_source_ref(&mut bytes[80..88], self.pending);
+        encode_source_ref(&mut bytes[88..96], self.cancellation);
+        write_u64(&mut bytes, 96, self.cancellation_fact);
+        write_u64(&mut bytes, 104, self.cancellation_at);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, RequestError> {
+        if bytes.len() != MEMBERSHIP_BYTES || bytes[1..4].iter().any(|byte| *byte != 0) {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let tag = match bytes[0] {
+            0 => MembershipTag::Unready,
+            1 => MembershipTag::Bound,
+            2 => MembershipTag::EligibleUnbound,
+            3 => MembershipTag::Cancelled,
+            4 => MembershipTag::Closed,
+            _ => return Err(RequestError::Storage(FixedStorageError::NonCanonical)),
+        };
+        let mut anchor = [0; 64];
+        anchor.copy_from_slice(&bytes[8..72]);
+        let value = Self {
+            tag,
+            epoch: read_u32(bytes, 4),
+            anchor: SupportMembershipAnchor(anchor),
+            initial: decode_source_ref(&bytes[72..80])?,
+            pending: decode_source_ref(&bytes[80..88])?,
+            cancellation: decode_source_ref(&bytes[88..96])?,
+            cancellation_fact: read_u64(bytes, 96),
+            cancellation_at: read_u64(bytes, 104),
+        };
+        value
+            .canonical()
+            .then_some(value)
+            .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InitialReadyMarker {
+    pub(crate) request: RequestId,
+    pub(crate) kind: InitialReadyKind,
+    pub(crate) identity: [u8; 32],
+    pub(crate) domain: [u8; 16],
+    pub(crate) occurred_at: MonotonicTime,
+    pub(crate) funding: PlanMemberFunding,
+    pub(crate) obligation: SupportOperationObligationId,
+    pub(crate) credit: PhysicalStartCreditId,
+}
+
+impl InitialReadyMarker {
+    pub(crate) fn validate(self) -> Result<(), RequestError> {
+        (self.identity != [0; 32]
+            && self.domain != [0; 16]
+            && self.occurred_at.as_micros() != 0
+            && self.funding.request_id == self.request
+            && self.obligation.get() != self.credit.get())
+        .then_some(())
+        .ok_or(RequestError::InvalidTransition)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MergeInitialMarker {
+    pub(crate) identities: [[u8; 32]; 3],
+    pub(crate) source_count: u8,
+    pub(crate) domain: [u8; 16],
+    pub(crate) occurred_at: MonotonicTime,
+}
+
+impl MergeInitialMarker {
+    fn validate(self) -> Result<(), RequestError> {
+        let count = usize::from(self.source_count);
+        if !(2..=3).contains(&count)
+            || self.domain == [0; 16]
+            || self.occurred_at.as_micros() == 0
+            || self.identities[..count].contains(&[0; 32])
+            || self.identities[count..]
+                .iter()
+                .any(|identity| *identity != [0; 32])
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MembershipDestination {
+    Destination(u8),
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MembershipMutation {
+    pub(crate) request: RequestId,
+    pub(crate) expected_status: RequestStatusVersion,
+    pub(crate) destination: MembershipDestination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MembershipEventInput {
+    pub(crate) kind: MembershipEventKind,
+    pub(crate) source_identity: Option<[u8; 32]>,
+    pub(crate) member_count: u8,
+    pub(crate) destination_count: u8,
+    pub(crate) members: [Option<MembershipMutation>; 4],
+    pub(crate) occurred_at: MonotonicTime,
+}
+
+impl MembershipEventInput {
+    fn validate(self) -> Result<(), RequestError> {
+        let count = usize::from(self.member_count);
+        let destination_count = usize::from(self.destination_count);
+        let valid_count = match self.kind {
+            MembershipEventKind::Join | MembershipEventKind::Merge => (2..=4).contains(&count),
+            MembershipEventKind::Rebind | MembershipEventKind::Close => (1..=4).contains(&count),
+            MembershipEventKind::Split => count == 4,
+            _ => false,
+        };
+        let valid_destinations = match self.kind {
+            MembershipEventKind::Join
+            | MembershipEventKind::Rebind
+            | MembershipEventKind::Merge => destination_count == 1,
+            MembershipEventKind::Split => destination_count == 4,
+            MembershipEventKind::Close => destination_count == 0,
+            _ => false,
+        };
+        let valid_source = match self.kind {
+            MembershipEventKind::Join => self.source_identity.is_some(),
+            MembershipEventKind::Rebind => true,
+            MembershipEventKind::Split
+            | MembershipEventKind::Merge
+            | MembershipEventKind::Close => self.source_identity.is_none(),
+            _ => false,
+        };
+        if !valid_count
+            || !valid_destinations
+            || !valid_source
+            || self.occurred_at.as_micros() == 0
+            || self.members[..count].iter().any(Option::is_none)
+            || self.members[count..].iter().any(Option::is_some)
+            || self
+                .source_identity
+                .is_some_and(|identity| identity == [0; 32])
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        let mut used = [false; 4];
+        for member in self.members[..count].iter().flatten() {
+            match member.destination {
+                MembershipDestination::Destination(ordinal) => {
+                    let ordinal = usize::from(ordinal);
+                    if self.kind == MembershipEventKind::Close || ordinal >= destination_count {
+                        return Err(RequestError::InvalidTransition);
+                    }
+                    used[ordinal] = true;
+                }
+                MembershipDestination::Closed => {
+                    if self.kind != MembershipEventKind::Close {
+                        return Err(RequestError::InvalidTransition);
+                    }
+                }
+            }
+        }
+        if used[..destination_count].iter().any(|used| !used)
+            || used[destination_count..].iter().any(|used| *used)
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EligibilityMarker {
+    pub(crate) request: RequestId,
+    pub(crate) identity: [u8; 32],
+    pub(crate) previous_anchor: SupportMembershipAnchor,
+    pub(crate) occurred_at: MonotonicTime,
+}
+
+impl EligibilityMarker {
+    fn validate(self) -> Result<(), RequestError> {
+        (self.identity != [0; 32]
+            && !self.previous_anchor.is_absent()
+            && self.occurred_at.as_micros() != 0)
+            .then_some(())
+            .ok_or(RequestError::InvalidTransition)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CancellationMarker {
+    pub(crate) request: RequestId,
+    pub(crate) identity: [u8; 32],
+    pub(crate) kind: CancellationKind,
+    pub(crate) previous_anchor: SupportMembershipAnchor,
+    pub(crate) occurred_at: MonotonicTime,
+}
+
+impl CancellationMarker {
+    fn validate(self) -> Result<(), RequestError> {
+        (self.identity != [0; 32]
+            && !self.previous_anchor.is_absent()
+            && self.occurred_at.as_micros() != 0)
+            .then_some(())
+            .ok_or(RequestError::InvalidTransition)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceRecord {
+    key: [u8; 33],
+    kind: SourceKind,
+    initial_kind: u8,
+    cancellation_kind: u8,
+    state: SourceStateTag,
+    request: RequestAddress,
+    accepted_identity: [u8; 32],
+    domain: [u8; 16],
+    previous_anchor: SupportMembershipAnchor,
+    occurred_at: u64,
+    cancellation_fact: u64,
+    create_event: EventRecordRef,
+    consumed_event: EventRecordRef,
+}
