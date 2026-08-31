@@ -4303,4 +4303,110 @@ impl SupportC17 {
             .expect("validated membership topology");
         self.commit_membership_topology_prevalidated(change, true);
     }
+
+    pub(in crate::support) fn commit_membership_topology_prevalidated(
+        &mut self,
+        change: PreparedMembershipTopology,
+        apply_index_plans: bool,
+    ) {
+        let source_count = change.preview.source_count;
+        let destination_count = change.preview.destination_count;
+        for index in 0..source_count {
+            let journal = change.source_journals[index].expect("active source journal");
+            self.formations
+                .install_reserved_image_direct(change.formations[index], journal.formation_after);
+            self.mutations
+                .install_reserved_image_direct(change.mutations[index], journal.mutation_after);
+            self.groups
+                .replace_image_prevalidated(journal.before.group, journal.group_after);
+            if journal.before.locator_kind == 1 {
+                self.external_heads
+                    .replace_image_prevalidated(journal.before.locator, journal.locator_after);
+            } else {
+                self.wrappers.install_reserved_image_direct(
+                    journal.locator_after_ref,
+                    journal.locator_after,
+                );
+            }
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                self.funders.install_reserved_image_direct(
+                    change.funders[index * PLAN_MEMBERS_MAX + ordinal],
+                    journal.funder_after[ordinal],
+                );
+                self.members.replace_image_prevalidated(
+                    journal.before.members[ordinal].member,
+                    journal.member_after[ordinal],
+                );
+            }
+        }
+        for destination_index in 0..destination_count {
+            let journal =
+                change.destination_journals[destination_index].expect("active destination journal");
+            let formation_index = source_count + destination_index;
+            self.groups
+                .install_reserved_image_direct(journal.group, journal.group_image);
+            self.formations
+                .install_reserved_image_direct(journal.formation, journal.formation_image);
+            if journal.locator_kind == 1 {
+                self.external_heads
+                    .install_reserved_image_direct(journal.locator, journal.locator_image);
+            } else {
+                self.wrappers
+                    .install_reserved_image_direct(journal.locator, journal.locator_image);
+            }
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                self.funders.install_reserved_image_direct(
+                    change.funders[formation_index * PLAN_MEMBERS_MAX + ordinal],
+                    journal.funder_images[ordinal],
+                );
+                self.members.install_reserved_image_direct(
+                    change.members[destination_index * PLAN_MEMBERS_MAX + ordinal],
+                    journal.member_images[ordinal],
+                );
+            }
+        }
+        self.memberships
+            .install_reserved_image_direct(change.memberships[0], change.membership_image);
+        self.mutations.install_reserved_image_direct(
+            change.mutations[source_count],
+            change.membership_mutation,
+        );
+        for index in 0..change.link_count {
+            self.links.install_reserved_image_direct(
+                change.links[index],
+                change.replacement_links[index],
+            );
+        }
+        for journal in change.lifecycle_journals[..change.preview.lifecycle_record_count]
+            .iter()
+            .copied()
+            .flatten()
+        {
+            self.lifecycle
+                .replace_image_prevalidated(journal.snapshot.reference, journal.after);
+        }
+        for index in 0..change.preview.owner_count {
+            let references = change.owner_references[index];
+            self.owner_rows
+                .replace_image_prevalidated(references[1], change.owner_rows_after[index]);
+            self.owners
+                .replace_image_prevalidated(references[3], change.owners_after[index]);
+            self.links.replace_image_prevalidated(
+                change.retired_links[index],
+                change.retired_link_after[index],
+            );
+        }
+        if apply_index_plans {
+            if let Some(plan) = change.raw_plan {
+                self.raw.commit_assignment_plan_prevalidated(plan);
+            }
+            if let Some(plan) = change.authority_plan {
+                self.authority.commit_assignment_plan_prevalidated(plan);
+            }
+            self.local
+                .commit_assignment_plan_prevalidated(change.local_plan);
+        }
+        self.assign_membership_topology_arena_headers(change.arena_headers_after);
+        self.header = change.header_after;
+    }
 }
