@@ -2220,4 +2220,404 @@ impl<const K: usize, const V: usize> ReusablePatricia<K, V> {
         self.header.free_leaf_len -= 1;
         Ok(())
     }
+
+    fn pop_free_branch(&mut self, expected: usize) -> Result<(), FixedStorageError> {
+        let selected = self.selected_free_branch()?;
+        if selected != expected {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        self.header.free_branch_len -= 1;
+        Ok(())
+    }
+
+    fn push_free_leaf(&mut self, index: usize, generation: u32) -> Result<(), FixedStorageError> {
+        let position = self.header.free_leaf_len as usize;
+        if position >= self.header.leaf_capacity as usize {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        self.write_leaf_vacant(index, generation, position as u32);
+        write_u32(&mut self.free_leaves, position * 4, index as u32);
+        self.header.free_leaf_len += 1;
+        Ok(())
+    }
+
+    fn push_free_branch(&mut self, index: usize, generation: u32) -> Result<(), FixedStorageError> {
+        let position = self.header.free_branch_len as usize;
+        if position >= self.header.branch_capacity as usize {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        self.write_branch_vacant(index, generation, position as u32);
+        write_u32(&mut self.free_branches, position * 4, index as u32);
+        self.header.free_branch_len += 1;
+        Ok(())
+    }
+
+    fn leaf_slot(&self, handle: NodeHandle) -> Result<&[u8], FixedStorageError> {
+        let index = leaf_index(handle)?;
+        let slot = self.leaf_bytes_at(index);
+        (slot[0] == 1
+            && slot[1..4].iter().all(|byte| *byte == 0)
+            && read_u32(slot, 4) == handle.generation())
+        .then_some(slot)
+        .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn branch_slot(&self, handle: NodeHandle) -> Result<&[u8], FixedStorageError> {
+        let index = branch_index(handle)?;
+        let slot = self.branch_bytes_at(index);
+        (slot[0] == 1
+            && slot[1..4].iter().all(|byte| *byte == 0)
+            && read_u32(slot, 4) == handle.generation()
+            && slot[18..24].iter().all(|byte| *byte == 0))
+        .then_some(slot)
+        .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn replace_child(
+        &mut self,
+        parent: NodeHandle,
+        before: NodeHandle,
+        after: NodeHandle,
+    ) -> Result<(), FixedStorageError> {
+        let index = branch_index(parent)?;
+        let slot = self.branch_bytes_at_mut(index);
+        if slot[0] != 1 || read_u32(slot, 4) != parent.generation() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let offset = if read_handle(slot, 24) == before {
+            24
+        } else if read_handle(slot, 32) == before {
+            32
+        } else {
+            return Err(FixedStorageError::NonCanonical);
+        };
+        write_handle(slot, offset, after);
+        Ok(())
+    }
+
+    fn set_parent(
+        &mut self,
+        child: NodeHandle,
+        parent: NodeHandle,
+    ) -> Result<(), FixedStorageError> {
+        match node_tag(child.node()) {
+            LEAF_TAG => {
+                let index = leaf_index(child)?;
+                let slot = self.leaf_bytes_at_mut(index);
+                if slot[0] != 1 || read_u32(slot, 4) != child.generation() {
+                    return Err(FixedStorageError::NonCanonical);
+                }
+                write_handle(slot, 8, parent);
+            }
+            BRANCH_TAG => {
+                let index = branch_index(child)?;
+                let slot = self.branch_bytes_at_mut(index);
+                if slot[0] != 1 || read_u32(slot, 4) != child.generation() {
+                    return Err(FixedStorageError::NonCanonical);
+                }
+                write_handle(slot, 8, parent);
+            }
+            _ => return Err(FixedStorageError::NonCanonical),
+        }
+        Ok(())
+    }
+
+    fn write_leaf_vacant(&mut self, index: usize, generation: u32, free_position: u32) {
+        let slot = self.leaf_bytes_at_mut(index);
+        slot.fill(0);
+        write_u32(slot, 4, generation);
+        write_u32(slot, 8, free_position);
+    }
+
+    fn write_leaf_occupied(
+        &mut self,
+        index: usize,
+        generation: u32,
+        parent: NodeHandle,
+        key: &[u8; K],
+        value: &[u8; V],
+    ) {
+        let slot = self.leaf_bytes_at_mut(index);
+        slot.fill(0);
+        slot[0] = 1;
+        write_u32(slot, 4, generation);
+        write_handle(slot, 8, parent);
+        slot[16..16 + K].copy_from_slice(key);
+        slot[16 + K..16 + K + V].copy_from_slice(value);
+    }
+
+    fn write_branch_vacant(&mut self, index: usize, generation: u32, free_position: u32) {
+        let slot = self.branch_bytes_at_mut(index);
+        slot.fill(0);
+        write_u32(slot, 4, generation);
+        write_u32(slot, 8, free_position);
+    }
+
+    fn write_branch_occupied(
+        &mut self,
+        index: usize,
+        generation: u32,
+        parent: NodeHandle,
+        bit: u16,
+        children: [NodeHandle; 2],
+    ) {
+        let slot = self.branch_bytes_at_mut(index);
+        slot.fill(0);
+        slot[0] = 1;
+        write_u32(slot, 4, generation);
+        write_handle(slot, 8, parent);
+        write_u16(slot, 16, bit);
+        write_handle(slot, 24, children[0]);
+        write_handle(slot, 32, children[1]);
+    }
+
+    fn leaf_bytes_at(&self, index: usize) -> &[u8] {
+        let width = leaf_bytes(K, V).expect("validated leaf width");
+        let start = index.checked_mul(width).expect("validated leaf index");
+        &self.leaves[start..start + width]
+    }
+
+    fn leaf_bytes_at_mut(&mut self, index: usize) -> &mut [u8] {
+        let width = leaf_bytes(K, V).expect("validated leaf width");
+        let start = index.checked_mul(width).expect("validated leaf index");
+        &mut self.leaves[start..start + width]
+    }
+
+    fn branch_bytes_at(&self, index: usize) -> &[u8] {
+        let start = index
+            .checked_mul(BRANCH_SLOT_BYTES)
+            .expect("validated branch index");
+        &self.branches[start..start + BRANCH_SLOT_BYTES]
+    }
+
+    fn branch_bytes_at_mut(&mut self, index: usize) -> &mut [u8] {
+        let start = index
+            .checked_mul(BRANCH_SLOT_BYTES)
+            .expect("validated branch index");
+        &mut self.branches[start..start + BRANCH_SLOT_BYTES]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RemovalPath {
+    grandparent: NodeHandle,
+    parent: NodeHandle,
+    sibling: NodeHandle,
+    leaf: NodeHandle,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(C)]
+pub(crate) struct ArenaRef {
+    pub(crate) slot: u32,
+    pub(crate) generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArenaSelection<const N: usize> {
+    refs: [ArenaRef; N],
+    len: usize,
+}
+
+impl<const N: usize> ArenaSelection<N> {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            refs: [ArenaRef {
+                slot: 0,
+                generation: 0,
+            }; N],
+            len: 0,
+        }
+    }
+
+    pub(crate) const fn as_slice(&self) -> &[ArenaRef] {
+        let (prefix, _) = self.refs.split_at(self.len);
+        prefix
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<const N: usize> std::ops::Index<usize> for ArenaSelection<N> {
+    type Output = ArenaRef;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.as_slice()[index]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct ByteArenaHeaderImage(pub(crate) [u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub(crate) struct ByteArenaFreeCellImage(pub(crate) [u8; 4]);
+
+impl ByteArenaHeaderImage {
+    pub(crate) const ZERO: Self = Self([0; 32]);
+}
+
+impl ByteArenaFreeCellImage {
+    pub(crate) const ZERO: Self = Self([0; 4]);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+struct ByteArenaHeader {
+    generation: u64,
+    occupied: u32,
+    capacity: u32,
+    free_len: u32,
+    reserved_count: u32,
+    inactive_count: u32,
+    reserved: u32,
+}
+
+/// A fixed two-slice arena whose exact physical equation is
+/// `64 + L * (T + 4)`. Slot generations are inline in each canonical image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct FixedByteArena<const T: usize> {
+    header: ByteArenaHeader,
+    slots: Box<[u8]>,
+    free: Box<[u8]>,
+}
+
+impl<const T: usize> FixedByteArena<T> {
+    pub(crate) fn storage_bytes(capacity: usize) -> Option<u64> {
+        if capacity == 0 || T < 16 {
+            return None;
+        }
+        64u64.checked_add(
+            u64::try_from(capacity)
+                .ok()?
+                .checked_mul(u64::try_from(T.checked_add(4)?).ok()?)?,
+        )
+    }
+
+    pub(crate) fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
+        if capacity == 0 || T < 16 || capacity >= u32::MAX as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        let slot_bytes = capacity.checked_mul(T).ok_or(FixedStorageError::Capacity)?;
+        let free_bytes = capacity.checked_mul(4).ok_or(FixedStorageError::Capacity)?;
+        if slot_bytes > isize::MAX as usize || free_bytes > isize::MAX as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        let mut value = Self {
+            header: ByteArenaHeader {
+                generation: 0,
+                occupied: 0,
+                capacity: capacity as u32,
+                free_len: capacity as u32,
+                reserved_count: 0,
+                inactive_count: 0,
+                reserved: 0,
+            },
+            slots: zeroed(slot_bytes)?,
+            free: zeroed(free_bytes)?,
+        };
+        for index in 0..capacity {
+            let position = capacity - 1 - index;
+            value.write_vacant(index, 0, position as u32);
+            write_u32(&mut value.free, position * 4, index as u32);
+        }
+        value.validate_header()?;
+        Ok(value)
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.header.generation
+    }
+
+    pub(crate) fn header_image(&self) -> ByteArenaHeaderImage {
+        Self::encode_header(self.header)
+    }
+
+    pub(crate) fn prepare_reserve_header_after<const N: usize>(
+        &self,
+        selection: &ArenaSelection<N>,
+        installed_occupied: usize,
+        installed_inactive: usize,
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        self.prepare_reserve_header_after_advances(
+            selection,
+            installed_occupied,
+            installed_inactive,
+            1,
+        )
+    }
+
+    pub(crate) fn prepare_reserve_header_after_advances<const N: usize>(
+        &self,
+        selection: &ArenaSelection<N>,
+        installed_occupied: usize,
+        installed_inactive: usize,
+        generation_advances: u64,
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        let expected = self.prepare_reserve::<N>(selection.len)?;
+        if expected.as_slice() != selection.as_slice() || generation_advances == 0 {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let installed = installed_occupied
+            .checked_add(installed_inactive)
+            .ok_or(FixedStorageError::Capacity)?;
+        if installed > selection.len {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let selected = u32::try_from(selection.len).map_err(|_| FixedStorageError::Capacity)?;
+        let occupied =
+            u32::try_from(installed_occupied).map_err(|_| FixedStorageError::Capacity)?;
+        let inactive =
+            u32::try_from(installed_inactive).map_err(|_| FixedStorageError::Capacity)?;
+        let mut header = self.header;
+        header.generation = header
+            .generation
+            .checked_add(generation_advances)
+            .ok_or(FixedStorageError::Capacity)?;
+        header.free_len = header
+            .free_len
+            .checked_sub(selected)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        header.reserved_count = header
+            .reserved_count
+            .checked_add(selected)
+            .and_then(|value| value.checked_sub(occupied))
+            .and_then(|value| value.checked_sub(inactive))
+            .ok_or(FixedStorageError::NonCanonical)?;
+        header.occupied = header
+            .occupied
+            .checked_add(occupied)
+            .ok_or(FixedStorageError::Capacity)?;
+        header.inactive_count = header
+            .inactive_count
+            .checked_add(inactive)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(Self::encode_header(header))
+    }
+
+    pub(crate) fn prepare_generation_header_after(
+        &self,
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        self.prepare_generation_header_after_advances(1)
+    }
+
+    pub(crate) fn prepare_generation_header_after_advances(
+        &self,
+        generation_advances: u64,
+    ) -> Result<ByteArenaHeaderImage, FixedStorageError> {
+        self.validate_header()?;
+        if generation_advances == 0 {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let mut header = self.header;
+        header.generation = header
+            .generation
+            .checked_add(generation_advances)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(Self::encode_header(header))
+    }
 }
