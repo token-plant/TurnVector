@@ -390,4 +390,360 @@ impl SupportC17 {
                 .expect("test lifecycle record exists"),
         )
     }
+
+    #[cfg(test)]
+    pub(super) fn corrupt_inactive_lifecycle_record_for_test(&mut self, ordinal: usize) {
+        let reference = self
+            .inactive_reference(ordinal)
+            .expect("test lifecycle ordinal is inactive");
+        let mut image = *self
+            .lifecycle
+            .image(reference, &[3])
+            .expect("test lifecycle record exists");
+        image[1_024] = 1;
+        self.lifecycle.replace_image_prevalidated(reference, image);
+    }
+
+    #[cfg(test)]
+    pub(super) fn raw_owner_value_for_test(&self, key: [u8; 32]) -> [u8; 8] {
+        self.raw
+            .find(&key)
+            .expect("test Raw index is canonical")
+            .expect("test Raw owner exists")
+    }
+
+    #[cfg(test)]
+    pub(super) fn corrupt_raw_owner_pointer_for_test(&mut self, key: [u8; 32]) {
+        let handle = self
+            .raw
+            .find_handle(&key)
+            .expect("test Raw index is canonical")
+            .expect("test Raw owner exists");
+        let mut value = self
+            .raw
+            .find(&key)
+            .expect("test Raw index is canonical")
+            .expect("test Raw owner exists");
+        value[0] ^= 1;
+        self.raw.replace_value_direct(handle, value);
+    }
+
+    pub(super) fn attached(&self, class: usize, pool: usize) -> Result<u32, SupportLedgerError> {
+        if class >= 4 || pool >= 3 {
+            return Err(noncanonical_error());
+        }
+        Ok(read_u32(&self.header.0, (class * 3 + pool) * 4))
+    }
+
+    pub(super) fn pending_lifecycle_aggregate(
+        &self,
+    ) -> Result<Option<LifecycleAggregate>, SupportLedgerError> {
+        match self.pending_state()? {
+            PendingState::Empty => Ok(None),
+            PendingState::Staging | PendingState::Aborting => Ok(Some(self.pending_aggregate()?)),
+        }
+    }
+
+    pub(super) fn validate_attached_change(
+        &self,
+        delta: [[i32; 3]; 4],
+    ) -> Result<[[u32; 3]; 4], SupportLedgerError> {
+        let mut after = [[0; 3]; 4];
+        for class in 0..4 {
+            for pool in 0..3 {
+                let before = self.attached(class, pool)?;
+                after[class][pool] = if delta[class][pool] >= 0 {
+                    before
+                        .checked_add(delta[class][pool] as u32)
+                        .ok_or_else(capacity_error)?
+                } else {
+                    before
+                        .checked_sub(delta[class][pool].unsigned_abs())
+                        .ok_or_else(noncanonical_error)?
+                };
+            }
+        }
+        Ok(after)
+    }
+
+    pub(super) fn commit_attached_change(&mut self, after: [[u32; 3]; 4]) {
+        for (class, row) in after.into_iter().enumerate() {
+            for (pool, value) in row.into_iter().enumerate() {
+                write_u32(&mut self.header.0, (class * 3 + pool) * 4, value);
+            }
+        }
+    }
+
+    pub(super) fn prepare_legacy_insert(
+        &self,
+        record_slot: usize,
+        obligation: [u8; 32],
+        credit: [u8; 32],
+    ) -> Result<PreparedLegacyInsert, SupportLedgerError> {
+        self.prepare_legacy_insert_batch(std::iter::once((record_slot, obligation, credit)))
+    }
+
+    pub(super) fn prepare_legacy_insert_batch(
+        &self,
+        records: impl IntoIterator<Item = (usize, [u8; 32], [u8; 32])>,
+    ) -> Result<PreparedLegacyInsert, SupportLedgerError> {
+        let mut entries = [([0; 32], [0; 8]); LEGACY_RAW_EDIT_MAX];
+        let mut entry_count = 0usize;
+        for (record_slot, obligation, credit) in records {
+            if entry_count + 2 > entries.len()
+                || obligation == [0; 32]
+                || credit == [0; 32]
+                || obligation == credit
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            let owner = ArenaRef {
+                slot: u32::try_from(record_slot).map_err(|_| capacity_error())?,
+                generation: 1,
+            };
+            entries[entry_count] = (
+                obligation,
+                encode_raw_owner(
+                    RawOwnerKind::LegacyObligation,
+                    RawOwnerState::Committed,
+                    owner,
+                )?,
+            );
+            entries[entry_count + 1] = (
+                credit,
+                encode_raw_owner(RawOwnerKind::LegacyCredit, RawOwnerState::Committed, owner)?,
+            );
+            entry_count += 2;
+        }
+        if entry_count == 0 {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        entries[..entry_count].sort_unstable_by_key(|entry| entry.0);
+        if entries[..entry_count]
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.raw.validate_insert_batch(&entries[..entry_count])?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedLegacyInsert {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            entries,
+            entry_count,
+        })
+    }
+
+    pub(super) fn validate_legacy_insert(
+        &self,
+        change: &PreparedLegacyInsert,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || !(2..=LEGACY_RAW_EDIT_MAX).contains(&change.entry_count)
+            || change.entry_count % 2 != 0
+            || change.entries[change.entry_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 32], [0; 8]))
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw
+            .validate_insert_batch(&change.entries[..change.entry_count])?;
+        Ok(())
+    }
+
+    pub(super) fn commit_legacy_insert(&mut self, change: PreparedLegacyInsert) {
+        self.validate_legacy_insert(&change)
+            .expect("validated legacy Raw insertion");
+        self.raw
+            .insert_batch_prevalidated(&change.entries[..change.entry_count]);
+        self.advance_generation();
+    }
+
+    pub(super) fn prepare_legacy_update(
+        &self,
+        record_slot: usize,
+        obligation: [u8; 32],
+        credit: [u8; 32],
+        retained: bool,
+    ) -> Result<PreparedLegacyUpdate, SupportLedgerError> {
+        self.prepare_legacy_update_batch(std::iter::once((
+            record_slot,
+            obligation,
+            credit,
+            retained,
+        )))
+    }
+
+    pub(super) fn prepare_legacy_update_batch(
+        &self,
+        records: impl IntoIterator<Item = (usize, [u8; 32], [u8; 32], bool)>,
+    ) -> Result<PreparedLegacyUpdate, SupportLedgerError> {
+        let mut updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); LEGACY_RAW_EDIT_MAX];
+        let mut update_count = 0usize;
+        for (record_slot, obligation, credit, retained) in records {
+            if update_count + 2 > updates.len()
+                || obligation == [0; 32]
+                || credit == [0; 32]
+                || obligation == credit
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            let expected_owner = ArenaRef {
+                slot: u32::try_from(record_slot).map_err(|_| capacity_error())?,
+                generation: 1,
+            };
+            let next_state = if retained {
+                RawOwnerState::Retained
+            } else {
+                RawOwnerState::Committed
+            };
+            for (offset, (key, expected_kind)) in [
+                (obligation, RawOwnerKind::LegacyObligation),
+                (credit, RawOwnerKind::LegacyCredit),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let handle = self
+                    .raw
+                    .find_handle(&key)?
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let (kind, state, owner) = decode_raw_owner(self.raw.value_at(handle)?)?;
+                if kind != expected_kind
+                    || owner != expected_owner
+                    || !matches!(state, RawOwnerState::Committed | RawOwnerState::Retained)
+                    || state == RawOwnerState::Retained && !retained
+                {
+                    return Err(noncanonical_error());
+                }
+                updates[update_count + offset] = (
+                    key,
+                    handle,
+                    encode_raw_owner(expected_kind, next_state, expected_owner)?,
+                );
+            }
+            update_count += 2;
+        }
+        if update_count == 0 {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        updates[..update_count].sort_unstable_by_key(|entry| entry.0);
+        if updates[..update_count]
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.raw.validate_update_batch(&updates[..update_count])?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedLegacyUpdate {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            updates,
+            update_count,
+        })
+    }
+
+    pub(super) fn validate_legacy_update(
+        &self,
+        change: &PreparedLegacyUpdate,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || !(2..=LEGACY_RAW_EDIT_MAX).contains(&change.update_count)
+            || change.update_count % 2 != 0
+            || change.updates[change.update_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 32], NodeHandle::SENTINEL, [0; 8]))
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw
+            .validate_update_batch(&change.updates[..change.update_count])?;
+        Ok(())
+    }
+
+    pub(super) fn commit_legacy_update(&mut self, change: PreparedLegacyUpdate) {
+        self.validate_legacy_update(&change)
+            .expect("validated legacy Raw update");
+        self.raw
+            .update_batch_prevalidated(&change.updates[..change.update_count]);
+        self.advance_generation();
+    }
+
+    /// Preflights up to the full landed lifecycle bound without allocating or
+    /// moving a 1,024-record capability. `record` is an immutable indexed view
+    /// over two independently sorted key sequences.
+    pub(super) fn prepare_legacy_insert_stream<F>(
+        &self,
+        record_count: usize,
+        record: F,
+    ) -> Result<PreparedLegacyInsertStream, SupportLedgerError>
+    where
+        F: Fn(usize) -> (usize, [u8; 32], [u8; 32]) + Copy,
+    {
+        if !(1..=LIFECYCLE_BATCH_MAX).contains(&record_count) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut prior_obligation = None;
+        let mut prior_credit = None;
+        for ordinal in 0..record_count {
+            let (slot, obligation, credit) = record(ordinal);
+            if obligation == [0; 32]
+                || credit == [0; 32]
+                || obligation == credit
+                || prior_obligation.is_some_and(|prior| prior >= obligation)
+                || prior_credit.is_some_and(|prior| prior >= credit)
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            let owner = ArenaRef {
+                slot: u32::try_from(slot).map_err(|_| capacity_error())?,
+                generation: 1,
+            };
+            encode_raw_owner(
+                RawOwnerKind::LegacyObligation,
+                RawOwnerState::Committed,
+                owner,
+            )?;
+            encode_raw_owner(RawOwnerKind::LegacyCredit, RawOwnerState::Committed, owner)?;
+            prior_obligation = Some(obligation);
+            prior_credit = Some(credit);
+        }
+        let edit_count = record_count.checked_mul(2).ok_or_else(capacity_error)?;
+        self.raw
+            .validate_insert_stream(legacy_insert_stream(record_count, record), edit_count)?;
+        self.generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        Ok(PreparedLegacyInsertStream {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            record_count,
+        })
+    }
+
+    pub(super) fn commit_legacy_insert_stream<F>(
+        &mut self,
+        change: PreparedLegacyInsertStream,
+        record: F,
+    ) where
+        F: Fn(usize) -> (usize, [u8; 32], [u8; 32]) + Copy,
+    {
+        assert_eq!(self.generation(), change.expected_c17);
+        assert_eq!(self.raw.generation(), change.expected_raw);
+        let edit_count = change.record_count * 2;
+        self.raw.insert_stream_prevalidated(
+            legacy_insert_stream(change.record_count, record),
+            edit_count,
+        );
+        self.advance_generation();
+    }
 }
