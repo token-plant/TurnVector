@@ -1354,4 +1354,381 @@ impl RequestBookC17 {
     pub(crate) fn force_generation_for_test(&mut self, generation: u64) {
         write_u64(&mut self.header.0, 24, generation);
     }
+
+    pub(crate) fn prepare_request_install<const I: usize, const S: usize, const T: usize>(
+        &self,
+        request: &AcceptedRequest<I, S, T>,
+        expected: RequestBookGeneration,
+        next: RequestBookGeneration,
+    ) -> Result<PreparedRequestInstall, RequestError> {
+        if self.generation() != expected.get() {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        if expected.next()? != next {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let request_key = request_key(request.id());
+        if self.request_index.find(&request_key)?.is_some() {
+            return Err(RequestError::InvalidTransition);
+        }
+        let expected_request_header = self.requests.header_image();
+        let selection = self.requests.prepare_reserve::<1>(1)?;
+        let reference = selection[0];
+        let address = RequestAddress {
+            key: request_key,
+            slot: u16::try_from(reference.slot)
+                .map_err(|_| RequestError::Storage(FixedStorageError::Capacity))?,
+            reserved: 0,
+            slot_generation: reference.generation,
+            status: request.status().get(),
+        };
+        if !address.canonical() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut slot_image = [0; REQUEST_IMAGE_BYTES];
+        slot_image[8..64].copy_from_slice(&address.encode());
+        slot_image[64..64 + MEMBERSHIP_BYTES]
+            .copy_from_slice(&MembershipStateRow::unready().encode()?);
+        let slot_image = self
+            .requests
+            .prepare_reserved_image_after(reference, slot_image, 1)?;
+        let request_header_after =
+            self.requests
+                .prepare_reserve_header_after(&selection, selection.len(), 0)?;
+        let index_plan = self.request_index.prepare_insert_assignment_plan(
+            REQUEST_INDEX_ASSIGNMENT_ARENA,
+            &[(request_key, address.encode())],
+        )?;
+
+        let mut header_after = self.header;
+        write_u64(&mut header_after.0, 24, next.get());
+        for offset in [32, 56] {
+            let owner_after = read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            write_u64(&mut header_after.0, offset, owner_after);
+        }
+        let free_after = self
+            .requests
+            .free_len()
+            .checked_sub(1)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+        write_u32(&mut header_after.0, 68, free_after);
+        for offset in [96, 108] {
+            let count_after = read_u32(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+            write_u32(&mut header_after.0, offset, count_after);
+        }
+
+        Ok(PreparedRequestInstall {
+            expected_request_header,
+            request_header_after,
+            selection,
+            address,
+            slot_image,
+            index_plan,
+            header_after,
+        })
+    }
+
+    pub(crate) fn validate_request_install<const I: usize, const S: usize, const T: usize>(
+        &self,
+        request: &AcceptedRequest<I, S, T>,
+        change: &PreparedRequestInstall,
+    ) -> Result<(), RequestError> {
+        if request_key(request.id()) != change.address.key
+            || request.status().get() != change.address.status
+            || self.requests.header_image() != change.expected_request_header
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let expected = RequestBookGeneration::new(self.generation())
+            .map_err(|_| RequestError::PreparedChangeStale)?;
+        let next = expected.next()?;
+        let reconstructed = self.prepare_request_install(request, expected, next)?;
+        (&reconstructed == change)
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_request_install(&mut self, change: PreparedRequestInstall) {
+        let reference = change.selection[0];
+        self.requests
+            .install_reserved_image_direct(reference, change.slot_image);
+        self.request_index
+            .commit_assignment_plan_prevalidated(change.index_plan);
+        self.requests
+            .assign_header_direct(change.request_header_after);
+        self.header = change.header_after;
+    }
+
+    fn prepare_request_direct_images(
+        &self,
+        generation_after: u64,
+        source_update: Option<(SourceRecordRef, SourceRecord)>,
+        source_install: Option<(ArenaRef, SourceRecord)>,
+        event_install: Option<(ArenaRef, MembershipEventRecord)>,
+        request_updates: [Option<(RequestAddress, MembershipStateRow, u64)>; 4],
+    ) -> Result<PreparedRequestDirectImages, RequestError> {
+        if self.generation().checked_add(1) != Some(generation_after) {
+            return Err(RequestError::GenerationOverflow);
+        }
+        let generation_after = RequestBookGeneration::new(generation_after)?;
+        let expected_arena_headers = self.request_arena_headers();
+        let event_header = event_install.map(|(_, event)| (event.id, event.cancellation_fact));
+        let source_update = source_update
+            .map(|(reference, record)| {
+                let reference = reference.arena()?;
+                let mut image = *self.sources.image(reference, &[1])?;
+                let encoded = record.encode()?;
+                image[8..].copy_from_slice(&encoded[8..]);
+                Ok::<_, RequestError>((reference, image))
+            })
+            .transpose()?;
+        let source_install = source_install
+            .map(|(reference, record)| {
+                let image = record.encode()?;
+                let image = self
+                    .sources
+                    .prepare_reserved_image_after(reference, image, 1)?;
+                Ok::<_, RequestError>((reference, image))
+            })
+            .transpose()?;
+        let event_install = event_install
+            .map(|(reference, event)| {
+                let image = event.encode()?;
+                let image = self
+                    .events
+                    .prepare_reserved_image_after(reference, image, 1)?;
+                Ok::<_, RequestError>((reference, image))
+            })
+            .transpose()?;
+
+        let mut request_slots = [None; 4];
+        let mut request_count = 0usize;
+        for (index, update) in request_updates.into_iter().enumerate() {
+            let Some((before, row, status)) = update else {
+                if request_updates[index + 1..].iter().any(Option::is_some) {
+                    return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                }
+                break;
+            };
+            let status =
+                RequestStatusVersion::new(status).map_err(|_| RequestError::GenerationOverflow)?;
+            let mut after = before;
+            after.status = status.get();
+            let reference = before.arena();
+            let mut image = *self.requests.image(reference, &[1])?;
+            image[8..64].copy_from_slice(&after.encode());
+            image[64..64 + MEMBERSHIP_BYTES].copy_from_slice(&row.encode()?);
+            request_slots[index] = Some((reference, image, status));
+            request_count += 1;
+        }
+        if request_count == 0 {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let request_header_after = self.requests.prepare_generation_header_after()?;
+        let event_header_after = if let Some((reference, _)) = event_install.as_ref() {
+            let selection = self.events.prepare_reserve::<1>(1)?;
+            if selection[0] != *reference {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            self.events
+                .prepare_reserve_header_after(&selection, selection.len(), 0)?
+        } else {
+            self.events.header_image()
+        };
+        let source_header_after = if let Some((reference, _)) = source_install.as_ref() {
+            let selection = self.sources.prepare_reserve::<1>(1)?;
+            if selection[0] != *reference {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            self.sources.prepare_reserve_header_after_advances(
+                &selection,
+                selection.len(),
+                0,
+                1 + u64::from(source_update.is_some()),
+            )?
+        } else if source_update.is_some() {
+            self.sources.prepare_generation_header_after()?
+        } else {
+            self.sources.header_image()
+        };
+        let arena_headers_after = [
+            request_header_after,
+            event_header_after,
+            source_header_after,
+        ];
+
+        let mut header_after = self.header;
+        write_u64(&mut header_after.0, 24, generation_after.get());
+        if let Some((event_id, cancellation_fact)) = event_header {
+            if read_u64(&self.header.0, 8) != event_id {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            let next_event = event_id
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            write_u64(&mut header_after.0, 8, next_event);
+            if cancellation_fact != 0 {
+                if read_u64(&self.header.0, 16) != cancellation_fact {
+                    return Err(RequestError::PreparedChangeStale);
+                }
+                let next_fact = cancellation_fact
+                    .checked_add(1)
+                    .ok_or(RequestError::GenerationOverflow)?;
+                write_u64(&mut header_after.0, 16, next_fact);
+            }
+            let free_after = self
+                .events
+                .free_len()
+                .checked_sub(1)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+            write_u32(&mut header_after.0, 76, free_after);
+            let count_after = read_u32(&self.header.0, 100)
+                .checked_add(1)
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+            write_u32(&mut header_after.0, 100, count_after);
+        }
+        if source_install.is_some() {
+            let free_after = self
+                .sources
+                .free_len()
+                .checked_sub(1)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+            write_u32(&mut header_after.0, 84, free_after);
+            let count_after = read_u32(&self.header.0, 104)
+                .checked_add(1)
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+            write_u32(&mut header_after.0, 104, count_after);
+        }
+        for offset in [
+            event_install.is_some().then_some(40),
+            (source_update.is_some() || source_install.is_some()).then_some(48),
+            Some(56),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let owner_after = read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            write_u64(&mut header_after.0, offset, owner_after);
+        }
+
+        Ok(PreparedRequestDirectImages {
+            generation_after,
+            expected_arena_headers,
+            arena_headers_after,
+            source_update,
+            source_install,
+            event_install,
+            request_slots,
+            header_after,
+        })
+    }
+
+    fn request_updates(
+        event: &MembershipEventRecord,
+        statuses: &[u64; 4],
+    ) -> Result<[Option<(RequestAddress, MembershipStateRow, u64)>; 4], RequestError> {
+        let count = usize::from(event.member_count);
+        if count == 0 || count > 4 || statuses[count..].iter().any(|status| *status != 0) {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut updates = [None; 4];
+        for index in 0..count {
+            updates[index] = Some((
+                event.affected[index]
+                    .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?,
+                event.after[index].ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?,
+                statuses[index],
+            ));
+        }
+        Ok(updates)
+    }
+
+    fn commit_request_direct_images<const I: usize, const S: usize, const T: usize>(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        direct: PreparedRequestDirectImages,
+    ) {
+        if let Some((reference, image)) = direct.source_update {
+            self.sources.replace_image_prevalidated(reference, image);
+        }
+        if let Some((reference, image)) = direct.source_install {
+            self.sources.install_reserved_image_direct(reference, image);
+        }
+        if let Some((reference, image)) = direct.event_install {
+            self.events.install_reserved_image_direct(reference, image);
+        }
+        for (reference, image, status) in direct.request_slots.into_iter().flatten() {
+            self.requests.replace_image_prevalidated(reference, image);
+            accepted[reference.slot as usize].status = status;
+        }
+        self.assign_request_arena_headers(direct.arena_headers_after);
+        self.header = direct.header_after;
+    }
+
+    fn request_arena_headers(&self) -> [ByteArenaHeaderImage; 3] {
+        [
+            self.requests.header_image(),
+            self.events.header_image(),
+            self.sources.header_image(),
+        ]
+    }
+
+    fn assign_request_arena_headers(&mut self, headers: [ByteArenaHeaderImage; 3]) {
+        self.requests.assign_header_direct(headers[0]);
+        self.events.assign_header_direct(headers[1]);
+        self.sources.assign_header_direct(headers[2]);
+    }
+
+    pub(crate) fn membership(
+        &self,
+        id: RequestId,
+        status: RequestStatusVersion,
+    ) -> Result<(RequestAddress, MembershipStateRow), RequestError> {
+        let key = request_key(id);
+        let value = self
+            .request_index
+            .find(&key)?
+            .ok_or(RequestError::InvalidTransition)?;
+        let address = RequestAddress::decode(&value)?;
+        self.validate_address(address, id, status)?;
+        let image = self.requests.image(address.arena(), &[1])?;
+        if image[8..64] != address.encode() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        Ok((
+            address,
+            MembershipStateRow::decode(&image[64..64 + MEMBERSHIP_BYTES])?,
+        ))
+    }
+
+    fn membership_by_key(
+        &self,
+        key: [u8; 40],
+    ) -> Result<(RequestAddress, MembershipStateRow), RequestError> {
+        let value = self
+            .request_index
+            .find(&key)?
+            .ok_or(RequestError::InvalidTransition)?;
+        let address = RequestAddress::decode(&value)?;
+        if address.key != key {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let image = self.requests.image(address.arena(), &[1])?;
+        if image[8..64] != address.encode() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        Ok((
+            address,
+            MembershipStateRow::decode(&image[64..64 + MEMBERSHIP_BYTES])?,
+        ))
+    }
 }
