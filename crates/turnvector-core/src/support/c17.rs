@@ -1808,4 +1808,396 @@ impl SupportC17 {
         }
         Ok(())
     }
+
+    fn validates_plan_slot_images(
+        &self,
+        change: &PreparedPlanCreate,
+    ) -> Result<bool, SupportLedgerError> {
+        for branch in 0..PLAN_BRANCHES {
+            let row_start = branch * PLAN_MEMBERS_MAX;
+            let group = self.groups.prepare_reserved_image_after(
+                change.groups[branch],
+                encode_plan_group(
+                    branch,
+                    change.input.member_count,
+                    change.input.authority_key,
+                    change.formations[branch],
+                    change.external_heads[branch],
+                    change.members.as_slice()[row_start..row_start + PLAN_MEMBERS_MAX]
+                        .try_into()
+                        .expect("fixed Plan member range"),
+                    change
+                        .groups
+                        .as_slice()
+                        .try_into()
+                        .expect("three Plan groups"),
+                ),
+                1,
+            )?;
+            let formation = self.formations.prepare_reserved_image_after(
+                change.formations[branch],
+                encode_plan_formation(
+                    change.input.identity,
+                    branch,
+                    change.groups[branch],
+                    change.external_heads[branch],
+                    change.input.occurred_at,
+                ),
+                1,
+            )?;
+            let head = self.external_heads.prepare_reserved_image_after(
+                change.external_heads[branch],
+                encode_plan_head(
+                    branch,
+                    change.input.member_count,
+                    change.groups[branch],
+                    change.formations[branch],
+                    change.input.obligations[branch],
+                    change.input.credits[branch],
+                    change.input.authority_key,
+                ),
+                1,
+            )?;
+            if change.group_images[branch] != group
+                || change.formation_images[branch] != formation
+                || change.head_images[branch] != head
+            {
+                return Ok(false);
+            }
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                let row = row_start + ordinal;
+                let active = ordinal < change.input.member_count;
+                let funder = self.funders.prepare_reserved_image_after(
+                    change.funders[row],
+                    encode_plan_funder(
+                        branch,
+                        ordinal,
+                        active,
+                        change.groups[branch],
+                        change.formations[branch],
+                        change.members[row],
+                        change.input.members[ordinal],
+                    ),
+                    1,
+                )?;
+                let member = self.members.prepare_reserved_image_after(
+                    change.members[row],
+                    encode_plan_member(
+                        branch,
+                        ordinal,
+                        active,
+                        change.groups[branch],
+                        change.funders[row],
+                        change.input.members[ordinal],
+                    ),
+                    1,
+                )?;
+                if change.funder_images[row] != funder || change.member_images[row] != member {
+                    return Ok(false);
+                }
+            }
+        }
+        for ordinal in 0..change.input.member_count {
+            let link = self.links.prepare_reserved_image_after(
+                change.links[ordinal],
+                encode_plan_link(
+                    change.input.members[ordinal].owner_header,
+                    change.groups[0],
+                    change.formations[0],
+                    change.input.authority_key,
+                    self.generation(),
+                ),
+                1,
+            )?;
+            if change.link_images[ordinal] != link {
+                return Ok(false);
+            }
+        }
+        let mutation = self.mutations.prepare_reserved_image_after(
+            change.mutations[0],
+            encode_plan_mutation(
+                change.input.authority_key,
+                change
+                    .groups
+                    .as_slice()
+                    .try_into()
+                    .expect("three Plan groups"),
+                change
+                    .formations
+                    .as_slice()
+                    .try_into()
+                    .expect("three Plan formations"),
+                self.generation(),
+                change.input.occurred_at,
+            ),
+            1,
+        )?;
+        Ok(change.mutation_image == mutation)
+    }
+
+    pub(super) fn commit_plan_create_prevalidated(
+        &mut self,
+        change: PreparedPlanCreate,
+        apply_index_plans: bool,
+    ) {
+        for branch in 0..PLAN_BRANCHES {
+            self.groups
+                .install_reserved_image_direct(change.groups[branch], change.group_images[branch]);
+            self.external_heads.install_reserved_image_direct(
+                change.external_heads[branch],
+                change.head_images[branch],
+            );
+            self.formations.install_reserved_image_direct(
+                change.formations[branch],
+                change.formation_images[branch],
+            );
+        }
+        for row in 0..PLAN_FUNDER_ROWS {
+            self.funders
+                .install_reserved_image_direct(change.funders[row], change.funder_images[row]);
+            self.members
+                .install_reserved_image_direct(change.members[row], change.member_images[row]);
+        }
+        for ordinal in 0..change.input.member_count {
+            self.links
+                .install_reserved_image_direct(change.links[ordinal], change.link_images[ordinal]);
+        }
+        self.mutations
+            .install_reserved_image_direct(change.mutations[0], change.mutation_image);
+        for ordinal in 0..change.input.member_count {
+            self.owner_rows.replace_image_prevalidated(
+                change.owner_references[ordinal][1],
+                change.owner_row_images[ordinal],
+            );
+            self.owners.replace_image_prevalidated(
+                change.owner_references[ordinal][3],
+                change.owner_images[ordinal],
+            );
+        }
+        if apply_index_plans {
+            self.authority
+                .commit_assignment_plan_prevalidated(change.authority_plan);
+            self.raw
+                .commit_assignment_plan_prevalidated(change.raw_plan);
+            self.local
+                .commit_assignment_plan_prevalidated(change.local_plan);
+        }
+        self.assign_plan_arena_headers(change.arena_headers_after);
+        self.header = change.header_after;
+    }
+
+    pub(super) fn plan_links(change: &PreparedPlanCreate) -> &[ArenaRef] {
+        change.links.as_slice()
+    }
+
+    fn prepare_plan_owner_updates(
+        &self,
+        input: PlanCreateInput,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+        links: &[ArenaRef],
+    ) -> Result<
+        (
+            [[ArenaRef; 4]; PLAN_MEMBERS_MAX],
+            [[u8; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX],
+            [[u8; OWNER_BYTES]; PLAN_MEMBERS_MAX],
+        ),
+        SupportLedgerError,
+    > {
+        if links.len() != input.member_count
+            || owner_records[..input.member_count]
+                .iter()
+                .any(Option::is_none)
+            || owner_records[input.member_count..]
+                .iter()
+                .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut references = [[ArenaRef::default(); 4]; PLAN_MEMBERS_MAX];
+        let mut rows = [[0; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX];
+        let mut owners = [[0; OWNER_BYTES]; PLAN_MEMBERS_MAX];
+        for ordinal in 0..input.member_count {
+            let member = input.members[ordinal];
+            let record = owner_records[ordinal].expect("validated active Plan owner");
+            if member.record_slot != member.owner_header.slot
+                || record.request_owner != member.request.expect("active Plan member")
+                || crate::request_book::c17::request_key(record.request_owner) != member.request_key
+                || record.entitlement.get() != member.entitlement
+                || record.vector.get() != member.vector
+                || !matches!(
+                    record.state,
+                    BundleState::LivePristine | BundleState::LiveConsumed
+                )
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            references[ordinal] = [
+                self.owner_headers.reference_at(member.record_slot, &[1])?,
+                self.owner_rows.reference_at(member.record_slot, &[1])?,
+                self.owner_indices.reference_at(member.record_slot, &[1])?,
+                self.owners.reference_at(member.record_slot, &[1])?,
+            ];
+            if references[ordinal][0] != member.owner_header {
+                return Err(noncanonical_error());
+            }
+            let current = [
+                self.owner_headers
+                    .image(references[ordinal][0], &[1])?
+                    .as_slice(),
+                self.owner_rows
+                    .image(references[ordinal][1], &[1])?
+                    .as_slice(),
+                self.owner_indices
+                    .image(references[ordinal][2], &[1])?
+                    .as_slice(),
+                self.owners.image(references[ordinal][3], &[1])?.as_slice(),
+            ];
+            validate_c16_owner_set(
+                current,
+                references[ordinal],
+                member.record_slot,
+                &record,
+                OWNER_STATE_LIVE,
+            )?;
+            let mut row = *self.owner_rows.image(references[ordinal][1], &[1])?;
+            let mut owner = *self.owners.image(references[ordinal][3], &[1])?;
+            if row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            let next_claims = record
+                .linked_claims
+                .checked_add(PLAN_BRANCHES as u32)
+                .ok_or_else(capacity_error)?;
+            let next_current = read_u64(&row, OWNER_ROW_CURRENT)
+                .checked_add(PLAN_BRANCHES as u64)
+                .ok_or_else(capacity_error)?;
+            let mut next_branches = [0u64; PLAN_BRANCHES];
+            for (branch, next_slot) in next_branches.iter_mut().enumerate() {
+                let offset = OWNER_ROW_BRANCH_CURRENT + branch * 8;
+                *next_slot = read_u64(&row, offset)
+                    .checked_add(1)
+                    .ok_or_else(capacity_error)?;
+            }
+            let terminal_current = read_u64(&row, OWNER_ROW_BRANCH_CURRENT + 3 * 8);
+            let formation_current = next_branches[1]
+                .checked_add(next_branches[2])
+                .and_then(|value| value.checked_add(terminal_current))
+                .ok_or_else(capacity_error)?;
+            if next_branches[0] > member.branch_limits[0]
+                || formation_current > member.branch_limits[1].min(member.branch_limits[2])
+            {
+                return Err(capacity_error());
+            }
+            for (branch, next) in next_branches.into_iter().enumerate() {
+                write_u64(&mut row, OWNER_ROW_BRANCH_CURRENT + branch * 8, next);
+            }
+            write_u32(&mut row, OWNER_ROW_LINKED_CLAIMS, next_claims);
+            write_u64(&mut row, OWNER_ROW_CURRENT, next_current);
+            encode_arena_ref(
+                &mut row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8],
+                links[ordinal],
+            );
+            write_u32(&mut owner, OWNER_IMAGE_LINKED_CLAIMS, next_claims);
+            rows[ordinal] = row;
+            owners[ordinal] = owner;
+        }
+        Ok((references, rows, owners))
+    }
+
+    fn prepare_plan_arena_headers_after(
+        &self,
+        groups: &ArenaSelection<PLAN_BRANCHES>,
+        external_heads: &ArenaSelection<PLAN_BRANCHES>,
+        formations: &ArenaSelection<PLAN_BRANCHES>,
+        funders: &ArenaSelection<PLAN_FUNDER_ROWS>,
+        members: &ArenaSelection<PLAN_MEMBER_ROWS>,
+        links: &ArenaSelection<PLAN_MEMBERS_MAX>,
+        mutations: &ArenaSelection<1>,
+    ) -> Result<[ByteArenaHeaderImage; 11], SupportLedgerError> {
+        Ok([
+            self.groups
+                .prepare_reserve_header_after(groups, groups.len(), 0)?,
+            self.external_heads.prepare_reserve_header_after(
+                external_heads,
+                external_heads.len(),
+                0,
+            )?,
+            self.formations
+                .prepare_reserve_header_after(formations, formations.len(), 0)?,
+            self.funders
+                .prepare_reserve_header_after(funders, funders.len(), 0)?,
+            self.members
+                .prepare_reserve_header_after(members, members.len(), 0)?,
+            self.links
+                .prepare_reserve_header_after(links, links.len(), 0)?,
+            self.mutations
+                .prepare_reserve_header_after(mutations, mutations.len(), 0)?,
+            self.owner_headers.header_image(),
+            self.owner_rows.prepare_generation_header_after()?,
+            self.owner_indices.header_image(),
+            self.owners.prepare_generation_header_after()?,
+        ])
+    }
+
+    fn assign_plan_arena_headers(&mut self, headers: [ByteArenaHeaderImage; 11]) {
+        self.groups.assign_header_direct(headers[0]);
+        self.external_heads.assign_header_direct(headers[1]);
+        self.formations.assign_header_direct(headers[2]);
+        self.funders.assign_header_direct(headers[3]);
+        self.members.assign_header_direct(headers[4]);
+        self.links.assign_header_direct(headers[5]);
+        self.mutations.assign_header_direct(headers[6]);
+        self.owner_headers.assign_header_direct(headers[7]);
+        self.owner_rows.assign_header_direct(headers[8]);
+        self.owner_indices.assign_header_direct(headers[9]);
+        self.owners.assign_header_direct(headers[10]);
+    }
+
+    fn plan_arena_headers(&self) -> [ByteArenaHeaderImage; 11] {
+        [
+            self.groups.header_image(),
+            self.external_heads.header_image(),
+            self.formations.header_image(),
+            self.funders.header_image(),
+            self.members.header_image(),
+            self.links.header_image(),
+            self.mutations.header_image(),
+            self.owner_headers.header_image(),
+            self.owner_rows.header_image(),
+            self.owner_indices.header_image(),
+            self.owners.header_image(),
+        ]
+    }
+
+    fn prepare_begin_pending_image(
+        &self,
+        batch: u64,
+        aggregate: LifecycleAggregate,
+        before_support: SupportLedgerGeneration,
+        selection: &ArenaSelection<LIFECYCLE_BATCH_MAX>,
+    ) -> Result<PendingLifecycleHeaderImage, SupportLedgerError> {
+        let mut pending = PendingLifecycleHeaderImage::ZERO;
+        pending.0[PENDING_STATE] = PendingState::Staging as u8;
+        write_u64(&mut pending.0, PENDING_BATCH, batch);
+        write_u16(&mut pending.0, PENDING_TOTAL, selection.len() as u16);
+        write_u16(&mut pending.0, PENDING_CURSOR, selection.len() as u16);
+        write_u16(&mut pending.0, PENDING_RESERVED, selection.len() as u16);
+        for (ordinal, reference) in selection.as_slice().iter().enumerate() {
+            write_u16(
+                &mut pending.0,
+                PENDING_SLOTS + ordinal * 2,
+                reference.slot as u16,
+            );
+        }
+        pending.0[PENDING_AGGREGATE..PENDING_BEFORE_SUPPORT].copy_from_slice(&aggregate.encode());
+        write_u64(&mut pending.0, PENDING_BEFORE_SUPPORT, before_support.get());
+        write_u64(&mut pending.0, PENDING_EXPECTED_RAW, self.raw.generation());
+        for (index, value) in aggregate.withholding()?.into_iter().enumerate() {
+            write_u64(&mut pending.0, PENDING_WITHHELD + index * 8, value);
+        }
+        Ok(pending)
+    }
 }
