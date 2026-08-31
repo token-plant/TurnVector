@@ -349,3 +349,219 @@ fn support_ceiling(values: &BTreeMap<String, u64>) -> Option<u64> {
     ];
     checked_sum(values)
 }
+
+fn b04(b03: &[u8], values: &BTreeMap<String, u64>, ceiling: u64) -> Vec<u8> {
+    let slot = |name: &str| probe_value(values, name).checked_add(4);
+    let reduction_r20 = checked_sum([
+        3_072_000,
+        checked_product(6_400, slot("formation.size").expect("Formation width"))
+            .expect("R20 Formation reduction"),
+        checked_product(25_600, slot("funder.size").expect("Funder width"))
+            .expect("R20 Funder reduction"),
+        checked_product(3_712, slot("initial_wrapper.size").expect("Wrapper width"))
+            .expect("R20 Wrapper reduction"),
+        checked_product(6_400, slot("mutation.size").expect("Mutation width"))
+            .expect("R20 Mutation reduction"),
+    ])
+    .expect("R20 reduction");
+    let reduction_r19 = checked_sum([
+        9_707_520,
+        checked_product(3_456, slot("group.size").expect("Group width"))
+            .expect("R19 Group reduction"),
+        checked_product(20_224, slot("formation.size").expect("Formation width"))
+            .expect("R19 Formation reduction"),
+        checked_product(80_896, slot("funder.size").expect("Funder width"))
+            .expect("R19 Funder reduction"),
+        checked_product(13_824, slot("member.size").expect("Member width"))
+            .expect("R19 Member reduction"),
+        checked_product(17_536, slot("initial_wrapper.size").expect("Wrapper width"))
+            .expect("R19 Wrapper reduction"),
+        checked_product(16_768, slot("mutation.size").expect("Mutation width"))
+            .expect("R19 Mutation reduction"),
+    ])
+    .expect("R19 reduction");
+    let local_index = index_bytes(
+        probe_value(values, "leaf.17_8"),
+        probe_value(values, "index.header_size"),
+        probe_value(values, "index.header_size"),
+        probe_value(values, "box_slice.size"),
+        LOCAL_CAPACITY as u64,
+    )
+    .expect("Local index");
+    format!(
+        concat!(
+            "turnvector.c17.b04.v1\n",
+            "b03_sha256={}\n",
+            "landed_prefix={}\n",
+            "landed_backing={}\n",
+            "legacy_record_bytes={}\n",
+            "legacy_avl_node_bytes={}\n",
+            "funding_claim_bytes={}\n",
+            "group_bytes={}\n",
+            "formation_bytes={}\n",
+            "funder_bytes={}\n",
+            "member_bytes={}\n",
+            "wrapper_bytes={}\n",
+            "mutation_bytes={}\n",
+            "v={}\n",
+            "horizons={},{},{}\n",
+            "q_history={}\n",
+            "r_physical={}\n",
+            "f_physical={}\n",
+            "e_history={}\n",
+            "c_cells={}\n",
+            "formation_max={}\n",
+            "local_index_bytes={}\n",
+            "reduction_r20={}\n",
+            "reduction_r19={}\n",
+            "support_ledger_ceiling_bytes={}\n"
+        ),
+        hex(sha256(b03)),
+        probe_value(values, "support.landed_prefix"),
+        landed_backing(values).expect("landed backing"),
+        probe_value(values, "support.legacy_record"),
+        probe_value(values, "support.legacy_avl_node"),
+        probe_value(values, "support.funding_claim"),
+        probe_value(values, "group.size"),
+        probe_value(values, "formation.size"),
+        probe_value(values, "funder.size"),
+        probe_value(values, "member.size"),
+        probe_value(values, "initial_wrapper.size"),
+        probe_value(values, "mutation.size"),
+        V_AXES,
+        HORIZONS[0],
+        HORIZONS[1],
+        HORIZONS[2],
+        Q_HISTORY,
+        R_PHYSICAL,
+        F_PHYSICAL,
+        E_HISTORY,
+        C_CELLS,
+        FORMATION_CAPACITY,
+        local_index,
+        reduction_r20,
+        reduction_r19,
+        ceiling,
+    )
+    .into_bytes()
+}
+
+fn b05(s3: [u8; 32], d3: [u8; 32], s4: [u8; 32], d4: [u8; 32], s5: [u8; 32]) -> Vec<u8> {
+    format!(
+        concat!(
+            "turnvector.c17.b05.v1\n",
+            "s3={}\n",
+            "d3={}\n",
+            "s4={}\n",
+            "d4={}\n",
+            "s5={}\n",
+            "chain=s3->d3;(s4,d3)->d4;(s5,d3,d4)->d5\n",
+            "b03_double_run=identical\n",
+            "b04_double_run=identical\n"
+        ),
+        hex(s3),
+        hex(d3),
+        hex(s4),
+        hex(d4),
+        hex(s5),
+    )
+    .into_bytes()
+}
+
+fn write(directory: &Path, name: &str, payload: &[u8]) {
+    fs::write(directory.join(name), payload)
+        .unwrap_or_else(|error| panic!("write {name}: {error}"));
+}
+
+fn chained_digest(domain: &[u8], values: &[&[u8]]) -> [u8; 32] {
+    let length = domain.len() + values.iter().map(|value| value.len()).sum::<usize>();
+    let mut input = Vec::with_capacity(length);
+    input.extend_from_slice(domain);
+    for value in values {
+        input.extend_from_slice(value);
+    }
+    sha256(&input)
+}
+
+fn hex(value: [u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in value {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 15) as usize] as char);
+    }
+    output
+}
+
+fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut state = SHA_INITIAL;
+    let full = input.len() / 64;
+    for block in input[..full * 64].chunks_exact(64) {
+        compress(&mut state, block.try_into().expect("SHA block"));
+    }
+    let remainder = input.len() % 64;
+    let mut final_block = [0; 64];
+    final_block[..remainder].copy_from_slice(&input[full * 64..]);
+    final_block[remainder] = 0x80;
+    if remainder >= 56 {
+        compress(&mut state, &final_block);
+        final_block = [0; 64];
+    }
+    let bits = u64::try_from(input.len())
+        .expect("build input fits u64")
+        .checked_mul(8)
+        .expect("SHA bit length");
+    final_block[56..].copy_from_slice(&bits.to_be_bytes());
+    compress(&mut state, &final_block);
+    let mut output = [0; 32];
+    for (bytes, word) in output.chunks_exact_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+    output
+}
+
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut words = [0; 16];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = u32::from_be_bytes(
+            block[index * 4..index * 4 + 4]
+                .try_into()
+                .expect("SHA word"),
+        );
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for (index, constant) in SHA_ROUNDS.into_iter().enumerate() {
+        let word = if index < 16 {
+            words[index]
+        } else {
+            let x = words[(index - 15) % 16];
+            let y = words[(index - 2) % 16];
+            let word = words[(index - 16) % 16]
+                .wrapping_add(x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3))
+                .wrapping_add(words[(index - 7) % 16])
+                .wrapping_add(y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10));
+            words[index % 16] = word;
+            word
+        };
+        let first = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ ((!e) & g))
+            .wrapping_add(constant)
+            .wrapping_add(word);
+        let second = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+        (h, g, f, e, d, c, b, a) = (
+            g,
+            f,
+            e,
+            d.wrapping_add(first),
+            c,
+            b,
+            a,
+            first.wrapping_add(second),
+        );
+    }
+    for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+        *slot = slot.wrapping_add(value);
+    }
+}
