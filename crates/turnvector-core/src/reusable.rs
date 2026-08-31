@@ -1825,4 +1825,399 @@ impl<const K: usize, const V: usize> ReusablePatricia<K, V> {
         }
         Ok(())
     }
+
+    pub(crate) fn update_batch_prevalidated(&mut self, entries: &[([u8; K], NodeHandle, [u8; V])]) {
+        self.validate_update_batch(entries)
+            .expect("validated Patricia update batch");
+        let next = self
+            .header
+            .generation
+            .checked_add(1)
+            .expect("validated Patricia generation");
+        for (_, handle, value) in entries.iter().copied() {
+            let index = leaf_index(handle).expect("validated Patricia leaf handle");
+            self.leaf_bytes_at_mut(index)[16 + K..16 + K + V].copy_from_slice(&value);
+        }
+        self.header.generation = next;
+    }
+
+    pub(crate) fn replace_value_direct(&mut self, handle: NodeHandle, value: [u8; V]) {
+        debug_assert_eq!(handle.node() & !NODE_INDEX_MASK, LEAF_TAG);
+        let index = (handle.node() & NODE_INDEX_MASK) as usize;
+        self.leaf_bytes_at_mut(index)[16 + K..16 + K + V].copy_from_slice(&value);
+    }
+
+    pub(crate) fn validate_update_stream(
+        &self,
+        entries: impl IntoIterator<Item = ([u8; K], [u8; V])>,
+        count: usize,
+    ) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if count == 0 {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let mut previous = None;
+        let mut seen = 0usize;
+        for (key, _) in entries {
+            if seen >= count || previous.is_some_and(|prior| prior >= key) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.find_handle(&key)?
+                .ok_or(FixedStorageError::NonCanonical)?;
+            previous = Some(key);
+            seen += 1;
+        }
+        (seen == count)
+            .then_some(())
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    pub(crate) fn update_stream_prevalidated(
+        &mut self,
+        entries: impl IntoIterator<Item = ([u8; K], [u8; V])>,
+        count: usize,
+    ) {
+        let before = self.header.generation;
+        let mut seen = 0usize;
+        for (key, value) in entries {
+            assert!(seen < count, "prevalidated Patricia stream count");
+            let handle = self
+                .find_handle(&key)
+                .expect("validated Patricia stream lookup")
+                .expect("validated Patricia stream key");
+            self.update(&key, handle, value)
+                .expect("prevalidated Patricia stream update");
+            self.header.generation = before;
+            seen += 1;
+        }
+        assert_eq!(seen, count, "prevalidated Patricia stream count");
+        self.header.generation = before
+            .checked_add(1)
+            .expect("validated Patricia generation");
+    }
+
+    pub(crate) fn validate_remove_batch(&self, keys: &[[u8; K]]) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        if keys.is_empty() || keys.len() > self.header.occupied as usize {
+            return Err(FixedStorageError::Capacity);
+        }
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        for (index, key) in keys.iter().enumerate() {
+            if keys[..index].contains(key) || self.find(key)?.is_none() {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_batch_prevalidated(&mut self, keys: &[[u8; K]]) {
+        self.validate_remove_batch(keys)
+            .expect("validated Patricia removal batch");
+        let before = self.header.generation;
+        for key in keys {
+            self.remove(key)
+                .expect("prevalidated Patricia removal")
+                .expect("prevalidated Patricia key exists");
+            self.header.generation = before;
+        }
+        self.header.generation = before
+            .checked_add(1)
+            .expect("validated Patricia generation");
+    }
+
+    pub(crate) fn validate_advance_generation(&self) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        self.header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)
+            .map(|_| ())
+    }
+
+    pub(crate) fn advance_generation_prevalidated(&mut self) {
+        self.validate_advance_generation()
+            .expect("validated Patricia generation advance");
+        self.header.generation += 1;
+    }
+
+    pub(crate) fn remove(&mut self, key: &[u8; K]) -> Result<Option<[u8; V]>, FixedStorageError> {
+        self.validate_header()?;
+        if self.header.root.is_sentinel() {
+            return Ok(None);
+        }
+        let path = self.removal_path(key)?;
+        let leaf_slot = self.leaf_slot(path.leaf)?;
+        if leaf_slot[16..16 + K] != key[..] {
+            return Ok(None);
+        }
+        let mut value = [0; V];
+        value.copy_from_slice(&leaf_slot[16 + K..16 + K + V]);
+        let next_generation = self
+            .header
+            .generation
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        if self.header.free_leaf_len == self.header.leaf_capacity
+            || self.header.free_branch_len > self.header.branch_capacity
+        {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        if path.parent.is_sentinel() {
+            if !path.grandparent.is_sentinel() || !path.sibling.is_sentinel() {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.header.root = NodeHandle::SENTINEL;
+        } else {
+            if path.sibling.is_sentinel() {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.set_parent(path.sibling, path.grandparent)?;
+            if path.grandparent.is_sentinel() {
+                self.header.root = path.sibling;
+            } else {
+                self.replace_child(path.grandparent, path.parent, path.sibling)?;
+            }
+            let branch = branch_index(path.parent)?;
+            let generation = read_u32(self.branch_bytes_at(branch), 4);
+            self.push_free_branch(branch, generation)?;
+        }
+        let leaf = leaf_index(path.leaf)?;
+        let generation = read_u32(self.leaf_bytes_at(leaf), 4);
+        self.push_free_leaf(leaf, generation)?;
+        self.header.occupied = self
+            .header
+            .occupied
+            .checked_sub(1)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        self.header.generation = next_generation;
+        Ok(Some(value))
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "C17 structural tests consume this validator")
+    )]
+    pub(crate) fn validate_structure(&self) -> Result<(), FixedStorageError> {
+        self.validate_header()?;
+        let occupied = self.header.occupied as usize;
+        if occupied == 0 {
+            return self
+                .header
+                .root
+                .is_sentinel()
+                .then_some(())
+                .ok_or(FixedStorageError::NonCanonical);
+        }
+        if self.header.root.is_sentinel() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let mut leaves = 0usize;
+        let mut branches = 0usize;
+        let mut stack = vec![(self.header.root, NodeHandle::SENTINEL, None)];
+        while let Some((handle, parent, prior_bit)) = stack.pop() {
+            match node_tag(handle.node()) {
+                LEAF_TAG => {
+                    let slot = self.leaf_slot(handle)?;
+                    if read_handle(slot, 8) != parent {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    leaves += 1;
+                }
+                BRANCH_TAG => {
+                    let slot = self.branch_slot(handle)?;
+                    if read_handle(slot, 8) != parent {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    let bit = read_u16(slot, 16);
+                    if bit as usize >= K * 8 || prior_bit.is_some_and(|prior| prior >= bit) {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    let zero = read_handle(slot, 24);
+                    let one = read_handle(slot, 32);
+                    if zero == one || zero.is_sentinel() || one.is_sentinel() {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    branches += 1;
+                    stack.push((one, handle, Some(bit)));
+                    stack.push((zero, handle, Some(bit)));
+                }
+                _ => return Err(FixedStorageError::NonCanonical),
+            }
+            if leaves + branches > occupied.saturating_mul(2) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+        }
+        (leaves == occupied && branches + 1 == leaves)
+            .then_some(())
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn validate_header(&self) -> Result<(), FixedStorageError> {
+        let leaf_width = leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)?;
+        let leaves = self.header.leaf_capacity as usize;
+        let branches = self.header.branch_capacity as usize;
+        let canonical = self.header.reserved == 0
+            && leaves > 0
+            && leaves < (1 << NODE_TAG_SHIFT)
+            && branches + 1 == leaves
+            && self.leaves.len() == leaves.checked_mul(leaf_width).unwrap_or(usize::MAX)
+            && self.branches.len()
+                == branches
+                    .checked_mul(BRANCH_SLOT_BYTES)
+                    .unwrap_or(usize::MAX)
+            && self.free_leaves.len() == leaves.checked_mul(4).unwrap_or(usize::MAX)
+            && self.free_branches.len() == branches.checked_mul(4).unwrap_or(usize::MAX)
+            && self.header.free_leaf_len <= self.header.leaf_capacity
+            && self.header.free_branch_len <= self.header.branch_capacity
+            && self.header.occupied <= self.header.leaf_capacity
+            && self.header.occupied + self.header.free_leaf_len == self.header.leaf_capacity
+            && (self.header.occupied == 0) == self.header.root.is_sentinel();
+        canonical
+            .then_some(())
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn locate(&self, key: &[u8; K]) -> Result<(NodeHandle, Option<u16>), FixedStorageError> {
+        let mut handle = self.header.root;
+        let mut parent = NodeHandle::SENTINEL;
+        let mut prior = None;
+        loop {
+            match node_tag(handle.node()) {
+                LEAF_TAG => {
+                    let slot = self.leaf_slot(handle)?;
+                    if read_handle(slot, 8) != parent {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    return Ok((handle, prior));
+                }
+                BRANCH_TAG => {
+                    let slot = self.branch_slot(handle)?;
+                    if read_handle(slot, 8) != parent {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    let bit = read_u16(slot, 16);
+                    if bit as usize >= K * 8 || prior.is_some_and(|value| value >= bit) {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    let children = [read_handle(slot, 24), read_handle(slot, 32)];
+                    if children[0] == children[1]
+                        || children[0].is_sentinel()
+                        || children[1].is_sentinel()
+                    {
+                        return Err(FixedStorageError::NonCanonical);
+                    }
+                    parent = handle;
+                    prior = Some(bit);
+                    handle = children[key_bit(key, bit)];
+                }
+                _ => return Err(FixedStorageError::NonCanonical),
+            }
+        }
+    }
+
+    fn insertion_point(
+        &self,
+        key: &[u8; K],
+        bit: u16,
+    ) -> Result<(NodeHandle, NodeHandle), FixedStorageError> {
+        let mut parent = NodeHandle::SENTINEL;
+        let mut child = self.header.root;
+        let mut prior = None;
+        while node_tag(child.node()) == BRANCH_TAG {
+            let slot = self.branch_slot(child)?;
+            if read_handle(slot, 8) != parent {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let child_bit = read_u16(slot, 16);
+            if child_bit as usize >= K * 8 || prior.is_some_and(|value| value >= child_bit) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            if child_bit >= bit {
+                break;
+            }
+            let children = [read_handle(slot, 24), read_handle(slot, 32)];
+            parent = child;
+            prior = Some(child_bit);
+            child = children[key_bit(key, child_bit)];
+        }
+        Ok((parent, child))
+    }
+
+    fn removal_path(&self, key: &[u8; K]) -> Result<RemovalPath, FixedStorageError> {
+        let mut grandparent = NodeHandle::SENTINEL;
+        let mut parent = NodeHandle::SENTINEL;
+        let mut sibling = NodeHandle::SENTINEL;
+        let mut leaf = self.header.root;
+        let mut prior = None;
+        while node_tag(leaf.node()) == BRANCH_TAG {
+            let slot = self.branch_slot(leaf)?;
+            if read_handle(slot, 8) != parent {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let bit = read_u16(slot, 16);
+            if bit as usize >= K * 8 || prior.is_some_and(|value| value >= bit) {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let children = [read_handle(slot, 24), read_handle(slot, 32)];
+            let selected = key_bit(key, bit);
+            grandparent = parent;
+            parent = leaf;
+            sibling = children[1 - selected];
+            leaf = children[selected];
+            prior = Some(bit);
+        }
+        self.leaf_slot(leaf)?;
+        Ok(RemovalPath {
+            grandparent,
+            parent,
+            sibling,
+            leaf,
+        })
+    }
+
+    fn selected_free_leaf(&self) -> Result<usize, FixedStorageError> {
+        let length = self.header.free_leaf_len as usize;
+        let position = length.checked_sub(1).ok_or(FixedStorageError::Capacity)?;
+        let index = read_u32(&self.free_leaves, position * 4) as usize;
+        let slot = self.leaf_bytes_at(index);
+        let canonical = index < self.header.leaf_capacity as usize
+            && slot[0] == 0
+            && slot[1..4].iter().all(|byte| *byte == 0)
+            && read_u32(slot, 8) as usize == position
+            && slot[12..].iter().all(|byte| *byte == 0);
+        canonical
+            .then_some(index)
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn selected_free_branch(&self) -> Result<usize, FixedStorageError> {
+        let length = self.header.free_branch_len as usize;
+        let position = length.checked_sub(1).ok_or(FixedStorageError::Capacity)?;
+        let index = read_u32(&self.free_branches, position * 4) as usize;
+        let slot = self.branch_bytes_at(index);
+        let canonical = index < self.header.branch_capacity as usize
+            && slot[0] == 0
+            && slot[1..4].iter().all(|byte| *byte == 0)
+            && read_u32(slot, 8) as usize == position
+            && slot[12..].iter().all(|byte| *byte == 0);
+        canonical
+            .then_some(index)
+            .ok_or(FixedStorageError::NonCanonical)
+    }
+
+    fn pop_free_leaf(&mut self, expected: usize) -> Result<(), FixedStorageError> {
+        let selected = self.selected_free_leaf()?;
+        if selected != expected {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        self.header.free_leaf_len -= 1;
+        Ok(())
+    }
 }
