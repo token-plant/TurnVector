@@ -1732,4 +1732,365 @@ impl SupportC17 {
         }
         Ok((resolution_journals, raw_updates, raw_update_count))
     }
+
+    pub(in crate::support) fn validate_root_batch(
+        &self,
+        change: &PreparedRootBatch,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) -> Result<(), SupportLedgerError> {
+        self.validate_preview(&change.preview)?;
+        if let Some((offset, maximum)) = change.preview.operation.retained_budget()
+            && read_u32(&self.header.0, offset) >= maximum
+        {
+            return Err(capacity_error());
+        }
+        if change.local_count == 0
+            || change.local_count > ROOT_BATCH_LOCAL_MAX
+            || change.raw_update_count > RESOLUTION_RAW_MAX
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let expected_arena_headers = self.semantic_arena_headers();
+        let arena_headers_after = self.prepare_semantic_arena_headers_after(
+            &change.preview,
+            &change.formations,
+            &change.funders,
+            &change.wrappers,
+            &change.mutations,
+            &change.links,
+        )?;
+        let mut header_after = self.header;
+        if let Some((offset, _)) = change.preview.operation.retained_budget() {
+            let next = read_u32(&header_after.0, offset)
+                .checked_add(1)
+                .ok_or_else(capacity_error)?;
+            write_u32(&mut header_after.0, offset, next);
+        }
+        if let Some((_, after)) = change.preview.plan_event {
+            write_u64(&mut header_after.0, NEXT_PLAN_CAUSAL_EVENT, after);
+        }
+        write_u64(&mut header_after.0, 48, generation_after);
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || self.local.generation() != change.expected_local
+            || self.lifecycle.generation() != change.expected_lifecycle
+            || expected_arena_headers != change.expected_arena_headers
+            || arena_headers_after != change.arena_headers_after
+            || header_after != change.header_after
+            || !self.local.validates_assignment_plan(&change.local_plan)
+            || owner_records != change.owner_records_before
+            || self
+                .formations
+                .prepare_reserve::<ROOT_BATCH_MAX>(change.preview.transition_count)?
+                .as_slice()
+                != change.formations.as_slice()
+            || self
+                .funders
+                .prepare_reserve::<ROOT_BATCH_FUNDER_MAX>(
+                    change.preview.transition_count * PLAN_MEMBERS_MAX,
+                )?
+                .as_slice()
+                != change.funders.as_slice()
+            || change.wrapper_count
+                != change.preview.transitions[..change.preview.transition_count]
+                    .iter()
+                    .flatten()
+                    .filter(|transition| transition.before.locator_kind == 2)
+                    .count()
+            || change.wrappers.len() != change.wrapper_count
+            || (change.wrapper_count > 0
+                && self
+                    .wrappers
+                    .prepare_reserve::<ROOT_BATCH_MAX>(change.wrapper_count)?
+                    .as_slice()
+                    != change.wrappers.as_slice())
+            || self
+                .mutations
+                .prepare_reserve::<ROOT_BATCH_MAX>(change.preview.transition_count)?
+                .as_slice()
+                != change.mutations.as_slice()
+            || change.links.len() != change.link_count
+            || (change.link_count > 0
+                && self
+                    .links
+                    .prepare_reserve::<PLAN_MEMBERS_MAX>(change.link_count)?
+                    .as_slice()
+                    != change.links.as_slice())
+            || change.local_entries[change.local_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 17], [0; 8]))
+            || change.resolution_journals[..change.preview.resolution_record_count]
+                .iter()
+                .any(Option::is_none)
+            || change.resolution_journals[change.preview.resolution_record_count..]
+                .iter()
+                .any(Option::is_some)
+            || change.raw_update_count > RESOLUTION_RAW_MAX
+            || change.raw_updates[..change.raw_update_count]
+                .iter()
+                .any(Option::is_none)
+            || change.raw_updates[change.raw_update_count..]
+                .iter()
+                .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        for index in 0..change.preview.owner_count {
+            let references = change.owner_references[index];
+            validate_c16_owner_set(
+                [
+                    self.owner_headers.image(references[0], &[1])?.as_slice(),
+                    self.owner_rows.image(references[1], &[1])?.as_slice(),
+                    self.owner_indices.image(references[2], &[1])?.as_slice(),
+                    self.owners.image(references[3], &[1])?.as_slice(),
+                ],
+                references,
+                change.preview.owners[index].slot,
+                &owner_records[index].ok_or(SupportLedgerError::Generation)?,
+                OWNER_STATE_LIVE,
+            )?;
+            if !matches!(change.preview.resolver, ResolverChange::Keep) {
+                let reference = change.retired_links[index];
+                if self.links.image(reference, &[1])? != &change.retired_link_before[index] {
+                    return Err(SupportLedgerError::Generation);
+                }
+            }
+        }
+        for journal in change.resolution_journals[..change.preview.resolution_record_count]
+            .iter()
+            .copied()
+            .flatten()
+        {
+            if self.lifecycle.image(journal.snapshot.reference, &[1])? != &journal.snapshot.image {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        if change.preview.resolution_record_count > 0 {
+            self.lifecycle.validate_advance_generation()?;
+        }
+        let expected_raw_plan = if change.raw_update_count > 0 {
+            let mut updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); RESOLUTION_RAW_MAX];
+            for (index, update) in change.raw_updates[..change.raw_update_count]
+                .iter()
+                .copied()
+                .flatten()
+                .enumerate()
+            {
+                if self.raw.value_at(update.handle)? != update.before {
+                    return Err(SupportLedgerError::Generation);
+                }
+                updates[index] = (update.key, update.handle, update.after);
+            }
+            self.raw
+                .validate_update_batch(&updates[..change.raw_update_count])?;
+            Some(self.raw.prepare_update_assignment_plan(
+                RAW_INDEX_ASSIGNMENT_ARENA,
+                &updates[..change.raw_update_count],
+            )?)
+        } else {
+            None
+        };
+        self.local
+            .validate_insert_batch(&change.local_entries[..change.local_count])?;
+        let expected_local_plan = self.local.prepare_insert_assignment_plan(
+            LOCAL_INDEX_ASSIGNMENT_ARENA,
+            &change.local_entries[..change.local_count],
+        )?;
+        if expected_raw_plan != change.raw_plan || expected_local_plan != change.local_plan {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut census = crate::work::ExactWorkCensus::new();
+        let reconstructed = self.prepare_root_batch(change.preview, owner_records, &mut census)?;
+        if &reconstructed != change {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(in crate::support) fn commit_root_batch_prevalidated(
+        &mut self,
+        change: PreparedRootBatch,
+        apply_index_plans: bool,
+    ) {
+        for index in 0..change.preview.transition_count {
+            let journal = change.journals[index].expect("sealed semantic journal");
+            self.formations
+                .install_reserved_image_direct(change.formations[index], journal.formation_after);
+            self.mutations
+                .install_reserved_image_direct(change.mutations[index], journal.mutation_after);
+            self.groups
+                .replace_image_prevalidated(journal.before.group, journal.group_after);
+            if journal.before.locator_kind == 1 {
+                self.external_heads
+                    .replace_image_prevalidated(journal.before.locator, journal.locator_after);
+            } else {
+                self.wrappers.install_reserved_image_direct(
+                    journal.locator_after_ref,
+                    journal.locator_after,
+                );
+            }
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                let funder = change.funders[index * PLAN_MEMBERS_MAX + ordinal];
+                self.funders
+                    .install_reserved_image_direct(funder, journal.funder_after[ordinal]);
+                self.members.replace_image_prevalidated(
+                    journal.before.members[ordinal].member,
+                    journal.member_after[ordinal],
+                );
+            }
+        }
+        if change.link_count > 0 {
+            for index in 0..change.preview.owner_count {
+                self.links.install_reserved_image_direct(
+                    change.links[index],
+                    change.new_link_images[index],
+                );
+            }
+        }
+        if apply_index_plans {
+            if let Some(raw_plan) = change.raw_plan {
+                self.raw.commit_assignment_plan_prevalidated(raw_plan);
+            }
+        }
+        for journal in change.resolution_journals[..change.preview.resolution_record_count]
+            .iter()
+            .copied()
+            .flatten()
+        {
+            self.lifecycle
+                .replace_image_prevalidated(journal.snapshot.reference, journal.after);
+        }
+        for index in 0..change.preview.owner_count {
+            let references = change.owner_references[index];
+            self.owner_rows
+                .replace_image_prevalidated(references[1], change.owner_rows_after[index]);
+            self.owners
+                .replace_image_prevalidated(references[3], change.owners_after[index]);
+            if !matches!(change.preview.resolver, ResolverChange::Keep) {
+                self.links.replace_image_prevalidated(
+                    change.retired_links[index],
+                    change.retired_link_after[index],
+                );
+            }
+        }
+        if apply_index_plans {
+            self.local
+                .commit_assignment_plan_prevalidated(change.local_plan);
+        }
+        self.assign_semantic_arena_headers(change.arena_headers_after);
+        self.header = change.header_after;
+    }
+
+    fn preview_root_batch(
+        &self,
+        operation: SemanticOperation,
+        cause: FormationCause,
+        transitions: [Option<(RootSnapshot, RootState, u8)>; ROOT_BATCH_MAX],
+        resolver: ResolverChange,
+        occurred_at: u64,
+    ) -> Result<RootBatchPreview, SupportLedgerError> {
+        let transition_count = transitions.iter().flatten().count();
+        if transition_count == 0
+            || transitions[..transition_count].iter().any(Option::is_none)
+            || transitions[transition_count..].iter().any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut specs = [None; ROOT_BATCH_MAX];
+        let mut aggregate = AggregateDelta::ZERO;
+        let mut owners = [OwnerDelta::ZERO; PLAN_MEMBERS_MAX];
+        let mut owner_count = 0;
+        for index in 0..transition_count {
+            let (before, after, reason) = transitions[index].expect("contiguous transition");
+            if before.version >= 4 || occurred_at <= before.occurred_at {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            let delta = transition_aggregate(before.state, after, before.member_count)?;
+            aggregate.add(delta)?;
+            if matches!(
+                after,
+                RootState::ClosedConditional | RootState::ClosedPending
+            ) {
+                for member in before.members[..before.member_count].iter().copied() {
+                    let position = owners[..owner_count]
+                        .iter()
+                        .position(|owner| owner.owner == member.owner)
+                        .unwrap_or_else(|| {
+                            let position = owner_count;
+                            owners[position].owner = member.owner;
+                            owners[position].slot = member.owner.slot;
+                            owner_count += 1;
+                            position
+                        });
+                    owners[position].linked = owners[position]
+                        .linked
+                        .checked_sub(1)
+                        .ok_or_else(capacity_error)?;
+                    let branch = usize::from(funding_branch(before.branch)?);
+                    owners[position].branch[branch] = owners[position].branch[branch]
+                        .checked_sub(1)
+                        .ok_or_else(capacity_error)?;
+                }
+            }
+            specs[index] = Some(RootTransitionSpec {
+                before,
+                after,
+                cause,
+                close_reason: reason,
+                close_authority: [0; 32],
+                occurred_at,
+            });
+        }
+        if owner_count == 0 {
+            let resolver_root = specs[0].expect("one transition").before;
+            for member in resolver_root.members[..resolver_root.member_count]
+                .iter()
+                .copied()
+            {
+                owners[owner_count] = OwnerDelta {
+                    slot: member.owner.slot,
+                    owner: member.owner,
+                    linked: 0,
+                    branch: [0; 4],
+                };
+                owner_count += 1;
+            }
+        }
+        for transition in specs[..transition_count].iter().flatten() {
+            if transition.before.member_count != owner_count
+                || transition.before.members[..owner_count]
+                    .iter()
+                    .zip(owners[..owner_count].iter())
+                    .any(|(member, owner)| member.owner != owner.owner)
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+        }
+        if let ResolverChange::MoveTo(index) = resolver
+            && index >= transition_count
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        Ok(RootBatchPreview {
+            expected_c17: self.generation(),
+            operation,
+            transitions: specs,
+            transition_count,
+            aggregate,
+            owners,
+            owner_count,
+            resolver,
+            plan_event: None,
+            resolution_records: [None; RESOLUTION_RECORD_MAX],
+            resolution_record_count: 0,
+            lifecycle_before: LifecycleAggregate::ZERO,
+            lifecycle_after: LifecycleAggregate::ZERO,
+            retractions: [LifecyclePublication::ZERO; RESOLUTION_PUBLICATION_MAX],
+            retraction_count: 0,
+        })
+    }
 }
