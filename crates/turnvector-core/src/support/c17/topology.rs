@@ -1759,4 +1759,393 @@ impl SupportC17 {
             occurred_at: event.occurred_at,
         })
     }
+
+    pub(crate) fn inspect_cancellation_topology(
+        &self,
+        cancellation: &PreparedCancellation,
+    ) -> Result<MembershipTopologyPreview, SupportLedgerError> {
+        let event = *cancellation.event();
+        let address = event.affected[0].ok_or(SupportLedgerError::InvalidTransition)?;
+        let before = event.before[0].ok_or(SupportLedgerError::InvalidTransition)?;
+        let after = event.after[0].ok_or(SupportLedgerError::InvalidTransition)?;
+        let operation = match (before.tag, event.source_count) {
+            (MembershipTag::Bound, 1) => SemanticOperation::CancellationRemoveBound,
+            (MembershipTag::EligibleUnbound, 2) => {
+                SemanticOperation::CancellationRemoveEligibleUnbound
+            }
+            _ => return Err(SupportLedgerError::InvalidTransition),
+        };
+        if event.kind != MembershipEventKind::CancellationRemove
+            || event.member_count != 1
+            || !event.consumed_by_support
+            || event.id == 0
+            || event.cancellation_fact == 0
+            || event.occurred_at == 0
+            || event.generation_after != event.generation_before.checked_add(1).unwrap_or(0)
+            || address != cancellation.request()
+            || before.anchor != cancellation.previous_anchor()
+            || before.anchor.is_absent()
+            || before.anchor.group() != before.anchor.root()
+            || before.anchor.branch() > STANDALONE_BRANCH
+            || after.tag != MembershipTag::Cancelled
+            || after.epoch != before.epoch
+            || !after.anchor.is_absent()
+            || after.initial != before.initial
+            || !after.pending.is_absent()
+            || after.cancellation.is_absent()
+            || after.cancellation_fact != event.cancellation_fact
+            || after.cancellation_at != event.occurred_at
+            || event.affected[1..].iter().any(Option::is_some)
+            || event.before[1..].iter().any(Option::is_some)
+            || event.after[1..].iter().any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+
+        let anchor = before.anchor;
+        let root = self.root_at_group(anchor.group(), anchor.authority_key(), anchor.branch())?;
+        let authority = self.authority.find(&root.authority_key)?;
+        let authority_matches = if root.authority_key[0] == 0x32 {
+            authority.is_none()
+        } else {
+            authority
+                .map(|value| decode_arena_ref(&value))
+                .transpose()?
+                .is_some_and(|current| current == root.group)
+        };
+        if root.state != RootState::Pending
+            || root.version < anchor.root_version()
+            || root.version == 4
+            || event.occurred_at <= root.occurred_at
+            || !authority_matches
+            || !(1..=PLAN_MEMBERS_MAX).contains(&root.member_count)
+            || root.members[..root.member_count]
+                .windows(2)
+                .any(|pair| pair[0].request_key >= pair[1].request_key)
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let target_index = root.members[..root.member_count]
+            .iter()
+            .position(|member| member.request_key == address.key)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        for (index, member) in root.members[..root.member_count].iter().enumerate() {
+            if !member.active
+                || root.members[..index].iter().any(|prior| {
+                    prior.owner == member.owner
+                        || prior.entitlement == member.entitlement
+                        || prior.vector == member.vector
+                })
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+        }
+
+        let terminal_destination = root.member_count == 1;
+        let destination_member_count = if terminal_destination {
+            1
+        } else {
+            root.member_count - 1
+        };
+        let destination_group = self.groups.prepare_reserve::<1>(1)?[0];
+        let destination_branch = if terminal_destination { 4 } else { root.branch };
+        let destination_anchor = SupportMembershipAnchor::try_new(
+            root.authority_key,
+            destination_branch,
+            destination_group.slot,
+            destination_group.generation,
+            destination_group.slot,
+            destination_group.generation,
+            1,
+        )
+        .map_err(|_| SupportLedgerError::InvalidTransition)?;
+        let mut destination = TopologyDestination {
+            anchor: destination_anchor,
+            locator_kind: 2,
+            member_count: destination_member_count,
+            members: [RootMemberSnapshot::ZERO; PLAN_MEMBERS_MAX],
+            obligation: [0; 32],
+            credit: [0; 32],
+        };
+        if terminal_destination {
+            destination.members[0] = root.members[target_index];
+        } else {
+            let mut destination_index = 0usize;
+            for (index, member) in root.members[..root.member_count]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                if index != target_index {
+                    destination.members[destination_index] = member;
+                    destination_index += 1;
+                }
+            }
+            debug_assert_eq!(destination_index, destination_member_count);
+        }
+
+        let mut destinations = [TopologyDestination::ZERO; SURGERY_DESTINATION_MAX];
+        destinations[0] = destination;
+        let sources = [Some(root), None, None];
+        let mut member_destinations = [0; PLAN_MEMBERS_MAX];
+        let mut owners = [TopologyOwner::ZERO; PLAN_MEMBERS_MAX];
+        let source_branch = usize::from(funding_branch(root.branch)?);
+        for (index, member) in root.members[..root.member_count]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let removed = index == target_index;
+            member_destinations[index] = if removed { u8::MAX } else { 0 };
+            let root_delta = if removed && !terminal_destination {
+                -1
+            } else {
+                0
+            };
+            let mut branch_delta = [0; 4];
+            branch_delta[source_branch] = root_delta;
+            owners[index] = TopologyOwner {
+                slot: member.owner.slot,
+                owner: member.owner,
+                request_key: member.request_key,
+                source: 0,
+                branch_delta,
+                vector_delta: branch_delta,
+                linked_delta: root_delta,
+            };
+        }
+
+        let mut aggregate = transition_aggregate(
+            RootState::Pending,
+            RootState::ClosedPending,
+            root.member_count,
+        )?;
+        aggregate.add(materialize_pending_delta(destination_member_count)?)?;
+        let (
+            lifecycle_records,
+            lifecycle_record_count,
+            lifecycle_before,
+            lifecycle_after,
+            retractions,
+            retraction_count,
+        ) = self.inspect_topology_lifecycle(
+            &sources,
+            1,
+            1,
+            terminal_destination,
+            &member_destinations,
+            &mut owners,
+        )?;
+        add_topology_lifecycle_aggregate_delta(&mut aggregate, lifecycle_before, lifecycle_after)?;
+        Ok(MembershipTopologyPreview {
+            expected_c17: self.generation(),
+            operation,
+            sources,
+            source_count: 1,
+            destinations,
+            destination_count: 1,
+            terminal_destination,
+            member_destinations,
+            member_count: root.member_count,
+            aggregate,
+            owners,
+            owner_count: root.member_count,
+            lifecycle_records,
+            lifecycle_record_count,
+            lifecycle_before,
+            lifecycle_after,
+            retractions,
+            retraction_count,
+            event_id: event.id,
+            request_generation: event.generation_after,
+            occurred_at: event.occurred_at,
+        })
+    }
+
+    fn inspect_topology_lifecycle(
+        &self,
+        sources: &[Option<RootSnapshot>; SOURCE_MAX],
+        source_count: usize,
+        destination_count: usize,
+        terminal_destination: bool,
+        member_destinations: &[u8; PLAN_MEMBERS_MAX],
+        owners: &mut [TopologyOwner; PLAN_MEMBERS_MAX],
+    ) -> Result<
+        (
+            [Option<TopologyLifecycleSnapshot>; SURGERY_LIFECYCLE_MAX],
+            usize,
+            LifecycleAggregate,
+            LifecycleAggregate,
+            [LifecyclePublication; SURGERY_LIFECYCLE_PUBLICATION_MAX],
+            usize,
+        ),
+        SupportLedgerError,
+    > {
+        if self.pending_state()? != PendingState::Empty {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let owner_count = owners
+            .iter()
+            .position(|owner| *owner == TopologyOwner::ZERO)
+            .unwrap_or(PLAN_MEMBERS_MAX);
+        if owner_count == 0 {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let mut active_links = [ArenaRef::default(); PLAN_MEMBERS_MAX];
+        for index in 0..owner_count {
+            let owner = owners[index];
+            let source = sources
+                .get(owner.source)
+                .copied()
+                .flatten()
+                .ok_or(SupportLedgerError::InvalidInput)?;
+            let row = self
+                .owner_rows
+                .image(self.owner_rows.reference_at(owner.slot, &[1])?, &[1])?;
+            let link =
+                decode_optional_arena_ref(&row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8])?
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+            let image = self.links.image(link, &[1])?;
+            if image[8] != 1
+                || decode_arena_ref(&image[16..24])? != owner.owner
+                || decode_arena_ref(&image[24..32])? != source.group
+                || decode_arena_ref(&image[32..40])? != source.initial_formation
+            {
+                return Err(noncanonical_error());
+            }
+            active_links[index] = link;
+        }
+
+        let mut records = [None; SURGERY_LIFECYCLE_MAX];
+        let mut record_count = 0usize;
+        let mut before = LifecycleAggregate::ZERO;
+        let mut after = LifecycleAggregate::ZERO;
+        let mut retractions = [LifecyclePublication::ZERO; SURGERY_LIFECYCLE_PUBLICATION_MAX];
+        let mut retraction_count = 0usize;
+        for slot in 0..self.lifecycle.capacity() {
+            let Some(reference) = self.lifecycle.reference_if_occupied(slot as u32)? else {
+                continue;
+            };
+            let image = *self.lifecycle.image(reference, &[1])?;
+            if image[488] != 0 {
+                validate_topology_closed_lifecycle_image(&image)?;
+                continue;
+            }
+            let record = LifecycleRecordInput::decode(&image)?;
+            self.validate_lifecycle_record_owner_set(record, reference)?;
+            let lifecycle_owner_count = record
+                .owners
+                .iter()
+                .position(|owner| *owner == LifecycleOwnerRow::ZERO)
+                .unwrap_or(PLAN_MEMBERS_MAX);
+            let linked = record.owners[..lifecycle_owner_count].iter().any(|owner| {
+                decode_arena_ref(&owner.link.to_le_bytes())
+                    .is_ok_and(|link| active_links[..owner_count].contains(&link))
+            });
+            if !linked {
+                continue;
+            }
+            if record_count == records.len() || lifecycle_owner_count == 0 {
+                return Err(capacity_error());
+            }
+            let mut destination = None;
+            let mut close = destination_count == 0 || terminal_destination;
+            for lifecycle_owner in record.owners[..lifecycle_owner_count].iter().copied() {
+                let owner_ref = decode_arena_ref(&lifecycle_owner.owner.to_le_bytes())?;
+                let owner_index = owners[..owner_count]
+                    .iter()
+                    .position(|owner| owner.owner == owner_ref)
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let link = decode_arena_ref(&lifecycle_owner.link.to_le_bytes())?;
+                if active_links[owner_index] != link {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                if destination_count > 0 && !terminal_destination {
+                    let current = member_destinations[owner_index];
+                    if current == u8::MAX {
+                        close = true;
+                    } else if usize::from(current) >= destination_count {
+                        return Err(SupportLedgerError::InvalidTransition);
+                    } else if destination.is_some_and(|expected| expected != current) {
+                        close = true;
+                    } else if !close {
+                        destination = Some(current);
+                    }
+                }
+            }
+            let destination = if close {
+                u8::MAX
+            } else {
+                destination.ok_or(SupportLedgerError::InvalidTransition)?
+            };
+            for (kind, key) in [
+                (RawOwnerKind::LifecycleObligation, record.obligation_raw),
+                (RawOwnerKind::LifecycleCredit, record.credit_raw),
+            ] {
+                let raw = self.raw.find(&key)?.ok_or_else(noncanonical_error)?;
+                let (actual_kind, state, owner) = decode_raw_owner(raw)?;
+                if actual_kind != kind || state != RawOwnerState::Committed || owner != reference {
+                    return Err(noncanonical_error());
+                }
+            }
+            before.accrue(record)?;
+            if destination != u8::MAX {
+                after.accrue(record)?;
+            } else {
+                let branch = usize::from(funding_branch(record.final_owner[17])?);
+                let axis = u8::try_from(record.aggregate[2]).map_err(|_| noncanonical_error())?;
+                let horizon =
+                    u8::try_from(record.aggregate[3]).map_err(|_| noncanonical_error())?;
+                for lifecycle_owner in record.owners[..lifecycle_owner_count].iter().copied() {
+                    let owner_ref = decode_arena_ref(&lifecycle_owner.owner.to_le_bytes())?;
+                    let owner_index = owners[..owner_count]
+                        .iter()
+                        .position(|owner| owner.owner == owner_ref)
+                        .ok_or_else(noncanonical_error)?;
+                    owners[owner_index].linked_delta = owners[owner_index]
+                        .linked_delta
+                        .checked_sub(1)
+                        .ok_or_else(capacity_error)?;
+                    owners[owner_index].branch_delta[branch] = owners[owner_index].branch_delta
+                        [branch]
+                        .checked_sub(1)
+                        .ok_or_else(capacity_error)?;
+                    if retraction_count == retractions.len() {
+                        return Err(capacity_error());
+                    }
+                    let member = decode_arena_ref(&lifecycle_owner.source.to_le_bytes())?;
+                    let member_image = self.members.image(member, &[1])?;
+                    retractions[retraction_count] = LifecyclePublication {
+                        owner_slot: owner_ref.slot,
+                        funder: decode_arena_ref(&member_image[24..32])?,
+                        branch: record.final_owner[17],
+                        axis,
+                        horizon,
+                        zero: 0,
+                    };
+                    retraction_count += 1;
+                }
+            }
+            records[record_count] = Some(TopologyLifecycleSnapshot {
+                reference,
+                record,
+                image,
+                destination,
+            });
+            record_count += 1;
+        }
+        let _ = source_count;
+        Ok((
+            records,
+            record_count,
+            before,
+            after,
+            retractions,
+            retraction_count,
+        ))
+    }
+}
+
+fn arena_ref_word(reference: ArenaRef) -> u64 {
+    u64::from_le_bytes(encode_arena_ref_value(reference))
 }
