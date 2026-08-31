@@ -1016,3 +1016,342 @@ pub(crate) struct PreparedCancellation {
     request_index_plan: PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>,
     direct: PreparedRequestDirectImages,
 }
+
+impl PreparedCancellation {
+    pub(crate) const fn generation_after(&self) -> RequestBookGeneration {
+        self.direct.generation_after
+    }
+
+    pub(crate) const fn request(&self) -> RequestAddress {
+        self.request
+    }
+
+    pub(crate) const fn previous_anchor(&self) -> SupportMembershipAnchor {
+        self.before.anchor
+    }
+
+    pub(crate) const fn source_count(&self) -> u8 {
+        self.event.source_count
+    }
+
+    pub(crate) const fn event_id(&self) -> u64 {
+        self.event.id
+    }
+
+    pub(crate) const fn fact_id(&self) -> u64 {
+        self.event.cancellation_fact
+    }
+
+    pub(crate) const fn event(&self) -> &MembershipEventRecord {
+        &self.event
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.source_index_plan.visit_assignments(visitor);
+        self.event_index_plan.visit_assignments(visitor);
+        self.request_index_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedCreateStandalone {
+    expected_generation: u64,
+    request: RequestAddress,
+    before: MembershipStateRow,
+    after_status: u64,
+    source: SourceRecord,
+    source_selection: ArenaSelection<1>,
+    event_selection: ArenaSelection<1>,
+    event: MembershipEventRecord,
+    source_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    event_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    request_index_plan: PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>,
+    direct: PreparedRequestDirectImages,
+}
+
+impl PreparedCreateStandalone {
+    pub(crate) const fn generation_after(&self) -> RequestBookGeneration {
+        self.direct.generation_after
+    }
+
+    pub(crate) const fn request(&self) -> RequestAddress {
+        self.request
+    }
+
+    pub(crate) const fn event_id(&self) -> u64 {
+        self.event.id
+    }
+
+    pub(crate) const fn source_ref(&self) -> SourceRecordRef {
+        self.event.sources[0]
+    }
+
+    pub(crate) const fn event(&self) -> &MembershipEventRecord {
+        &self.event
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.source_index_plan.visit_assignments(visitor);
+        self.event_index_plan.visit_assignments(visitor);
+        self.request_index_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedMergeInitial {
+    expected_generation: u64,
+    event_selection: ArenaSelection<1>,
+    event: MembershipEventRecord,
+    after_status: [u64; 4],
+    event_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+    request_index_plan: PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>,
+    direct: PreparedRequestDirectImages,
+}
+
+impl PreparedMergeInitial {
+    pub(crate) const fn generation_after(&self) -> RequestBookGeneration {
+        self.direct.generation_after
+    }
+
+    pub(crate) const fn event_id(&self) -> u64 {
+        self.event.id
+    }
+
+    pub(crate) const fn source_count(&self) -> u8 {
+        self.event.source_count
+    }
+
+    pub(crate) const fn event(&self) -> &MembershipEventRecord {
+        &self.event
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.event_index_plan.visit_assignments(visitor);
+        self.request_index_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedMembershipIntent {
+    expected_generation: u64,
+    event_selection: ArenaSelection<1>,
+    event: MembershipEventRecord,
+    after_status: [u64; 4],
+    destinations: [MembershipDestination; 4],
+    destination_count: u8,
+    source_update: Option<(SourceRecordRef, SourceRecord, SourceRecord)>,
+    event_index_plan: PatriciaAssignmentPlan<SINGLE_INDEX_ASSIGNMENTS>,
+}
+
+impl PreparedMembershipIntent {
+    pub(crate) const fn event_id(&self) -> u64 {
+        self.event.id
+    }
+
+    pub(crate) const fn kind(&self) -> MembershipEventKind {
+        self.event.kind
+    }
+
+    pub(crate) const fn member_count(&self) -> usize {
+        self.event.member_count as usize
+    }
+
+    pub(crate) const fn destination_count(&self) -> usize {
+        self.destination_count as usize
+    }
+
+    pub(crate) const fn occurred_at(&self) -> u64 {
+        self.event.occurred_at
+    }
+
+    pub(crate) const fn event(&self) -> &MembershipEventRecord {
+        &self.event
+    }
+
+    pub(crate) const fn destination(&self, index: usize) -> Option<MembershipDestination> {
+        if index < self.event.member_count as usize {
+            Some(self.destinations[index])
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedMembershipEvent {
+    intent: PreparedMembershipIntent,
+    request_index_plan: PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>,
+    direct: PreparedRequestDirectImages,
+}
+
+impl PreparedMembershipEvent {
+    pub(crate) const fn generation_after(&self) -> RequestBookGeneration {
+        self.direct.generation_after
+    }
+
+    pub(crate) const fn event_id(&self) -> u64 {
+        self.intent.event.id
+    }
+
+    pub(crate) const fn kind(&self) -> MembershipEventKind {
+        self.intent.event.kind
+    }
+
+    pub(crate) const fn event(&self) -> &MembershipEventRecord {
+        &self.intent.event
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.intent.event_index_plan.visit_assignments(visitor);
+        self.request_index_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestBookC17Capacities {
+    requests: usize,
+    events: usize,
+    sources: usize,
+}
+
+impl RequestBookC17Capacities {
+    pub(crate) const fn production() -> Self {
+        Self {
+            requests: REQUEST_CAPACITY,
+            events: EVENT_CAPACITY,
+            sources: SOURCE_CAPACITY,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn testing(requests: usize) -> Self {
+        Self {
+            requests,
+            events: 64,
+            sources: 64,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub(crate) struct RequestBookC17 {
+    header: RequestBookC17HeaderImage,
+    requests: FixedByteArena<REQUEST_IMAGE_BYTES>,
+    request_index: ReusablePatricia<40, 56>,
+    events: FixedByteArena<EVENT_IMAGE_BYTES>,
+    event_index: ReusablePatricia<8, 8>,
+    sources: FixedByteArena<SOURCE_IMAGE_BYTES>,
+    source_index: ReusablePatricia<33, 8>,
+}
+
+impl RequestBookC17 {
+    pub(crate) fn try_new(
+        capacities: RequestBookC17Capacities,
+        generation: RequestBookGeneration,
+    ) -> Result<Self, RequestError> {
+        if capacities.requests == 0
+            || capacities.requests > REQUEST_CAPACITY
+            || capacities.events == 0
+            || capacities.events > EVENT_CAPACITY
+            || capacities.sources == 0
+            || capacities.sources > SOURCE_CAPACITY
+        {
+            return Err(RequestError::Storage(FixedStorageError::Capacity));
+        }
+        let mut header = RequestBookC17HeaderImage::ZERO;
+        for (offset, value) in [
+            (0, 1),
+            (8, 1),
+            (16, 1),
+            (24, generation.get()),
+            (32, 1),
+            (40, 1),
+            (48, 1),
+            (56, 1),
+        ] {
+            write_u64(&mut header.0, offset, value);
+        }
+        write_u32(&mut header.0, 64, capacities.requests as u32);
+        write_u32(&mut header.0, 68, capacities.requests as u32);
+        write_u32(&mut header.0, 72, capacities.events as u32);
+        write_u32(&mut header.0, 76, capacities.events as u32);
+        write_u32(&mut header.0, 80, capacities.sources as u32);
+        write_u32(&mut header.0, 84, capacities.sources as u32);
+        Ok(Self {
+            header,
+            requests: FixedByteArena::try_new(capacities.requests)?,
+            request_index: ReusablePatricia::try_new(capacities.requests)?,
+            events: FixedByteArena::try_new(capacities.events)?,
+            event_index: ReusablePatricia::try_new(capacities.events)?,
+            sources: FixedByteArena::try_new(capacities.sources)?,
+            source_index: ReusablePatricia::try_new(capacities.sources)?,
+        })
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        read_u64_const(&self.header.0, 24)
+    }
+
+    pub(crate) fn commit_assignment_direct(&mut self, assignment: &Assignment) {
+        match assignment.destination_arena {
+            REQUEST_INDEX_ASSIGNMENT_ARENA => {
+                self.request_index.commit_assignment_direct(assignment)
+            }
+            EVENT_INDEX_ASSIGNMENT_ARENA => self.event_index.commit_assignment_direct(assignment),
+            SOURCE_INDEX_ASSIGNMENT_ARENA => self.source_index.commit_assignment_direct(assignment),
+            _ => unreachable!("validated RequestBook assignment arena"),
+        }
+    }
+
+    pub(crate) fn validate_request_book_generation(
+        &self,
+        expected: RequestBookGeneration,
+    ) -> Result<(), RequestError> {
+        (self.generation() == expected.get())
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_request_book_generation(
+        &mut self,
+        expected: RequestBookGeneration,
+        next: RequestBookGeneration,
+    ) {
+        self.validate_request_book_generation(expected)
+            .expect("validated RequestBook generation");
+        assert_eq!(
+            expected.get().checked_add(1),
+            Some(next.get()),
+            "prepared RequestBook generation"
+        );
+        write_u64(&mut self.header.0, 24, next.get());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_counts(&self) -> [u32; 4] {
+        [
+            read_u32(&self.header.0, 96),
+            read_u32(&self.header.0, 100),
+            read_u32(&self.header.0, 104),
+            read_u32(&self.header.0, 108),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_generation_for_test(&mut self, generation: u64) {
+        write_u64(&mut self.header.0, 24, generation);
+    }
+}
