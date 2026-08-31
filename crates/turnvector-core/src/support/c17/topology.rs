@@ -1403,4 +1403,360 @@ impl MembershipTopologyPreview {
 }
 
 impl SupportC17 {
+    pub(crate) fn inspect_membership_topology(
+        &self,
+        intent: &PreparedMembershipIntent,
+    ) -> Result<MembershipTopologyPreview, SupportLedgerError> {
+        let event = intent.event();
+        let member_count = intent.member_count();
+        let destination_count = intent.destination_count();
+        if !(1..=PLAN_MEMBERS_MAX).contains(&member_count)
+            || destination_count > SURGERY_DESTINATION_MAX
+            || event.id != intent.event_id()
+            || event.kind != intent.kind()
+            || event.member_count as usize != member_count
+            || event.occurred_at != intent.occurred_at()
+            || event.occurred_at == 0
+            || !event.consumed_by_support
+            || event.cancellation_fact != 0
+            || event.after.iter().any(Option::is_some)
+            || event.affected[..member_count].iter().any(Option::is_none)
+            || event.before[..member_count].iter().any(Option::is_none)
+            || event.affected[member_count..].iter().any(Option::is_some)
+            || event.before[member_count..].iter().any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let operation = match (event.kind, event.source_count) {
+            (MembershipEventKind::Join, 1) => SemanticOperation::NewlyEligibleJoin,
+            (MembershipEventKind::Rebind, 0) => SemanticOperation::SourceFreeRebind,
+            (MembershipEventKind::Rebind, 1) => SemanticOperation::NewlyEligibleRebind,
+            (MembershipEventKind::Split, 0) => SemanticOperation::Split,
+            (MembershipEventKind::Merge, 0) => SemanticOperation::Merge,
+            (MembershipEventKind::Close, 0) => SemanticOperation::MembershipClose,
+            _ => return Err(SupportLedgerError::InvalidTransition),
+        };
+        let expected_destination_count = match event.kind {
+            MembershipEventKind::Join
+            | MembershipEventKind::Rebind
+            | MembershipEventKind::Merge => 1,
+            MembershipEventKind::Split => 4,
+            MembershipEventKind::Close => 0,
+            _ => return Err(SupportLedgerError::InvalidTransition),
+        };
+        if destination_count != expected_destination_count {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+
+        let mut source_anchors = [SupportMembershipAnchor::ABSENT; SOURCE_MAX];
+        let mut source_count = 0usize;
+        let mut member_destinations = [0; PLAN_MEMBERS_MAX];
+        let mut used_destinations = [false; SURGERY_DESTINATION_MAX];
+        for index in 0..member_count {
+            let address = event.affected[index].ok_or(SupportLedgerError::InvalidInput)?;
+            let before = event.before[index].ok_or(SupportLedgerError::InvalidInput)?;
+            if !matches!(
+                before.tag,
+                MembershipTag::Bound | MembershipTag::EligibleUnbound
+            ) || before.anchor.is_absent()
+                || before.anchor.authority_key() == [0; 17]
+                || before.anchor.branch() > 3
+                || before.anchor.group() != before.anchor.root()
+                || before.anchor.root_version() == 0
+                || (index > 0
+                    && event.affected[index - 1].is_none_or(|prior| prior.key >= address.key))
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            if !source_anchors[..source_count].contains(&before.anchor) {
+                if source_count == SOURCE_MAX {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                source_anchors[source_count] = before.anchor;
+                source_count += 1;
+            }
+            match intent
+                .destination(index)
+                .ok_or(SupportLedgerError::InvalidInput)?
+            {
+                MembershipDestination::Destination(ordinal) => {
+                    let ordinal = usize::from(ordinal);
+                    if ordinal >= destination_count {
+                        return Err(SupportLedgerError::InvalidInput);
+                    }
+                    member_destinations[index] = ordinal as u8;
+                    used_destinations[ordinal] = true;
+                }
+                MembershipDestination::Closed => {
+                    if event.kind != MembershipEventKind::Close {
+                        return Err(SupportLedgerError::InvalidInput);
+                    }
+                    member_destinations[index] = u8::MAX;
+                }
+            }
+        }
+        if used_destinations[..destination_count]
+            .iter()
+            .any(|used| !used)
+            || used_destinations[destination_count..]
+                .iter()
+                .any(|used| *used)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let valid_source_count = match event.kind {
+            MembershipEventKind::Join
+            | MembershipEventKind::Rebind
+            | MembershipEventKind::Split
+            | MembershipEventKind::Close => source_count == 1,
+            MembershipEventKind::Merge => (2..=SOURCE_MAX).contains(&source_count),
+            _ => false,
+        };
+        if !valid_source_count {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+
+        let mut sources = [None; SOURCE_MAX];
+        for index in 0..source_count {
+            let anchor = source_anchors[index];
+            let root =
+                self.root_at_group(anchor.group(), anchor.authority_key(), anchor.branch())?;
+            if root.state != RootState::Pending
+                || root.version < anchor.root_version()
+                || event.occurred_at <= root.occurred_at
+                || root.version == 4
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            sources[index] = Some(root);
+        }
+        sources[..source_count].sort_unstable_by_key(|source| {
+            source.expect("active topology source").members[0].request_key
+        });
+        let branch = sources[0].expect("one topology source").branch;
+        if sources[..source_count]
+            .iter()
+            .flatten()
+            .any(|source| source.branch != branch)
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+
+        let mut total_members = 0usize;
+        let mut all_members = [RootMemberSnapshot::ZERO; PLAN_MEMBERS_MAX];
+        for source in sources[..source_count].iter().copied().flatten() {
+            total_members = total_members
+                .checked_add(source.member_count)
+                .ok_or_else(capacity_error)?;
+            if total_members > PLAN_MEMBERS_MAX {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            for member in source.members[..source.member_count].iter().copied() {
+                let event_index = event.affected[..member_count]
+                    .iter()
+                    .position(|address| {
+                        address.is_some_and(|address| address.key == member.request_key)
+                    })
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let before =
+                    event.before[event_index].ok_or(SupportLedgerError::InvalidTransition)?;
+                if before.anchor.group() != source.group
+                    || before.anchor.authority_key() != source.authority_key
+                    || before.anchor.branch() != source.branch
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let occupied = all_members[..total_members]
+                    .iter()
+                    .position(|candidate| candidate.request_key == [0; 40])
+                    .ok_or_else(noncanonical_error)?;
+                all_members[occupied] = member;
+            }
+        }
+        if total_members != member_count {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        all_members[..member_count].sort_unstable_by_key(|member| member.request_key);
+        for index in 0..member_count {
+            let address = event.affected[index].ok_or(SupportLedgerError::InvalidTransition)?;
+            let member = all_members[index];
+            if member.request_key != address.key
+                || !member.active
+                || all_members[..index].iter().any(|prior| {
+                    prior.owner == member.owner
+                        || prior.entitlement == member.entitlement
+                        || prior.vector == member.vector
+                })
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+        }
+
+        if matches!(
+            event.kind,
+            MembershipEventKind::Rebind | MembershipEventKind::Split
+        ) && sources[0].expect("source").locator_kind != 2
+            || event.kind == MembershipEventKind::Merge
+                && !sources[..source_count]
+                    .iter()
+                    .flatten()
+                    .any(|source| source.locator_kind == 2)
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let initial_source = if matches!(
+            event.kind,
+            MembershipEventKind::Rebind | MembershipEventKind::Split | MembershipEventKind::Merge
+        ) {
+            sources[..source_count]
+                .iter()
+                .copied()
+                .flatten()
+                .filter(|source| source.locator_kind == 2)
+                .min_by_key(|source| source.authority_key)
+        } else {
+            None
+        };
+        let initial_destination = match event.kind {
+            MembershipEventKind::Rebind | MembershipEventKind::Merge => Some(0),
+            MembershipEventKind::Split => Some(0),
+            MembershipEventKind::Join | MembershipEventKind::Close => None,
+            _ => return Err(SupportLedgerError::InvalidTransition),
+        };
+        if initial_destination.is_some() && initial_source.is_none() {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+
+        let destination_groups = if destination_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.groups
+                .prepare_reserve::<SURGERY_DESTINATION_MAX>(destination_count)?
+        };
+        let mut destinations = [TopologyDestination::ZERO; SURGERY_DESTINATION_MAX];
+        for destination_index in 0..destination_count {
+            let initial = initial_destination == Some(destination_index);
+            let authority_key = if initial {
+                initial_source
+                    .expect("initial destination source")
+                    .authority_key
+            } else {
+                topology_external_authority(event, destination_index)?
+            };
+            let group = destination_groups[destination_index];
+            let anchor = SupportMembershipAnchor::try_new(
+                authority_key,
+                branch,
+                group.slot,
+                group.generation,
+                group.slot,
+                group.generation,
+                1,
+            )
+            .map_err(|_| SupportLedgerError::InvalidInput)?;
+            let (obligation, credit) = if initial {
+                ([0; 32], [0; 32])
+            } else {
+                topology_external_raw(event, destination_index)?
+            };
+            let mut destination = TopologyDestination {
+                anchor,
+                locator_kind: if initial { 2 } else { 1 },
+                member_count: 0,
+                members: [RootMemberSnapshot::ZERO; PLAN_MEMBERS_MAX],
+                obligation,
+                credit,
+            };
+            for member_index in 0..member_count {
+                if usize::from(member_destinations[member_index]) == destination_index {
+                    destination.members[destination.member_count] = all_members[member_index];
+                    destination.member_count += 1;
+                }
+            }
+            if destination.member_count == 0 {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            destinations[destination_index] = destination;
+        }
+
+        let mut aggregate = AggregateDelta::ZERO;
+        for source in sources[..source_count].iter().copied().flatten() {
+            aggregate.add(transition_aggregate(
+                RootState::Pending,
+                RootState::ClosedPending,
+                source.member_count,
+            )?)?;
+        }
+        for destination in &destinations[..destination_count] {
+            aggregate.add(materialize_pending_delta(destination.member_count)?)?;
+        }
+
+        let mut owners = [TopologyOwner::ZERO; PLAN_MEMBERS_MAX];
+        for index in 0..member_count {
+            let member = all_members[index];
+            let source = sources[..source_count]
+                .iter()
+                .position(|source| {
+                    source.is_some_and(|source| {
+                        source.members[..source.member_count]
+                            .iter()
+                            .any(|candidate| candidate.owner == member.owner)
+                    })
+                })
+                .ok_or_else(noncanonical_error)?;
+            let mut branch_delta = [0; 4];
+            let linked_delta = if destination_count == 0 { -1 } else { 0 };
+            if destination_count == 0 {
+                branch_delta[usize::from(funding_branch(branch)?)] = -1;
+            }
+            owners[index] = TopologyOwner {
+                slot: member.owner.slot,
+                owner: member.owner,
+                request_key: member.request_key,
+                source,
+                branch_delta,
+                vector_delta: branch_delta,
+                linked_delta,
+            };
+        }
+        let (
+            lifecycle_records,
+            lifecycle_record_count,
+            lifecycle_before,
+            lifecycle_after,
+            retractions,
+            retraction_count,
+        ) = self.inspect_topology_lifecycle(
+            &sources,
+            source_count,
+            destination_count,
+            false,
+            &member_destinations,
+            &mut owners,
+        )?;
+        add_topology_lifecycle_aggregate_delta(&mut aggregate, lifecycle_before, lifecycle_after)?;
+        Ok(MembershipTopologyPreview {
+            expected_c17: self.generation(),
+            operation,
+            sources,
+            source_count,
+            destinations,
+            destination_count,
+            terminal_destination: false,
+            member_destinations,
+            member_count,
+            aggregate,
+            owners,
+            owner_count: member_count,
+            lifecycle_records,
+            lifecycle_record_count,
+            lifecycle_before,
+            lifecycle_after,
+            retractions,
+            retraction_count,
+            event_id: event.id,
+            request_generation: event.generation_after,
+            occurred_at: event.occurred_at,
+        })
+    }
 }
