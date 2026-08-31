@@ -1414,4 +1414,398 @@ impl SupportC17 {
             .expect("prepared C17 owner generation");
         write_u64(&mut self.header.0, offset, next);
     }
+
+    pub(super) fn prepare_plan_create(
+        &self,
+        input: PlanCreateInput,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) -> Result<PreparedPlanCreate, SupportLedgerError> {
+        input.validate()?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let expected_arena_headers = self.plan_arena_headers();
+
+        if let Some(value) = self.authority.find(&input.authority_key)? {
+            let group = decode_arena_ref(&value)?;
+            let image = self.groups.image(group, &[1])?;
+            let formation = decode_arena_ref(&image[16..24])?;
+            let formation_image = self.formations.image(formation, &[1])?;
+            if formation_image[8..8 + PLAN_IDENTITY_BYTES] == input.identity {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            return Err(noncanonical_error());
+        }
+
+        let groups = self
+            .groups
+            .prepare_reserve::<PLAN_BRANCHES>(PLAN_BRANCHES)?;
+        let external_heads = self
+            .external_heads
+            .prepare_reserve::<PLAN_BRANCHES>(PLAN_BRANCHES)?;
+        let formations = self
+            .formations
+            .prepare_reserve::<PLAN_BRANCHES>(PLAN_BRANCHES)?;
+        let funders = self
+            .funders
+            .prepare_reserve::<PLAN_FUNDER_ROWS>(PLAN_FUNDER_ROWS)?;
+        let members = self
+            .members
+            .prepare_reserve::<PLAN_MEMBER_ROWS>(PLAN_MEMBER_ROWS)?;
+        let links = self
+            .links
+            .prepare_reserve::<PLAN_MEMBERS_MAX>(input.member_count)?;
+        let mutations = self.mutations.prepare_reserve::<1>(1)?;
+
+        let mut authority_entries = [([0; 17], [0; 8]); 1];
+        authority_entries[0] = (input.authority_key, encode_arena_ref_value(groups[0]));
+        self.authority.validate_insert_batch(&authority_entries)?;
+
+        let mut raw_entries = [([0; 32], [0; 8]); PLAN_RAW_EDITS];
+        for branch in 0..PLAN_BRANCHES {
+            raw_entries[branch * 2] = (
+                input.obligations[branch],
+                encode_raw_owner_at(
+                    RawOwnerKind::PlanRoot,
+                    RawOwnerState::Committed,
+                    branch as u8,
+                    external_heads[branch],
+                )?,
+            );
+            raw_entries[branch * 2 + 1] = (
+                input.credits[branch],
+                encode_raw_owner_at(
+                    RawOwnerKind::Formation,
+                    RawOwnerState::Committed,
+                    branch as u8,
+                    external_heads[branch],
+                )?,
+            );
+        }
+        raw_entries.sort_unstable_by_key(|entry| entry.0);
+        if raw_entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.raw.validate_insert_batch(&raw_entries)?;
+
+        let mut local_entries = [([0; 17], [0; 8]); PLAN_LOCAL_EDITS];
+        let mut local_count = 0;
+        for reference in groups.as_slice() {
+            local_entries[local_count] = (
+                local_key(LocalKind::Group, *reference),
+                encode_arena_ref_value(*reference),
+            );
+            local_count += 1;
+        }
+        for reference in funders.as_slice() {
+            local_entries[local_count] = (
+                local_key(LocalKind::Funder, *reference),
+                encode_arena_ref_value(*reference),
+            );
+            local_count += 1;
+        }
+        for reference in links.as_slice() {
+            local_entries[local_count] = (
+                local_key(LocalKind::Link, *reference),
+                encode_arena_ref_value(*reference),
+            );
+            local_count += 1;
+        }
+        local_entries[local_count] = (
+            local_key(LocalKind::Mutation, mutations[0]),
+            encode_arena_ref_value(mutations[0]),
+        );
+        local_count += 1;
+        debug_assert_eq!(local_count, 3 + 12 + input.member_count + 1);
+        local_entries[..local_count].sort_unstable_by_key(|entry| entry.0);
+        self.local
+            .validate_insert_batch(&local_entries[..local_count])?;
+
+        let mut group_images = [[0; GROUP_BYTES]; PLAN_BRANCHES];
+        let mut head_images = [[0; EXTERNAL_HEAD_BYTES]; PLAN_BRANCHES];
+        let mut formation_images = [[0; FORMATION_BYTES]; PLAN_BRANCHES];
+        let mut funder_images = [[0; FUNDER_BYTES]; PLAN_FUNDER_ROWS];
+        let mut member_images = [[0; MEMBER_BYTES]; PLAN_MEMBER_ROWS];
+        let mut link_images = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+
+        for branch in 0..PLAN_BRANCHES {
+            let row_start = branch * PLAN_MEMBERS_MAX;
+            group_images[branch] = self.groups.prepare_reserved_image_after(
+                groups[branch],
+                encode_plan_group(
+                    branch,
+                    input.member_count,
+                    input.authority_key,
+                    formations[branch],
+                    external_heads[branch],
+                    members.as_slice()[row_start..row_start + PLAN_MEMBERS_MAX]
+                        .try_into()
+                        .expect("fixed Plan member range"),
+                    groups.as_slice().try_into().expect("three Plan groups"),
+                ),
+                1,
+            )?;
+            formation_images[branch] = self.formations.prepare_reserved_image_after(
+                formations[branch],
+                encode_plan_formation(
+                    input.identity,
+                    branch,
+                    groups[branch],
+                    external_heads[branch],
+                    input.occurred_at,
+                ),
+                1,
+            )?;
+            head_images[branch] = self.external_heads.prepare_reserved_image_after(
+                external_heads[branch],
+                encode_plan_head(
+                    branch,
+                    input.member_count,
+                    groups[branch],
+                    formations[branch],
+                    input.obligations[branch],
+                    input.credits[branch],
+                    input.authority_key,
+                ),
+                1,
+            )?;
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                let row = row_start + ordinal;
+                let active = ordinal < input.member_count;
+                funder_images[row] = self.funders.prepare_reserved_image_after(
+                    funders[row],
+                    encode_plan_funder(
+                        branch,
+                        ordinal,
+                        active,
+                        groups[branch],
+                        formations[branch],
+                        members[row],
+                        input.members[ordinal],
+                    ),
+                    1,
+                )?;
+                member_images[row] = self.members.prepare_reserved_image_after(
+                    members[row],
+                    encode_plan_member(
+                        branch,
+                        ordinal,
+                        active,
+                        groups[branch],
+                        funders[row],
+                        input.members[ordinal],
+                    ),
+                    1,
+                )?;
+            }
+        }
+        for ordinal in 0..input.member_count {
+            link_images[ordinal] = self.links.prepare_reserved_image_after(
+                links[ordinal],
+                encode_plan_link(
+                    input.members[ordinal].owner_header,
+                    groups[0],
+                    formations[0],
+                    input.authority_key,
+                    self.generation(),
+                ),
+                1,
+            )?;
+        }
+        let mutation_image = self.mutations.prepare_reserved_image_after(
+            mutations[0],
+            encode_plan_mutation(
+                input.authority_key,
+                groups.as_slice().try_into().expect("three Plan groups"),
+                formations
+                    .as_slice()
+                    .try_into()
+                    .expect("three Plan formations"),
+                self.generation(),
+                input.occurred_at,
+            ),
+            1,
+        )?;
+        let (owner_references, owner_row_images, owner_images) =
+            self.prepare_plan_owner_updates(input, owner_records, links.as_slice())?;
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        let arena_headers_after = self.prepare_plan_arena_headers_after(
+            &groups,
+            &external_heads,
+            &formations,
+            &funders,
+            &members,
+            &links,
+            &mutations,
+        )?;
+        let raw_plan = self
+            .raw
+            .prepare_insert_assignment_plan(RAW_INDEX_ASSIGNMENT_ARENA, &raw_entries)?;
+        let authority_plan = self
+            .authority
+            .prepare_insert_assignment_plan(AUTHORITY_INDEX_ASSIGNMENT_ARENA, &authority_entries)?;
+        let local_plan = self.local.prepare_insert_assignment_plan(
+            LOCAL_INDEX_ASSIGNMENT_ARENA,
+            &local_entries[..local_count],
+        )?;
+        let mut header_after = self.header;
+        write_u64(&mut header_after.0, 48, generation_after);
+
+        Ok(PreparedPlanCreate {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            expected_authority: self.authority.generation(),
+            expected_local: self.local.generation(),
+            expected_arena_headers,
+            arena_headers_after,
+            input,
+            groups,
+            external_heads,
+            formations,
+            funders,
+            members,
+            links,
+            mutations,
+            authority_entries,
+            raw_entries,
+            local_entries,
+            local_count,
+            group_images,
+            head_images,
+            formation_images,
+            funder_images,
+            member_images,
+            link_images,
+            mutation_image,
+            owner_references,
+            owner_row_images,
+            owner_images,
+            header_after,
+            raw_plan,
+            authority_plan,
+            local_plan,
+        })
+    }
+
+    pub(super) fn validate_plan_create(
+        &self,
+        change: &PreparedPlanCreate,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) -> Result<(), SupportLedgerError> {
+        change.input.validate()?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let expected_arena_headers = self.plan_arena_headers();
+        let arena_headers_after = self.prepare_plan_arena_headers_after(
+            &change.groups,
+            &change.external_heads,
+            &change.formations,
+            &change.funders,
+            &change.members,
+            &change.links,
+            &change.mutations,
+        )?;
+        let mut header_after = self.header;
+        write_u64(&mut header_after.0, 48, generation_after);
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || self.authority.generation() != change.expected_authority
+            || self.local.generation() != change.expected_local
+            || expected_arena_headers != change.expected_arena_headers
+            || arena_headers_after != change.arena_headers_after
+            || header_after != change.header_after
+            || !self.raw.validates_assignment_plan(&change.raw_plan)
+            || !self
+                .authority
+                .validates_assignment_plan(&change.authority_plan)
+            || !self.local.validates_assignment_plan(&change.local_plan)
+            || self
+                .groups
+                .prepare_reserve::<PLAN_BRANCHES>(PLAN_BRANCHES)?
+                .as_slice()
+                != change.groups.as_slice()
+            || self
+                .external_heads
+                .prepare_reserve::<PLAN_BRANCHES>(PLAN_BRANCHES)?
+                .as_slice()
+                != change.external_heads.as_slice()
+            || self
+                .formations
+                .prepare_reserve::<PLAN_BRANCHES>(PLAN_BRANCHES)?
+                .as_slice()
+                != change.formations.as_slice()
+            || self
+                .funders
+                .prepare_reserve::<PLAN_FUNDER_ROWS>(PLAN_FUNDER_ROWS)?
+                .as_slice()
+                != change.funders.as_slice()
+            || self
+                .members
+                .prepare_reserve::<PLAN_MEMBER_ROWS>(PLAN_MEMBER_ROWS)?
+                .as_slice()
+                != change.members.as_slice()
+            || self
+                .links
+                .prepare_reserve::<PLAN_MEMBERS_MAX>(change.input.member_count)?
+                .as_slice()
+                != change.links.as_slice()
+            || self.mutations.prepare_reserve::<1>(1)?.as_slice() != change.mutations.as_slice()
+            || change.local_count != 3 + 12 + change.input.member_count + 1
+            || change.local_entries[change.local_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 17], [0; 8]))
+            || change.link_images[change.input.member_count..]
+                .iter()
+                .any(|image| *image != [0; LINK_BYTES])
+            || !self.validates_plan_slot_images(change)?
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let (owner_references, owner_row_images, owner_images) =
+            self.prepare_plan_owner_updates(change.input, owner_records, change.links.as_slice())?;
+        if owner_references != change.owner_references
+            || owner_row_images != change.owner_row_images
+            || owner_images != change.owner_images
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        if let Some(value) = self.authority.find(&change.input.authority_key)? {
+            let group = decode_arena_ref(&value)?;
+            let group_image = self.groups.image(group, &[1])?;
+            let formation = decode_arena_ref(&group_image[16..24])?;
+            let image = self.formations.image(formation, &[1])?;
+            return if image[8..8 + PLAN_IDENTITY_BYTES] == change.input.identity {
+                Err(SupportLedgerError::InvalidTransition)
+            } else {
+                Err(noncanonical_error())
+            };
+        }
+        self.authority
+            .validate_insert_batch(&change.authority_entries)?;
+        self.raw.validate_insert_batch(&change.raw_entries)?;
+        self.local
+            .validate_insert_batch(&change.local_entries[..change.local_count])?;
+        if self
+            .raw
+            .prepare_insert_assignment_plan(RAW_INDEX_ASSIGNMENT_ARENA, &change.raw_entries)?
+            != change.raw_plan
+            || self.authority.prepare_insert_assignment_plan(
+                AUTHORITY_INDEX_ASSIGNMENT_ARENA,
+                &change.authority_entries,
+            )? != change.authority_plan
+            || self.local.prepare_insert_assignment_plan(
+                LOCAL_INDEX_ASSIGNMENT_ARENA,
+                &change.local_entries[..change.local_count],
+            )? != change.local_plan
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
 }
