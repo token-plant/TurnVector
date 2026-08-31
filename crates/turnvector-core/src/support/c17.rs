@@ -3297,4 +3297,385 @@ impl SupportC17 {
             OWNER_STATE_LIVE,
         )
     }
+
+    fn validate_finalizable(
+        &self,
+        expected_support: SupportLedgerGeneration,
+    ) -> Result<(), SupportLedgerError> {
+        if self.pending_state()? != PendingState::Staging {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        let before_support = read_u64(&self.pending.0, PENDING_BEFORE_SUPPORT);
+        if total == 0
+            || usize::from(read_u16(&self.pending.0, PENDING_STAGED)) != total
+            || expected_support.get() < before_support
+            || read_u64(&self.pending.0, PENDING_EXPECTED_RAW) != self.raw.generation()
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let batch = read_u64(&self.pending.0, PENDING_BATCH);
+        let target = self.pending_aggregate()?;
+        let mut recomputed = LifecycleAggregate::ZERO;
+        let mut previous_obligation = None;
+        let mut previous_credit = None;
+        for ordinal in 0..total {
+            let reference = self.inactive_reference(ordinal)?;
+            let image = self.lifecycle.image(reference, &[3])?;
+            if read_u64(image, 8) != batch
+                || usize::from(read_u16(image, 16)) != ordinal
+                || image[480..488]
+                    != encode_raw_owner(
+                        RawOwnerKind::LifecycleObligation,
+                        RawOwnerState::Inactive,
+                        reference,
+                    )?
+            {
+                return Err(noncanonical_error());
+            }
+            let record = LifecycleRecordInput::decode(image)?;
+            self.validate_lifecycle_record_owner_set(record, reference)?;
+            if previous_obligation.is_some_and(|previous| previous >= record.obligation_raw)
+                || previous_credit.is_some_and(|previous| previous >= record.credit_raw)
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+            previous_obligation = Some(record.obligation_raw);
+            previous_credit = Some(record.credit_raw);
+            recomputed.accrue(record)?;
+            for key_offset in [96, 128] {
+                let mut key = [0; 32];
+                key.copy_from_slice(&image[key_offset..key_offset + 32]);
+                let value = self
+                    .raw
+                    .find(&key)?
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let (_, state, owner) = decode_raw_owner(value)?;
+                if state != RawOwnerState::Inactive || owner != reference {
+                    return Err(noncanonical_error());
+                }
+            }
+        }
+        if recomputed != target {
+            return Err(noncanonical_error());
+        }
+        let mut references = [ArenaRef::default(); LIFECYCLE_BATCH_MAX];
+        for (ordinal, reference) in references[..total].iter_mut().enumerate() {
+            *reference = self.inactive_reference(ordinal)?;
+        }
+        self.lifecycle
+            .validate_commit_inactive_batch(&references[..total])?;
+        Ok(())
+    }
+
+    fn pending_aggregate(&self) -> Result<LifecycleAggregate, SupportLedgerError> {
+        LifecycleAggregate::decode(&self.pending.0[PENDING_AGGREGATE..PENDING_BEFORE_SUPPORT])
+    }
+
+    fn validate_pending_header(&self, state: PendingState) -> Result<(), SupportLedgerError> {
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        let staged = usize::from(read_u16(&self.pending.0, PENDING_STAGED));
+        let cursor = usize::from(read_u16(&self.pending.0, PENDING_CURSOR));
+        let reserved = usize::from(read_u16(&self.pending.0, PENDING_RESERVED));
+        if !(1..=LIFECYCLE_BATCH_MAX).contains(&total)
+            || staged > total
+            || reserved != total
+            || cursor > total
+            || (state == PendingState::Staging && cursor != total)
+            || (state == PendingState::Aborting && cursor == 0)
+            || self.pending.0[PENDING_SLOTS + total * 2..PENDING_AGGREGATE]
+                .iter()
+                .any(|byte| *byte != 0)
+            || self.pending.0[PENDING_WITHHELD + 32..PENDING_WITHHELD + 64]
+                .iter()
+                .any(|byte| *byte != 0)
+            || self.pending.0[PENDING_WITHHELD + 64..]
+                .iter()
+                .any(|byte| *byte != 0)
+            || read_u64(&self.pending.0, PENDING_BEFORE_SUPPORT) == 0
+        {
+            return Err(noncanonical_error());
+        }
+        let aggregate = self.pending_aggregate()?;
+        if aggregate == LifecycleAggregate::ZERO {
+            return Err(noncanonical_error());
+        }
+        for (index, expected) in aggregate.withholding()?.into_iter().enumerate() {
+            if read_u64(&self.pending.0, PENDING_WITHHELD + index * 8) != expected {
+                return Err(noncanonical_error());
+            }
+        }
+        let mut slots = [0u16; LIFECYCLE_BATCH_MAX];
+        for ordinal in 0..total {
+            let slot = read_u16(&self.pending.0, PENDING_SLOTS + ordinal * 2);
+            if usize::from(slot) >= self.lifecycle.capacity() || slots[..ordinal].contains(&slot) {
+                return Err(noncanonical_error());
+            }
+            slots[ordinal] = slot;
+        }
+        Ok(())
+    }
+
+    fn pending_state(&self) -> Result<PendingState, SupportLedgerError> {
+        if self.pending.0[1..8].iter().any(|byte| *byte != 0) {
+            return Err(noncanonical_error());
+        }
+        match self.pending.0[PENDING_STATE] {
+            0 => {
+                let batch = read_u64(&self.pending.0, PENDING_BATCH);
+                let mut canonical = PendingLifecycleHeaderImage::ZERO;
+                write_u64(&mut canonical.0, PENDING_BATCH, batch);
+                (canonical == self.pending)
+                    .then_some(PendingState::Empty)
+                    .ok_or_else(noncanonical_error)
+            }
+            1 => {
+                self.validate_pending_header(PendingState::Staging)?;
+                Ok(PendingState::Staging)
+            }
+            2 => {
+                self.validate_pending_header(PendingState::Aborting)?;
+                Ok(PendingState::Aborting)
+            }
+            _ => Err(noncanonical_error()),
+        }
+    }
+
+    fn reserved_reference(&self, ordinal: usize) -> Result<ArenaRef, SupportLedgerError> {
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        if ordinal >= total {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let slot = u32::from(read_u16(&self.pending.0, PENDING_SLOTS + ordinal * 2));
+        Ok(self.lifecycle.reference_at(slot, &[2])?)
+    }
+
+    fn inactive_reference(&self, ordinal: usize) -> Result<ArenaRef, SupportLedgerError> {
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        if ordinal >= total {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let slot = u32::from(read_u16(&self.pending.0, PENDING_SLOTS + ordinal * 2));
+        Ok(self.lifecycle.reference_at(slot, &[3])?)
+    }
+
+    fn reset_pending(&mut self, batch: u64) {
+        self.pending.0.fill(0);
+        write_u64(&mut self.pending.0, PENDING_BATCH, batch);
+    }
+
+    fn advance_generation(&mut self) {
+        let next = self
+            .generation()
+            .checked_add(1)
+            .expect("prepared C17 generation");
+        write_u64(&mut self.header.0, 48, next);
+        if matches!(
+            self.pending.0[PENDING_STATE],
+            value if value == PendingState::Staging as u8 || value == PendingState::Aborting as u8
+        ) {
+            write_u64(
+                &mut self.pending.0,
+                PENDING_EXPECTED_RAW,
+                self.raw.generation(),
+            );
+        }
+    }
+}
+
+const PLAN_BRANCHES: usize = 3;
+const OWNER_FUNDING_BRANCHES: usize = 4;
+const PLAN_MEMBERS_MAX: usize = 4;
+const PLAN_FUNDER_ROWS: usize = PLAN_BRANCHES * PLAN_MEMBERS_MAX;
+const PLAN_MEMBER_ROWS: usize = PLAN_BRANCHES * PLAN_MEMBERS_MAX;
+const PLAN_RAW_EDITS: usize = PLAN_BRANCHES * 2;
+const PLAN_LOCAL_EDITS: usize = 3 + PLAN_FUNDER_ROWS + PLAN_MEMBERS_MAX + 1;
+const PLAN_RAW_ASSIGNMENT_MAX: usize = 9 * PLAN_RAW_EDITS + 1;
+const PLAN_AUTHORITY_ASSIGNMENT_MAX: usize = 9 + 1;
+const PLAN_LOCAL_ASSIGNMENT_MAX: usize = 9 * PLAN_LOCAL_EDITS + 1;
+pub(super) const PLAN_IDENTITY_BYTES: usize = 212;
+
+fn funding_branch(root_branch: u8) -> Result<u8, SupportLedgerError> {
+    match root_branch {
+        0..=2 => Ok(root_branch),
+        3 | 4 => Ok((OWNER_FUNDING_BRANCHES - 1) as u8),
+        _ => Err(noncanonical_error()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlanCreateMember {
+    pub(super) request: Option<RequestId>,
+    pub(super) request_key: [u8; 40],
+    pub(super) record_slot: u32,
+    pub(super) owner_header: ArenaRef,
+    pub(super) entitlement: [u8; 32],
+    pub(super) vector: [u8; 32],
+    pub(super) branch_limits: [u64; PLAN_BRANCHES],
+}
+
+impl PlanCreateMember {
+    pub(super) const ZERO: Self = Self {
+        request: None,
+        request_key: [0; 40],
+        record_slot: 0,
+        owner_header: ArenaRef {
+            slot: 0,
+            generation: 0,
+        },
+        entitlement: [0; 32],
+        vector: [0; 32],
+        branch_limits: [0; PLAN_BRANCHES],
+    };
+
+    fn active(self) -> bool {
+        self.request.is_some()
+            && self.request_key != [0; 40]
+            && self.owner_header.generation != 0
+            && self.entitlement != [0; 32]
+            && self.vector != [0; 32]
+            && self.branch_limits.into_iter().all(|limit| limit > 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlanCreateInput {
+    pub(super) authority_key: [u8; 17],
+    pub(super) identity: [u8; PLAN_IDENTITY_BYTES],
+    pub(super) obligations: [[u8; 32]; PLAN_BRANCHES],
+    pub(super) credits: [[u8; 32]; PLAN_BRANCHES],
+    pub(super) members: [PlanCreateMember; PLAN_MEMBERS_MAX],
+    pub(super) member_count: usize,
+    pub(super) occurred_at: u64,
+}
+
+impl PlanCreateInput {
+    fn validate(self) -> Result<(), SupportLedgerError> {
+        if self.authority_key[0] != 0x30
+            || self.authority_key[1..] == [0; 16]
+            || self.identity == [0; PLAN_IDENTITY_BYTES]
+            || !(1..=PLAN_MEMBERS_MAX).contains(&self.member_count)
+            || self.occurred_at == 0
+            || self.obligations.contains(&[0; 32])
+            || self.credits.contains(&[0; 32])
+            || self.members[..self.member_count]
+                .iter()
+                .any(|member| !member.active())
+            || self.members[self.member_count..]
+                .iter()
+                .any(|member| *member != PlanCreateMember::ZERO)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        for index in 0..self.member_count {
+            let member = self.members[index];
+            if self.members[..index].iter().any(|prior| {
+                prior.request_key >= member.request_key
+                    || prior.owner_header == member.owner_header
+                    || prior.entitlement == member.entitlement
+                    || prior.vector == member.vector
+            }) {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedPlanCreate {
+    expected_c17: u64,
+    expected_raw: u64,
+    expected_authority: u64,
+    expected_local: u64,
+    expected_arena_headers: [ByteArenaHeaderImage; 11],
+    arena_headers_after: [ByteArenaHeaderImage; 11],
+    input: PlanCreateInput,
+    groups: ArenaSelection<PLAN_BRANCHES>,
+    external_heads: ArenaSelection<PLAN_BRANCHES>,
+    formations: ArenaSelection<PLAN_BRANCHES>,
+    funders: ArenaSelection<PLAN_FUNDER_ROWS>,
+    members: ArenaSelection<PLAN_MEMBER_ROWS>,
+    links: ArenaSelection<PLAN_MEMBERS_MAX>,
+    mutations: ArenaSelection<1>,
+    authority_entries: [([u8; 17], [u8; 8]); 1],
+    raw_entries: [([u8; 32], [u8; 8]); PLAN_RAW_EDITS],
+    local_entries: [([u8; 17], [u8; 8]); PLAN_LOCAL_EDITS],
+    local_count: usize,
+    group_images: [[u8; GROUP_BYTES]; PLAN_BRANCHES],
+    head_images: [[u8; EXTERNAL_HEAD_BYTES]; PLAN_BRANCHES],
+    formation_images: [[u8; FORMATION_BYTES]; PLAN_BRANCHES],
+    funder_images: [[u8; FUNDER_BYTES]; PLAN_FUNDER_ROWS],
+    member_images: [[u8; MEMBER_BYTES]; PLAN_MEMBER_ROWS],
+    link_images: [[u8; LINK_BYTES]; PLAN_MEMBERS_MAX],
+    mutation_image: [u8; MUTATION_BYTES],
+    owner_references: [[ArenaRef; 4]; PLAN_MEMBERS_MAX],
+    owner_row_images: [[u8; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX],
+    owner_images: [[u8; OWNER_BYTES]; PLAN_MEMBERS_MAX],
+    header_after: C17HeaderImage,
+    raw_plan: PatriciaAssignmentPlan<PLAN_RAW_ASSIGNMENT_MAX>,
+    authority_plan: PatriciaAssignmentPlan<PLAN_AUTHORITY_ASSIGNMENT_MAX>,
+    local_plan: PatriciaAssignmentPlan<PLAN_LOCAL_ASSIGNMENT_MAX>,
+}
+
+impl PreparedPlanCreate {
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.raw_plan.visit_assignments(visitor);
+        self.authority_plan.visit_assignments(visitor);
+        self.local_plan.visit_assignments(visitor);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum LocalKind {
+    Group = 1,
+    Funder = 2,
+    Link = 3,
+    Membership = 4,
+    Mutation = 5,
+}
+
+fn local_key(kind: LocalKind, reference: ArenaRef) -> [u8; 17] {
+    let mut key = [0; 17];
+    key[0] = kind as u8;
+    let identity = (u128::from(reference.generation) << 32) | (u128::from(reference.slot) + 1);
+    key[1..].copy_from_slice(&identity.to_be_bytes());
+    key
+}
+
+fn encode_arena_ref_value(reference: ArenaRef) -> [u8; 8] {
+    let mut value = [0; 8];
+    encode_arena_ref(&mut value, reference);
+    value
+}
+
+fn encode_plan_group(
+    branch: usize,
+    member_count: usize,
+    authority_key: [u8; 17],
+    formation: ArenaRef,
+    head: ArenaRef,
+    members: [ArenaRef; PLAN_MEMBERS_MAX],
+    siblings: [ArenaRef; PLAN_BRANCHES],
+) -> [u8; GROUP_BYTES] {
+    let mut image = GroupImage::ZERO.0;
+    image[8] = branch as u8;
+    image[9] = RootState::Conditional as u8;
+    image[10] = member_count as u8;
+    image[11] = 1;
+    encode_arena_ref(&mut image[16..24], formation);
+    encode_arena_ref(&mut image[24..32], head);
+    write_u64(&mut image, 32, 1);
+    image[40..57].copy_from_slice(&authority_key);
+    for (ordinal, reference) in members.into_iter().enumerate() {
+        encode_arena_ref(&mut image[64 + ordinal * 8..72 + ordinal * 8], reference);
+    }
+    for (ordinal, reference) in siblings.into_iter().enumerate() {
+        encode_arena_ref(&mut image[96 + ordinal * 8..104 + ordinal * 8], reference);
+    }
+    image
 }
