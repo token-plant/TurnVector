@@ -3080,4 +3080,404 @@ impl RequestBookC17 {
         }
         Ok(())
     }
+
+    pub(crate) fn seal_membership_event(
+        &self,
+        mut intent: PreparedMembershipIntent,
+        destinations: [SupportMembershipAnchor; 4],
+        destination_count: u8,
+    ) -> Result<PreparedMembershipEvent, RequestError> {
+        self.validate_membership_intent(&intent)?;
+        if destination_count != intent.destination_count {
+            return Err(RequestError::InvalidTransition);
+        }
+        let active_destinations = usize::from(destination_count);
+        for index in 0..destinations.len() {
+            if index < active_destinations {
+                if destinations[index].is_absent()
+                    || !destinations[index].canonical()
+                    || destinations[index].branch() == 0
+                    || destinations[..index].contains(&destinations[index])
+                {
+                    return Err(RequestError::InvalidTransition);
+                }
+            } else if !destinations[index].is_absent() {
+                return Err(RequestError::InvalidTransition);
+            }
+        }
+        let count = usize::from(intent.event.member_count);
+        for index in 0..count {
+            let before = intent.event.before[index]
+                .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+            let after = match intent.destinations[index] {
+                MembershipDestination::Destination(ordinal) => {
+                    let anchor = destinations[usize::from(ordinal)];
+                    if before.anchor == anchor {
+                        return Err(RequestError::InvalidTransition);
+                    }
+                    let mut after = before;
+                    after.tag = MembershipTag::Bound;
+                    after.anchor = anchor;
+                    after.pending = SourceRecordRef::ABSENT;
+                    after.epoch = after
+                        .epoch
+                        .checked_add(1)
+                        .ok_or(RequestError::GenerationOverflow)?;
+                    after
+                }
+                MembershipDestination::Closed => {
+                    let mut after = before;
+                    after.tag = MembershipTag::Closed;
+                    after.anchor = SupportMembershipAnchor::ABSENT;
+                    after.pending = SourceRecordRef::ABSENT;
+                    after
+                }
+            };
+            intent.event.after[index] = Some(after);
+        }
+        intent.event.encode()?;
+        if intent.source_update.is_none() {
+            self.validate_event_sources(
+                &intent.event,
+                EventRecordRef::from_arena(intent.event_selection[0])?,
+            )?;
+        }
+        self.validate_membership_updates(&intent.event, &intent.after_status)?;
+        let request_index_plan =
+            self.prepare_request_index_plan(&intent.event, &intent.after_status)?;
+        let direct = self.prepare_request_direct_images(
+            intent.event.generation_after,
+            intent
+                .source_update
+                .map(|(reference, _, after)| (reference, after)),
+            None,
+            Some((intent.event_selection[0], intent.event)),
+            Self::request_updates(&intent.event, &intent.after_status)?,
+        )?;
+        Ok(PreparedMembershipEvent {
+            intent,
+            request_index_plan,
+            direct,
+        })
+    }
+
+    pub(crate) fn validate_membership_event(
+        &self,
+        change: &PreparedMembershipEvent,
+    ) -> Result<(), RequestError> {
+        let intent = &change.intent;
+        if self.generation() != intent.expected_generation
+            || read_u64(&self.header.0, 8) != intent.event.id
+            || self.events.prepare_reserve::<1>(1)?.as_slice() != intent.event_selection.as_slice()
+            || self
+                .event_index
+                .find(&intent.event.id.to_be_bytes())?
+                .is_some()
+            || !self
+                .event_index
+                .validates_assignment_plan(&intent.event_index_plan)
+            || !self
+                .request_index
+                .validates_assignment_plan(&change.request_index_plan)
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        if let Some((reference, before, after)) = intent.source_update {
+            if self.source_record(reference)? != before {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            after.encode()?;
+        } else {
+            self.validate_event_sources(
+                &intent.event,
+                EventRecordRef::from_arena(intent.event_selection[0])?,
+            )?;
+        }
+        intent.event.encode()?;
+        self.validate_membership_updates(&intent.event, &intent.after_status)?;
+        let direct = self.prepare_request_direct_images(
+            intent.event.generation_after,
+            intent
+                .source_update
+                .map(|(reference, _, after)| (reference, after)),
+            None,
+            Some((intent.event_selection[0], intent.event)),
+            Self::request_updates(&intent.event, &intent.after_status)?,
+        )?;
+        (direct == change.direct)
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_membership_event<const I: usize, const S: usize, const T: usize>(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedMembershipEvent,
+    ) -> MembershipEventRecord {
+        self.validate_membership_event(&change)
+            .expect("validated membership event");
+        self.commit_membership_event_prevalidated(accepted, change, true)
+    }
+
+    pub(crate) fn commit_membership_event_prevalidated<
+        const I: usize,
+        const S: usize,
+        const T: usize,
+    >(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedMembershipEvent,
+        apply_index_plans: bool,
+    ) -> MembershipEventRecord {
+        let PreparedMembershipEvent {
+            intent: change,
+            request_index_plan,
+            direct,
+        } = change;
+        let event = change.event;
+        if apply_index_plans {
+            self.event_index
+                .commit_assignment_plan_prevalidated(change.event_index_plan);
+            self.request_index
+                .commit_assignment_plan_prevalidated(request_index_plan);
+        }
+        self.commit_request_direct_images(accepted, direct);
+        event
+    }
+
+    pub(crate) fn event(
+        &self,
+        id: u64,
+    ) -> Result<(EventRecordRef, MembershipEventRecord), RequestError> {
+        if id == 0 {
+            return Err(RequestError::InvalidTransition);
+        }
+        let encoded = self
+            .event_index
+            .find(&id.to_be_bytes())?
+            .ok_or(RequestError::InvalidTransition)?;
+        let reference = decode_event_ref(&encoded)?;
+        let event = self.event_record(reference)?;
+        if event.id != id {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        self.validate_event_sources(&event, reference)?;
+        Ok((reference, event))
+    }
+
+    fn validate_address(
+        &self,
+        address: RequestAddress,
+        id: RequestId,
+        status: RequestStatusVersion,
+    ) -> Result<(), RequestError> {
+        if address.key != request_key(id) || address.status != status.get() {
+            return Err(RequestError::InvalidTransition);
+        }
+        let image = self.requests.image(address.arena(), &[1])?;
+        if image[8..64] != address.encode() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        MembershipStateRow::decode(&image[64..64 + MEMBERSHIP_BYTES])?;
+        Ok(())
+    }
+
+    fn membership_index_updates(
+        &self,
+        event: &MembershipEventRecord,
+        statuses: &[u64; 4],
+    ) -> Result<([([u8; 40], NodeHandle, [u8; 56]); 4], usize), RequestError> {
+        if !event.canonical() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let count = usize::from(event.member_count);
+        if statuses[count..].iter().any(|status| *status != 0) {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut updates = [([0; 40], NodeHandle::SENTINEL, [0; 56]); 4];
+        for index in 0..count {
+            let address = event.affected[index]
+                .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+            let before = event.before[index]
+                .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+            let (_, current) = self.membership(
+                request_id_from_key(address.key)?,
+                RequestStatusVersion::new(address.status)
+                    .map_err(|_| RequestError::InvalidTransition)?,
+            )?;
+            if current != before || address.status.checked_add(1) != Some(statuses[index]) {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            let mut after_address = address;
+            after_address.status = statuses[index];
+            updates[index] = (
+                address.key,
+                self.request_index
+                    .find_handle(&address.key)?
+                    .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?,
+                after_address.encode(),
+            );
+        }
+        Ok((updates, count))
+    }
+
+    fn prepare_request_index_plan(
+        &self,
+        event: &MembershipEventRecord,
+        statuses: &[u64; 4],
+    ) -> Result<PatriciaAssignmentPlan<REQUEST_UPDATE_ASSIGNMENTS>, RequestError> {
+        let (updates, count) = self.membership_index_updates(event, statuses)?;
+        self.request_index
+            .prepare_update_assignment_plan(REQUEST_INDEX_ASSIGNMENT_ARENA, &updates[..count])
+            .map_err(RequestError::Storage)
+    }
+
+    fn validate_membership_updates(
+        &self,
+        event: &MembershipEventRecord,
+        statuses: &[u64; 4],
+    ) -> Result<(), RequestError> {
+        let (updates, count) = self.membership_index_updates(event, statuses)?;
+        self.request_index
+            .validate_update_batch(&updates[..count])?;
+        Ok(())
+    }
+
+    fn commit_membership_slots_prevalidated(
+        &mut self,
+        event: &MembershipEventRecord,
+        statuses: &[u64; 4],
+    ) {
+        let count = usize::from(event.member_count);
+        for index in 0..count {
+            let before = event.affected[index].expect("validated affected request");
+            let after_row = event.after[index].expect("validated membership after row");
+            let mut after = before;
+            after.status = statuses[index];
+            let image = self.requests.image_mut_prevalidated(before.arena());
+            image[8..64].copy_from_slice(&after.encode());
+            image[64..64 + MEMBERSHIP_BYTES].copy_from_slice(
+                &after_row
+                    .encode()
+                    .expect("validated membership after image"),
+            );
+        }
+    }
+
+    fn event_record(
+        &self,
+        reference: EventRecordRef,
+    ) -> Result<MembershipEventRecord, RequestError> {
+        MembershipEventRecord::decode(self.events.image(reference.arena()?, &[1])?)
+    }
+
+    fn write_membership_slot_prevalidated(
+        &mut self,
+        before: RequestAddress,
+        row: MembershipStateRow,
+        status: u64,
+    ) {
+        let mut after = before;
+        after.status = status;
+        let image = self.requests.image_mut_prevalidated(before.arena());
+        image[8..64].copy_from_slice(&after.encode());
+        image[64..64 + MEMBERSHIP_BYTES]
+            .copy_from_slice(&row.encode().expect("validated membership row"));
+    }
+
+    fn write_membership(&mut self, before: RequestAddress, row: MembershipStateRow, status: u64) {
+        let mut after = before;
+        after.status = status;
+        self.write_membership_slot_prevalidated(before, row, status);
+        let handle = self
+            .request_index
+            .find_handle(&before.key)
+            .expect("validated request index")
+            .expect("validated request key");
+        self.request_index
+            .update(&before.key, handle, after.encode())
+            .expect("validated request index update");
+    }
+
+    fn source_record(&self, reference: SourceRecordRef) -> Result<SourceRecord, RequestError> {
+        SourceRecord::decode(self.sources.image(reference.arena()?, &[1])?)
+    }
+
+    fn validate_event_sources(
+        &self,
+        event: &MembershipEventRecord,
+        event_ref: EventRecordRef,
+    ) -> Result<(), RequestError> {
+        if !event.canonical() {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        let mut previous_key = None;
+        let mut initial = 0usize;
+        let mut newly_eligible = 0usize;
+        let mut cancellation = 0usize;
+        for reference in &event.sources[..usize::from(event.source_count)] {
+            let source = self.source_record(*reference)?;
+            if previous_key.is_some_and(|key| key >= source.key) {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            previous_key = Some(source.key);
+            match source.kind {
+                SourceKind::InitialReady => {
+                    initial += 1;
+                    if source.state != SourceStateTag::InitialCreated
+                        || source.create_event.is_absent()
+                        || !source.consumed_event.is_absent()
+                    {
+                        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                    }
+                }
+                SourceKind::NewlyEligible => {
+                    newly_eligible += 1;
+                    if source.state != SourceStateTag::Consumed
+                        || source.consumed_event != event_ref
+                    {
+                        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                    }
+                }
+                SourceKind::Cancellation => {
+                    cancellation += 1;
+                    if source.state != SourceStateTag::Consumed
+                        || source.consumed_event != event_ref
+                        || source.cancellation_fact != event.cancellation_fact
+                    {
+                        return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+                    }
+                }
+            }
+        }
+        let valid = match event.kind {
+            MembershipEventKind::CreateStandalone => {
+                (initial, newly_eligible, cancellation) == (1, 0, 0)
+                    && self.source_record(event.sources[0])?.create_event == event_ref
+            }
+            MembershipEventKind::MergeInitial => {
+                (2..=3).contains(&initial) && newly_eligible == 0 && cancellation == 0
+            }
+            MembershipEventKind::Join => (initial, newly_eligible, cancellation) == (0, 1, 0),
+            MembershipEventKind::Rebind => initial == 0 && cancellation == 0 && newly_eligible <= 1,
+            MembershipEventKind::CancellationRemove => {
+                initial == 0 && cancellation == 1 && newly_eligible <= 1
+            }
+            MembershipEventKind::Split
+            | MembershipEventKind::Merge
+            | MembershipEventKind::Close => (initial, newly_eligible, cancellation) == (0, 0, 0),
+        };
+        valid
+            .then_some(())
+            .ok_or(RequestError::Storage(FixedStorageError::NonCanonical))
+    }
+
+    fn write_source(&mut self, reference: SourceRecordRef, record: SourceRecord) {
+        let encoded = record.encode().expect("validated source update");
+        let image = self.sources.image_mut_prevalidated(ArenaRef {
+            slot: u32::from(reference.slot),
+            generation: reference.generation,
+        });
+        image[8..].copy_from_slice(&encoded[8..]);
+    }
 }
