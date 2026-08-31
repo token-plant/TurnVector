@@ -1084,4 +1084,406 @@ impl SupportC17 {
         preview.plan_event = plan_event;
         Ok(preview)
     }
+
+    pub(in crate::support) fn prepare_root_batch(
+        &self,
+        preview: RootBatchPreview,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedRootBatch, SupportLedgerError> {
+        self.validate_preview(&preview)?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let expected_arena_headers = self.semantic_arena_headers();
+        if let Some((offset, maximum)) = preview.operation.retained_budget()
+            && read_u32(&self.header.0, offset) >= maximum
+        {
+            return Err(capacity_error());
+        }
+        let transition_count = preview.transition_count;
+        let formations = self
+            .formations
+            .prepare_reserve::<ROOT_BATCH_MAX>(transition_count)?;
+        let funders = self
+            .funders
+            .prepare_reserve::<ROOT_BATCH_FUNDER_MAX>(transition_count * PLAN_MEMBERS_MAX)?;
+        let wrapper_count = preview.transitions[..transition_count]
+            .iter()
+            .flatten()
+            .filter(|transition| transition.before.locator_kind == 2)
+            .count();
+        let wrappers = if wrapper_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.wrappers
+                .prepare_reserve::<ROOT_BATCH_MAX>(wrapper_count)?
+        };
+        let mutations = self
+            .mutations
+            .prepare_reserve::<ROOT_BATCH_MAX>(transition_count)?;
+        let link_count = if matches!(preview.resolver, ResolverChange::MoveTo(_)) {
+            preview.owner_count
+        } else {
+            0
+        };
+        let links = if link_count == 0 {
+            ArenaSelection::empty()
+        } else {
+            self.links.prepare_reserve::<PLAN_MEMBERS_MAX>(link_count)?
+        };
+        self.groups.validate_advance_generation()?;
+        self.members.validate_advance_generation()?;
+        let touches_external = preview.transitions[..transition_count]
+            .iter()
+            .flatten()
+            .any(|transition| transition.before.locator_kind == 1);
+        if touches_external {
+            self.external_heads.validate_advance_generation()?;
+        }
+        if preview.owner_count > 0 {
+            self.owner_rows.validate_advance_generation()?;
+            self.owners.validate_advance_generation()?;
+        }
+        if !matches!(preview.resolver, ResolverChange::Keep) {
+            self.links.validate_advance_generation()?;
+        }
+
+        let mut journals = [None; ROOT_BATCH_MAX];
+        let mut local_entries = [([0; 17], [0; 8]); ROOT_BATCH_LOCAL_MAX];
+        let mut local_count = 0;
+        let mut wrapper_index = 0;
+        for transition_index in 0..transition_count {
+            let spec = preview.transitions[transition_index].expect("active root transition");
+            let formation = formations[transition_index];
+            let locator_after_ref = if spec.before.locator_kind == 1 {
+                spec.before.locator
+            } else {
+                let reference = wrappers[wrapper_index];
+                wrapper_index += 1;
+                reference
+            };
+            let mut group_after = spec.before.group_image;
+            group_after[9] = spec.after as u8;
+            encode_arena_ref(&mut group_after[16..24], formation);
+            encode_arena_ref(&mut group_after[24..32], locator_after_ref);
+            write_u64(&mut group_after, 32, spec.before.version + 1);
+            let mut locator_after = spec.before.locator_image;
+            if spec.before.locator_kind == 2 {
+                locator_after[..8].fill(0);
+            }
+            locator_after[9] = spec.after as u8;
+            encode_arena_ref(&mut locator_after[24..32], formation);
+            let locator_version = if spec.before.locator_kind == 1 {
+                120
+            } else {
+                56
+            };
+            write_u64(&mut locator_after, locator_version, spec.before.version + 1);
+            if spec.before.locator_kind == 2 {
+                locator_after = self.wrappers.prepare_reserved_image_after(
+                    locator_after_ref,
+                    locator_after,
+                    1,
+                )?;
+            }
+            let formation_after = self.formations.prepare_reserved_image_after(
+                formation,
+                encode_successor_formation(
+                    spec,
+                    formation,
+                    locator_after_ref,
+                    preview.operation,
+                    transition_index,
+                ),
+                1,
+            )?;
+            let mut funder_after = [[0; FUNDER_BYTES]; PLAN_MEMBERS_MAX];
+            let mut member_after = [[0; MEMBER_BYTES]; PLAN_MEMBERS_MAX];
+            for ordinal in 0..PLAN_MEMBERS_MAX {
+                let member = spec.before.members[ordinal];
+                let next_funder = funders[transition_index * PLAN_MEMBERS_MAX + ordinal];
+                let mut funder = *self.funders.image(member.funder, &[1])?;
+                funder[..8].fill(0);
+                funder[10] = u8::try_from(spec.before.version + 1).map_err(|_| capacity_error())?;
+                encode_arena_ref(&mut funder[24..32], formation);
+                let mut member_image = *self.members.image(member.member, &[1])?;
+                encode_arena_ref(&mut member_image[24..32], next_funder);
+                funder_after[ordinal] =
+                    self.funders
+                        .prepare_reserved_image_after(next_funder, funder, 1)?;
+                member_after[ordinal] = member_image;
+                local_entries[local_count] = (
+                    local_key(LocalKind::Funder, next_funder),
+                    encode_arena_ref_value(next_funder),
+                );
+                local_count += 1;
+            }
+            let mutation = mutations[transition_index];
+            let mutation_after = self.mutations.prepare_reserved_image_after(
+                mutation,
+                encode_root_mutation(
+                    preview.operation,
+                    transition_index,
+                    spec,
+                    formation,
+                    self.generation(),
+                ),
+                1,
+            )?;
+            local_entries[local_count] = (
+                local_key(LocalKind::Mutation, mutation),
+                encode_arena_ref_value(mutation),
+            );
+            local_count += 1;
+            journals[transition_index] = Some(RootJournal {
+                before: spec.before,
+                locator_after_ref,
+                group_after,
+                locator_after,
+                formation_after,
+                funder_after,
+                member_after,
+                mutation_after,
+            });
+        }
+
+        let mut owner_records_after = owner_records;
+        let mut owner_references = [[ArenaRef::default(); 4]; PLAN_MEMBERS_MAX];
+        let mut owner_rows_after = [[0; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX];
+        let mut owners_after = [[0; OWNER_BYTES]; PLAN_MEMBERS_MAX];
+        let mut retired_links = [ArenaRef::default(); PLAN_MEMBERS_MAX];
+        let mut retired_link_before = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+        let mut retired_link_after = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+        let mut new_link_images = [[0; LINK_BYTES]; PLAN_MEMBERS_MAX];
+        let resolver_before = preview.transitions[0]
+            .expect("root batch has one transition")
+            .before;
+        let resolver_target = match preview.resolver {
+            ResolverChange::MoveTo(index) => Some((
+                preview.transitions[index]
+                    .ok_or(SupportLedgerError::InvalidInput)?
+                    .before
+                    .group,
+                preview.transitions[index]
+                    .ok_or(SupportLedgerError::InvalidInput)?
+                    .before
+                    .initial_formation,
+            )),
+            _ => None,
+        };
+        for ordinal in 0..preview.owner_count {
+            let delta = preview.owners[ordinal];
+            let before_record =
+                owner_records[ordinal].ok_or(SupportLedgerError::InvalidTransition)?;
+            if before_record.request_owner
+                != request_id_from_key_for_support(resolver_before.members[ordinal].request_key)?
+                || delta.slot != delta.owner.slot
+            {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            owner_references[ordinal] = [
+                self.owner_headers.reference_at(delta.slot, &[1])?,
+                self.owner_rows.reference_at(delta.slot, &[1])?,
+                self.owner_indices.reference_at(delta.slot, &[1])?,
+                self.owners.reference_at(delta.slot, &[1])?,
+            ];
+            if owner_references[ordinal][0] != delta.owner {
+                return Err(noncanonical_error());
+            }
+            validate_c16_owner_set(
+                [
+                    self.owner_headers
+                        .image(owner_references[ordinal][0], &[1])?
+                        .as_slice(),
+                    self.owner_rows
+                        .image(owner_references[ordinal][1], &[1])?
+                        .as_slice(),
+                    self.owner_indices
+                        .image(owner_references[ordinal][2], &[1])?
+                        .as_slice(),
+                    self.owners
+                        .image(owner_references[ordinal][3], &[1])?
+                        .as_slice(),
+                ],
+                owner_references[ordinal],
+                delta.slot,
+                &before_record,
+                OWNER_STATE_LIVE,
+            )?;
+            let mut record_after = before_record;
+            record_after.linked_claims = apply_i32_u32(record_after.linked_claims, delta.linked)?;
+            let mut row = *self.owner_rows.image(owner_references[ordinal][1], &[1])?;
+            let mut owner = *self.owners.image(owner_references[ordinal][3], &[1])?;
+            write_u32(
+                &mut row,
+                OWNER_ROW_LINKED_CLAIMS,
+                record_after.linked_claims,
+            );
+            let current_after = apply_i32_u64(read_u64(&row, OWNER_ROW_CURRENT), delta.linked)?;
+            write_u64(&mut row, OWNER_ROW_CURRENT, current_after);
+            for branch in 0..4 {
+                let offset = OWNER_ROW_BRANCH_CURRENT + branch * 8;
+                let branch_after = apply_i32_u64(read_u64(&row, offset), delta.branch[branch])?;
+                write_u64(&mut row, offset, branch_after);
+            }
+            write_u32(
+                &mut owner,
+                OWNER_IMAGE_LINKED_CLAIMS,
+                record_after.linked_claims,
+            );
+            if !matches!(preview.resolver, ResolverChange::Keep) {
+                let active = decode_optional_arena_ref(
+                    &row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8],
+                )?
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+                let before_link = *self.links.image(active, &[1])?;
+                if before_link[8] != 1
+                    || decode_arena_ref(&before_link[16..24])? != delta.owner
+                    || decode_arena_ref(&before_link[24..32])? != resolver_before.group
+                    || decode_arena_ref(&before_link[32..40])? != resolver_before.initial_formation
+                {
+                    return Err(noncanonical_error());
+                }
+                let mut after_link = before_link;
+                after_link[8] = 0;
+                write_u64(&mut after_link, 80, self.generation() + 1);
+                write_u64(
+                    &mut after_link,
+                    88,
+                    preview.transitions[0].expect("transition").occurred_at,
+                );
+                retired_links[ordinal] = active;
+                retired_link_before[ordinal] = before_link;
+                retired_link_after[ordinal] = after_link;
+                match resolver_target {
+                    Some((group, formation)) => {
+                        let next = links[ordinal];
+                        encode_arena_ref(
+                            &mut row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8],
+                            next,
+                        );
+                        new_link_images[ordinal] = self.links.prepare_reserved_image_after(
+                            next,
+                            encode_plan_link(
+                                delta.owner,
+                                group,
+                                formation,
+                                resolver_before.authority_key,
+                                self.generation() + 1,
+                            ),
+                            1,
+                        )?;
+                        local_entries[local_count] = (
+                            local_key(LocalKind::Link, next),
+                            encode_arena_ref_value(next),
+                        );
+                        local_count += 1;
+                    }
+                    None => row[OWNER_ROW_ACTIVE_LINK..OWNER_ROW_ACTIVE_LINK + 8].fill(0),
+                }
+            }
+            owner_records_after[ordinal] = Some(record_after);
+            owner_rows_after[ordinal] = row;
+            owners_after[ordinal] = owner;
+        }
+        let (resolution_journals, raw_updates, raw_update_count) = self
+            .prepare_resolution_journals(
+                &preview,
+                &formations,
+                &funders,
+                &links,
+                &mut journals,
+                &owner_references,
+                &mut owner_records_after,
+                &mut owner_rows_after,
+                &mut owners_after,
+            )?;
+        if owner_records[preview.owner_count..]
+            .iter()
+            .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        local_entries[..local_count].sort_unstable_by_key(|entry| entry.0);
+        if local_entries[..local_count]
+            .windows(2)
+            .any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.local
+            .validate_insert_batch(&local_entries[..local_count])?;
+        let local_plan = self.local.prepare_insert_assignment_plan(
+            LOCAL_INDEX_ASSIGNMENT_ARENA,
+            &local_entries[..local_count],
+        )?;
+        let raw_plan = if raw_update_count == 0 {
+            None
+        } else {
+            let mut updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); RESOLUTION_RAW_MAX];
+            for (index, update) in raw_updates[..raw_update_count]
+                .iter()
+                .copied()
+                .flatten()
+                .enumerate()
+            {
+                updates[index] = (update.key, update.handle, update.after);
+            }
+            Some(self.raw.prepare_update_assignment_plan(
+                RAW_INDEX_ASSIGNMENT_ARENA,
+                &updates[..raw_update_count],
+            )?)
+        };
+        let arena_headers_after = self.prepare_semantic_arena_headers_after(
+            &preview,
+            &formations,
+            &funders,
+            &wrappers,
+            &mutations,
+            &links,
+        )?;
+        let mut header_after = self.header;
+        if let Some((offset, _)) = preview.operation.retained_budget() {
+            let next = read_u32(&header_after.0, offset)
+                .checked_add(1)
+                .ok_or_else(capacity_error)?;
+            write_u32(&mut header_after.0, offset, next);
+        }
+        if let Some((_, after)) = preview.plan_event {
+            write_u64(&mut header_after.0, NEXT_PLAN_CAUSAL_EVENT, after);
+        }
+        write_u64(&mut header_after.0, 48, generation_after);
+        work.charge(HotPathWorkWitness::new(preview.operation.work()))?;
+        Ok(PreparedRootBatch {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            expected_local: self.local.generation(),
+            expected_lifecycle: self.lifecycle.generation(),
+            expected_arena_headers,
+            arena_headers_after,
+            preview,
+            formations,
+            funders,
+            wrappers,
+            wrapper_count,
+            mutations,
+            links,
+            link_count,
+            local_entries,
+            local_count,
+            journals,
+            owner_records_before: owner_records,
+            owner_records_after,
+            owner_references,
+            owner_rows_after,
+            owners_after,
+            retired_links,
+            retired_link_before,
+            retired_link_after,
+            new_link_images,
+            resolution_journals,
+        }
+    }
 }
