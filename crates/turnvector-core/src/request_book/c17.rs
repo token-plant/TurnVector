@@ -2468,4 +2468,274 @@ impl RequestBookC17 {
         self.commit_request_direct_images(accepted, change.direct);
         source_ref
     }
+
+    pub(crate) fn merge_initial_source_anchors(
+        &self,
+        marker: MergeInitialMarker,
+    ) -> Result<([SupportMembershipAnchor; 3], u8), RequestError> {
+        marker.validate()?;
+        let count = usize::from(marker.source_count);
+        let mut anchors = [SupportMembershipAnchor::ABSENT; 3];
+        for index in 0..count {
+            let key = source_key(SourceKind::InitialReady, marker.identities[index]);
+            if marker.identities[..index].contains(&marker.identities[index]) {
+                return Err(RequestError::InvalidTransition);
+            }
+            let encoded = self
+                .source_index
+                .find(&key)?
+                .ok_or(RequestError::InvalidTransition)?;
+            let reference = decode_source_value(encoded)?;
+            let source = self.source_record(reference)?;
+            if source.kind != SourceKind::InitialReady || source.domain != marker.domain {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            if source.state != SourceStateTag::InitialCreated
+                || source.create_event.is_absent()
+                || !source.consumed_event.is_absent()
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            let create = self.event_record(source.create_event)?;
+            let (create_ref, indexed_create) = self.event(create.id)?;
+            if create_ref != source.create_event
+                || indexed_create != create
+                || create.kind != MembershipEventKind::CreateStandalone
+                || create.sources[0] != reference
+                || create.member_count != 1
+            {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            let (address, row) = self.membership_by_key(source.request.key)?;
+            if source.request.slot != address.slot
+                || source.request.slot_generation != address.slot_generation
+                || source.request.status.checked_add(1) != Some(address.status)
+                || row.tag != MembershipTag::Bound
+                || row.initial != reference
+                || row.anchor.is_absent()
+                || anchors[..index].contains(&row.anchor)
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            anchors[index] = row.anchor;
+        }
+        Ok((anchors, marker.source_count))
+    }
+
+    pub(crate) fn prepare_merge_initial(
+        &self,
+        marker: MergeInitialMarker,
+        destination_anchor: SupportMembershipAnchor,
+    ) -> Result<PreparedMergeInitial, RequestError> {
+        marker.validate()?;
+        if destination_anchor.is_absent()
+            || !destination_anchor.canonical()
+            || destination_anchor.branch() != 3
+            || destination_anchor.root_version() != 1
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        let count = usize::from(marker.source_count);
+        let mut source_rows: [Option<(SourceRecordRef, SourceRecord)>; 3] = [None; 3];
+        let mut member_rows: [Option<(RequestAddress, MembershipStateRow, MembershipStateRow, u64)>;
+            4] = [None; 4];
+        for index in 0..count {
+            let key = source_key(SourceKind::InitialReady, marker.identities[index]);
+            if source_rows[..index]
+                .iter()
+                .flatten()
+                .any(|(_, source)| source.key == key)
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            let encoded = self
+                .source_index
+                .find(&key)?
+                .ok_or(RequestError::InvalidTransition)?;
+            let reference = decode_source_value(encoded)?;
+            let source = self.source_record(reference)?;
+            if source.kind != SourceKind::InitialReady || source.domain != marker.domain {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            if source.state != SourceStateTag::InitialCreated
+                || source.create_event.is_absent()
+                || !source.consumed_event.is_absent()
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            let create = self.event_record(source.create_event)?;
+            let (create_ref, indexed_create) = self.event(create.id)?;
+            if create_ref != source.create_event
+                || indexed_create != create
+                || create.kind != MembershipEventKind::CreateStandalone
+                || create.sources[0] != reference
+                || create.member_count != 1
+            {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            let (address, before) = self.membership_by_key(source.request.key)?;
+            if source.request.slot != address.slot
+                || source.request.slot_generation != address.slot_generation
+                || source.request.status.checked_add(1) != Some(address.status)
+                || before.tag != MembershipTag::Bound
+                || before.initial != reference
+                || before.anchor.is_absent()
+                || before.anchor == destination_anchor
+                || member_rows[..index]
+                    .iter()
+                    .flatten()
+                    .any(|(_, prior, _, _)| prior.anchor == before.anchor)
+            {
+                return Err(RequestError::InvalidTransition);
+            }
+            let mut after = before;
+            after.anchor = destination_anchor;
+            after.epoch = after
+                .epoch
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            let status = address
+                .status
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            source_rows[index] = Some((reference, source));
+            member_rows[index] = Some((address, before, after, status));
+        }
+        source_rows[..count].sort_unstable_by_key(|entry| entry.expect("active source").1.key);
+        member_rows[..count].sort_unstable_by_key(|entry| entry.expect("active member").0.key);
+        let event_selection = self.events.prepare_reserve::<1>(1)?;
+        let event_ref = EventRecordRef::from_arena(event_selection[0])?;
+        let event_id = read_u64(&self.header.0, 8);
+        event_id
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        self.event_index.validate_insert(&event_id.to_be_bytes())?;
+        let next_generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        for offset in [40, 56] {
+            read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+        }
+        read_u32(&self.header.0, 100)
+            .checked_add(1)
+            .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+        let mut event = MembershipEventRecord {
+            id: event_id,
+            kind: MembershipEventKind::MergeInitial,
+            source_count: marker.source_count,
+            member_count: marker.source_count,
+            consumed_by_support: true,
+            sources: [SourceRecordRef::ABSENT; 3],
+            affected: [None; 4],
+            before: [None; 4],
+            after: [None; 4],
+            generation_before: self.generation(),
+            generation_after: next_generation,
+            occurred_at: marker.occurred_at.as_micros(),
+            cancellation_fact: 0,
+        };
+        let mut after_status = [0; 4];
+        for index in 0..count {
+            event.sources[index] = source_rows[index].expect("active source").0;
+            let (address, before, after, status) = member_rows[index].expect("active member");
+            event.affected[index] = Some(address);
+            event.before[index] = Some(before);
+            event.after[index] = Some(after);
+            after_status[index] = status;
+        }
+        event.encode()?;
+        self.validate_event_sources(&event, event_ref)?;
+        self.validate_membership_updates(&event, &after_status)?;
+        let event_index_plan = self.event_index.prepare_insert_assignment_plan(
+            EVENT_INDEX_ASSIGNMENT_ARENA,
+            &[(event.id.to_be_bytes(), encode_event_value(event_ref))],
+        )?;
+        let request_index_plan = self.prepare_request_index_plan(&event, &after_status)?;
+        let direct = self.prepare_request_direct_images(
+            next_generation,
+            None,
+            None,
+            Some((event_selection[0], event)),
+            Self::request_updates(&event, &after_status)?,
+        )?;
+        Ok(PreparedMergeInitial {
+            expected_generation: self.generation(),
+            event_selection,
+            event,
+            after_status,
+            event_index_plan,
+            request_index_plan,
+            direct,
+        })
+    }
+
+    pub(crate) fn validate_merge_initial(
+        &self,
+        change: &PreparedMergeInitial,
+    ) -> Result<(), RequestError> {
+        if self.generation() != change.expected_generation
+            || read_u64(&self.header.0, 8) != change.event.id
+            || self.events.prepare_reserve::<1>(1)?.as_slice() != change.event_selection.as_slice()
+            || self
+                .event_index
+                .find(&change.event.id.to_be_bytes())?
+                .is_some()
+            || !self
+                .event_index
+                .validates_assignment_plan(&change.event_index_plan)
+            || !self
+                .request_index
+                .validates_assignment_plan(&change.request_index_plan)
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let event_ref = EventRecordRef::from_arena(change.event_selection[0])?;
+        change.event.encode()?;
+        self.validate_event_sources(&change.event, event_ref)?;
+        self.validate_membership_updates(&change.event, &change.after_status)?;
+        let direct = self.prepare_request_direct_images(
+            change.event.generation_after,
+            None,
+            None,
+            Some((change.event_selection[0], change.event)),
+            Self::request_updates(&change.event, &change.after_status)?,
+        )?;
+        (direct == change.direct)
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_merge_initial<const I: usize, const S: usize, const T: usize>(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedMergeInitial,
+    ) -> MembershipEventRecord {
+        self.validate_merge_initial(&change)
+            .expect("validated MergeInitial change");
+        self.commit_merge_initial_prevalidated(accepted, change, true)
+    }
+
+    pub(crate) fn commit_merge_initial_prevalidated<
+        const I: usize,
+        const S: usize,
+        const T: usize,
+    >(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedMergeInitial,
+        apply_index_plans: bool,
+    ) -> MembershipEventRecord {
+        let event = change.event;
+        if apply_index_plans {
+            self.event_index
+                .commit_assignment_plan_prevalidated(change.event_index_plan);
+            self.request_index
+                .commit_assignment_plan_prevalidated(change.request_index_plan);
+        }
+        self.commit_request_direct_images(accepted, change.direct);
+        event
+    }
 }
