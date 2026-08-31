@@ -555,4 +555,387 @@ impl SupportC17 {
             local_plan,
         })
     }
+
+    pub(in crate::support) fn validate_create_standalone_root(
+        &self,
+        change: &PreparedCreateStandaloneRoot,
+        owner_record: BundleRecord,
+    ) -> Result<(), SupportLedgerError> {
+        change.input.validate()?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let next_create_count = read_u32(&self.header.0, 88)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let mut header_after = self.header;
+        write_u32(&mut header_after.0, 88, next_create_count);
+        write_u64(&mut header_after.0, 48, generation_after);
+        let expected_arena_headers = self.membership_arena_headers();
+        let arena_headers_after = self.prepare_membership_arena_headers_after(
+            &change.group,
+            &change.formation,
+            &change.funders,
+            &change.members,
+            &change.wrapper,
+            &change.link,
+            &change.membership,
+            &change.mutation,
+        )?;
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || self.authority.generation() != change.expected_authority
+            || self.local.generation() != change.expected_local
+            || expected_arena_headers != change.expected_arena_headers
+            || arena_headers_after != change.arena_headers_after
+            || header_after != change.header_after
+            || owner_record != change.owner_record_before
+            || self.groups.prepare_reserve::<1>(1)?.as_slice() != change.group.as_slice()
+            || self.formations.prepare_reserve::<1>(1)?.as_slice() != change.formation.as_slice()
+            || self
+                .funders
+                .prepare_reserve::<STANDALONE_FUNDER_ROWS>(STANDALONE_FUNDER_ROWS)?
+                .as_slice()
+                != change.funders.as_slice()
+            || self
+                .members
+                .prepare_reserve::<STANDALONE_MEMBER_ROWS>(STANDALONE_MEMBER_ROWS)?
+                .as_slice()
+                != change.members.as_slice()
+            || self.wrappers.prepare_reserve::<1>(1)?.as_slice() != change.wrapper.as_slice()
+            || self.links.prepare_reserve::<1>(1)?.as_slice() != change.link.as_slice()
+            || self.memberships.prepare_reserve::<1>(1)?.as_slice() != change.membership.as_slice()
+            || self.mutations.prepare_reserve::<1>(1)?.as_slice() != change.mutation.as_slice()
+            || self.authority.find(&change.input.authority_key)?
+                != change.authority_before.map(|(value, _)| value)
+            || read_u32(&self.header.0, 88) >= CREATE_STANDALONE_BUDGET as u32
+            || !self.raw.validates_assignment_plan(&change.raw_plan)
+            || !self
+                .authority
+                .validates_assignment_plan(&change.authority_plan)
+            || !self.local.validates_assignment_plan(&change.local_plan)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        validate_c16_owner_set(
+            [
+                self.owner_headers
+                    .image(change.owner_references[0], &[1])?
+                    .as_slice(),
+                self.owner_rows
+                    .image(change.owner_references[1], &[1])?
+                    .as_slice(),
+                self.owner_indices
+                    .image(change.owner_references[2], &[1])?
+                    .as_slice(),
+                self.owners
+                    .image(change.owner_references[3], &[1])?
+                    .as_slice(),
+            ],
+            change.owner_references,
+            change.input.funding.record_slot,
+            &owner_record,
+            OWNER_STATE_LIVE,
+        )?;
+        match change.authority_before {
+            Some((_, handle)) => self.authority.validate_update_batch(&[(
+                change.input.authority_key,
+                handle,
+                change.authority_after,
+            )])?,
+            None => self
+                .authority
+                .validate_insert_batch(&[(change.input.authority_key, change.authority_after)])?,
+        }
+        for (index, (key, _, _)) in change.raw_updates.iter().enumerate() {
+            if self.raw.find(key)? != Some(change.raw_before[index]) {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        self.raw.validate_update_batch(&change.raw_updates)?;
+        self.local.validate_insert_batch(&change.local_entries)?;
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        let reconstructed = self.prepare_create_standalone_root(change.input, owner_record)?;
+        if &reconstructed != change {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(in crate::support) fn commit_create_standalone_root(
+        &mut self,
+        change: PreparedCreateStandaloneRoot,
+        owner_record: BundleRecord,
+    ) {
+        self.validate_create_standalone_root(&change, owner_record)
+            .expect("validated CreateStandalone Support root");
+        self.commit_create_standalone_root_prevalidated(change, true);
+    }
+
+    pub(in crate::support) fn commit_create_standalone_root_prevalidated(
+        &mut self,
+        change: PreparedCreateStandaloneRoot,
+        apply_index_plans: bool,
+    ) {
+        self.groups
+            .install_reserved_image_direct(change.group[0], change.group_image);
+        self.formations
+            .install_reserved_image_direct(change.formation[0], change.formation_image);
+        for ordinal in 0..PLAN_MEMBERS_MAX {
+            self.funders.install_reserved_image_direct(
+                change.funders[ordinal],
+                change.funder_images[ordinal],
+            );
+            self.members.install_reserved_image_direct(
+                change.members[ordinal],
+                change.member_images[ordinal],
+            );
+        }
+        self.wrappers
+            .install_reserved_image_direct(change.wrapper[0], change.wrapper_image);
+        self.links
+            .install_reserved_image_direct(change.link[0], change.link_image);
+        self.memberships
+            .install_reserved_image_direct(change.membership[0], change.membership_image);
+        self.mutations
+            .install_reserved_image_direct(change.mutation[0], change.mutation_image);
+        self.owner_rows
+            .replace_image_prevalidated(change.owner_references[1], change.owner_row_after);
+        self.owners
+            .replace_image_prevalidated(change.owner_references[3], change.owner_after);
+        if apply_index_plans {
+            self.authority
+                .commit_assignment_plan_prevalidated(change.authority_plan);
+            self.raw
+                .commit_assignment_plan_prevalidated(change.raw_plan);
+            self.local
+                .commit_assignment_plan_prevalidated(change.local_plan);
+        }
+        self.assign_membership_arena_headers(change.arena_headers_after);
+        self.header = change.header_after;
+    }
+
+    fn prepare_membership_arena_headers_after(
+        &self,
+        group: &ArenaSelection<1>,
+        formation: &ArenaSelection<1>,
+        funders: &ArenaSelection<STANDALONE_FUNDER_ROWS>,
+        members: &ArenaSelection<STANDALONE_MEMBER_ROWS>,
+        wrapper: &ArenaSelection<1>,
+        link: &ArenaSelection<1>,
+        membership: &ArenaSelection<1>,
+        mutation: &ArenaSelection<1>,
+    ) -> Result<[ByteArenaHeaderImage; 10], SupportLedgerError> {
+        Ok([
+            self.groups
+                .prepare_reserve_header_after(group, group.len(), 0)?,
+            self.formations
+                .prepare_reserve_header_after(formation, formation.len(), 0)?,
+            self.funders
+                .prepare_reserve_header_after(funders, funders.len(), 0)?,
+            self.members
+                .prepare_reserve_header_after(members, members.len(), 0)?,
+            self.wrappers
+                .prepare_reserve_header_after(wrapper, wrapper.len(), 0)?,
+            self.owner_rows.prepare_generation_header_after()?,
+            self.owners.prepare_generation_header_after()?,
+            self.links
+                .prepare_reserve_header_after(link, link.len(), 0)?,
+            self.memberships
+                .prepare_reserve_header_after(membership, membership.len(), 0)?,
+            self.mutations
+                .prepare_reserve_header_after(mutation, mutation.len(), 0)?,
+        ])
+    }
+
+    fn assign_membership_arena_headers(&mut self, headers: [ByteArenaHeaderImage; 10]) {
+        self.groups.assign_header_direct(headers[0]);
+        self.formations.assign_header_direct(headers[1]);
+        self.funders.assign_header_direct(headers[2]);
+        self.members.assign_header_direct(headers[3]);
+        self.wrappers.assign_header_direct(headers[4]);
+        self.owner_rows.assign_header_direct(headers[5]);
+        self.owners.assign_header_direct(headers[6]);
+        self.links.assign_header_direct(headers[7]);
+        self.memberships.assign_header_direct(headers[8]);
+        self.mutations.assign_header_direct(headers[9]);
+    }
+
+    fn membership_arena_headers(&self) -> [ByteArenaHeaderImage; 10] {
+        [
+            self.groups.header_image(),
+            self.formations.header_image(),
+            self.funders.header_image(),
+            self.members.header_image(),
+            self.wrappers.header_image(),
+            self.owner_rows.header_image(),
+            self.owners.header_image(),
+            self.links.header_image(),
+            self.memberships.header_image(),
+            self.mutations.header_image(),
+        ]
+    }
+}
+
+pub(super) fn encode_membership_group(
+    branch: u8,
+    state: RootState,
+    locator_kind: u8,
+    authority_key: [u8; 17],
+    formation: ArenaRef,
+    locator: ArenaRef,
+    members: [ArenaRef; PLAN_MEMBERS_MAX],
+    member_count: usize,
+) -> [u8; GROUP_BYTES] {
+    let mut image = [0; GROUP_BYTES];
+    image[8] = branch;
+    image[9] = state as u8;
+    image[10] = member_count as u8;
+    image[11] = locator_kind;
+    encode_arena_ref(&mut image[16..24], formation);
+    encode_arena_ref(&mut image[24..32], locator);
+    write_u64(&mut image, 32, 1);
+    image[40..57].copy_from_slice(&authority_key);
+    for (ordinal, reference) in members.into_iter().enumerate() {
+        encode_arena_ref(&mut image[64 + ordinal * 8..72 + ordinal * 8], reference);
+    }
+    image
+}
+
+fn encode_standalone_formation(
+    input: CreateStandaloneInput,
+    group: ArenaRef,
+    wrapper: ArenaRef,
+) -> [u8; FORMATION_BYTES] {
+    let mut image = [0; FORMATION_BYTES];
+    image[8..16].copy_from_slice(&encode_source_ref_word(input.source));
+    write_u64(&mut image, 16, input.event_id);
+    image[24..40].copy_from_slice(&input.domain);
+    image[40..72].copy_from_slice(&input.obligation);
+    image[72..104].copy_from_slice(&input.credit);
+    image[104..121].copy_from_slice(&input.authority_key);
+    image[220] = STANDALONE_BRANCH;
+    image[221] = RootState::Conditional as u8;
+    image[222] = FormationCause::InitialReady as u8;
+    write_u64(&mut image, 224, 1);
+    write_u64(&mut image, 232, input.occurred_at);
+    encode_arena_ref(&mut image[240..248], group);
+    encode_arena_ref(&mut image[248..256], wrapper);
+    image
+}
+
+pub(super) fn encode_membership_wrapper(
+    branch: u8,
+    state: RootState,
+    group: ArenaRef,
+    formation: ArenaRef,
+    authority_key: [u8; 17],
+    version: u64,
+) -> [u8; WRAPPER_BYTES] {
+    let mut image = [0; WRAPPER_BYTES];
+    image[8] = branch;
+    image[9] = state as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], formation);
+    image[32..49].copy_from_slice(&authority_key);
+    write_u64(&mut image, 56, version);
+    image
+}
+
+pub(super) fn encode_membership_funder(
+    branch: u8,
+    ordinal: usize,
+    active: bool,
+    group: ArenaRef,
+    formation: ArenaRef,
+    member: ArenaRef,
+    funding: MembershipFunding,
+    version: u8,
+) -> [u8; FUNDER_BYTES] {
+    let mut image = [0; FUNDER_BYTES];
+    image[8] = u8::from(active);
+    image[9] = branch;
+    image[10] = version;
+    image[11] = ordinal as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], formation);
+    encode_arena_ref(&mut image[32..40], member);
+    if active {
+        encode_arena_ref(&mut image[40..48], funding.owner_header);
+        image[48..80].copy_from_slice(&funding.entitlement);
+        image[80..112].copy_from_slice(&funding.vector);
+        write_u64(&mut image, 112, 1);
+        write_u64(&mut image, 120, funding.branch_limit);
+    }
+    image
+}
+
+pub(super) fn encode_membership_member(
+    branch: u8,
+    ordinal: usize,
+    active: bool,
+    group: ArenaRef,
+    funder: ArenaRef,
+    funding: MembershipFunding,
+) -> [u8; MEMBER_BYTES] {
+    let mut image = [0; MEMBER_BYTES];
+    image[8] = u8::from(active);
+    image[9] = branch;
+    image[10] = ordinal as u8;
+    encode_arena_ref(&mut image[16..24], group);
+    encode_arena_ref(&mut image[24..32], funder);
+    if active {
+        image[32..72].copy_from_slice(&funding.request_key);
+        encode_arena_ref(&mut image[72..80], funding.owner_header);
+        image[80..112].copy_from_slice(&funding.entitlement);
+    }
+    image
+}
+
+pub(super) fn encode_membership_event_image(
+    operation: SemanticOperation,
+    event_id: u64,
+    source: SourceRecordRef,
+    anchor: SupportMembershipAnchor,
+    request_key: [u8; 40],
+    generation: u64,
+    occurred_at: u64,
+) -> [u8; MEMBERSHIP_BYTES] {
+    let mut image = [0; MEMBERSHIP_BYTES];
+    image[8] = operation as u8;
+    image[9] = 1;
+    write_u64(&mut image, 16, event_id);
+    image[24..32].copy_from_slice(&encode_source_ref_word(source));
+    image[32..72].copy_from_slice(&request_key);
+    image[72..104].copy_from_slice(&anchor.bytes()[..32]);
+    write_u64(&mut image, 104, generation ^ occurred_at);
+    image
+}
+
+pub(super) fn encode_membership_mutation(
+    operation: SemanticOperation,
+    event_id: u64,
+    group: ArenaRef,
+    formation: ArenaRef,
+    generation: u64,
+    occurred_at: u64,
+) -> [u8; MUTATION_BYTES] {
+    let mut image = [0; MUTATION_BYTES];
+    image[8] = operation as u8;
+    image[9] = 1;
+    write_u64(&mut image, 16, generation);
+    write_u64(&mut image, 24, occurred_at);
+    write_u64(&mut image, 32, event_id);
+    encode_arena_ref(&mut image[40..48], group);
+    encode_arena_ref(&mut image[48..56], formation);
+    image
+}
+
+fn encode_source_ref_word(reference: SourceRecordRef) -> [u8; 8] {
+    let mut bytes = [0; 8];
+    bytes[..2].copy_from_slice(&reference.slot().to_le_bytes());
+    bytes[4..].copy_from_slice(&reference.generation().to_le_bytes());
+    bytes
 }
