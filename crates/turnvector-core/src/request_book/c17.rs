@@ -2080,4 +2080,392 @@ impl RequestBookC17 {
             direct,
         })
     }
+
+    pub(crate) fn seal_cancellation(
+        &self,
+        mut change: PreparedCancellation,
+        member_keys: [[u8; 40]; 4],
+        member_count: u8,
+        survivor: SupportMembershipAnchor,
+    ) -> Result<PreparedCancellation, RequestError> {
+        self.validate_cancellation(&change)?;
+        let count = usize::from(member_count);
+        if !(1..=4).contains(&count)
+            || member_keys[..count].contains(&[0; 40])
+            || !member_keys[..count]
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || member_keys[count..].iter().any(|key| *key != [0; 40])
+            || !member_keys[..count].contains(&change.request.key)
+            || (count == 1 && !survivor.is_absent())
+            || (count > 1
+                && (survivor.is_absent()
+                    || !survivor.canonical()
+                    || survivor.branch() == 4
+                    || survivor == change.before.anchor))
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        let target_after =
+            change.event.after[0].ok_or(RequestError::Storage(FixedStorageError::NonCanonical))?;
+        if target_after.tag != MembershipTag::Cancelled
+            || !target_after.anchor.is_absent()
+            || target_after.initial != change.before.initial
+        {
+            return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+        }
+        change.event.member_count = member_count;
+        change.event.affected = [None; 4];
+        change.event.before = [None; 4];
+        change.event.after = [None; 4];
+        change.after_status = [0; 4];
+        for (index, key) in member_keys[..count].iter().copied().enumerate() {
+            let (address, before) = self.membership_by_key(key)?;
+            let status = address
+                .status
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+            let after = if key == change.request.key {
+                if address != change.request || before != change.before {
+                    return Err(RequestError::PreparedChangeStale);
+                }
+                target_after
+            } else {
+                if before.tag != MembershipTag::Bound
+                    || before.anchor != change.before.anchor
+                    || before.initial.is_absent()
+                {
+                    return Err(RequestError::InvalidTransition);
+                }
+                let mut after = before;
+                after.anchor = survivor;
+                after.epoch = after
+                    .epoch
+                    .checked_add(1)
+                    .ok_or(RequestError::GenerationOverflow)?;
+                after
+            };
+            change.event.affected[index] = Some(address);
+            change.event.before[index] = Some(before);
+            change.event.after[index] = Some(after);
+            change.after_status[index] = status;
+        }
+        change.event.encode()?;
+        self.validate_membership_updates(&change.event, &change.after_status)?;
+        change.request_index_plan =
+            self.prepare_request_index_plan(&change.event, &change.after_status)?;
+        change.direct = self.prepare_request_direct_images(
+            change.event.generation_after,
+            change
+                .pending
+                .map(|(reference, _, after)| (reference, after)),
+            Some((change.source_selection[0], change.cancellation)),
+            Some((change.event_selection[0], change.event)),
+            Self::request_updates(&change.event, &change.after_status)?,
+        )?;
+        Ok(change)
+    }
+
+    pub(crate) fn validate_cancellation(
+        &self,
+        change: &PreparedCancellation,
+    ) -> Result<(), RequestError> {
+        if self.generation() != change.expected_generation
+            || read_u64(&self.header.0, 8) != change.event.id
+            || read_u64(&self.header.0, 16) != change.event.cancellation_fact
+            || self.sources.prepare_reserve::<1>(1)?.as_slice()
+                != change.source_selection.as_slice()
+            || self.events.prepare_reserve::<1>(1)?.as_slice() != change.event_selection.as_slice()
+            || self.source_index.find(&change.cancellation.key)?.is_some()
+            || self
+                .event_index
+                .find(&change.event.id.to_be_bytes())?
+                .is_some()
+            || !self
+                .source_index
+                .validates_assignment_plan(&change.source_index_plan)
+            || !self
+                .event_index
+                .validates_assignment_plan(&change.event_index_plan)
+            || !self
+                .request_index
+                .validates_assignment_plan(&change.request_index_plan)
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let (_, before) = self.membership(
+            request_id_from_key(change.request.key)?,
+            RequestStatusVersion::new(change.request.status)
+                .map_err(|_| RequestError::InvalidTransition)?,
+        )?;
+        if before != change.before {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        if let Some((reference, expected, after)) = change.pending {
+            if self.source_record(reference)? != expected {
+                return Err(RequestError::PreparedChangeStale);
+            }
+            after.encode()?;
+        }
+        change.cancellation.encode()?;
+        change.event.encode()?;
+        self.validate_membership_updates(&change.event, &change.after_status)?;
+        let direct = self.prepare_request_direct_images(
+            change.event.generation_after,
+            change
+                .pending
+                .map(|(reference, _, after)| (reference, after)),
+            Some((change.source_selection[0], change.cancellation)),
+            Some((change.event_selection[0], change.event)),
+            Self::request_updates(&change.event, &change.after_status)?,
+        )?;
+        (direct == change.direct)
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_cancellation<const I: usize, const S: usize, const T: usize>(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedCancellation,
+    ) -> MembershipEventRecord {
+        self.validate_cancellation(&change)
+            .expect("validated Cancellation change");
+        self.commit_cancellation_prevalidated(accepted, change, true)
+    }
+
+    pub(crate) fn commit_cancellation_prevalidated<
+        const I: usize,
+        const S: usize,
+        const T: usize,
+    >(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedCancellation,
+        apply_index_plans: bool,
+    ) -> MembershipEventRecord {
+        let event = change.event;
+        if apply_index_plans {
+            self.source_index
+                .commit_assignment_plan_prevalidated(change.source_index_plan);
+            self.event_index
+                .commit_assignment_plan_prevalidated(change.event_index_plan);
+            self.request_index
+                .commit_assignment_plan_prevalidated(change.request_index_plan);
+        }
+        self.commit_request_direct_images(accepted, change.direct);
+        event
+    }
+
+    pub(crate) fn prepare_create_standalone<const I: usize, const S: usize, const T: usize>(
+        &self,
+        accepted: &AcceptedRequest<I, S, T>,
+        marker: InitialReadyMarker,
+        anchor: SupportMembershipAnchor,
+    ) -> Result<PreparedCreateStandalone, RequestError> {
+        marker.validate()?;
+        if marker.request != accepted.id() || anchor.is_absent() || !anchor.canonical() {
+            return Err(RequestError::InvalidTransition);
+        }
+        let key = source_key(SourceKind::InitialReady, marker.identity);
+        let probe = SourceRecord {
+            key,
+            kind: SourceKind::InitialReady,
+            initial_kind: marker.kind as u8,
+            cancellation_kind: 0,
+            state: SourceStateTag::InitialCreated,
+            request: RequestAddress {
+                key: request_key(marker.request),
+                slot: 0,
+                reserved: 0,
+                slot_generation: 1,
+                status: 1,
+            },
+            accepted_identity: marker.identity,
+            domain: marker.domain,
+            previous_anchor: SupportMembershipAnchor::ABSENT,
+            occurred_at: marker.occurred_at.as_micros(),
+            cancellation_fact: 0,
+            create_event: EventRecordRef::ABSENT,
+            consumed_event: EventRecordRef::ABSENT,
+        };
+        if let Some(reference) = self.source_index.find(&key)? {
+            let stored = self.source_record(decode_source_value(reference)?)?;
+            if !stored.normalized_eq(&probe) {
+                return Err(RequestError::Storage(FixedStorageError::NonCanonical));
+            }
+            return Err(RequestError::InvalidTransition);
+        }
+        let (request, before) = self.membership(accepted.id(), accepted.status())?;
+        if before != MembershipStateRow::unready() {
+            return Err(RequestError::InvalidTransition);
+        }
+        let source_selection = self.sources.prepare_reserve::<1>(1)?;
+        let event_selection = self.events.prepare_reserve::<1>(1)?;
+        let source_ref = SourceRecordRef::from_arena(source_selection[0])?;
+        let event_ref = EventRecordRef::from_arena(event_selection[0])?;
+        let event_id = read_u64(&self.header.0, 8);
+        event_id
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        self.source_index.validate_insert(&key)?;
+        self.event_index.validate_insert(&event_id.to_be_bytes())?;
+        let after_status = request
+            .status
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        let next_generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or(RequestError::GenerationOverflow)?;
+        for offset in [40, 48, 56] {
+            read_u64(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::GenerationOverflow)?;
+        }
+        for offset in [100, 104] {
+            read_u32(&self.header.0, offset)
+                .checked_add(1)
+                .ok_or(RequestError::Storage(FixedStorageError::Capacity))?;
+        }
+        let source = SourceRecord {
+            request,
+            create_event: event_ref,
+            ..probe
+        };
+        source.encode()?;
+        let mut after = MembershipStateRow::unready();
+        after.tag = MembershipTag::Bound;
+        after.epoch = 1;
+        after.anchor = anchor;
+        after.initial = source_ref;
+        let event = single_member_event(
+            event_id,
+            MembershipEventKind::CreateStandalone,
+            source_ref,
+            request,
+            before,
+            after,
+            self.generation(),
+            next_generation,
+            marker.occurred_at.as_micros(),
+        );
+        event.encode()?;
+        self.validate_membership_updates(&event, &[after_status, 0, 0, 0])?;
+        let source_index_plan = self.source_index.prepare_insert_assignment_plan(
+            SOURCE_INDEX_ASSIGNMENT_ARENA,
+            &[(source.key, encode_source_value(source_ref))],
+        )?;
+        let event_index_plan = self.event_index.prepare_insert_assignment_plan(
+            EVENT_INDEX_ASSIGNMENT_ARENA,
+            &[(event.id.to_be_bytes(), encode_event_value(event_ref))],
+        )?;
+        let request_index_plan =
+            self.prepare_request_index_plan(&event, &[after_status, 0, 0, 0])?;
+        let statuses = [after_status, 0, 0, 0];
+        let direct = self.prepare_request_direct_images(
+            next_generation,
+            None,
+            Some((source_selection[0], source)),
+            Some((event_selection[0], event)),
+            Self::request_updates(&event, &statuses)?,
+        )?;
+        Ok(PreparedCreateStandalone {
+            expected_generation: self.generation(),
+            request,
+            before,
+            after_status,
+            source,
+            source_selection,
+            event_selection,
+            event,
+            source_index_plan,
+            event_index_plan,
+            request_index_plan,
+            direct,
+        })
+    }
+
+    pub(crate) fn validate_create_standalone(
+        &self,
+        change: &PreparedCreateStandalone,
+    ) -> Result<(), RequestError> {
+        if self.generation() != change.expected_generation
+            || read_u64(&self.header.0, 8) != change.event.id
+            || self.sources.prepare_reserve::<1>(1)?.as_slice()
+                != change.source_selection.as_slice()
+            || self.events.prepare_reserve::<1>(1)?.as_slice() != change.event_selection.as_slice()
+            || self.source_index.find(&change.source.key)?.is_some()
+            || self
+                .event_index
+                .find(&change.event.id.to_be_bytes())?
+                .is_some()
+            || !self
+                .source_index
+                .validates_assignment_plan(&change.source_index_plan)
+            || !self
+                .event_index
+                .validates_assignment_plan(&change.event_index_plan)
+            || !self
+                .request_index
+                .validates_assignment_plan(&change.request_index_plan)
+        {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        let (_, before) = self.membership(
+            request_id_from_key(change.request.key)?,
+            RequestStatusVersion::new(change.request.status)
+                .map_err(|_| RequestError::InvalidTransition)?,
+        )?;
+        if before != change.before {
+            return Err(RequestError::PreparedChangeStale);
+        }
+        change.source.encode()?;
+        change.event.encode()?;
+        let statuses = [change.after_status, 0, 0, 0];
+        self.validate_membership_updates(&change.event, &statuses)?;
+        let direct = self.prepare_request_direct_images(
+            change.event.generation_after,
+            None,
+            Some((change.source_selection[0], change.source)),
+            Some((change.event_selection[0], change.event)),
+            Self::request_updates(&change.event, &statuses)?,
+        )?;
+        (direct == change.direct)
+            .then_some(())
+            .ok_or(RequestError::PreparedChangeStale)
+    }
+
+    pub(crate) fn commit_create_standalone<const I: usize, const S: usize, const T: usize>(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedCreateStandalone,
+    ) -> SourceRecordRef {
+        self.validate_create_standalone(&change)
+            .expect("validated CreateStandalone change");
+        self.commit_create_standalone_prevalidated(accepted, change, true)
+    }
+
+    pub(crate) fn commit_create_standalone_prevalidated<
+        const I: usize,
+        const S: usize,
+        const T: usize,
+    >(
+        &mut self,
+        accepted: &mut [AcceptedRequest<I, S, T>],
+        change: PreparedCreateStandalone,
+        apply_index_plans: bool,
+    ) -> SourceRecordRef {
+        let source_ref = change.event.sources[0];
+        if apply_index_plans {
+            self.source_index
+                .commit_assignment_plan_prevalidated(change.source_index_plan);
+            self.event_index
+                .commit_assignment_plan_prevalidated(change.event_index_plan);
+            self.request_index
+                .commit_assignment_plan_prevalidated(change.request_index_plan);
+        }
+        self.commit_request_direct_images(accepted, change.direct);
+        source_ref
+    }
 }
