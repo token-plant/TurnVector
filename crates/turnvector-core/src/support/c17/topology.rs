@@ -3938,4 +3938,369 @@ fn push_surgery_local(
 }
 
 impl SupportC17 {
+    pub(in crate::support) fn validate_membership_topology(
+        &self,
+        change: &PreparedMembershipTopology,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) -> Result<(), SupportLedgerError> {
+        self.validate_membership_topology_preview(&change.preview)?;
+        validate_membership_topology_event(&change.preview, &change.event)?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let next_post = read_u32(&self.header.0, 96)
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let mut header_after = self.header;
+        write_u32(&mut header_after.0, 96, next_post);
+        write_u64(&mut header_after.0, 48, generation_after);
+        let source_count = change.preview.source_count;
+        let destination_count = change.preview.destination_count;
+        let formation_count = source_count + destination_count;
+        let mut expected_link_indices = [u8::MAX; PLAN_MEMBERS_MAX];
+        let mut expected_link_count = 0usize;
+        for (owner_index, link_index) in expected_link_indices
+            .iter_mut()
+            .enumerate()
+            .take(change.preview.owner_count)
+        {
+            if change.preview.owner_has_resolver(owner_index) {
+                *link_index = u8::try_from(expected_link_count).map_err(|_| capacity_error())?;
+                expected_link_count += 1;
+            }
+        }
+        let mut expected_authority_insert_count = 0usize;
+        let mut expected_authority_update_count = 0usize;
+        for destination in change.preview.destinations[..destination_count]
+            .iter()
+            .filter(|destination| destination.locator_kind == 2)
+        {
+            let key = destination.anchor.authority_key();
+            if self.authority.find(&key)?.is_some() {
+                expected_authority_update_count += 1;
+            } else if key[0] == 0x32 {
+                expected_authority_insert_count += 1;
+            } else {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        let expected_external_head_count = change.preview.destinations[..destination_count]
+            .iter()
+            .filter(|destination| destination.locator_kind == 1)
+            .count();
+        let expected_wrapper_count = change.preview.sources[..source_count]
+            .iter()
+            .flatten()
+            .filter(|source| source.locator_kind == 2)
+            .count()
+            + change.preview.destinations[..destination_count]
+                .iter()
+                .filter(|destination| destination.locator_kind == 2)
+                .count();
+        let expected_arena_headers = self.membership_topology_arena_headers();
+        let arena_headers_after = self.prepare_membership_topology_arena_headers_after(
+            &change.preview,
+            &change.groups,
+            &change.external_heads,
+            &change.formations,
+            &change.funders,
+            &change.members,
+            &change.wrappers,
+            &change.links,
+            &change.memberships,
+            &change.mutations,
+        )?;
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || self.authority.generation() != change.expected_authority
+            || self.local.generation() != change.expected_local
+            || self.lifecycle.generation() != change.expected_lifecycle
+            || expected_arena_headers != change.expected_arena_headers
+            || arena_headers_after != change.arena_headers_after
+            || header_after != change.header_after
+            || owner_records != change.owner_records_before
+            || read_u32(&self.header.0, 96) >= POST_CREATE_BUDGET as u32
+            || change.external_head_count != expected_external_head_count
+            || change.wrapper_count != expected_wrapper_count
+            || change.link_count != expected_link_count
+            || change.replacement_link_indices != expected_link_indices
+            || change.raw_count != change.external_head_count * 2
+            || change.authority_insert_count != expected_authority_insert_count
+            || change.authority_update_count != expected_authority_update_count
+            || change.raw_entries[change.raw_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 32], [0; 8]))
+            || change.authority_inserts[change.authority_insert_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 17], [0; 8]))
+            || change.authority_updates[change.authority_update_count..]
+                .iter()
+                .any(Option::is_some)
+            || change.local_entries[change.local_count..]
+                .iter()
+                .any(|entry| *entry != ([0; 17], [0; 8]))
+            || change.source_journals[..source_count]
+                .iter()
+                .any(Option::is_none)
+            || change.source_journals[source_count..]
+                .iter()
+                .any(Option::is_some)
+            || change.destination_journals[..destination_count]
+                .iter()
+                .any(Option::is_none)
+            || change.destination_journals[destination_count..]
+                .iter()
+                .any(Option::is_some)
+            || change.lifecycle_journals[..change.preview.lifecycle_record_count]
+                .iter()
+                .any(Option::is_none)
+            || change.lifecycle_journals[change.preview.lifecycle_record_count..]
+                .iter()
+                .any(Option::is_some)
+            || change.lifecycle_raw_update_count > SURGERY_LIFECYCLE_RAW_MAX
+            || change.lifecycle_raw_updates[..change.lifecycle_raw_update_count]
+                .iter()
+                .any(Option::is_none)
+            || change.lifecycle_raw_updates[change.lifecycle_raw_update_count..]
+                .iter()
+                .any(Option::is_some)
+            || change.lifecycle_raw_update_count
+                != change.preview.lifecycle_records[..change.preview.lifecycle_record_count]
+                    .iter()
+                    .flatten()
+                    .filter(|snapshot| snapshot.destination == u8::MAX)
+                    .count()
+                    * 2
+            || change.raw_plan.is_some()
+                != (change.raw_count + change.lifecycle_raw_update_count > 0)
+            || change.authority_plan.is_some()
+                != (change.authority_insert_count + change.authority_update_count > 0)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if destination_count == 0 {
+            if change.groups.len() != 0 || change.members.len() != 0 {
+                return Err(SupportLedgerError::Generation);
+            }
+        } else if self
+            .groups
+            .prepare_reserve::<SURGERY_DESTINATION_MAX>(destination_count)?
+            .as_slice()
+            != change.groups.as_slice()
+            || self
+                .members
+                .prepare_reserve::<SURGERY_MEMBER_MAX>(destination_count * PLAN_MEMBERS_MAX)?
+                .as_slice()
+                != change.members.as_slice()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if change.external_head_count == 0 {
+            if change.external_heads.len() != 0 {
+                return Err(SupportLedgerError::Generation);
+            }
+        } else if self
+            .external_heads
+            .prepare_reserve::<SURGERY_HEAD_MAX>(change.external_head_count)?
+            .as_slice()
+            != change.external_heads.as_slice()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if self
+            .formations
+            .prepare_reserve::<SURGERY_FORMATION_MAX>(formation_count)?
+            .as_slice()
+            != change.formations.as_slice()
+            || self
+                .funders
+                .prepare_reserve::<SURGERY_FUNDER_MAX>(formation_count * PLAN_MEMBERS_MAX)?
+                .as_slice()
+                != change.funders.as_slice()
+            || self.memberships.prepare_reserve::<1>(1)?.as_slice() != change.memberships.as_slice()
+            || self
+                .mutations
+                .prepare_reserve::<SURGERY_MUTATION_MAX>(source_count + 1)?
+                .as_slice()
+                != change.mutations.as_slice()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if change.wrapper_count == 0 {
+            if change.wrappers.len() != 0 {
+                return Err(SupportLedgerError::Generation);
+            }
+        } else if self
+            .wrappers
+            .prepare_reserve::<SURGERY_WRAPPER_MAX>(change.wrapper_count)?
+            .as_slice()
+            != change.wrappers.as_slice()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if change.link_count == 0 {
+            if change.links.len() != 0 {
+                return Err(SupportLedgerError::Generation);
+            }
+        } else if self
+            .links
+            .prepare_reserve::<SURGERY_LINK_MAX>(change.link_count)?
+            .as_slice()
+            != change.links.as_slice()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        for destination in change.preview.destinations[..destination_count]
+            .iter()
+            .filter(|destination| destination.locator_kind == 1)
+        {
+            if self
+                .authority
+                .find(&destination.anchor.authority_key())?
+                .is_some()
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        if change.authority_insert_count > 0 {
+            self.authority.validate_insert_batch(
+                &change.authority_inserts[..change.authority_insert_count],
+            )?;
+        }
+        for update in change.authority_updates[..change.authority_update_count]
+            .iter()
+            .copied()
+            .flatten()
+        {
+            if self.authority.find(&update.key)? != Some(update.before) {
+                return Err(SupportLedgerError::Generation);
+            }
+            self.authority
+                .validate_update_batch(&[(update.key, update.handle, update.after)])?;
+        }
+        if change.raw_count > 0 {
+            self.raw
+                .validate_insert_batch(&change.raw_entries[..change.raw_count])?;
+        }
+        if change
+            .raw_plan
+            .as_ref()
+            .is_some_and(|plan| !self.raw.validates_assignment_plan(plan))
+            || change
+                .authority_plan
+                .as_ref()
+                .is_some_and(|plan| !self.authority.validates_assignment_plan(plan))
+            || !self.local.validates_assignment_plan(&change.local_plan)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        for index in 0..source_count {
+            let journal = change.source_journals[index].expect("source journal");
+            let current = self.root_at_group(
+                journal.before.group,
+                journal.before.authority_key,
+                journal.before.branch,
+            )?;
+            if current != journal.before {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        for index in 0..change.preview.owner_count {
+            let owner = change.preview.owners[index];
+            let references = change.owner_references[index];
+            validate_c16_owner_set(
+                [
+                    self.owner_headers.image(references[0], &[1])?.as_slice(),
+                    self.owner_rows.image(references[1], &[1])?.as_slice(),
+                    self.owner_indices.image(references[2], &[1])?.as_slice(),
+                    self.owners.image(references[3], &[1])?.as_slice(),
+                ],
+                references,
+                owner.slot,
+                &owner_records[index].ok_or(SupportLedgerError::Generation)?,
+                OWNER_STATE_LIVE,
+            )?;
+            if self.links.image(change.retired_links[index], &[1])?
+                != &change.retired_link_before[index]
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        validate_topology_initial_and_raw_identity(&owner_records[..change.preview.owner_count])?;
+        for (index, journal) in change.lifecycle_journals[..change.preview.lifecycle_record_count]
+            .iter()
+            .copied()
+            .flatten()
+            .enumerate()
+        {
+            if Some(journal.snapshot) != change.preview.lifecycle_records[index]
+                || self.lifecycle.image(journal.snapshot.reference, &[1])?
+                    != &journal.snapshot.image
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+            if journal.snapshot.destination == u8::MAX {
+                validate_topology_closed_lifecycle_image(&journal.after)?;
+            } else {
+                LifecycleRecordInput::decode(&journal.after)?;
+            }
+        }
+        if change.preview.lifecycle_record_count > 0 {
+            self.lifecycle.validate_advance_generation()?;
+        }
+        if change.lifecycle_raw_update_count > 0 {
+            let mut updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); SURGERY_LIFECYCLE_RAW_MAX];
+            for (index, update) in change.lifecycle_raw_updates[..change.lifecycle_raw_update_count]
+                .iter()
+                .copied()
+                .flatten()
+                .enumerate()
+            {
+                if self.raw.value_at(update.handle)? != update.before {
+                    return Err(SupportLedgerError::Generation);
+                }
+                updates[index] = (update.key, update.handle, update.after);
+            }
+            self.raw
+                .validate_update_batch(&updates[..change.lifecycle_raw_update_count])?;
+        }
+        self.local
+            .validate_insert_batch(&change.local_entries[..change.local_count])?;
+        self.groups.validate_advance_generation()?;
+        self.members.validate_advance_generation()?;
+        if change.preview.sources[..source_count]
+            .iter()
+            .flatten()
+            .any(|source| source.locator_kind == 1)
+        {
+            self.external_heads.validate_advance_generation()?;
+        }
+        self.owner_rows.validate_advance_generation()?;
+        self.owners.validate_advance_generation()?;
+        if change.link_count == 0 {
+            self.links.validate_advance_generation()?;
+        }
+        let mut census = crate::work::ExactWorkCensus::new();
+        let reconstructed = self.prepare_membership_topology(
+            change.preview,
+            change.event,
+            owner_records,
+            &mut census,
+        )?;
+        if &reconstructed != change {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(in crate::support) fn commit_membership_topology(
+        &mut self,
+        change: PreparedMembershipTopology,
+        owner_records: [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+    ) {
+        self.validate_membership_topology(&change, owner_records)
+            .expect("validated membership topology");
+        self.commit_membership_topology_prevalidated(change, true);
+    }
 }
