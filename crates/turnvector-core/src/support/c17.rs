@@ -2902,4 +2902,399 @@ impl SupportC17 {
         self.pending = change.pending_after;
         write_u64(&mut self.header.0, 48, change.generation_after);
     }
+
+    pub(crate) fn prepare_abort_chunk(&self) -> Result<PreparedLifecycleAbort, SupportLedgerError> {
+        let state = self.pending_state()?;
+        if !matches!(state, PendingState::Staging | PendingState::Aborting) {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        let staged = usize::from(read_u16(&self.pending.0, PENDING_STAGED));
+        let cursor = if state == PendingState::Staging {
+            total
+        } else {
+            usize::from(read_u16(&self.pending.0, PENDING_CURSOR))
+        };
+        if cursor == 0 || staged > total || cursor > total {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let first = cursor.saturating_sub(LIFECYCLE_CHUNK_MAX);
+        let len = cursor - first;
+        let expected_arena_header = self.lifecycle.header_image();
+        let mut references = [ArenaRef::default(); LIFECYCLE_CHUNK_MAX];
+        let mut free_positions = [0; LIFECYCLE_CHUNK_MAX];
+        let mut vacant_images = [[0; LIFECYCLE_BYTES]; LIFECYCLE_CHUNK_MAX];
+        let mut free_cell_images = [ByteArenaFreeCellImage::ZERO; LIFECYCLE_CHUNK_MAX];
+        let mut raw_keys = [[0; 32]; 2 * LIFECYCLE_CHUNK_MAX];
+        let mut raw_count = 0;
+        for (offset, ordinal) in (first..cursor).rev().enumerate() {
+            let reference = if ordinal < staged {
+                let reference = self.inactive_reference(ordinal)?;
+                let image = self.lifecycle.image(reference, &[3])?;
+                for key_offset in [96, 128] {
+                    raw_keys[raw_count].copy_from_slice(&image[key_offset..key_offset + 32]);
+                    let encoded = self
+                        .raw
+                        .find(&raw_keys[raw_count])?
+                        .ok_or(SupportLedgerError::InvalidTransition)?;
+                    let (_, state, owner) = decode_raw_owner(encoded)?;
+                    if state != RawOwnerState::Inactive || owner != reference {
+                        return Err(noncanonical_error());
+                    }
+                    raw_count += 1;
+                }
+                reference
+            } else {
+                self.reserved_reference(ordinal)?
+            };
+            references[offset] = reference;
+            let (position, vacant, free_cell) = self
+                .lifecycle
+                .prepare_release_outcome_after(reference, offset)?;
+            free_positions[offset] = position;
+            vacant_images[offset] = vacant;
+            free_cell_images[offset] = free_cell;
+        }
+        let arena_header_after = self
+            .lifecycle
+            .prepare_release_header_after(&references[..len])?;
+        raw_keys[..raw_count].sort_unstable();
+        let raw_plan = if raw_count == 0 {
+            self.raw
+                .prepare_generation_assignment_plan(RAW_INDEX_ASSIGNMENT_ARENA)?
+        } else {
+            self.raw.prepare_remove_assignment_plan(
+                RAW_INDEX_ASSIGNMENT_ARENA,
+                &raw_keys[..raw_count],
+            )?
+        };
+        self.lifecycle.validate_release_batch(&references[..len])?;
+        let generation_after = self
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let raw_generation_after = self
+            .raw
+            .generation()
+            .checked_add(1)
+            .ok_or_else(capacity_error)?;
+        let batch = read_u64(&self.pending.0, PENDING_BATCH);
+        let pending_after = if first == 0 {
+            let mut pending = PendingLifecycleHeaderImage::ZERO;
+            write_u64(&mut pending.0, PENDING_BATCH, batch);
+            pending
+        } else {
+            let mut pending = self.pending;
+            pending.0[PENDING_STATE] = PendingState::Aborting as u8;
+            write_u16(&mut pending.0, PENDING_CURSOR, first as u16);
+            write_u64(&mut pending.0, PENDING_EXPECTED_RAW, raw_generation_after);
+            pending
+        };
+        Ok(PreparedLifecycleAbort {
+            expected_c17: self.generation(),
+            generation_after,
+            expected_raw: self.raw.generation(),
+            expected_arena_header,
+            arena_header_after,
+            batch,
+            first,
+            len,
+            references,
+            free_positions,
+            vacant_images,
+            free_cell_images,
+            raw_keys,
+            raw_count,
+            pending_after,
+            raw_plan,
+        })
+    }
+
+    pub(crate) fn validate_abort_chunk(
+        &self,
+        change: &PreparedLifecycleAbort,
+    ) -> Result<(), SupportLedgerError> {
+        let state = self.pending_state()?;
+        let cursor = if state == PendingState::Staging {
+            usize::from(read_u16(&self.pending.0, PENDING_TOTAL))
+        } else if state == PendingState::Aborting {
+            usize::from(read_u16(&self.pending.0, PENDING_CURSOR))
+        } else {
+            return Err(SupportLedgerError::InvalidTransition);
+        };
+        let staged = usize::from(read_u16(&self.pending.0, PENDING_STAGED));
+        let cursor_after = change
+            .first
+            .checked_add(change.len)
+            .ok_or(SupportLedgerError::Generation)?;
+        if self.generation() != change.expected_c17
+            || change.expected_c17.checked_add(1) != Some(change.generation_after)
+            || self.raw.generation() != change.expected_raw
+            || self.lifecycle.header_image() != change.expected_arena_header
+            || self
+                .lifecycle
+                .prepare_release_header_after(&change.references[..change.len])?
+                != change.arena_header_after
+            || read_u64(&self.pending.0, PENDING_BATCH) != change.batch
+            || cursor != cursor_after
+            || change.first != cursor.saturating_sub(LIFECYCLE_CHUNK_MAX)
+            || !(1..=LIFECYCLE_CHUNK_MAX).contains(&change.len)
+            || change.raw_count > 2 * change.len
+            || change.raw_count % 2 != 0
+            || change.references[change.len..]
+                .iter()
+                .any(|reference| *reference != ArenaRef::default())
+            || change.free_positions[change.len..]
+                .iter()
+                .any(|position| *position != 0)
+            || change.vacant_images[change.len..]
+                .iter()
+                .flatten()
+                .any(|byte| *byte != 0)
+            || change.free_cell_images[change.len..]
+                .iter()
+                .any(|image| *image != ByteArenaFreeCellImage::ZERO)
+            || change.raw_keys[change.raw_count..]
+                .iter()
+                .any(|key| *key != [0; 32])
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let raw_generation_after = change
+            .expected_raw
+            .checked_add(1)
+            .ok_or(SupportLedgerError::Generation)?;
+        let expected_pending_after = if change.first == 0 {
+            let mut pending = PendingLifecycleHeaderImage::ZERO;
+            write_u64(&mut pending.0, PENDING_BATCH, change.batch);
+            pending
+        } else {
+            let mut pending = self.pending;
+            pending.0[PENDING_STATE] = PendingState::Aborting as u8;
+            write_u16(&mut pending.0, PENDING_CURSOR, change.first as u16);
+            write_u64(&mut pending.0, PENDING_EXPECTED_RAW, raw_generation_after);
+            pending
+        };
+        if expected_pending_after != change.pending_after {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut expected_keys = [[0; 32]; 2 * LIFECYCLE_CHUNK_MAX];
+        let mut expected_count = 0usize;
+        for (offset, ordinal) in (change.first..cursor).rev().enumerate() {
+            let expected_reference = if ordinal < staged {
+                let reference = self.inactive_reference(ordinal)?;
+                let image = self.lifecycle.image(reference, &[3])?;
+                for key_offset in [96, 128] {
+                    expected_keys[expected_count]
+                        .copy_from_slice(&image[key_offset..key_offset + 32]);
+                    let encoded = self
+                        .raw
+                        .find(&expected_keys[expected_count])?
+                        .ok_or(SupportLedgerError::InvalidTransition)?;
+                    let (_, owner_state, owner) = decode_raw_owner(encoded)?;
+                    if owner_state != RawOwnerState::Inactive || owner != reference {
+                        return Err(noncanonical_error());
+                    }
+                    expected_count += 1;
+                }
+                reference
+            } else {
+                self.reserved_reference(ordinal)?
+            };
+            if change.references[offset] != expected_reference {
+                return Err(SupportLedgerError::Generation);
+            }
+            let (position, vacant, free_cell) = self
+                .lifecycle
+                .prepare_release_outcome_after(expected_reference, offset)?;
+            if change.free_positions[offset] != position
+                || change.vacant_images[offset] != vacant
+                || change.free_cell_images[offset] != free_cell
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        expected_keys[..expected_count].sort_unstable();
+        if expected_count != change.raw_count
+            || expected_keys[..expected_count] != change.raw_keys[..change.raw_count]
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        if change.raw_count == 0 {
+            self.raw.validate_advance_generation()?;
+        } else {
+            self.raw
+                .validate_remove_batch(&change.raw_keys[..change.raw_count])?;
+        }
+        if !self.raw.validates_assignment_plan(&change.raw_plan) {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.lifecycle
+            .validate_release_batch(&change.references[..change.len])?;
+        Ok(())
+    }
+
+    pub(crate) fn commit_abort_chunk(&mut self, change: PreparedLifecycleAbort) -> bool {
+        self.raw
+            .commit_assignment_plan_prevalidated(change.raw_plan);
+        for offset in 0..change.len {
+            self.lifecycle.install_reserved_image_direct(
+                change.references[offset],
+                change.vacant_images[offset],
+            );
+            self.lifecycle.assign_free_cell_direct(
+                change.free_positions[offset],
+                change.free_cell_images[offset],
+            );
+        }
+        self.lifecycle
+            .assign_header_direct(change.arena_header_after);
+        self.pending = change.pending_after;
+        write_u64(&mut self.header.0, 48, change.generation_after);
+        change.first == 0
+    }
+
+    pub(super) fn funder_image(
+        &self,
+        reference: ArenaRef,
+    ) -> Result<&[u8; FUNDER_BYTES], SupportLedgerError> {
+        Ok(self.funders.image(reference, &[1])?)
+    }
+
+    pub(crate) fn lifecycle_record_by_raw(
+        &self,
+        key: [u8; 32],
+    ) -> Result<Option<&[u8; LIFECYCLE_BYTES]>, SupportLedgerError> {
+        let Some(value) = self.raw.find(&key)? else {
+            return Ok(None);
+        };
+        let (_, state, reference) = decode_raw_owner(value)?;
+        if state != RawOwnerState::Committed {
+            return Ok(None);
+        }
+        let image = self.lifecycle.image(reference, &[1])?;
+        let reciprocal = image[96..128] == key || image[128..160] == key;
+        reciprocal
+            .then_some(Some(image))
+            .ok_or_else(noncanonical_error)
+    }
+
+    fn lifecycle_publications(
+        &self,
+    ) -> Result<([LifecyclePublication; LIFECYCLE_PUBLICATION_MAX], usize), SupportLedgerError>
+    {
+        if self.pending_state()? != PendingState::Staging {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let total = usize::from(read_u16(&self.pending.0, PENDING_TOTAL));
+        if total == 0 || usize::from(read_u16(&self.pending.0, PENDING_STAGED)) != total {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let mut publications = [LifecyclePublication::ZERO; LIFECYCLE_PUBLICATION_MAX];
+        let mut publication_count = 0usize;
+        for ordinal in 0..total {
+            let reserve = self.inactive_reference(ordinal)?;
+            let record = LifecycleRecordInput::decode(self.lifecycle.image(reserve, &[3])?)?;
+            self.validate_lifecycle_record_owner_set(record, reserve)?;
+            let axis = u8::try_from(record.aggregate[2]).map_err(|_| noncanonical_error())?;
+            let horizon = u8::try_from(record.aggregate[3]).map_err(|_| noncanonical_error())?;
+            let branch = funding_branch(record.final_owner[17])?;
+            for owner in record.owners {
+                if owner == LifecycleOwnerRow::ZERO {
+                    break;
+                }
+                let owner_header = decode_arena_ref(&owner.owner.to_le_bytes())?;
+                let owner_row = decode_arena_ref(&owner.request.to_le_bytes())?;
+                let owner_image = self.owners.reference_at(owner_header.slot, &[1])?;
+                if owner_row.slot != owner_header.slot || owner_image.slot != owner_header.slot {
+                    return Err(noncanonical_error());
+                }
+                let member = decode_arena_ref(&owner.source.to_le_bytes())?;
+                let member_image = self.members.image(member, &[1])?;
+                let funder = decode_arena_ref(&member_image[24..32])?;
+                let publication = LifecyclePublication {
+                    owner_slot: owner_header.slot,
+                    funder,
+                    branch,
+                    axis,
+                    horizon,
+                    zero: 0,
+                };
+                let prior = &publications[..publication_count];
+                let owner_delta = u64::try_from(
+                    prior
+                        .iter()
+                        .filter(|candidate| candidate.owner_slot == owner_header.slot)
+                        .count()
+                        + 1,
+                )
+                .map_err(|_| capacity_error())?;
+                let branch_delta = u64::try_from(
+                    prior
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.owner_slot == owner_header.slot && candidate.branch == branch
+                        })
+                        .count()
+                        + 1,
+                )
+                .map_err(|_| capacity_error())?;
+                let funder_delta = u64::try_from(
+                    prior
+                        .iter()
+                        .filter(|candidate| candidate.funder == funder)
+                        .count()
+                        + 1,
+                )
+                .map_err(|_| capacity_error())?;
+                let row = self.owner_rows.image(owner_row, &[1])?;
+                u64::from(read_u32(row, OWNER_ROW_LINKED_CLAIMS))
+                    .checked_add(owner_delta)
+                    .filter(|value| u32::try_from(*value).is_ok())
+                    .ok_or_else(capacity_error)?;
+                read_u64(row, OWNER_ROW_CURRENT)
+                    .checked_add(owner_delta)
+                    .ok_or_else(capacity_error)?;
+                read_u64(row, OWNER_ROW_BRANCH_CURRENT + usize::from(branch) * 8)
+                    .checked_add(branch_delta)
+                    .ok_or_else(capacity_error)?;
+                let funder_image = self.funders.image(funder, &[1])?;
+                let funder_current = read_u64(funder_image, 112)
+                    .checked_add(funder_delta)
+                    .ok_or_else(capacity_error)?;
+                if funder_current > read_u64(funder_image, 120) {
+                    return Err(capacity_error());
+                }
+                publications[publication_count] = publication;
+                publication_count += 1;
+            }
+        }
+        Ok((publications, publication_count))
+    }
+
+    pub(super) fn validate_lifecycle_publication_record(
+        &self,
+        publication: LifecyclePublication,
+        record: &BundleRecord,
+    ) -> Result<(), SupportLedgerError> {
+        let slot = publication.owner_slot;
+        let references = [
+            self.owner_headers.reference_at(slot, &[1])?,
+            self.owner_rows.reference_at(slot, &[1])?,
+            self.owner_indices.reference_at(slot, &[1])?,
+            self.owners.reference_at(slot, &[1])?,
+        ];
+        validate_c16_owner_set(
+            [
+                self.owner_headers.image(references[0], &[1])?.as_slice(),
+                self.owner_rows.image(references[1], &[1])?.as_slice(),
+                self.owner_indices.image(references[2], &[1])?.as_slice(),
+                self.owners.image(references[3], &[1])?.as_slice(),
+            ],
+            references,
+            slot,
+            record,
+            OWNER_STATE_LIVE,
+        )
+    }
 }
