@@ -1039,4 +1039,399 @@ impl<const K: usize, const V: usize> ReusablePatricia<K, V> {
         plan.finish()?;
         Ok(plan)
     }
+
+    fn shadow_apply_insert<const N: usize>(
+        &self,
+        plan: &mut PatriciaAssignmentPlan<N>,
+        header: &mut ReusableIndexHeader,
+        key: [u8; K],
+        value: [u8; V],
+    ) -> Result<(), FixedStorageError> {
+        let empty = header.root.is_sentinel();
+        let terminal = if empty {
+            None
+        } else {
+            let (leaf, _) = self.shadow_locate(plan, header.root, &key)?;
+            let slot = self.shadow_leaf(plan, leaf)?;
+            if slot[16..16 + K] == key {
+                return Err(FixedStorageError::Duplicate);
+            }
+            Some((leaf, slot))
+        };
+        let leaf_position = header
+            .free_leaf_len
+            .checked_sub(1)
+            .ok_or(FixedStorageError::Capacity)? as usize;
+        let leaf_index = read_u32(&self.free_leaves, leaf_position * 4) as usize;
+        let vacant_leaf = self.leaf_bytes_at(leaf_index);
+        if vacant_leaf[0] != 0 || read_u32(vacant_leaf, 8) as usize != leaf_position {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let leaf_generation = read_u32(vacant_leaf, 4)
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let leaf_handle = NodeHandle::new(leaf_index as u32 | LEAF_TAG, leaf_generation);
+        header.free_leaf_len -= 1;
+        if empty {
+            let image =
+                occupied_leaf_image::<K, V>(leaf_generation, NodeHandle::SENTINEL, &key, &value)?;
+            self.shadow_set_leaf(plan, leaf_index, &image)?;
+            header.root = leaf_handle;
+        } else {
+            let (terminal, peer) = terminal.expect("nonempty shadow has terminal");
+            let bit = first_difference(&key, &peer[16..16 + K])?;
+            let (parent, child) = self.shadow_insertion_point(plan, header.root, &key, bit)?;
+            let branch_position = header
+                .free_branch_len
+                .checked_sub(1)
+                .ok_or(FixedStorageError::Capacity)? as usize;
+            let branch_index = read_u32(&self.free_branches, branch_position * 4) as usize;
+            let vacant_branch = self.branch_bytes_at(branch_index);
+            if vacant_branch[0] != 0 || read_u32(vacant_branch, 8) as usize != branch_position {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            let branch_generation = read_u32(vacant_branch, 4)
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+            let branch_handle =
+                NodeHandle::new(branch_index as u32 | BRANCH_TAG, branch_generation);
+            header.free_branch_len -= 1;
+            let children = if key_bit(&key, bit) == 0 {
+                [leaf_handle, child]
+            } else {
+                [child, leaf_handle]
+            };
+            let leaf_image =
+                occupied_leaf_image::<K, V>(leaf_generation, branch_handle, &key, &value)?;
+            let branch_image = occupied_branch_image(branch_generation, parent, bit, children);
+            self.shadow_set_leaf(plan, leaf_index, &leaf_image)?;
+            self.shadow_set_branch(plan, branch_index, &branch_image)?;
+            self.shadow_set_parent(plan, child, branch_handle)?;
+            if parent.is_sentinel() {
+                header.root = branch_handle;
+            } else {
+                self.shadow_replace_child(plan, parent, child, branch_handle)?;
+            }
+            let _ = terminal;
+        }
+        header.occupied = header
+            .occupied
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        Ok(())
+    }
+
+    fn shadow_apply_remove<const N: usize>(
+        &self,
+        plan: &mut PatriciaAssignmentPlan<N>,
+        header: &mut ReusableIndexHeader,
+        key: &[u8; K],
+    ) -> Result<(), FixedStorageError> {
+        let path = self.shadow_removal_path(plan, header.root, key)?;
+        let leaf_image = self.shadow_leaf(plan, path.leaf)?;
+        if leaf_image[16..16 + K] != key[..] {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        if path.parent.is_sentinel() {
+            if !path.grandparent.is_sentinel() || !path.sibling.is_sentinel() {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            header.root = NodeHandle::SENTINEL;
+        } else {
+            if path.sibling.is_sentinel() {
+                return Err(FixedStorageError::NonCanonical);
+            }
+            self.shadow_set_parent(plan, path.sibling, path.grandparent)?;
+            if path.grandparent.is_sentinel() {
+                header.root = path.sibling;
+            } else {
+                self.shadow_replace_child(plan, path.grandparent, path.parent, path.sibling)?;
+            }
+            let branch_index = branch_index(path.parent)?;
+            let branch_image = self.shadow_branch(plan, path.parent)?;
+            let generation = read_u32(&branch_image, 4);
+            let free_position = header.free_branch_len;
+            let vacant = vacant_branch_image(generation, free_position);
+            self.shadow_set_branch(plan, branch_index, &vacant)?;
+            plan.set(
+                DestinationKind::FreeCell,
+                FREE_BRANCH_CELL_FLAG | free_position,
+                self.header.generation,
+                &(branch_index as u32).to_le_bytes(),
+            )?;
+            header.free_branch_len = header
+                .free_branch_len
+                .checked_add(1)
+                .ok_or(FixedStorageError::Capacity)?;
+        }
+        let leaf_index = leaf_index(path.leaf)?;
+        let generation = read_u32(&leaf_image, 4);
+        let free_position = header.free_leaf_len;
+        let vacant = vacant_leaf_image::<K, V>(generation, free_position)?;
+        self.shadow_set_leaf(plan, leaf_index, &vacant)?;
+        plan.set(
+            DestinationKind::FreeCell,
+            free_position,
+            self.header.generation,
+            &(leaf_index as u32).to_le_bytes(),
+        )?;
+        header.free_leaf_len = header
+            .free_leaf_len
+            .checked_add(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        header.occupied = header
+            .occupied
+            .checked_sub(1)
+            .ok_or(FixedStorageError::NonCanonical)?;
+        Ok(())
+    }
+
+    pub(crate) fn validates_assignment_plan<const N: usize>(
+        &self,
+        plan: &PatriciaAssignmentPlan<N>,
+    ) -> bool {
+        if plan.expected_generation != self.header.generation
+            || plan.assignments().is_empty()
+            || plan.assignments().iter().any(|assignment| {
+                !assignment.validate()
+                    || *assignment != Assignment::NOOP && assignment.destination_arena != plan.arena
+            })
+            || plan.edit_len == 0
+            || plan.edit_len > ASSIGNMENT_EDIT_MAX
+            || !plan.current_is_generation
+            || plan.next_ordinal != 1
+            || plan.len != (plan.edit_len - 1) * 9 + 1
+            || (0..plan.len).any(|index| {
+                plan.resolve_order_ref(plan.order_refs[index])
+                    .is_none_or(|key| key.arena != plan.arena)
+                    || index > 0
+                        && plan
+                            .resolve_order_ref(plan.order_refs[index - 1])
+                            .zip(plan.resolve_order_ref(plan.order_refs[index]))
+                            .is_none_or(|(prior, current)| prior >= current)
+            })
+            || plan.edits[..plan.edit_len]
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || plan.edits[..plan.edit_len]
+                .iter()
+                .any(|edit| edit.arena != plan.arena)
+            || plan.order_refs[plan.len..]
+                .iter()
+                .any(|reference| *reference != AssignmentOrderRef::ZERO)
+            || plan.edits[plan.edit_len..]
+                .iter()
+                .any(|edit| *edit != AssignmentOrderKey::ZERO)
+        {
+            return false;
+        }
+        let mut header_seen = false;
+        for (assignment_index, assignment) in plan.assignments().iter().enumerate() {
+            let prior_destination = || {
+                plan.assignments[..assignment_index]
+                    .iter()
+                    .rev()
+                    .find(|prior| {
+                        **prior != Assignment::NOOP
+                            && prior.destination_kind == assignment.destination_kind
+                            && prior.destination_slot == assignment.destination_slot
+                    })
+            };
+            let valid = match assignment.destination_kind {
+                value if value == DestinationKind::Leaf as u8 => {
+                    let index = assignment.destination_slot as usize;
+                    index < self.header.leaf_capacity as usize
+                        && assignment.image_len as usize
+                            == assignment_image_width(leaf_bytes(K, V).unwrap_or(0)).unwrap_or(0)
+                        && prior_destination().map_or_else(
+                            || read_u32(self.leaf_bytes_at(index), 4) as u64,
+                            |prior| read_u32(&prior.payload, 4) as u64,
+                        ) == assignment.expected_generation
+                }
+                value if value == DestinationKind::Branch as u8 => {
+                    let index = assignment.destination_slot as usize;
+                    index < self.header.branch_capacity as usize
+                        && assignment.image_len as usize == BRANCH_SLOT_BYTES
+                        && prior_destination().map_or_else(
+                            || read_u32(self.branch_bytes_at(index), 4) as u64,
+                            |prior| read_u32(&prior.payload, 4) as u64,
+                        ) == assignment.expected_generation
+                }
+                value if value == DestinationKind::Header as u8 => {
+                    if header_seen {
+                        return false;
+                    }
+                    header_seen = true;
+                    assignment.destination_slot == 0
+                        && assignment.image_len as usize == INDEX_HEADER_BYTES
+                        && assignment.expected_generation == self.header.generation
+                        && assignment.payload[..INDEX_HEADER_BYTES]
+                            == encode_index_header(plan.after_header)
+                }
+                value if value == DestinationKind::FreeCell as u8 => {
+                    let branch = assignment.destination_slot & FREE_BRANCH_CELL_FLAG != 0;
+                    let position = (assignment.destination_slot & !FREE_BRANCH_CELL_FLAG) as usize;
+                    assignment.image_len == 4
+                        && assignment.expected_generation == self.header.generation
+                        && if branch {
+                            position < self.header.branch_capacity as usize
+                        } else {
+                            position < self.header.leaf_capacity as usize
+                        }
+                }
+                value if value == DestinationKind::Noop as u8 => *assignment == Assignment::NOOP,
+                _ => false,
+            };
+            if !valid {
+                return false;
+            }
+        }
+        header_seen
+    }
+
+    pub(crate) fn commit_assignment_plan<const N: usize>(
+        &mut self,
+        plan: PatriciaAssignmentPlan<N>,
+    ) {
+        assert!(
+            self.validates_assignment_plan(&plan),
+            "validated direct Patricia assignment plan"
+        );
+        self.commit_assignment_plan_prevalidated(plan);
+    }
+
+    pub(crate) fn commit_assignment_plan_prevalidated<const N: usize>(
+        &mut self,
+        plan: PatriciaAssignmentPlan<N>,
+    ) {
+        let PatriciaAssignmentPlan {
+            after_header,
+            assignments,
+            len,
+            ..
+        } = plan;
+        for assignment in &assignments[..len] {
+            match assignment.destination_kind {
+                value if value == DestinationKind::Leaf as u8 => {
+                    let destination = self.leaf_bytes_at_mut(assignment.destination_slot as usize);
+                    destination.copy_from_slice(&assignment.payload[..destination.len()]);
+                }
+                value if value == DestinationKind::Branch as u8 => {
+                    let destination =
+                        self.branch_bytes_at_mut(assignment.destination_slot as usize);
+                    destination.copy_from_slice(&assignment.payload[..BRANCH_SLOT_BYTES]);
+                }
+                value if value == DestinationKind::Header as u8 => {}
+                value if value == DestinationKind::FreeCell as u8 => {
+                    let branch = assignment.destination_slot & FREE_BRANCH_CELL_FLAG != 0;
+                    let position = (assignment.destination_slot & !FREE_BRANCH_CELL_FLAG) as usize;
+                    let destination = if branch {
+                        &mut self.free_branches[position * 4..position * 4 + 4]
+                    } else {
+                        &mut self.free_leaves[position * 4..position * 4 + 4]
+                    };
+                    destination.copy_from_slice(&assignment.payload[..4]);
+                }
+                value if value == DestinationKind::Noop as u8 => {}
+                _ => unreachable!("validated direct Patricia destination"),
+            }
+        }
+        self.header = after_header;
+    }
+
+    pub(crate) fn commit_assignment_direct(&mut self, assignment: &Assignment) {
+        match assignment.destination_kind {
+            value if value == DestinationKind::Leaf as u8 => {
+                let destination = self.leaf_bytes_at_mut(assignment.destination_slot as usize);
+                destination.copy_from_slice(&assignment.payload[..destination.len()]);
+            }
+            value if value == DestinationKind::Branch as u8 => {
+                let destination = self.branch_bytes_at_mut(assignment.destination_slot as usize);
+                destination.copy_from_slice(&assignment.payload[..BRANCH_SLOT_BYTES]);
+            }
+            value if value == DestinationKind::Header as u8 => {
+                self.header = ReusableIndexHeader {
+                    generation: read_handle(&assignment.payload, 0).0,
+                    root: read_handle(&assignment.payload, 8),
+                    occupied: read_u32(&assignment.payload, 16),
+                    leaf_capacity: read_u32(&assignment.payload, 20),
+                    branch_capacity: read_u32(&assignment.payload, 24),
+                    free_leaf_len: read_u32(&assignment.payload, 28),
+                    free_branch_len: read_u32(&assignment.payload, 32),
+                    reserved: read_u32(&assignment.payload, 36),
+                };
+            }
+            value if value == DestinationKind::FreeCell as u8 => {
+                let branch = assignment.destination_slot & FREE_BRANCH_CELL_FLAG != 0;
+                let position = (assignment.destination_slot & !FREE_BRANCH_CELL_FLAG) as usize;
+                let destination = if branch {
+                    &mut self.free_branches[position * 4..position * 4 + 4]
+                } else {
+                    &mut self.free_leaves[position * 4..position * 4 + 4]
+                };
+                destination.copy_from_slice(&assignment.payload[..4]);
+            }
+            value if value == DestinationKind::Noop as u8 => {}
+            _ => unreachable!("validated direct Patricia destination"),
+        }
+    }
+
+    fn shadow_leaf<const N: usize>(
+        &self,
+        plan: &PatriciaAssignmentPlan<N>,
+        handle: NodeHandle,
+    ) -> Result<[u8; 112], FixedStorageError> {
+        let index = leaf_index(handle)?;
+        let width = leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)?;
+        let source = plan
+            .image(DestinationKind::Leaf, index as u32)
+            .unwrap_or_else(|| self.leaf_bytes_at(index));
+        if source.len() < width || source[0] != 1 || read_u32(source, 4) != handle.generation() {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let mut image = [0; 112];
+        image[..width].copy_from_slice(&source[..width]);
+        Ok(image)
+    }
+
+    fn shadow_branch<const N: usize>(
+        &self,
+        plan: &PatriciaAssignmentPlan<N>,
+        handle: NodeHandle,
+    ) -> Result<[u8; BRANCH_SLOT_BYTES], FixedStorageError> {
+        let index = branch_index(handle)?;
+        let source = plan
+            .image(DestinationKind::Branch, index as u32)
+            .unwrap_or_else(|| self.branch_bytes_at(index));
+        if source.len() != BRANCH_SLOT_BYTES
+            || source[0] != 1
+            || read_u32(source, 4) != handle.generation()
+        {
+            return Err(FixedStorageError::NonCanonical);
+        }
+        let mut image = [0; BRANCH_SLOT_BYTES];
+        image.copy_from_slice(source);
+        Ok(image)
+    }
+
+    fn shadow_set_leaf<const N: usize>(
+        &self,
+        plan: &mut PatriciaAssignmentPlan<N>,
+        index: usize,
+        image: &[u8; 112],
+    ) -> Result<(), FixedStorageError> {
+        let width = leaf_bytes(K, V).ok_or(FixedStorageError::Capacity)?;
+        let slot = u32::try_from(index).map_err(|_| FixedStorageError::Capacity)?;
+        let expected = plan.image(DestinationKind::Leaf, slot).map_or_else(
+            || read_u32(self.leaf_bytes_at(index), 4) as u64,
+            |prior| read_u32(prior, 4) as u64,
+        );
+        let stored_width = assignment_image_width(width)?;
+        plan.set(
+            DestinationKind::Leaf,
+            slot,
+            expected,
+            &image[..stored_width],
+        )
+    }
 }
