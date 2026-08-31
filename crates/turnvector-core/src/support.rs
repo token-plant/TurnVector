@@ -1,9 +1,14 @@
+pub(crate) mod c17;
+
 use crate::bounded::FixedWindowStart;
+use crate::c17_layout::{Assignment, WORK_MIGRATED_C16, WORK_TOMBSTONE, legacy_migrated};
+use crate::reusable::AssignmentOrderKey;
+use crate::work::{ExactWorkCensus, WorkRecorder};
 use crate::{
     Duration, FixedRecordArena, FixedStartCountBound, FixedStorageError, FixedWindowCounter,
     FutureTurnSupportEntitlementId, HotPathWorkWitness, MonotonicTime, PhysicalStartCreditId,
     RequestId, RuntimeOverheadBoundSetId, SupportLedgerGeneration, SupportOperationObligationId,
-    SupportOutstandingCreditVectorId, WorkBudgetError, WorkDimension, WorkMeter,
+    SupportOutstandingCreditVectorId, TurnPlan, WorkBudgetError, WorkDimension, WorkMeter,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 const POOLS: usize = 3;
@@ -12,6 +17,25 @@ const PENDING: usize = 1;
 const ACTIVE: usize = 2;
 const CREDITS: usize = 3;
 const CLAIMS: usize = 4;
+
+fn migrated_legacy_witness(
+    work: HotPathWorkWitness,
+) -> Result<HotPathWorkWitness, SupportLedgerError> {
+    if work.value(WorkDimension::Allocations) != 0 || work.value(WorkDimension::CandidateWork) != 0
+    {
+        return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+    }
+    legacy_migrated([
+        work.value(WorkDimension::VisitedEntities),
+        work.value(WorkDimension::CopiedBytes),
+        0,
+        0,
+        work.value(WorkDimension::InvariantChecks),
+    ])
+    .map(HotPathWorkWitness::new)
+    .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))
+}
+
 macro_rules! values {
     ($($name:ident { $($variant:ident $(($value:ty))?),+ $(,)? })+) => {$(
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -105,14 +129,317 @@ pub(crate) struct OrdinarySupportSpec {
 pub(crate) enum SupportChangeInput { BeginOrdinary(OrdinarySupportSpec, MonotonicTime), BeginPending(SupportOperationObligationId, LifecycleReserveKind, MonotonicTime), FinishActive(SupportOperationObligationId) }
 enum SupportDelta {
     BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart),
-    BeginPending(usize, Record, MonotonicTime, FixedWindowStart),
-    FinishActive(usize, Record),
+    BeginPending(
+        usize,
+        Record,
+        SupportOperationObligationId,
+        MonotonicTime,
+        FixedWindowStart,
+    ),
+    FinishActive(usize, Record, SupportOperationObligationId),
     FinishInitial(u32, u8, InitialRequirementRecord, BundleState),
+}
+enum LegacyC17Change {
+    Insert(c17::PreparedLegacyInsert),
+    Update(c17::PreparedLegacyUpdate),
+    C16Touch(c17::PreparedC16Touch),
 }
 pub(crate) struct SupportChange {
     expected: SupportLedgerGeneration,
     records: usize,
     delta: SupportDelta,
+    charge: Option<HotPathWorkWitness>,
+    c17: Option<LegacyC17Change>,
+}
+
+pub(crate) struct PreparedC17PlanCreate {
+    expected: SupportLedgerGeneration,
+    generation_after: SupportLedgerGeneration,
+    member_count: usize,
+    owner_slots: [u32; 4],
+    owner_records_before: [Option<BundleRecord>; 4],
+    owner_records_after: [Option<BundleRecord>; 4],
+    cell_outcomes: [C17DirectCellOutcome; C17_DIRECT_CELL_MAX],
+    cell_count: usize,
+    usage_after: [[u32; POOLS]; 5],
+    reserved_after: [[u32; POOLS]; 5],
+    attached_after: [[u32; POOLS]; 4],
+    c17: c17::PreparedPlanCreate,
+}
+
+impl PreparedC17PlanCreate {
+    pub(crate) const fn expected_generation(&self) -> SupportLedgerGeneration {
+        self.expected
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.c17.visit_assignments(visitor);
+    }
+}
+
+const C17_DIRECT_CELL_MAX: usize = 4 * 21 * 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct C17DirectCellOutcome {
+    cell_slot: u32,
+    current_before: u64,
+    current_after: u64,
+}
+
+impl C17DirectCellOutcome {
+    const ZERO: Self = Self {
+        cell_slot: 0,
+        current_before: 0,
+        current_after: 0,
+    };
+}
+
+pub(crate) struct PreparedC17CreateStandalone {
+    expected: SupportLedgerGeneration,
+    generation_after: SupportLedgerGeneration,
+    owner_slot: u32,
+    owner_record_before: BundleRecord,
+    owner_record_after: BundleRecord,
+    cell_outcomes: [C17DirectCellOutcome; C17_DIRECT_CELL_MAX],
+    cell_count: usize,
+    usage_after: [[u32; POOLS]; 5],
+    reserved_after: [[u32; POOLS]; 5],
+    attached_after: [[u32; POOLS]; 4],
+    c17: c17::PreparedCreateStandaloneRoot,
+}
+
+pub(crate) struct PreparedC17MergeInitial {
+    expected: SupportLedgerGeneration,
+    generation_after: SupportLedgerGeneration,
+    owner_count: usize,
+    owner_slots: [u32; 4],
+    owner_records_before: [Option<BundleRecord>; 4],
+    owner_records_after: [Option<BundleRecord>; 4],
+    cell_outcomes: [C17DirectCellOutcome; C17_DIRECT_CELL_MAX],
+    cell_count: usize,
+    usage_after: [[u32; POOLS]; 5],
+    reserved_after: [[u32; POOLS]; 5],
+    attached_after: [[u32; POOLS]; 4],
+    c17: c17::PreparedMergeInitialTopology,
+}
+
+pub(crate) struct PreparedC17MembershipTopology {
+    expected: SupportLedgerGeneration,
+    generation_after: SupportLedgerGeneration,
+    owner_count: usize,
+    owner_slots: [u32; 4],
+    owner_records_before: [Option<BundleRecord>; 4],
+    owner_records_after: [Option<BundleRecord>; 4],
+    cell_outcomes: [C17DirectCellOutcome; C17_DIRECT_CELL_MAX],
+    cell_count: usize,
+    usage_after: [[u32; POOLS]; 5],
+    reserved_after: [[u32; POOLS]; 5],
+    attached_after: [[u32; POOLS]; 4],
+    vector_after: [[u64; 3]; 21],
+    c17: c17::PreparedMembershipTopology,
+}
+
+impl PreparedC17CreateStandalone {
+    pub(crate) const fn generation_after(&self) -> SupportLedgerGeneration {
+        self.generation_after
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.c17.visit_assignments(visitor);
+    }
+}
+
+impl PreparedC17MergeInitial {
+    pub(crate) const fn generation_after(&self) -> SupportLedgerGeneration {
+        self.generation_after
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.c17.visit_assignments(visitor);
+    }
+}
+
+impl PreparedC17MembershipTopology {
+    pub(crate) const fn generation_after(&self) -> SupportLedgerGeneration {
+        self.generation_after
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.c17.visit_assignments(visitor);
+    }
+}
+
+pub(crate) struct PreparedC17RootBatch {
+    expected: SupportLedgerGeneration,
+    generation_after: SupportLedgerGeneration,
+    owner_count: usize,
+    owner_slots: [u32; 4],
+    owner_records_before: [Option<BundleRecord>; 4],
+    owner_records_after: [Option<BundleRecord>; 4],
+    cell_outcomes: [C17DirectCellOutcome; C17_DIRECT_CELL_MAX],
+    cell_count: usize,
+    usage_after: [[u32; POOLS]; 5],
+    reserved_after: [[u32; POOLS]; 5],
+    attached_after: [[u32; POOLS]; 4],
+    vector_after: [[u64; 3]; 21],
+    c17: c17::PreparedRootBatch,
+}
+
+impl PreparedC17RootBatch {
+    pub(crate) const fn expected_generation(&self) -> SupportLedgerGeneration {
+        self.expected
+    }
+
+    pub(crate) fn visit_assignments(
+        &self,
+        visitor: &mut dyn FnMut(AssignmentOrderKey, Assignment),
+    ) {
+        self.c17.visit_assignments(visitor);
+    }
+}
+
+pub(crate) struct PreparedC17LifecycleBegin {
+    expected: SupportLedgerGeneration,
+    c17: c17::PreparedLifecycleBegin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct C17LifecycleOwnerOutcome {
+    owner_slot: u32,
+    linked_after: u32,
+}
+
+impl C17LifecycleOwnerOutcome {
+    const ZERO: Self = Self {
+        owner_slot: 0,
+        linked_after: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct C17LifecycleCellOutcome([u8; 12]);
+
+impl C17LifecycleCellOutcome {
+    const ZERO: Self = Self([0; 12]);
+
+    fn new(cell_slot: u32, current_after: u64) -> Self {
+        let mut image = [0; 12];
+        image[..4].copy_from_slice(&cell_slot.to_le_bytes());
+        image[4..].copy_from_slice(&current_after.to_le_bytes());
+        Self(image)
+    }
+
+    fn cell_slot(self) -> u32 {
+        u32::from_le_bytes(self.0[..4].try_into().expect("fixed cell outcome slot"))
+    }
+
+    fn current_after(self) -> u64 {
+        u64::from_le_bytes(self.0[4..].try_into().expect("fixed cell outcome current"))
+    }
+
+    fn increment(&mut self) -> Option<u64> {
+        let after = self.current_after().checked_add(1)?;
+        self.0[4..].copy_from_slice(&after.to_le_bytes());
+        Some(after)
+    }
+}
+
+pub(crate) struct PreparedC17LifecycleFinalize {
+    expected: SupportLedgerGeneration,
+    generation_after: SupportLedgerGeneration,
+    usage_after: [[u32; POOLS]; 5],
+    reserved_after: [[u32; POOLS]; 5],
+    attached_after: [[u32; POOLS]; 4],
+    vector_after: [[u64; 3]; 21],
+    owner_outcomes: [C17LifecycleOwnerOutcome; crate::c17_layout::LIFECYCLE_CAPACITY],
+    owner_count: usize,
+    cell_outcomes: [C17LifecycleCellOutcome; c17::LIFECYCLE_PUBLICATION_MAX],
+    cell_count: usize,
+    c17_owner_outcomes: [c17::LifecycleOwnerOutcome; crate::c17_layout::LIFECYCLE_CAPACITY],
+    c17_owner_count: usize,
+    c17_funder_outcomes: [c17::LifecycleFunderOutcome; crate::c17_layout::LIFECYCLE_CAPACITY],
+    c17_funder_count: usize,
+    c17: c17::PreparedLifecycleFinalize,
+}
+
+impl std::fmt::Debug for PreparedC17LifecycleFinalize {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17LifecycleFinalize")
+            .field("expected", &self.expected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedC17LifecycleBegin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17LifecycleBegin")
+            .field("expected", &self.expected)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedC17MergeInitial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17MergeInitial")
+            .field("expected", &self.expected)
+            .field("owner_count", &self.owner_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedC17MembershipTopology {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17MembershipTopology")
+            .field("expected", &self.expected)
+            .field("owner_count", &self.owner_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedC17RootBatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17RootBatch")
+            .field("expected", &self.expected)
+            .field("owner_count", &self.owner_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedC17CreateStandalone {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17CreateStandalone")
+            .field("expected", &self.expected)
+            .field("owner_slot", &self.owner_slot)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PreparedC17PlanCreate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedC17PlanCreate")
+            .field("expected", &self.expected)
+            .field("member_count", &self.member_count)
+            .finish_non_exhaustive()
+    }
 }
 #[allow(dead_code, reason = "C12, G01, and G09 construct lifecycle reserves")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -188,15 +515,52 @@ type Record = (
     SupportObligationState,
     MonotonicTime,
     SupportCallScopeId,
-    Option<LifecycleReservation>,
+    RecordMetadata,
 );
-type LifecycleReservation = (LifecycleReserveKind, SupportOperationObligationId, u16);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+struct RecordMetadata {
+    lifecycle_kind: Option<LifecycleReserveKind>,
+    physical_credit: PhysicalStartCreditId,
+    lifecycle_count: u16,
+    reserved: u16,
+    first_record: u32,
+}
+
+impl RecordMetadata {
+    fn ordinary(physical_credit: PhysicalStartCreditId) -> Self {
+        Self {
+            lifecycle_kind: None,
+            physical_credit,
+            lifecycle_count: 0,
+            reserved: 0,
+            first_record: 0,
+        }
+    }
+
+    fn lifecycle(
+        kind: LifecycleReserveKind,
+        physical_credit: PhysicalStartCreditId,
+        count: u16,
+        first_record: usize,
+    ) -> Result<Self, SupportLedgerError> {
+        Ok(Self {
+            lifecycle_kind: Some(kind),
+            physical_credit,
+            lifecycle_count: count,
+            reserved: 0,
+            first_record: u32::try_from(first_record)
+                .map_err(|_| SupportLedgerError::Storage(FixedStorageError::Capacity))?,
+        })
+    }
+}
 #[derive(Clone, Copy)]
 enum ObligationOwner {
     Legacy { index: usize, record: Record },
     InitialBundle { record: u32, ordinal: u8 },
 }
 #[derive(Debug, Eq, PartialEq)]
+#[repr(C)]
 pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     generation: SupportLedgerGeneration,
     capacities: [[u32; POOLS]; 5],
@@ -212,7 +576,44 @@ pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     vector_capacity: [[u64; H]; 21],
     vector_usage: [[u64; H]; 21],
     instance_nonce: u64,
+    c17: c17::SupportC17,
 }
+
+pub(crate) const C17_LANDED_PREFIX_BYTES: usize =
+    std::mem::offset_of!(SupportChargeLedger<16_530, 2_057, 3>, c17);
+
+#[cfg(turnvector_c17_probe)]
+pub(crate) fn b03_probe_rows() -> Vec<(&'static str, usize)> {
+    use std::mem::{align_of, offset_of, size_of};
+    vec![
+        ("support.landed_prefix", C17_LANDED_PREFIX_BYTES),
+        (
+            "support.c17_offset",
+            offset_of!(SupportChargeLedger<16_530, 2_057, 3>, c17),
+        ),
+        (
+            "support.inline_size",
+            size_of::<SupportChargeLedger<16_530, 2_057, 3>>(),
+        ),
+        (
+            "support.inline_align",
+            align_of::<SupportChargeLedger<16_530, 2_057, 3>>(),
+        ),
+        ("support.c17_inline_size", size_of::<c17::SupportC17>()),
+        ("support.legacy_record", size_of::<Record>()),
+        (
+            "support.legacy_avl_node",
+            size_of::<crate::bounded::AvlNode>(),
+        ),
+        ("support.funding_claim", size_of::<SupportFundingClaim>()),
+        ("support.monotonic_time", size_of::<MonotonicTime>()),
+        ("support.bundle_record_slot", size_of::<RecordSlot>()),
+        ("support.c16_leaf", size_of::<LeafSlot>()),
+        ("support.c16_branch", size_of::<BranchSlot>()),
+        ("support.cell_slot", size_of::<CellSlot>()),
+    ]
+}
+
 /// Process-local one-issuance dispenser for private per-ledger instance
 /// nonces. Not a domain authority, generation, public identity, or
 /// caller-supplied fact: it only proves that a prepared Change belongs to one
@@ -291,7 +692,16 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             bundle_records,
             bundle_cells,
         )?;
-        if storage > 2_097_152 {
+        #[cfg(test)]
+        let c17_capacities = c17::SupportC17Capacities::testing();
+        #[cfg(not(test))]
+        let c17_capacities = c17::SupportC17Capacities::production();
+        let c17_storage = c17::SupportC17::physical_bytes(c17::SupportC17Capacities::production())
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+        let whole_storage = storage
+            .checked_add(c17_storage)
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+        if whole_storage > crate::c17_generated::SUPPORT_LEDGER_CEILING_BYTES {
             return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
         }
         let maxima = lifecycle_maxima.0;
@@ -351,6 +761,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         });
         let starts = FixedWindowCounter::try_new(starts)?;
         let bundles = RequestBundleStore::try_new(bundle_records, bundle_cells)?;
+        let c17 = c17::SupportC17::try_new(c17_capacities)?;
         let actual_backing = SupportBackingCapacities {
             legacy: records.backing_capacities(),
             history: starts.backing_capacities(),
@@ -380,17 +791,2232 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             vector_capacity,
             vector_usage: [[0; H]; 21],
             instance_nonce,
+            c17,
         })
     }
     pub const fn generation(&self) -> SupportLedgerGeneration {
         self.generation
     }
+
+    pub(crate) fn commit_c17_assignment_direct(
+        &mut self,
+        assignment: &crate::c17_layout::Assignment,
+    ) {
+        self.c17.commit_assignment_direct(assignment);
+    }
+
+    fn accumulate_c17_direct_cell_outcome(
+        outcomes: &mut [C17DirectCellOutcome; C17_DIRECT_CELL_MAX],
+        count: &mut usize,
+        cell_slot: u32,
+        current_before: u64,
+        delta: i32,
+        maximum: u64,
+    ) -> Result<(), SupportLedgerError> {
+        let index = if let Some(index) = outcomes[..*count]
+            .iter()
+            .position(|outcome| outcome.cell_slot == cell_slot)
+        {
+            if outcomes[index].current_before != current_before {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            }
+            index
+        } else {
+            if *count == outcomes.len() {
+                return Err(CAPACITY_ERROR);
+            }
+            let index = *count;
+            outcomes[index] = C17DirectCellOutcome {
+                cell_slot,
+                current_before,
+                current_after: current_before,
+            };
+            *count += 1;
+            index
+        };
+        let current = outcomes[index].current_after;
+        let current_after = if delta >= 0 {
+            current.checked_add(delta as u64).ok_or(CAPACITY_ERROR)?
+        } else {
+            current
+                .checked_sub(u64::from(delta.unsigned_abs()))
+                .ok_or(SupportLedgerError::Storage(FixedStorageError::NonCanonical))?
+        };
+        if current_after > maximum {
+            return Err(CAPACITY_ERROR);
+        }
+        outcomes[index].current_after = current_after;
+        Ok(())
+    }
+
+    fn prepare_c17_direct_cell_outcomes(
+        &self,
+        owner_count: usize,
+        owner_slots: [u32; 4],
+        owner_records: [Option<BundleRecord>; 4],
+        branch_deltas: [[i32; 4]; 4],
+        retractions: &[c17::LifecyclePublication],
+    ) -> Result<([C17DirectCellOutcome; C17_DIRECT_CELL_MAX], usize), SupportLedgerError> {
+        if owner_count > owner_slots.len()
+            || owner_records[owner_count..].iter().any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.validate_c17_lifecycle_retractions(retractions)?;
+        let mut outcomes = [C17DirectCellOutcome::ZERO; C17_DIRECT_CELL_MAX];
+        let mut count = 0usize;
+        for publication in retractions.iter().copied() {
+            let owner_slot = publication.owner_slot();
+            let record = self
+                .bundles
+                .get_record(owner_slot)
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+            let cell_slot = self.lifecycle_publication_cell(
+                owner_slot,
+                record,
+                publication.axis(),
+                publication.horizon(),
+            )?;
+            let CellSlot::Occupied { cell, current, .. } =
+                self.bundles.cells.slots[cell_slot as usize]
+            else {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            };
+            Self::accumulate_c17_direct_cell_outcome(
+                &mut outcomes,
+                &mut count,
+                cell_slot,
+                current,
+                -1,
+                cell.max_outstanding,
+            )?;
+        }
+        for index in 0..owner_count {
+            let owner_slot = owner_slots[index];
+            let record = owner_records[index].ok_or(SupportLedgerError::InvalidTransition)?;
+            let len = usize::try_from(record.vector_len)
+                .map_err(|_| SupportLedgerError::Storage(FixedStorageError::NonCanonical))?;
+            self.bundles
+                .validate_owner_chain_precharged(record.vector_head, len, owner_slot)?;
+            let mut next = record.vector_head;
+            for _ in 0..len {
+                let cell_slot = next;
+                let CellSlot::Occupied {
+                    owner_record,
+                    cell,
+                    current,
+                    next_owned,
+                } = self.bundles.cells.slots[cell_slot as usize]
+                else {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+                };
+                if owner_record != owner_slot || current > cell.max_outstanding {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+                }
+                let delta = record
+                    .branches
+                    .iter()
+                    .zip(branch_deltas[index])
+                    .filter(|(requirement, _)| {
+                        requirement.operation == cell.operation && requirement.pool == cell.pool
+                    })
+                    .try_fold(0i32, |total, (_, delta)| total.checked_add(delta))
+                    .ok_or(CAPACITY_ERROR)?;
+                Self::accumulate_c17_direct_cell_outcome(
+                    &mut outcomes,
+                    &mut count,
+                    cell_slot,
+                    current,
+                    delta,
+                    cell.max_outstanding,
+                )?;
+                next = next_owned;
+            }
+        }
+        Ok((outcomes, count))
+    }
+
+    fn commit_c17_direct_cell_outcomes(&mut self, outcomes: &[C17DirectCellOutcome]) {
+        for outcome in outcomes.iter().copied() {
+            let CellSlot::Occupied { current, .. } =
+                &mut self.bundles.cells.slots[outcome.cell_slot as usize]
+            else {
+                unreachable!("sealed C17 direct cell destination")
+            };
+            debug_assert_eq!(*current, outcome.current_before);
+            *current = outcome.current_after;
+        }
+    }
+
+    fn prepare_c17_plan_owner_records_after(
+        owner_records_before: [Option<BundleRecord>; 4],
+        member_count: usize,
+    ) -> Result<[Option<BundleRecord>; 4], SupportLedgerError> {
+        if !(1..=4).contains(&member_count)
+            || owner_records_before[..member_count]
+                .iter()
+                .any(Option::is_none)
+            || owner_records_before[member_count..]
+                .iter()
+                .any(Option::is_some)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut owner_records_after = owner_records_before;
+        for record in owner_records_after[..member_count].iter_mut().flatten() {
+            record.linked_claims = record.linked_claims.checked_add(3).ok_or(CAPACITY_ERROR)?;
+            if record.state == BundleState::LivePristine {
+                record.state = BundleState::LiveConsumed;
+            }
+        }
+        Ok(owner_records_after)
+    }
+
+    pub(crate) fn prepare_c17_plan_create<const MEMBERS: usize, W: WorkRecorder>(
+        &self,
+        expected: SupportLedgerGeneration,
+        plan: &TurnPlan<MEMBERS>,
+        occurred_at: MonotonicTime,
+        work: &mut W,
+    ) -> Result<PreparedC17PlanCreate, SupportLedgerError> {
+        if expected != self.generation || occurred_at.as_micros() == 0 {
+            return Err(SupportLedgerError::Generation);
+        }
+        let generation_after = expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        let member_count = plan.members().len();
+        if !(1..=4).contains(&member_count) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let support = plan.support();
+        let obligations = [
+            support.receipt_observation.id.get(),
+            support.conditional_continuation_formation.id.get(),
+            support.rejection_or_local_stale_formation.id.get(),
+        ];
+        let credits = [
+            support.receipt_observation.physical_credit.get(),
+            support
+                .conditional_continuation_formation
+                .physical_credit
+                .get(),
+            support
+                .rejection_or_local_stale_formation
+                .physical_credit
+                .get(),
+        ];
+        let funding_sets = [
+            &support.receipt_observation.funders,
+            &support.conditional_continuation_formation.funders,
+            &support.rejection_or_local_stale_formation.funders,
+        ];
+        if funding_sets
+            .into_iter()
+            .any(|funders| funders.as_slice() != plan.members().as_slice())
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+
+        let mut members = [c17::PlanCreateMember::ZERO; 4];
+        let mut owner_slots = [0; 4];
+        let mut owner_records_before = [None; 4];
+        for (ordinal, funding) in plan.members().iter().copied().enumerate() {
+            let (record_slot, record, branch_limits) =
+                self.find_funding_owner_precharged(funding, Some(plan.identity().bound_set))?;
+            let branch_limits = [branch_limits[0], branch_limits[1], branch_limits[2]];
+            let owner_header = self.c17.c16_owner_header_ref(record_slot, &record)?;
+            members[ordinal] = c17::PlanCreateMember {
+                request: Some(funding.request_id),
+                request_key: crate::request_book::c17::request_key(funding.request_id),
+                record_slot,
+                owner_header,
+                entitlement: funding.entitlement.get(),
+                vector: funding.credit_vector.get(),
+                branch_limits,
+            };
+            owner_slots[ordinal] = record_slot;
+            owner_records_before[ordinal] = Some(record);
+        }
+        let input = c17::PlanCreateInput {
+            authority_key: plan_authority_key(plan.identity().id.get()),
+            identity: encode_plan_identity(plan.identity()),
+            obligations,
+            credits,
+            members,
+            member_count,
+            occurred_at: occurred_at.as_micros(),
+        };
+        let (usage_after, reserved_after, attached_after) =
+            self.validate_plan_materialization(member_count)?;
+        let branch_deltas = std::array::from_fn(|index| {
+            if index < member_count {
+                [1, 1, 1, 0]
+            } else {
+                [0; 4]
+            }
+        });
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            member_count,
+            owner_slots,
+            owner_records_before,
+            branch_deltas,
+            &[],
+        )?;
+        let owner_records_after =
+            Self::prepare_c17_plan_owner_records_after(owner_records_before, member_count)?;
+        let c17 = self.c17.prepare_plan_create(input, owner_records_before)?;
+        work.charge(HotPathWorkWitness::new(crate::c17_layout::WORK_PLAN_CREATE))?;
+        Ok(PreparedC17PlanCreate {
+            expected,
+            generation_after,
+            member_count,
+            owner_slots,
+            owner_records_before,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            c17,
+        })
+    }
+
+    pub(crate) fn validate_c17_plan_create(
+        &self,
+        change: &PreparedC17PlanCreate,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation != change.expected
+            || change
+                .expected
+                .next()
+                .map_err(|_| SupportLedgerError::Generation)?
+                != change.generation_after
+            || !(1..=4).contains(&change.member_count)
+            || self.validate_plan_materialization(change.member_count)?
+                != (
+                    change.usage_after,
+                    change.reserved_after,
+                    change.attached_after,
+                )
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut current = [None; 4];
+        for ordinal in 0..change.member_count {
+            if change.owner_slots[..ordinal].contains(&change.owner_slots[ordinal]) {
+                return Err(SupportLedgerError::Generation);
+            }
+            current[ordinal] = Some(
+                *self
+                    .bundles
+                    .get_record(change.owner_slots[ordinal])
+                    .ok_or(SupportLedgerError::Generation)?,
+            );
+        }
+        let branch_deltas = std::array::from_fn(|index| {
+            if index < change.member_count {
+                [1, 1, 1, 0]
+            } else {
+                [0; 4]
+            }
+        });
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            change.member_count,
+            change.owner_slots,
+            current,
+            branch_deltas,
+            &[],
+        )?;
+        if current != change.owner_records_before
+            || Self::prepare_c17_plan_owner_records_after(current, change.member_count)?
+                != change.owner_records_after
+            || cell_count != change.cell_count
+            || cell_outcomes != change.cell_outcomes
+            || change.owner_slots[change.member_count..]
+                .iter()
+                .any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17
+            .validate_plan_create(&change.c17, change.owner_records_before)
+    }
+
+    pub(crate) fn commit_c17_plan_create(
+        &mut self,
+        change: PreparedC17PlanCreate,
+    ) -> SupportLedgerGeneration {
+        self.commit_c17_plan_create_prevalidated(change, true)
+    }
+
+    pub(crate) fn commit_c17_plan_create_prevalidated(
+        &mut self,
+        change: PreparedC17PlanCreate,
+        apply_index_plans: bool,
+    ) -> SupportLedgerGeneration {
+        assert_eq!(
+            self.generation, change.expected,
+            "sealed C17 Plan generation"
+        );
+        let PreparedC17PlanCreate {
+            expected: _,
+            generation_after,
+            member_count,
+            owner_slots,
+            owner_records_before: _,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            c17,
+        } = change;
+        self.c17
+            .commit_plan_create_prevalidated(c17, apply_index_plans);
+        for ordinal in 0..member_count {
+            let RecordSlot::Occupied(stored) =
+                &mut self.bundles.records[owner_slots[ordinal] as usize]
+            else {
+                unreachable!("sealed Plan owner destination")
+            };
+            *stored = owner_records_after[ordinal].expect("sealed Plan owner after-image");
+        }
+        self.commit_c17_direct_cell_outcomes(&cell_outcomes[..cell_count]);
+        self.usage = usage_after;
+        self.reserved = reserved_after;
+        self.c17.commit_attached_change(attached_after);
+        self.generation = generation_after;
+        self.generation
+    }
+
+    pub(crate) fn preview_c17_create_standalone_anchor(
+        &self,
+        domain: crate::FormationDomainId,
+    ) -> Result<crate::request_book::c17::SupportMembershipAnchor, SupportLedgerError> {
+        self.c17
+            .preview_create_standalone_anchor(standalone_authority_key(domain))
+    }
+
+    pub(crate) fn prepare_c17_create_standalone(
+        &self,
+        expected: SupportLedgerGeneration,
+        event: &crate::request_book::c17::MembershipEventRecord,
+        marker: crate::request_book::c17::InitialReadyMarker,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17CreateStandalone, SupportLedgerError> {
+        use crate::request_book::c17::{MembershipEventKind, MembershipTag};
+
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let generation_after = expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        marker
+            .validate()
+            .map_err(|_| SupportLedgerError::InvalidInput)?;
+        let affected = event.affected[0].ok_or(SupportLedgerError::InvalidTransition)?;
+        let before = event.before[0].ok_or(SupportLedgerError::InvalidTransition)?;
+        let after = event.after[0].ok_or(SupportLedgerError::InvalidTransition)?;
+        if event.kind != MembershipEventKind::CreateStandalone
+            || event.source_count != 1
+            || event.member_count != 1
+            || !event.consumed_by_support
+            || event.occurred_at != marker.occurred_at.as_micros()
+            || event.cancellation_fact != 0
+            || event.sources[0].is_absent()
+            || event.sources[1..].iter().any(|source| !source.is_absent())
+            || event.affected[1..].iter().any(Option::is_some)
+            || event.before[1..].iter().any(Option::is_some)
+            || event.after[1..].iter().any(Option::is_some)
+            || affected.key != crate::request_book::c17::request_key(marker.request)
+            || before.tag != MembershipTag::Unready
+            || before.epoch != 0
+            || !before.anchor.is_absent()
+            || !before.initial.is_absent()
+            || !before.pending.is_absent()
+            || !before.cancellation.is_absent()
+            || before.cancellation_fact != 0
+            || before.cancellation_at != 0
+            || after.tag != MembershipTag::Bound
+            || after.epoch != 1
+            || after.initial != event.sources[0]
+            || !after.pending.is_absent()
+            || !after.cancellation.is_absent()
+            || after.cancellation_fact != 0
+            || after.cancellation_at != 0
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let authority_key = standalone_authority_key(
+            crate::FormationDomainId::new(u128::from_be_bytes(marker.domain))
+                .map_err(|_| SupportLedgerError::InvalidInput)?,
+        );
+        if after.anchor.authority_key() != authority_key
+            || after.anchor.branch() != 3
+            || after.anchor.group() != after.anchor.root()
+            || after.anchor.root_version() != 1
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        let (owner_slot, owner_record, branch_limits) =
+            self.find_funding_owner_precharged(marker.funding, None)?;
+        let owner_header = self.c17.c16_owner_header_ref(owner_slot, &owner_record)?;
+        let funding = c17::MembershipFunding {
+            request: marker.funding.request_id,
+            request_key: crate::request_book::c17::request_key(marker.funding.request_id),
+            record_slot: owner_slot,
+            owner_header,
+            entitlement: marker.funding.entitlement.get(),
+            vector: marker.funding.credit_vector.get(),
+            branch_limit: branch_limits[3],
+        };
+        let input = c17::CreateStandaloneInput {
+            authority_key,
+            domain: marker.domain,
+            source: event.sources[0],
+            initial_kind: marker.kind as u8,
+            event_id: event.id,
+            anchor: after.anchor,
+            occurred_at: marker.occurred_at.as_micros(),
+            obligation: marker.obligation.get(),
+            credit: marker.credit.get(),
+            funding,
+        };
+        let delta = singleton_materialization_delta();
+        let (usage_after, reserved_after, attached_after) =
+            self.validate_c17_aggregate_delta(delta)?;
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            1,
+            [owner_slot, 0, 0, 0],
+            [Some(owner_record), None, None, None],
+            [[0, 0, 0, 1], [0; 4], [0; 4], [0; 4]],
+            &[],
+        )?;
+        let c17 = self
+            .c17
+            .prepare_create_standalone_root(input, owner_record)?;
+        if c17.owner_slot() != owner_slot || c17.owner_record_before() != owner_record {
+            return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+        }
+        let owner_record_after = c17.owner_record_after();
+        work.charge(HotPathWorkWitness::new(
+            crate::c17_layout::WORK_CREATE_STANDALONE,
+        ))?;
+        Ok(PreparedC17CreateStandalone {
+            expected,
+            generation_after,
+            owner_slot,
+            owner_record_before: owner_record,
+            owner_record_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            c17,
+        })
+    }
+
+    pub(crate) fn validate_c17_create_standalone(
+        &self,
+        change: &PreparedC17CreateStandalone,
+    ) -> Result<(), SupportLedgerError> {
+        let current = self
+            .bundles
+            .get_record(change.owner_slot)
+            .copied()
+            .ok_or(SupportLedgerError::Generation)?;
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            1,
+            [change.owner_slot, 0, 0, 0],
+            [Some(current), None, None, None],
+            [[0, 0, 0, 1], [0; 4], [0; 4], [0; 4]],
+            &[],
+        )?;
+        if self.generation != change.expected
+            || change
+                .expected
+                .next()
+                .map_err(|_| SupportLedgerError::Generation)?
+                != change.generation_after
+            || current != change.owner_record_before
+            || change.c17.owner_slot() != change.owner_slot
+            || change.c17.owner_record_before() != change.owner_record_before
+            || change.c17.owner_record_after() != change.owner_record_after
+            || cell_count != change.cell_count
+            || cell_outcomes != change.cell_outcomes
+            || self.validate_c17_aggregate_delta(singleton_materialization_delta())?
+                != (
+                    change.usage_after,
+                    change.reserved_after,
+                    change.attached_after,
+                )
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17
+            .validate_create_standalone_root(&change.c17, current)
+    }
+
+    pub(crate) fn commit_c17_create_standalone(
+        &mut self,
+        change: PreparedC17CreateStandalone,
+    ) -> SupportLedgerGeneration {
+        self.validate_c17_create_standalone(&change)
+            .expect("validated C17 CreateStandalone transaction");
+        let expected = change.expected;
+        let generation_after = change.generation_after();
+        self.commit_c17_create_standalone_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_c17_create_standalone_prevalidated(
+        &mut self,
+        change: PreparedC17CreateStandalone,
+        permit_before: SupportLedgerGeneration,
+        permit_after: SupportLedgerGeneration,
+        apply_index_plans: bool,
+    ) -> SupportLedgerGeneration {
+        assert_eq!(
+            self.generation, permit_before,
+            "sealed CreateStandalone generation"
+        );
+        assert_eq!(
+            change.expected, permit_before,
+            "prepared CreateStandalone generation"
+        );
+        assert_eq!(
+            change.generation_after, permit_after,
+            "prepared CreateStandalone generation after"
+        );
+        let PreparedC17CreateStandalone {
+            expected: _,
+            generation_after: _,
+            owner_slot,
+            owner_record_before: _,
+            owner_record_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            c17,
+        } = change;
+        self.c17
+            .commit_create_standalone_root_prevalidated(c17, apply_index_plans);
+        let RecordSlot::Occupied(record) = &mut self.bundles.records[owner_slot as usize] else {
+            unreachable!("validated CreateStandalone funding owner")
+        };
+        *record = owner_record_after;
+        self.commit_c17_direct_cell_outcomes(&cell_outcomes[..cell_count]);
+        self.usage = usage_after;
+        self.reserved = reserved_after;
+        self.c17.commit_attached_change(attached_after);
+        self.generation = permit_after;
+        self.generation
+    }
+
+    pub(crate) fn preview_c17_merge_initial(
+        &self,
+        expected: SupportLedgerGeneration,
+        anchors: [crate::request_book::c17::SupportMembershipAnchor; 3],
+        source_count: u8,
+        domain: [u8; 16],
+        occurred_at: MonotonicTime,
+    ) -> Result<c17::MergeInitialPreview, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17
+            .inspect_merge_initial(anchors, source_count, domain, occurred_at.as_micros())
+    }
+
+    pub(crate) fn prepare_c17_merge_initial(
+        &self,
+        expected: SupportLedgerGeneration,
+        preview: c17::MergeInitialPreview,
+        event: crate::request_book::c17::MembershipEventRecord,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17MergeInitial, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let generation_after = expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        let owner_count = preview.owner_count();
+        let owner_slots = preview.owner_slots();
+        if owner_count > owner_slots.len()
+            || owner_slots[..owner_count]
+                .iter()
+                .enumerate()
+                .any(|(index, slot)| owner_slots[..index].contains(slot))
+            || owner_slots[owner_count..].iter().any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut owner_records = [None; 4];
+        for index in 0..owner_count {
+            owner_records[index] = Some(
+                *self
+                    .bundles
+                    .get_record(owner_slots[index])
+                    .ok_or(SupportLedgerError::InvalidTransition)?,
+            );
+        }
+        let (usage_after, reserved_after, attached_after) =
+            self.validate_c17_aggregate_delta(preview.aggregate_delta())?;
+        let mut branch_deltas = [[0; 4]; 4];
+        for (index, delta) in branch_deltas.iter_mut().enumerate().take(owner_count) {
+            *delta = preview
+                .owner_branch_delta(index)
+                .ok_or(SupportLedgerError::InvalidInput)?;
+        }
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            owner_count,
+            owner_slots,
+            owner_records,
+            branch_deltas,
+            &[],
+        )?;
+        let c17 = self
+            .c17
+            .prepare_merge_initial_topology(preview, event, owner_records, work)?;
+        let owner_records_after = c17.owner_records_after();
+        Ok(PreparedC17MergeInitial {
+            expected,
+            generation_after,
+            owner_count,
+            owner_slots,
+            owner_records_before: owner_records,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            c17,
+        })
+    }
+
+    pub(crate) fn validate_c17_merge_initial(
+        &self,
+        change: &PreparedC17MergeInitial,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation != change.expected
+            || change
+                .expected
+                .next()
+                .map_err(|_| SupportLedgerError::Generation)?
+                != change.generation_after
+            || change.owner_count > change.owner_slots.len()
+            || self.validate_c17_aggregate_delta(change.c17.aggregate_delta())?
+                != (
+                    change.usage_after,
+                    change.reserved_after,
+                    change.attached_after,
+                )
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut current = [None; 4];
+        let mut branch_deltas = [[0; 4]; 4];
+        for (index, delta) in branch_deltas
+            .iter_mut()
+            .enumerate()
+            .take(change.owner_count)
+        {
+            if change.owner_slots[..index].contains(&change.owner_slots[index]) {
+                return Err(SupportLedgerError::Generation);
+            }
+            current[index] = Some(
+                *self
+                    .bundles
+                    .get_record(change.owner_slots[index])
+                    .ok_or(SupportLedgerError::Generation)?,
+            );
+            *delta = change
+                .c17
+                .owner_branch_delta(index)
+                .ok_or(SupportLedgerError::Generation)?;
+        }
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            change.owner_count,
+            change.owner_slots,
+            current,
+            branch_deltas,
+            &[],
+        )?;
+        if current != change.owner_records_before
+            || change.owner_records_after != change.c17.owner_records_after()
+            || cell_count != change.cell_count
+            || cell_outcomes != change.cell_outcomes
+            || change.owner_slots[change.owner_count..]
+                .iter()
+                .any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17
+            .validate_merge_initial_topology(&change.c17, current)
+    }
+
+    pub(crate) fn commit_c17_merge_initial(
+        &mut self,
+        change: PreparedC17MergeInitial,
+    ) -> SupportLedgerGeneration {
+        self.validate_c17_merge_initial(&change)
+            .expect("validated C17 MergeInitial transaction");
+        let expected = change.expected;
+        let generation_after = change.generation_after();
+        self.commit_c17_merge_initial_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_c17_merge_initial_prevalidated(
+        &mut self,
+        change: PreparedC17MergeInitial,
+        permit_before: SupportLedgerGeneration,
+        permit_after: SupportLedgerGeneration,
+        apply_index_plans: bool,
+    ) -> SupportLedgerGeneration {
+        assert_eq!(
+            self.generation, permit_before,
+            "sealed MergeInitial generation"
+        );
+        assert_eq!(
+            change.expected, permit_before,
+            "prepared MergeInitial generation"
+        );
+        assert_eq!(
+            change.generation_after, permit_after,
+            "prepared MergeInitial generation after"
+        );
+        let PreparedC17MergeInitial {
+            expected: _,
+            generation_after: _,
+            owner_count,
+            owner_slots,
+            owner_records_before: _,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            c17,
+        } = change;
+        self.c17
+            .commit_merge_initial_topology_prevalidated(c17, apply_index_plans);
+        for index in 0..owner_count {
+            let RecordSlot::Occupied(record) =
+                &mut self.bundles.records[owner_slots[index] as usize]
+            else {
+                unreachable!("validated MergeInitial owner record")
+            };
+            *record = owner_records_after[index].expect("MergeInitial owner after-image");
+        }
+        self.commit_c17_direct_cell_outcomes(&cell_outcomes[..cell_count]);
+        self.usage = usage_after;
+        self.reserved = reserved_after;
+        self.c17.commit_attached_change(attached_after);
+        self.generation = permit_after;
+        self.generation
+    }
+
+    pub(crate) fn preview_c17_membership_topology(
+        &self,
+        expected: SupportLedgerGeneration,
+        intent: &crate::request_book::c17::PreparedMembershipIntent,
+    ) -> Result<c17::MembershipTopologyPreview, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17.inspect_membership_topology(intent)
+    }
+
+    pub(crate) fn preview_c17_cancellation_topology(
+        &self,
+        expected: SupportLedgerGeneration,
+        cancellation: &crate::request_book::c17::PreparedCancellation,
+    ) -> Result<c17::MembershipTopologyPreview, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17.inspect_cancellation_topology(cancellation)
+    }
+
+    pub(crate) fn prepare_c17_membership_topology(
+        &self,
+        expected: SupportLedgerGeneration,
+        preview: c17::MembershipTopologyPreview,
+        event: crate::request_book::c17::MembershipEventRecord,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17MembershipTopology, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let generation_after = expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        let owner_count = preview.owner_count();
+        let owner_slots = preview.owner_slots();
+        if owner_count > owner_slots.len()
+            || owner_slots[..owner_count]
+                .iter()
+                .enumerate()
+                .any(|(index, slot)| owner_slots[..index].contains(slot))
+            || owner_slots[owner_count..].iter().any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut owner_records = [None; 4];
+        for index in 0..owner_count {
+            owner_records[index] = Some(
+                *self
+                    .bundles
+                    .get_record(owner_slots[index])
+                    .ok_or(SupportLedgerError::InvalidTransition)?,
+            );
+        }
+        let (usage_after, reserved_after, attached_after) =
+            self.validate_c17_aggregate_delta(preview.aggregate_delta())?;
+        let vector_after = self.validate_c17_lifecycle_vector_transition(
+            preview.lifecycle_before(),
+            preview.lifecycle_after(),
+        )?;
+        let mut branch_deltas = [[0; 4]; 4];
+        for (index, delta) in branch_deltas.iter_mut().enumerate().take(owner_count) {
+            *delta = preview
+                .owner_branch_delta(index)
+                .ok_or(SupportLedgerError::InvalidInput)?;
+        }
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            owner_count,
+            owner_slots,
+            owner_records,
+            branch_deltas,
+            preview.retractions(),
+        )?;
+        let c17 = self
+            .c17
+            .prepare_membership_topology(preview, event, owner_records, work)?;
+        let owner_records_after = c17.owner_records_after();
+        Ok(PreparedC17MembershipTopology {
+            expected,
+            generation_after,
+            owner_count,
+            owner_slots,
+            owner_records_before: owner_records,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            vector_after,
+            c17,
+        })
+    }
+
+    pub(crate) fn validate_c17_membership_topology(
+        &self,
+        change: &PreparedC17MembershipTopology,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation != change.expected
+            || change
+                .expected
+                .next()
+                .map_err(|_| SupportLedgerError::Generation)?
+                != change.generation_after
+            || change.owner_count > change.owner_slots.len()
+            || self.validate_c17_aggregate_delta(change.c17.aggregate_delta())?
+                != (
+                    change.usage_after,
+                    change.reserved_after,
+                    change.attached_after,
+                )
+            || self.validate_c17_lifecycle_vector_transition(
+                change.c17.lifecycle_before(),
+                change.c17.lifecycle_after(),
+            )? != change.vector_after
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut current = [None; 4];
+        let mut branch_deltas = [[0; 4]; 4];
+        for (index, delta) in branch_deltas
+            .iter_mut()
+            .enumerate()
+            .take(change.owner_count)
+        {
+            if change.owner_slots[..index].contains(&change.owner_slots[index]) {
+                return Err(SupportLedgerError::Generation);
+            }
+            current[index] = Some(
+                *self
+                    .bundles
+                    .get_record(change.owner_slots[index])
+                    .ok_or(SupportLedgerError::Generation)?,
+            );
+            *delta = change
+                .c17
+                .owner_branch_delta(index)
+                .ok_or(SupportLedgerError::Generation)?;
+        }
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            change.owner_count,
+            change.owner_slots,
+            current,
+            branch_deltas,
+            change.c17.retractions(),
+        )?;
+        if current != change.owner_records_before
+            || change.owner_records_after != change.c17.owner_records_after()
+            || cell_count != change.cell_count
+            || cell_outcomes != change.cell_outcomes
+            || change.owner_slots[change.owner_count..]
+                .iter()
+                .any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17.validate_membership_topology(&change.c17, current)
+    }
+
+    pub(crate) fn commit_c17_membership_topology(
+        &mut self,
+        change: PreparedC17MembershipTopology,
+    ) -> SupportLedgerGeneration {
+        self.validate_c17_membership_topology(&change)
+            .expect("validated C17 membership topology transaction");
+        let expected = change.expected;
+        let generation_after = change.generation_after();
+        self.commit_c17_membership_topology_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_c17_membership_topology_prevalidated(
+        &mut self,
+        change: PreparedC17MembershipTopology,
+        permit_before: SupportLedgerGeneration,
+        permit_after: SupportLedgerGeneration,
+        apply_index_plans: bool,
+    ) -> SupportLedgerGeneration {
+        assert_eq!(
+            self.generation, permit_before,
+            "sealed membership-topology generation"
+        );
+        assert_eq!(
+            change.expected, permit_before,
+            "prepared membership-topology generation"
+        );
+        assert_eq!(
+            change.generation_after, permit_after,
+            "prepared membership-topology generation after"
+        );
+        let PreparedC17MembershipTopology {
+            expected: _,
+            generation_after: _,
+            owner_count,
+            owner_slots,
+            owner_records_before: _,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            vector_after,
+            c17,
+        } = change;
+        self.c17
+            .commit_membership_topology_prevalidated(c17, apply_index_plans);
+        for index in 0..owner_count {
+            let RecordSlot::Occupied(record) =
+                &mut self.bundles.records[owner_slots[index] as usize]
+            else {
+                unreachable!("validated topology owner record")
+            };
+            *record = owner_records_after[index].expect("topology owner after-image");
+        }
+        self.commit_c17_direct_cell_outcomes(&cell_outcomes[..cell_count]);
+        self.usage = usage_after;
+        self.reserved = reserved_after;
+        self.c17.commit_attached_change(attached_after);
+        for (axis, row) in vector_after.into_iter().enumerate() {
+            for (horizon, value) in row.into_iter().take(H).enumerate() {
+                self.vector_usage[axis][horizon] = value;
+            }
+        }
+        self.generation = permit_after;
+        self.generation
+    }
+
+    pub(crate) fn prepare_c17_plan_disposition(
+        &self,
+        expected: SupportLedgerGeneration,
+        identity: crate::TurnPlanIdentity,
+        disposition: c17::PlanDisposition,
+        occurred_at: MonotonicTime,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let preview = self.c17.inspect_plan_disposition(
+            plan_authority_key(identity.id.get()),
+            encode_plan_identity(identity),
+            disposition,
+            occurred_at.as_micros(),
+        )?;
+        self.prepare_c17_root_preview(expected, preview, work)
+    }
+
+    pub(crate) fn prepare_c17_observation_resolution(
+        &self,
+        expected: SupportLedgerGeneration,
+        identity: crate::TurnPlanIdentity,
+        resolution: c17::ObservationResolution,
+        occurred_at: MonotonicTime,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let preview = self.c17.inspect_observation_resolution(
+            plan_authority_key(identity.id.get()),
+            encode_plan_identity(identity),
+            resolution,
+            occurred_at.as_micros(),
+        )?;
+        self.prepare_c17_root_preview(expected, preview, work)
+    }
+
+    pub(crate) fn prepare_c17_plan_root_action(
+        &self,
+        expected: SupportLedgerGeneration,
+        identity: crate::TurnPlanIdentity,
+        branch: u8,
+        action: c17::RootAction,
+        occurred_at: MonotonicTime,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let authority = plan_authority_key(identity.id.get());
+        let anchor =
+            self.c17
+                .plan_root_anchor(authority, encode_plan_identity(identity), branch)?;
+        let preview = self
+            .c17
+            .inspect_root_action(anchor, action, occurred_at.as_micros())?;
+        self.prepare_c17_root_preview(expected, preview, work)
+    }
+
+    pub(crate) fn prepare_c17_typed_close(
+        &self,
+        expected: SupportLedgerGeneration,
+        input: crate::TypedCloseInput,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let preview = self.c17.inspect_typed_close(input)?;
+        self.prepare_c17_root_preview(expected, preview, work)
+    }
+
+    pub(crate) fn prepare_c17_membership_root_action(
+        &self,
+        expected: SupportLedgerGeneration,
+        anchor: crate::request_book::c17::SupportMembershipAnchor,
+        action: c17::RootAction,
+        occurred_at: MonotonicTime,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let preview =
+            self.c17
+                .inspect_membership_root_action(anchor, action, occurred_at.as_micros())?;
+        self.prepare_c17_root_preview(expected, preview, work)
+    }
+
+    pub(crate) fn prepare_c17_root_action(
+        &self,
+        expected: SupportLedgerGeneration,
+        anchor: c17::RootAnchor,
+        action: c17::RootAction,
+        occurred_at: MonotonicTime,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let preview = self
+            .c17
+            .inspect_root_action(anchor, action, occurred_at.as_micros())?;
+        self.prepare_c17_root_preview(expected, preview, work)
+    }
+
+    fn prepare_c17_root_preview(
+        &self,
+        expected: SupportLedgerGeneration,
+        preview: c17::RootBatchPreview,
+        work: &mut impl WorkRecorder,
+    ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
+        let generation_after = expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        let owner_count = preview.owner_count();
+        let owner_slots = preview.owner_slots();
+        if owner_count > owner_slots.len()
+            || owner_slots[..owner_count]
+                .iter()
+                .enumerate()
+                .any(|(index, slot)| owner_slots[..index].contains(slot))
+            || owner_slots[owner_count..].iter().any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut owner_records = [None; 4];
+        let mut branch_deltas = [[0; 4]; 4];
+        for index in 0..owner_count {
+            owner_records[index] = Some(
+                *self
+                    .bundles
+                    .get_record(owner_slots[index])
+                    .ok_or(SupportLedgerError::InvalidTransition)?,
+            );
+            branch_deltas[index] = preview
+                .owner_branch_delta(index)
+                .ok_or(SupportLedgerError::InvalidInput)?;
+        }
+        let (usage_after, reserved_after, attached_after) =
+            self.validate_c17_aggregate_delta(preview.aggregate_delta())?;
+        let vector_after = self.validate_c17_lifecycle_vector_transition(
+            preview.lifecycle_before(),
+            preview.lifecycle_after(),
+        )?;
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            owner_count,
+            owner_slots,
+            owner_records,
+            branch_deltas,
+            preview.retractions(),
+        )?;
+        let c17 = self.c17.prepare_root_batch(preview, owner_records, work)?;
+        let owner_records_after = c17.owner_records_after();
+        Ok(PreparedC17RootBatch {
+            expected,
+            generation_after,
+            owner_count,
+            owner_slots,
+            owner_records_before: owner_records,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            vector_after,
+            c17,
+        })
+    }
+
+    pub(crate) fn validate_c17_root_batch(
+        &self,
+        change: &PreparedC17RootBatch,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation != change.expected
+            || change
+                .expected
+                .next()
+                .map_err(|_| SupportLedgerError::Generation)?
+                != change.generation_after
+            || change.owner_count > change.owner_slots.len()
+            || self.validate_c17_aggregate_delta(change.c17.aggregate_delta())?
+                != (
+                    change.usage_after,
+                    change.reserved_after,
+                    change.attached_after,
+                )
+            || self.validate_c17_lifecycle_vector_transition(
+                change.c17.lifecycle_before(),
+                change.c17.lifecycle_after(),
+            )? != change.vector_after
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut current = [None; 4];
+        let mut branch_deltas = [[0; 4]; 4];
+        for (index, delta) in branch_deltas
+            .iter_mut()
+            .enumerate()
+            .take(change.owner_count)
+        {
+            if change.owner_slots[..index].contains(&change.owner_slots[index]) {
+                return Err(SupportLedgerError::Generation);
+            }
+            current[index] = Some(
+                *self
+                    .bundles
+                    .get_record(change.owner_slots[index])
+                    .ok_or(SupportLedgerError::Generation)?,
+            );
+            *delta = change
+                .c17
+                .owner_branch_delta(index)
+                .ok_or(SupportLedgerError::Generation)?;
+        }
+        let (cell_outcomes, cell_count) = self.prepare_c17_direct_cell_outcomes(
+            change.owner_count,
+            change.owner_slots,
+            current,
+            branch_deltas,
+            change.c17.retractions(),
+        )?;
+        if current != change.owner_records_before
+            || change.owner_records_after != change.c17.owner_records_after()
+            || cell_count != change.cell_count
+            || cell_outcomes != change.cell_outcomes
+            || change.owner_slots[change.owner_count..]
+                .iter()
+                .any(|slot| *slot != 0)
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17.validate_root_batch(&change.c17, current)
+    }
+
+    pub(crate) fn commit_c17_root_batch(
+        &mut self,
+        change: PreparedC17RootBatch,
+    ) -> SupportLedgerGeneration {
+        self.commit_c17_root_batch_prevalidated(change, true)
+    }
+
+    pub(crate) fn commit_c17_root_batch_prevalidated(
+        &mut self,
+        change: PreparedC17RootBatch,
+        apply_index_plans: bool,
+    ) -> SupportLedgerGeneration {
+        assert_eq!(
+            self.generation, change.expected,
+            "sealed C17 root-batch generation"
+        );
+        let PreparedC17RootBatch {
+            expected: _,
+            generation_after,
+            owner_count,
+            owner_slots,
+            owner_records_before: _,
+            owner_records_after,
+            cell_outcomes,
+            cell_count,
+            usage_after,
+            reserved_after,
+            attached_after,
+            vector_after,
+            c17,
+        } = change;
+        self.c17
+            .commit_root_batch_prevalidated(c17, apply_index_plans);
+        for index in 0..owner_count {
+            let RecordSlot::Occupied(record) =
+                &mut self.bundles.records[owner_slots[index] as usize]
+            else {
+                unreachable!("sealed semantic owner destination")
+            };
+            *record = owner_records_after[index].expect("sealed semantic owner after-image");
+        }
+        self.commit_c17_direct_cell_outcomes(&cell_outcomes[..cell_count]);
+        self.usage = usage_after;
+        self.reserved = reserved_after;
+        self.c17.commit_attached_change(attached_after);
+        for (axis, row) in vector_after.into_iter().enumerate() {
+            for (horizon, value) in row.into_iter().take(H).enumerate() {
+                self.vector_usage[axis][horizon] = value;
+            }
+        }
+        self.generation = generation_after;
+        self.generation
+    }
+
+    pub(crate) fn prepare_c17_lifecycle_begin(
+        &self,
+        expected: SupportLedgerGeneration,
+        total: usize,
+        aggregate: c17::LifecycleAggregate,
+        work: &mut WorkMeter,
+    ) -> Result<PreparedC17LifecycleBegin, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        self.validate_c17_lifecycle_aggregate(aggregate)?;
+        let c17 = self.c17.prepare_begin_batch(total, aggregate, expected)?;
+        self.c17.validate_begin_batch(&c17)?;
+        work.charge(HotPathWorkWitness::new(
+            crate::c17_layout::WORK_LIFECYCLE_BEGIN,
+        ))?;
+        Ok(PreparedC17LifecycleBegin { expected, c17 })
+    }
+
+    pub(crate) fn validate_c17_lifecycle_begin(
+        &self,
+        change: &PreparedC17LifecycleBegin,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation != change.expected {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c17.validate_begin_batch(&change.c17)
+    }
+
+    pub(crate) fn commit_c17_lifecycle_begin(&mut self, change: PreparedC17LifecycleBegin) {
+        self.c17.commit_begin_batch(change.c17);
+    }
+
+    pub(crate) fn c17_lifecycle_plan_anchor(
+        &self,
+        identity: crate::TurnPlanIdentity,
+        branch: crate::PlanBranch,
+    ) -> Result<c17::RootAnchor, SupportLedgerError> {
+        self.c17.plan_root_anchor(
+            plan_authority_key(identity.id.get()),
+            encode_plan_identity(identity),
+            branch.ordinal(),
+        )
+    }
+
+    pub(crate) fn c17_lifecycle_membership_anchor(
+        &self,
+        anchor: crate::request_book::c17::SupportMembershipAnchor,
+    ) -> Result<c17::RootAnchor, SupportLedgerError> {
+        self.c17.current_membership_root_anchor(anchor)
+    }
+
+    pub(crate) fn c17_lifecycle_stage_start(&self) -> Result<usize, SupportLedgerError> {
+        self.c17.next_lifecycle_ordinal()
+    }
+
+    pub(crate) fn bind_c17_lifecycle_record_spec(
+        &self,
+        anchor: c17::RootAnchor,
+        ordinal: usize,
+        spec: crate::core::C17LifecycleRecordSpec,
+    ) -> Result<c17::LifecycleRecordInput, SupportLedgerError> {
+        self.c17.bind_lifecycle_record_spec(anchor, ordinal, spec)
+    }
+
+    pub(crate) fn prepare_c17_lifecycle_stage(
+        &self,
+        records: &[c17::LifecycleRecordInput],
+        work: &mut WorkMeter,
+    ) -> Result<c17::PreparedLifecycleStage, SupportLedgerError> {
+        let change = self.c17.prepare_stage_chunk(records)?;
+        self.c17.validate_stage_chunk(&change)?;
+        work.charge(HotPathWorkWitness::new(
+            crate::c17_layout::WORK_LIFECYCLE_STAGE,
+        ))?;
+        Ok(change)
+    }
+
+    pub(crate) fn validate_c17_lifecycle_stage(
+        &self,
+        change: &c17::PreparedLifecycleStage,
+    ) -> Result<(), SupportLedgerError> {
+        self.c17.validate_stage_chunk(change)
+    }
+
+    pub(crate) fn commit_c17_lifecycle_stage(&mut self, change: c17::PreparedLifecycleStage) {
+        self.c17.commit_stage_chunk(change);
+    }
+
+    pub(crate) fn prepare_c17_lifecycle_finalize(
+        &self,
+        work: &mut WorkMeter,
+    ) -> Result<PreparedC17LifecycleFinalize, SupportLedgerError> {
+        let expected = self.generation;
+        let generation_after = expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        let c17 = self.c17.prepare_finalize_batch(expected)?;
+        let mut c17_owner_outcomes =
+            [c17::LifecycleOwnerOutcome::ZERO; crate::c17_layout::LIFECYCLE_CAPACITY];
+        let mut c17_funder_outcomes =
+            [c17::LifecycleFunderOutcome::ZERO; crate::c17_layout::LIFECYCLE_CAPACITY];
+        let (c17_owner_count, c17_funder_count) = self.c17.prepare_finalize_owner_outcomes(
+            &c17,
+            &mut c17_owner_outcomes,
+            &mut c17_funder_outcomes,
+        )?;
+        let (usage_after, reserved_after, attached_after, vector_after) =
+            self.validate_c17_lifecycle_aggregate(c17.aggregate())?;
+        let mut owner_outcomes =
+            [C17LifecycleOwnerOutcome::ZERO; crate::c17_layout::LIFECYCLE_CAPACITY];
+        let mut cell_outcomes = [C17LifecycleCellOutcome::ZERO; c17::LIFECYCLE_PUBLICATION_MAX];
+        let (owner_count, cell_count) =
+            self.prepare_c17_lifecycle_publications(&c17, &mut owner_outcomes, &mut cell_outcomes)?;
+        work.charge(HotPathWorkWitness::new(
+            crate::c17_layout::WORK_LIFECYCLE_FINALIZE,
+        ))?;
+        Ok(PreparedC17LifecycleFinalize {
+            expected,
+            generation_after,
+            usage_after,
+            reserved_after,
+            attached_after,
+            vector_after,
+            owner_outcomes,
+            owner_count,
+            cell_outcomes,
+            cell_count,
+            c17_owner_outcomes,
+            c17_owner_count,
+            c17_funder_outcomes,
+            c17_funder_count,
+            c17,
+        })
+    }
+
+    pub(crate) fn validate_c17_lifecycle_finalize(
+        &self,
+        change: &PreparedC17LifecycleFinalize,
+    ) -> Result<(), SupportLedgerError> {
+        self.c17.validate_finalize_batch(&change.c17)?;
+        self.c17.validate_finalize_owner_outcomes(
+            &change.c17,
+            &change.c17_owner_outcomes,
+            change.c17_owner_count,
+            &change.c17_funder_outcomes,
+            change.c17_funder_count,
+        )?;
+        let aggregate_after = self.validate_c17_lifecycle_aggregate(change.c17.aggregate())?;
+        let generation_after = change
+            .expected
+            .next()
+            .map_err(|_| SupportLedgerError::Generation)?;
+        self.validate_c17_lifecycle_publications(
+            &change.c17,
+            &change.owner_outcomes,
+            change.owner_count,
+            &change.cell_outcomes,
+            change.cell_count,
+        )?;
+        if self.generation != change.expected
+            || generation_after != change.generation_after
+            || aggregate_after
+                != (
+                    change.usage_after,
+                    change.reserved_after,
+                    change.attached_after,
+                    change.vector_after,
+                )
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_c17_lifecycle_finalize(
+        &mut self,
+        change: PreparedC17LifecycleFinalize,
+    ) -> SupportLedgerGeneration {
+        self.c17.commit_finalize_records(&change.c17);
+        self.commit_c17_lifecycle_publications(
+            &change.owner_outcomes[..change.owner_count],
+            &change.cell_outcomes[..change.cell_count],
+        );
+        self.c17.commit_finalize_owner_sets(
+            &change.c17,
+            &change.c17_owner_outcomes[..change.c17_owner_count],
+            &change.c17_funder_outcomes[..change.c17_funder_count],
+        );
+        self.usage = change.usage_after;
+        self.reserved = change.reserved_after;
+        self.c17.commit_attached_change(change.attached_after);
+        for (axis, row) in change.vector_after.into_iter().enumerate() {
+            for (horizon, value) in row.into_iter().enumerate() {
+                self.vector_usage[axis][horizon] = value;
+            }
+        }
+        self.generation = change.generation_after;
+        self.c17.complete_finalize_batch(change.c17);
+        self.generation
+    }
+
+    pub(crate) fn prepare_c17_lifecycle_abort(
+        &self,
+        work: &mut WorkMeter,
+    ) -> Result<c17::PreparedLifecycleAbort, SupportLedgerError> {
+        let change = self.c17.prepare_abort_chunk()?;
+        self.c17.validate_abort_chunk(&change)?;
+        work.charge(HotPathWorkWitness::new(
+            crate::c17_layout::WORK_LIFECYCLE_ABORT,
+        ))?;
+        Ok(change)
+    }
+
+    pub(crate) fn validate_c17_lifecycle_abort(
+        &self,
+        change: &c17::PreparedLifecycleAbort,
+    ) -> Result<(), SupportLedgerError> {
+        self.c17.validate_abort_chunk(change)
+    }
+
+    pub(crate) fn commit_c17_lifecycle_abort(
+        &mut self,
+        change: c17::PreparedLifecycleAbort,
+    ) -> bool {
+        self.c17.commit_abort_chunk(change)
+    }
+
+    fn lifecycle_publication_cell(
+        &self,
+        owner_slot: u32,
+        record: &BundleRecord,
+        axis: usize,
+        horizon: usize,
+    ) -> Result<u32, SupportLedgerError> {
+        if axis >= 21 || horizon >= H {
+            return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+        }
+        let expected_horizon = self
+            .starts
+            .bounds(axis)
+            .and_then(|bounds| bounds.get(horizon))
+            .map(|bound| bound.0)
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::NonCanonical))?;
+        let len = usize::try_from(record.vector_len)
+            .map_err(|_| SupportLedgerError::Storage(FixedStorageError::NonCanonical))?;
+        self.bundles
+            .validate_owner_chain_precharged(record.vector_head, len, owner_slot)?;
+        let mut next = record.vector_head;
+        let mut found = None;
+        for _ in 0..len {
+            let index = next;
+            let CellSlot::Occupied {
+                owner_record,
+                cell,
+                current,
+                next_owned,
+            } = self.bundles.cells.slots[index as usize]
+            else {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            };
+            if owner_record != owner_slot || current > cell.max_outstanding {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            }
+            let cell_axis = cell.operation as usize * POOLS + cell.pool as usize;
+            if cell_axis == axis && cell.horizon == expected_horizon {
+                if found.replace(index).is_some() {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+                }
+            }
+            next = next_owned;
+        }
+        found.ok_or(SupportLedgerError::InvalidTransition)
+    }
+
+    fn validate_c17_lifecycle_vector_transition(
+        &self,
+        before: c17::LifecycleAggregate,
+        after: c17::LifecycleAggregate,
+    ) -> Result<[[u64; 3]; 21], SupportLedgerError> {
+        if (before != c17::LifecycleAggregate::ZERO || after != c17::LifecycleAggregate::ZERO)
+            && H != 3
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut vector_after = [[0; 3]; 21];
+        for axis in 0..21 {
+            for horizon in 0..H.min(3) {
+                vector_after[axis][horizon] = self.vector_usage[axis][horizon]
+                    .checked_sub(before.vector[axis][horizon])
+                    .and_then(|value| value.checked_add(after.vector[axis][horizon]))
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                if vector_after[axis][horizon] > self.vector_capacity[axis][horizon] {
+                    return Err(CAPACITY_ERROR);
+                }
+            }
+        }
+        Ok(vector_after)
+    }
+
+    fn validate_c17_lifecycle_retractions(
+        &self,
+        retractions: &[c17::LifecyclePublication],
+    ) -> Result<(), SupportLedgerError> {
+        for (index, publication) in retractions.iter().copied().enumerate() {
+            let owner_slot = publication.owner_slot();
+            let record = self
+                .bundles
+                .get_record(owner_slot)
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+            if !matches!(
+                record.state,
+                BundleState::LivePristine | BundleState::LiveConsumed
+            ) {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
+            self.c17
+                .validate_lifecycle_publication_record(publication, record)?;
+            let owner_delta = u32::try_from(
+                retractions[..index]
+                    .iter()
+                    .filter(|candidate| candidate.owner_slot() == owner_slot)
+                    .count()
+                    + 1,
+            )
+            .map_err(|_| CAPACITY_ERROR)?;
+            record
+                .linked_claims
+                .checked_sub(owner_delta)
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+            let funder_delta = u64::try_from(
+                retractions[..index]
+                    .iter()
+                    .filter(|candidate| candidate.funder() == publication.funder())
+                    .count()
+                    + 1,
+            )
+            .map_err(|_| CAPACITY_ERROR)?;
+            let funder = self.c17.funder_image(publication.funder())?;
+            u64::from_le_bytes(
+                funder[112..120]
+                    .try_into()
+                    .expect("fixed C17 Funder current"),
+            )
+            .checked_sub(funder_delta)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+            let cell = self.lifecycle_publication_cell(
+                owner_slot,
+                record,
+                publication.axis(),
+                publication.horizon(),
+            )?;
+            let CellSlot::Occupied { current, .. } = self.bundles.cells.slots[cell as usize] else {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            };
+            let cell_delta = u64::try_from(
+                retractions[..index]
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.owner_slot() == owner_slot
+                            && candidate.axis() == publication.axis()
+                            && candidate.horizon() == publication.horizon()
+                    })
+                    .count()
+                    + 1,
+            )
+            .map_err(|_| CAPACITY_ERROR)?;
+            current
+                .checked_sub(cell_delta)
+                .ok_or(SupportLedgerError::InvalidTransition)?;
+        }
+        Ok(())
+    }
+
+    fn c17_lifecycle_publication_destination(
+        &self,
+        publication: c17::LifecyclePublication,
+    ) -> Result<(u32, u32, u32, u64, u64), SupportLedgerError> {
+        let owner_slot = publication.owner_slot();
+        let record = self
+            .bundles
+            .get_record(owner_slot)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        if !matches!(
+            record.state,
+            BundleState::LivePristine | BundleState::LiveConsumed
+        ) {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        self.c17
+            .validate_lifecycle_publication_record(publication, record)?;
+        let cell_slot = self.lifecycle_publication_cell(
+            owner_slot,
+            record,
+            publication.axis(),
+            publication.horizon(),
+        )?;
+        let CellSlot::Occupied { cell, current, .. } = self.bundles.cells.slots[cell_slot as usize]
+        else {
+            unreachable!("validated lifecycle publication cell")
+        };
+        Ok((
+            owner_slot,
+            record.linked_claims,
+            cell_slot,
+            current,
+            cell.max_outstanding,
+        ))
+    }
+
+    fn prepare_c17_lifecycle_publications(
+        &self,
+        change: &c17::PreparedLifecycleFinalize,
+        owner_outcomes: &mut [C17LifecycleOwnerOutcome; crate::c17_layout::LIFECYCLE_CAPACITY],
+        cell_outcomes: &mut [C17LifecycleCellOutcome; c17::LIFECYCLE_PUBLICATION_MAX],
+    ) -> Result<(usize, usize), SupportLedgerError> {
+        let mut owner_count = 0usize;
+        let mut cell_count = 0usize;
+        self.c17
+            .visit_finalize_publications(change, &mut |publication| {
+                let (owner_slot, owner_before, cell_slot, cell_before, cell_max) =
+                    self.c17_lifecycle_publication_destination(publication)?;
+                if let Some(index) = owner_outcomes[..owner_count]
+                    .iter()
+                    .position(|outcome| outcome.owner_slot == owner_slot)
+                {
+                    owner_outcomes[index].linked_after = owner_outcomes[index]
+                        .linked_after
+                        .checked_add(1)
+                        .ok_or(CAPACITY_ERROR)?;
+                } else {
+                    if owner_count == owner_outcomes.len() {
+                        return Err(CAPACITY_ERROR);
+                    }
+                    owner_outcomes[owner_count] = C17LifecycleOwnerOutcome {
+                        owner_slot,
+                        linked_after: owner_before.checked_add(1).ok_or(CAPACITY_ERROR)?,
+                    };
+                    owner_count += 1;
+                }
+                if let Some(index) = cell_outcomes[..cell_count]
+                    .iter()
+                    .position(|outcome| outcome.cell_slot() == cell_slot)
+                {
+                    if cell_outcomes[index]
+                        .increment()
+                        .filter(|after| *after <= cell_max)
+                        .is_none()
+                    {
+                        return Err(CAPACITY_ERROR);
+                    }
+                } else {
+                    if cell_count == cell_outcomes.len() {
+                        return Err(CAPACITY_ERROR);
+                    }
+                    let current_after = cell_before.checked_add(1).ok_or(CAPACITY_ERROR)?;
+                    if current_after > cell_max {
+                        return Err(CAPACITY_ERROR);
+                    }
+                    cell_outcomes[cell_count] =
+                        C17LifecycleCellOutcome::new(cell_slot, current_after);
+                    cell_count += 1;
+                }
+                Ok(())
+            })?;
+        Ok((owner_count, cell_count))
+    }
+
+    fn validate_c17_lifecycle_publications(
+        &self,
+        change: &c17::PreparedLifecycleFinalize,
+        owner_outcomes: &[C17LifecycleOwnerOutcome; crate::c17_layout::LIFECYCLE_CAPACITY],
+        owner_count: usize,
+        cell_outcomes: &[C17LifecycleCellOutcome; c17::LIFECYCLE_PUBLICATION_MAX],
+        cell_count: usize,
+    ) -> Result<(), SupportLedgerError> {
+        if owner_count > owner_outcomes.len()
+            || cell_count > cell_outcomes.len()
+            || owner_outcomes[owner_count..]
+                .iter()
+                .any(|outcome| *outcome != C17LifecycleOwnerOutcome::ZERO)
+            || cell_outcomes[cell_count..]
+                .iter()
+                .any(|outcome| *outcome != C17LifecycleCellOutcome::ZERO)
+            || (0..owner_count).any(|index| {
+                owner_outcomes[..index]
+                    .iter()
+                    .any(|prior| prior.owner_slot == owner_outcomes[index].owner_slot)
+            })
+            || (0..cell_count).any(|index| {
+                cell_outcomes[..index]
+                    .iter()
+                    .any(|prior| prior.cell_slot() == cell_outcomes[index].cell_slot())
+            })
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut owner_seen = [0u16; crate::c17_layout::LIFECYCLE_CAPACITY];
+        let mut cell_seen = [0u16; c17::LIFECYCLE_PUBLICATION_MAX];
+        self.c17
+            .visit_finalize_publications(change, &mut |publication| {
+                let (owner_slot, _, cell_slot, _, _) =
+                    self.c17_lifecycle_publication_destination(publication)?;
+                let owner_index = owner_outcomes[..owner_count]
+                    .iter()
+                    .position(|outcome| outcome.owner_slot == owner_slot)
+                    .ok_or(SupportLedgerError::Generation)?;
+                owner_seen[owner_index] = owner_seen[owner_index]
+                    .checked_add(1)
+                    .ok_or(CAPACITY_ERROR)?;
+                let cell_index = cell_outcomes[..cell_count]
+                    .iter()
+                    .position(|outcome| outcome.cell_slot() == cell_slot)
+                    .ok_or(SupportLedgerError::Generation)?;
+                cell_seen[cell_index] =
+                    cell_seen[cell_index].checked_add(1).ok_or(CAPACITY_ERROR)?;
+                Ok(())
+            })?;
+        for (index, outcome) in owner_outcomes[..owner_count].iter().enumerate() {
+            let record = self
+                .bundles
+                .get_record(outcome.owner_slot)
+                .ok_or(SupportLedgerError::Generation)?;
+            if owner_seen[index] == 0
+                || record
+                    .linked_claims
+                    .checked_add(u32::from(owner_seen[index]))
+                    != Some(outcome.linked_after)
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        for (index, outcome) in cell_outcomes[..cell_count].iter().copied().enumerate() {
+            let CellSlot::Occupied { cell, current, .. } =
+                self.bundles.cells.slots[outcome.cell_slot() as usize]
+            else {
+                return Err(SupportLedgerError::Generation);
+            };
+            if cell_seen[index] == 0
+                || current
+                    .checked_add(u64::from(cell_seen[index]))
+                    .filter(|after| *after <= cell.max_outstanding)
+                    != Some(outcome.current_after())
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_c17_lifecycle_publications(
+        &mut self,
+        owner_outcomes: &[C17LifecycleOwnerOutcome],
+        cell_outcomes: &[C17LifecycleCellOutcome],
+    ) {
+        for outcome in owner_outcomes {
+            let RecordSlot::Occupied(record) =
+                &mut self.bundles.records[outcome.owner_slot as usize]
+            else {
+                unreachable!("validated lifecycle owner record")
+            };
+            record.linked_claims = outcome.linked_after;
+        }
+        for outcome in cell_outcomes.iter().copied() {
+            let CellSlot::Occupied { current, .. } =
+                &mut self.bundles.cells.slots[outcome.cell_slot() as usize]
+            else {
+                unreachable!("validated lifecycle publication cell")
+            };
+            *current = outcome.current_after();
+        }
+    }
+
+    fn validate_c17_lifecycle_aggregate(
+        &self,
+        aggregate: c17::LifecycleAggregate,
+    ) -> Result<
+        (
+            [[u32; POOLS]; 5],
+            [[u32; POOLS]; 5],
+            [[u32; POOLS]; 4],
+            [[u64; 3]; 21],
+        ),
+        SupportLedgerError,
+    > {
+        if H != 3 || aggregate == c17::LifecycleAggregate::ZERO {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        if let Some(withheld) = self.c17.pending_lifecycle_aggregate()?
+            && withheld != aggregate
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        let mut usage_after = self.usage;
+        let mut reserved_after = self.reserved;
+        let mut attached_after = [[0; POOLS]; 4];
+        for (class, row) in attached_after.iter_mut().enumerate() {
+            for (pool, value) in row.iter_mut().enumerate() {
+                *value = self.c17.attached(class, pool)?;
+            }
+        }
+        for pool in 0..POOLS {
+            let mut state_usage = 0u32;
+            let mut state_reserved = 0u32;
+            let mut state_attached = 0u32;
+            for class in 0..=ACTIVE {
+                if aggregate.reserved[class][pool]
+                    != aggregate.usage[class][pool]
+                        .checked_add(aggregate.attached[class][pool])
+                        .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?
+                {
+                    return Err(SupportLedgerError::InvalidInput);
+                }
+                state_usage = state_usage
+                    .checked_add(aggregate.usage[class][pool])
+                    .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+                state_reserved = state_reserved
+                    .checked_add(aggregate.reserved[class][pool])
+                    .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+                state_attached = state_attached
+                    .checked_add(aggregate.attached[class][pool])
+                    .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+            }
+            if aggregate.usage[CREDITS][pool] != state_usage
+                || aggregate.reserved[CREDITS][pool] != state_reserved
+                || aggregate.attached[CREDITS][pool] != state_attached
+                || aggregate.usage[CLAIMS][pool] != state_reserved
+                || aggregate.reserved[CLAIMS][pool] != state_reserved
+            {
+                return Err(SupportLedgerError::InvalidInput);
+            }
+        }
+        let claims = aggregate.usage[CLAIMS]
+            .iter()
+            .try_fold(0u64, |total, value| total.checked_add(u64::from(*value)))
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+        let vector_delta = aggregate
+            .vector
+            .iter()
+            .flatten()
+            .try_fold(0u64, |total, value| total.checked_add(*value));
+        if vector_delta != Some(claims) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                usage_after[class][pool] = usage_after[class][pool]
+                    .checked_add(aggregate.usage[class][pool])
+                    .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+                reserved_after[class][pool] = reserved_after[class][pool]
+                    .checked_sub(aggregate.reserved[class][pool])
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                if class < 4 {
+                    attached_after[class][pool] = attached_after[class][pool]
+                        .checked_add(aggregate.attached[class][pool])
+                        .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+                    let occupied = usage_after[class][pool]
+                        .checked_add(reserved_after[class][pool])
+                        .and_then(|value| value.checked_add(attached_after[class][pool]))
+                        .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+                    if occupied > self.capacities[class][pool] {
+                        return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
+                    }
+                } else if usage_after[class][pool]
+                    .checked_add(reserved_after[class][pool])
+                    .is_none_or(|occupied| occupied > self.capacities[class][pool])
+                {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
+                }
+            }
+        }
+        let mut vector_after = [[0; 3]; 21];
+        for axis in 0..21 {
+            for horizon in 0..3 {
+                vector_after[axis][horizon] = self.vector_usage[axis][horizon]
+                    .checked_add(aggregate.vector[axis][horizon])
+                    .ok_or(SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+                if vector_after[axis][horizon] > self.vector_capacity[axis][horizon] {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
+                }
+            }
+        }
+        Ok((usage_after, reserved_after, attached_after, vector_after))
+    }
+
+    fn validate_c17_aggregate_delta(
+        &self,
+        delta: c17::AggregateDelta,
+    ) -> Result<([[u32; POOLS]; 5], [[u32; POOLS]; 5], [[u32; POOLS]; 4]), SupportLedgerError> {
+        let mut usage_after = self.usage;
+        let mut reserved_after = self.reserved;
+        let mut attached_after = [[0; POOLS]; 4];
+        let withheld = self.pending_lifecycle_aggregate()?;
+        for class in 0..5 {
+            for pool in 0..POOLS {
+                usage_after[class][pool] =
+                    apply_signed_u32(self.usage[class][pool], delta.usage[class][pool])?;
+                reserved_after[class][pool] =
+                    apply_signed_u32(self.reserved[class][pool], delta.reserved[class][pool])?;
+                let attached = if class < 4 {
+                    let value = apply_signed_u32(
+                        self.c17.attached(class, pool)?,
+                        delta.attached[class][pool],
+                    )?;
+                    attached_after[class][pool] = value;
+                    u64::from(value)
+                } else {
+                    0
+                };
+                if reserved_after[class][pool] < withheld.reserved[class][pool] {
+                    return Err(CAPACITY_ERROR);
+                }
+                let occupied = u64::from(usage_after[class][pool])
+                    .checked_add(u64::from(reserved_after[class][pool]))
+                    .and_then(|value| value.checked_add(attached))
+                    .ok_or(CAPACITY_ERROR)?;
+                if occupied > u64::from(self.capacities[class][pool]) {
+                    return Err(CAPACITY_ERROR);
+                }
+            }
+        }
+        Ok((usage_after, reserved_after, attached_after))
+    }
+
+    fn find_funding_owner_precharged(
+        &self,
+        funding: crate::PlanMemberFunding,
+        expected_bound_set: Option<RuntimeOverheadBoundSetId>,
+    ) -> Result<(u32, BundleRecord, [u64; 4]), SupportLedgerError> {
+        let (entitlement_leaf, entitlement_owner) = self
+            .bundles
+            .route_precharged(TAG_ENTITLEMENT, &funding.entitlement.get())?;
+        let (vector_leaf, vector_owner) = self
+            .bundles
+            .route_precharged(TAG_VECTOR, &funding.credit_vector.get())?;
+        let owner = entitlement_owner
+            .filter(|owner| Some(*owner) == vector_owner)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        let (entitlement_record, entitlement_ordinal) = self
+            .bundles
+            .identities
+            .leaf(entitlement_leaf)
+            .ok_or_else(|| SupportLedgerError::Storage(FixedStorageError::NonCanonical))?;
+        let (vector_record, vector_ordinal) = self
+            .bundles
+            .identities
+            .leaf(vector_leaf)
+            .ok_or_else(|| SupportLedgerError::Storage(FixedStorageError::NonCanonical))?;
+        let record = *self
+            .bundles
+            .get_record(owner)
+            .ok_or(SupportLedgerError::InvalidTransition)?;
+        if entitlement_record != owner
+            || vector_record != owner
+            || entitlement_ordinal != 9
+            || vector_ordinal != 10
+            || record.request_owner != funding.request_id
+            || record.entitlement != funding.entitlement
+            || record.vector != funding.credit_vector
+            || expected_bound_set.is_some_and(|bound_set| record.bound_set != bound_set)
+            || !matches!(
+                record.state,
+                BundleState::LivePristine | BundleState::LiveConsumed
+            )
+        {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        self.bundles.validate_owner_chain_precharged(
+            record.vector_head,
+            record.vector_len as usize,
+            owner,
+        )?;
+        let mut branch_limits = [u64::MAX; 4];
+        let mut found = [false; 4];
+        let mut next = record.vector_head;
+        for _ in 0..record.vector_len {
+            let CellSlot::Occupied {
+                owner_record,
+                cell,
+                current,
+                next_owned,
+            } = self.bundles.cells.slots[next as usize]
+            else {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            };
+            if owner_record != owner || current > cell.max_outstanding {
+                return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+            }
+            for branch in 0..4 {
+                let requirement = record.branches[branch];
+                if cell.operation == requirement.operation && cell.pool == requirement.pool {
+                    found[branch] = true;
+                    branch_limits[branch] = branch_limits[branch].min(cell.max_outstanding);
+                }
+            }
+            next = next_owned;
+        }
+        if !found.into_iter().all(|present| present) {
+            return Err(SupportLedgerError::InvalidTransition);
+        }
+        Ok((owner, record, branch_limits))
+    }
+
+    fn validate_plan_materialization(
+        &self,
+        member_count: usize,
+    ) -> Result<([[u32; POOLS]; 5], [[u32; POOLS]; 5], [[u32; POOLS]; 4]), SupportLedgerError> {
+        let pool = SupportPool::MandatoryCompletion as usize;
+        let members = u32::try_from(member_count).map_err(|_| SupportLedgerError::InvalidInput)?;
+        let claims = members
+            .checked_mul(3)
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        for class in [CONDITIONAL, CREDITS, CLAIMS] {
+            if self.spendable_reserved(class, pool)? < claims {
+                return Err(CAPACITY_ERROR);
+            }
+        }
+        let mut usage_after = self.usage;
+        let mut reserved_after = self.reserved;
+        usage_after[CONDITIONAL][pool] = usage_after[CONDITIONAL][pool]
+            .checked_add(3)
+            .ok_or(CAPACITY_ERROR)?;
+        usage_after[CREDITS][pool] = usage_after[CREDITS][pool]
+            .checked_add(3)
+            .ok_or(CAPACITY_ERROR)?;
+        usage_after[CLAIMS][pool] = usage_after[CLAIMS][pool]
+            .checked_add(claims)
+            .ok_or(CAPACITY_ERROR)?;
+        for class in [CONDITIONAL, CREDITS, CLAIMS] {
+            reserved_after[class][pool] = reserved_after[class][pool]
+                .checked_sub(claims)
+                .ok_or(CAPACITY_ERROR)?;
+        }
+        let attached = members
+            .checked_sub(1)
+            .and_then(|value| value.checked_mul(3))
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        let mut delta = [[0i32; POOLS]; 4];
+        delta[CONDITIONAL][pool] = attached as i32;
+        delta[CREDITS][pool] = attached as i32;
+        let attached_after = self.c17.validate_attached_change(delta)?;
+        for (class, attached_class) in [(CONDITIONAL, CONDITIONAL), (CREDITS, CREDITS)] {
+            let total = usage_after[class][pool]
+                .checked_add(reserved_after[class][pool])
+                .and_then(|value| value.checked_add(attached_after[attached_class][pool]))
+                .ok_or(CAPACITY_ERROR)?;
+            if total > self.capacities[class][pool] {
+                return Err(CAPACITY_ERROR);
+            }
+        }
+        let claims_total = usage_after[CLAIMS][pool]
+            .checked_add(reserved_after[CLAIMS][pool])
+            .ok_or(CAPACITY_ERROR)?;
+        if claims_total > self.capacities[CLAIMS][pool] {
+            return Err(CAPACITY_ERROR);
+        }
+        Ok((usage_after, reserved_after, attached_after))
+    }
+
     pub fn reserve(
         &mut self,
         expected: SupportLedgerGeneration,
         spec: SupportObligationSpec<'_>,
-        work: &mut WorkMeter,
+        external_work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        let mut census = ExactWorkCensus::new();
+        let work = &mut census;
         let next = self.next(expected, work)?;
         let count = spec.claims.len();
         let pool = spec.pool as usize;
@@ -423,10 +3049,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         let claims = count as u32;
         for (class, added) in [(CONDITIONAL, 1), (CREDITS, 1), (CLAIMS, claims)] {
-            check!(work, self.available(class, pool, added), CAPACITY_ERROR)?;
+            check!(work, self.available(class, pool, added)?, CAPACITY_ERROR)?;
         }
         for identity in [key(0, spec.id.get()), key(1, spec.physical_credit.get())] {
-            let absent = self.records.find(identity, work)?.is_none();
+            let absent = self.records.find_with(identity, work)?.is_none();
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
         self.reciprocal_absent(spec.id.get(), spec.physical_credit.get(), work)?;
@@ -444,6 +3070,12 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         ]);
         work.charge(mutation)?;
         work.record(WorkDimension::CopiedBytes, 66)?;
+        let c17 = self.c17.prepare_legacy_insert(
+            self.records.len(),
+            spec.id.get(),
+            spec.physical_credit.get(),
+        )?;
+        external_work.charge(migrated_legacy_witness(work.witness())?)?;
         let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
         let record = (
             spec.operation,
@@ -452,9 +3084,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             Conditional,
             Default::default(),
             SupportCallScopeId([0; 32]),
-            None,
+            RecordMetadata::ordinary(spec.physical_credit),
         );
         self.records.push_prevalidated(keys, record, spec.claims);
+        self.c17.commit_legacy_insert(c17);
         self.usage[CONDITIONAL][pool] += 1;
         self.usage[CREDITS][pool] += 1;
         self.usage[CLAIMS][pool] += claims;
@@ -476,24 +3109,74 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &self,
         expected: SupportLedgerGeneration,
         input: SupportChangeInput,
-        work: &mut WorkMeter,
+        _work: &mut WorkMeter,
     ) -> Result<SupportChange, SupportLedgerError> {
-        match input {
+        let mut census = ExactWorkCensus::new();
+        let prepared = match input {
             SupportChangeInput::BeginOrdinary(spec, at) => {
-                self.prepare_begin(expected, spec, at, work)
+                self.prepare_begin(expected, spec, at, &mut census)
             }
             SupportChangeInput::BeginPending(id, kind, at) => {
-                self.prepare_pending(expected, id, kind, at, work)
+                self.prepare_pending(expected, id, kind, at, &mut census)
             }
-            SupportChangeInput::FinishActive(id) => self.prepare_finish(expected, id, work),
-        }
+            SupportChangeInput::FinishActive(id) => self.prepare_finish(expected, id, &mut census),
+        };
+        let mut change = match prepared {
+            Ok(change) => change,
+            Err(error) => {
+                _work.charge(census.witness())?;
+                return Err(error);
+            }
+        };
+        change.c17 = match &change.delta {
+            SupportDelta::BeginOrdinary(spec, ..) => {
+                Some(LegacyC17Change::Insert(self.c17.prepare_legacy_insert(
+                    change.records,
+                    spec.id.get(),
+                    spec.physical_credit.get(),
+                )?))
+            }
+            SupportDelta::BeginPending(index, record, id, ..) => {
+                Some(LegacyC17Change::Update(self.c17.prepare_legacy_update(
+                    *index,
+                    id.get(),
+                    record.6.physical_credit.get(),
+                    false,
+                )?))
+            }
+            SupportDelta::FinishActive(index, record, id) => {
+                Some(LegacyC17Change::Update(self.c17.prepare_legacy_update(
+                    *index,
+                    id.get(),
+                    record.6.physical_credit.get(),
+                    true,
+                )?))
+            }
+            SupportDelta::FinishInitial(index, ..) => {
+                let record = self
+                    .bundles
+                    .get_record(*index)
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                Some(LegacyC17Change::C16Touch(
+                    self.c17.prepare_c16_touch(*index, record)?,
+                ))
+            }
+        };
+        let base = match &change.delta {
+            SupportDelta::BeginOrdinary(..) => HotPathWorkWitness::new([74, 308, 0, 0, 22]),
+            SupportDelta::BeginPending(..) => HotPathWorkWitness::new([34, 185, 0, 0, 9]),
+            SupportDelta::FinishActive(..) => HotPathWorkWitness::new([31, 177, 0, 0, 4]),
+            SupportDelta::FinishInitial(..) => census.witness(),
+        };
+        change.charge = Some(migrated_legacy_witness(base)?);
+        Ok(change)
     }
-    fn prepare_begin(
+    fn prepare_begin<W: WorkRecorder + ?Sized>(
         &self,
         expected: SupportLedgerGeneration,
         spec: OrdinarySupportSpec,
         at: MonotonicTime,
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<SupportChange, SupportLedgerError> {
         self.next(expected, work)?;
         work.record(WorkDimension::InvariantChecks, 3)?;
@@ -507,10 +3190,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         check!(work, valid, SupportLedgerError::InvalidInput)?;
         let pool = SupportPool::Ordinary as usize;
         for class in [ACTIVE, CREDITS, CLAIMS] {
-            check!(work, self.available(class, pool, 1), CAPACITY_ERROR)?;
+            check!(work, self.available(class, pool, 1)?, CAPACITY_ERROR)?;
         }
         for identity in [key(0, spec.id.get()), key(1, spec.physical_credit.get())] {
-            let absent = self.records.find(identity, work)?.is_none();
+            let absent = self.records.find_with(identity, work)?.is_none();
             check!(work, absent, FixedStorageError::Duplicate)?;
         }
         self.reciprocal_absent(spec.id.get(), spec.physical_credit.get(), work)?;
@@ -524,13 +3207,15 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             expected,
             records: self.records.len(),
             delta: SupportDelta::BeginOrdinary(spec, at, start),
+            charge: None,
+            c17: None,
         })
     }
-    fn prepare_finish(
+    fn prepare_finish<W: WorkRecorder + ?Sized>(
         &self,
         expected: SupportLedgerGeneration,
         id: SupportOperationObligationId,
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<SupportChange, SupportLedgerError> {
         self.next(expected, work)?;
         let delta = match self.find_obligation(id, work)? {
@@ -540,7 +3225,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     record.3 == Active,
                     SupportLedgerError::InvalidTransition
                 )?;
-                SupportDelta::FinishActive(index, record)
+                SupportDelta::FinishActive(index, record, id)
             }
             ObligationOwner::InitialBundle { record, ordinal } => {
                 let bundle = *self
@@ -561,17 +3246,21 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             expected,
             records: self.records.len(),
             delta,
+            charge: None,
+            c17: None,
         })
     }
     #[rustfmt::skip]
-    fn prepare_pending(&self, expected: SupportLedgerGeneration, id: SupportOperationObligationId, kind: LifecycleReserveKind, at: MonotonicTime, work: &mut WorkMeter) -> Result<SupportChange, SupportLedgerError> { self.next(expected, work)?; let (index, record) = self.find_record(id, work)?; let reserve = record.6.ok_or(SupportLedgerError::InvalidTransition)?; check!(work, record.3 == Pending && reserve.0 == kind && at >= record.4 && self.reserved[ACTIVE][record.1 as usize] > 0, SupportLedgerError::InvalidTransition)?; let start = self.starts.prepare_start(record.0 as usize * POOLS + record.1 as usize, at, work)?; Ok(SupportChange { expected, records: self.records.len(), delta: SupportDelta::BeginPending(index, record, at, start) }) }
+    fn prepare_pending<W: WorkRecorder + ?Sized>(&self, expected: SupportLedgerGeneration, id: SupportOperationObligationId, kind: LifecycleReserveKind, at: MonotonicTime, work: &mut W) -> Result<SupportChange, SupportLedgerError> { self.next(expected, work)?; let (index, record) = self.find_record(id, work)?; let reserve_kind = record.6.lifecycle_kind.ok_or(SupportLedgerError::InvalidTransition)?; check!(work, record.3 == Pending && reserve_kind == kind && at >= record.4 && self.spendable_reserved(ACTIVE, record.1 as usize)? > 0, SupportLedgerError::InvalidTransition)?; let start = self.starts.prepare_start(record.0 as usize * POOLS + record.1 as usize, at, work)?; Ok(SupportChange { expected, records: self.records.len(), delta: SupportDelta::BeginPending(index, record, id, at, start), charge: None, c17: None }) }
     pub(crate) fn validate(&self, change: &SupportChange) -> Result<(), SupportLedgerError> {
         let target = match &change.delta {
             SupportDelta::BeginOrdinary(..) => true,
             SupportDelta::BeginPending(index, record, ..) => {
                 self.records.get(*index) == Some(record)
             }
-            SupportDelta::FinishActive(index, record) => self.records.get(*index) == Some(record),
+            SupportDelta::FinishActive(index, record, _) => {
+                self.records.get(*index) == Some(record)
+            }
             SupportDelta::FinishInitial(index, ordinal, item, state) => {
                 self.bundles.get_record(*index).is_some_and(|bundle| {
                     bundle.initial.get(usize::from(*ordinal)) == Some(item)
@@ -579,17 +3268,41 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 })
             }
         };
-        (self.generation == change.expected && self.records.len() == change.records && target)
-            .then_some(())
-            .ok_or(SupportLedgerError::Generation)
+        if self.generation != change.expected
+            || self.records.len() != change.records
+            || !target
+            || change.charge.is_none()
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        match (&change.delta, &change.c17) {
+            (SupportDelta::FinishInitial(..), Some(LegacyC17Change::C16Touch(capability))) => {
+                self.c17.validate_c16_touch(capability)
+            }
+            (SupportDelta::FinishInitial(..), _) => Err(SupportLedgerError::Generation),
+            (_, Some(LegacyC17Change::Insert(capability))) => {
+                self.c17.validate_legacy_insert(capability)
+            }
+            (_, Some(LegacyC17Change::Update(capability))) => {
+                self.c17.validate_legacy_update(capability)
+            }
+            _ => Err(SupportLedgerError::Generation),
+        }
     }
     pub(crate) fn commit(
         &mut self,
         change: SupportChange,
-        _work: &mut WorkMeter,
+        work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
         self.validate(&change)?;
-        match change.delta {
+        work.charge(change.charge.expect("validated migrated Work witness"))?;
+        let SupportChange {
+            expected,
+            delta,
+            c17,
+            ..
+        } = change;
+        match delta {
             SupportDelta::BeginOrdinary(spec, at, start) => {
                 let record = (
                     spec.operation,
@@ -598,7 +3311,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     Active,
                     at,
                     spec.scope,
-                    None,
+                    RecordMetadata::ordinary(spec.physical_credit),
                 );
                 let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
                 self.records.push_prevalidated(keys, record, &[spec.claim]);
@@ -607,7 +3320,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     self.usage[class][SupportPool::Ordinary as usize] += 1;
                 }
             }
-            SupportDelta::FinishActive(index, _) => {
+            SupportDelta::FinishActive(index, _, _) => {
                 self.records
                     .get_mut(index)
                     .expect("validated support record")
@@ -622,11 +3335,17 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     bundle.state = BundleState::LiveConsumed;
                 }
             }
-            SupportDelta::BeginPending(index, record, at, start) => {
+            SupportDelta::BeginPending(index, record, _, at, start) => {
                 self.commit_pending(index, record, at, start)
             }
         }
-        let next = change.expected.next().expect("prepared support generation");
+        match c17 {
+            Some(LegacyC17Change::Insert(capability)) => self.c17.commit_legacy_insert(capability),
+            Some(LegacyC17Change::Update(capability)) => self.c17.commit_legacy_update(capability),
+            Some(LegacyC17Change::C16Touch(capability)) => self.c17.commit_c16_touch(capability),
+            None => {}
+        }
+        let next = expected.next().expect("prepared support generation");
         self.generation = next;
         Ok(next)
     }
@@ -638,8 +3357,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         expected: SupportLedgerGeneration,
         at: MonotonicTime,
         specs: &[LifecycleReserveSpec],
-        work: &mut WorkMeter,
+        external_work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        let mut census = ExactWorkCensus::new();
+        let work = &mut census;
         let next = self.next(expected, work)?;
         let invalid = SupportLedgerError::InvalidInput;
         let count = u16::try_from(specs.len()).map_err(|_| invalid)?;
@@ -678,7 +3399,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             work.record(WorkDimension::InvariantChecks, 10)?;
             valid.then_some(()).ok_or(invalid)?;
             for identity in [key(0, spec.id.get()), key(1, spec.physical_credit.get())] {
-                let absent = self.records.find(identity, work)?.is_none();
+                let absent = self.records.find_with(identity, work)?.is_none();
                 check!(work, absent, FixedStorageError::Duplicate)?;
             }
             self.reciprocal_absent(spec.id.get(), spec.physical_credit.get(), work)?;
@@ -686,7 +3407,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         let (pool, added) = (pool as usize, u32::from(count));
         for class in [CONDITIONAL, PENDING, ACTIVE, CREDITS, CLAIMS] {
-            check!(work, self.available(class, pool, added), CAPACITY_ERROR)?;
+            check!(work, self.available(class, pool, added)?, CAPACITY_ERROR)?;
         }
         self.records.validate_capacity(specs.len())?;
         let members = u64::try_from(specs.len()).map_err(|_| invalid)?;
@@ -698,6 +3419,21 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             0,
             4 + 2 * members,
         ]))?;
+        let first_record = self.records.len();
+        u32::try_from(first_record)
+            .map_err(|_| SupportLedgerError::Storage(FixedStorageError::Capacity))?;
+        let raw_record = |offset: usize| {
+            let spec = &specs[offset];
+            (
+                first_record + offset,
+                spec.id.get(),
+                spec.physical_credit.get(),
+            )
+        };
+        let c17 = self
+            .c17
+            .prepare_legacy_insert_stream(specs.len(), raw_record)?;
+        external_work.charge(migrated_legacy_witness(census.witness())?)?;
         for spec in specs {
             let (operation, pool, _) = lifecycle_shape(spec.kind);
             let record = (
@@ -707,11 +3443,13 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 Conditional,
                 at,
                 spec.scope,
-                Some((spec.kind, first.id, count)),
+                RecordMetadata::lifecycle(spec.kind, spec.physical_credit, count, first_record)
+                    .expect("validated lifecycle record address"),
             );
             let keys = [key(0, spec.id.get()), key(1, spec.physical_credit.get())];
             self.records.push_prevalidated(keys, record, &[spec.claim]);
         }
+        self.c17.commit_legacy_insert_stream(c17, raw_record);
         for class in [CONDITIONAL, CREDITS, CLAIMS] {
             self.usage[class][pool] += added;
         }
@@ -728,8 +3466,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         at: MonotonicTime,
         ids: &[SupportOperationObligationId],
         result: LifecycleTriggerResult,
-        work: &mut WorkMeter,
+        external_work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
+        let mut census = ExactWorkCensus::new();
+        let work = &mut census;
         let next = self.next(expected, work)?;
         let count = u16::try_from(ids.len()).map_err(|_| SupportLedgerError::InvalidInput)?;
         check!(work, count > 0, SupportLedgerError::InvalidInput)?;
@@ -739,25 +3479,46 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let record_bytes = std::mem::size_of::<Record>() as u64;
         let mut first_index = None;
         for (offset, id) in ids.iter().enumerate() {
-            let index = self.records.find(key(0, id.get()), work)?.ok_or(invalid)?;
+            let index = self
+                .records
+                .find_with(key(0, id.get()), work)?
+                .ok_or(invalid)?;
             work.record(WorkDimension::CopiedBytes, record_bytes)?;
             let record = *self.records.get(index).expect("indexed support record");
-            let reserve = record.6.ok_or(invalid)?;
-            let actual_trigger = lifecycle_shape(reserve.0).2;
+            let reserve_kind = record.6.lifecycle_kind.ok_or(invalid)?;
+            let actual_trigger = lifecycle_shape(reserve_kind).2;
             let matching = record.3 == Conditional
                 && record.2 == predecessor
                 && at >= record.4
                 && pool == record.1 as usize
                 && index == *first_index.get_or_insert(index) + offset
-                && reserve.1 == ids[0]
-                && reserve.2 == count
+                && record.6.lifecycle_count == count
+                && usize::try_from(record.6.first_record).ok() == first_index
+                && record.6.reserved == 0
                 && (trigger == actual_trigger || trigger == 4 && actual_trigger >= 2);
             check!(work, matching, invalid)?;
         }
         let added = u32::from(count);
-        let held = self.reserved[PENDING][pool] >= added && self.reserved[ACTIVE][pool] >= added;
+        let held = self.spendable_reserved(PENDING, pool)? >= added
+            && self.spendable_reserved(ACTIVE, pool)? >= added;
         check!(work, held, invalid)?;
         let first_index = first_index.expect("nonempty lifecycle set");
+        let records = &self.records;
+        let raw_record = |offset: usize| {
+            let index = first_index + offset;
+            let record = records.get(index).expect("validated lifecycle record");
+            (
+                index,
+                ids[offset].get(),
+                record.6.physical_credit.get(),
+                !required,
+            )
+        };
+        let c17 = self
+            .c17
+            .prepare_legacy_update_stream(ids.len(), raw_record)?;
+        external_work.charge(migrated_legacy_witness(census.witness())?)?;
+        self.c17.commit_legacy_update_stream(c17, raw_record);
         for index in first_index..first_index + ids.len() {
             let record = self.records.get_mut(index).expect("indexed support record");
             record.3 = if required { Pending } else { ClosedConditional };
@@ -772,128 +3533,169 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         Ok(next)
     }
     #[rustfmt::skip]
-    pub(crate) fn lifecycle_kind(&self, id: SupportOperationObligationId, work: &mut WorkMeter) -> Result<LifecycleReserveKind, SupportLedgerError> { self.find_record(id, work)?.1.6.map(|reserve| reserve.0).ok_or(SupportLedgerError::InvalidTransition) }
+    pub(crate) fn lifecycle_kind(&self, id: SupportOperationObligationId, work: &mut WorkMeter) -> Result<LifecycleReserveKind, SupportLedgerError> { self.find_record(id, work)?.1.6.lifecycle_kind.ok_or(SupportLedgerError::InvalidTransition) }
     pub fn transition(
         &mut self,
         expected: SupportLedgerGeneration,
         id: SupportOperationObligationId,
         transition: SupportTransition,
-        work: &mut WorkMeter,
+        external_work: &mut WorkMeter,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
-        let next = self.next(expected, work)?;
-        match self.find_obligation(id, work)? {
-            ObligationOwner::InitialBundle { record, ordinal } => {
-                return self.transition_initial(next, record, ordinal, transition);
-            }
+        let mut census = ExactWorkCensus::new();
+        let next = self.next(expected, &mut census)?;
+        match self.find_obligation(id, &mut census)? {
             ObligationOwner::Legacy { index, record } => {
-                work.record(WorkDimension::InvariantChecks, 1)?;
-                let generic = record.6.is_none();
-                let (state, time) = match (record.3, transition) {
-                    (Conditional, PredecessorEnded(id, at)) if id == record.2 && generic => {
-                        (Pending, at)
+                census.record(WorkDimension::InvariantChecks, 1)?;
+                let generic = record.6.lifecycle_kind.is_none();
+                let (state, time, base) = match (record.3, transition) {
+                    (Conditional, PredecessorEnded(predecessor, at))
+                        if predecessor == record.2 && generic =>
+                    {
+                        (Pending, at, [31, 177, 0, 0, 5])
                     }
-                    (Pending, BeginSupport(at)) if at >= record.4 => (Active, at),
-                    (Active, FinishSupport) => (Retained, record.4),
+                    (Pending, BeginSupport(at)) if at >= record.4 => {
+                        (Active, at, [34, 185, 0, 0, 10])
+                    }
+                    (Active, FinishSupport) => (Retained, record.4, [31, 177, 0, 0, 4]),
                     (Conditional, CloseCausalCallImpossible) if generic => {
-                        (ClosedConditional, record.4)
+                        (ClosedConditional, record.4, [31, 177, 0, 0, 4])
                     }
-                    (Pending, CloseCausalCallImpossible) => (ClosedPending, record.4),
+                    (Pending, CloseCausalCallImpossible) => {
+                        (ClosedPending, record.4, [31, 177, 0, 0, 4])
+                    }
                     _ => return Err(SupportLedgerError::InvalidTransition),
                 };
                 let pool = record.1 as usize;
                 let (before, after) = (state_class(record.3), state_class(state));
+                if self.usage[before][pool] == 0 {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+                }
                 if before != after {
-                    let held =
-                        after == ACTIVE && record.6.is_some() && self.reserved[ACTIVE][pool] > 0;
-                    check!(work, held || self.available(after, pool, 1), CAPACITY_ERROR)?;
+                    let held = after == ACTIVE
+                        && record.6.lifecycle_kind.is_some()
+                        && self.spendable_reserved(ACTIVE, pool)? > 0;
+                    check!(
+                        &mut census,
+                        held || self.available(after, pool, 1)?,
+                        CAPACITY_ERROR
+                    )?;
                 }
-                if state == Active {
-                    self.starts
-                        .try_start(record.0 as usize * POOLS + pool, time, work)?;
+                let start = if state == Active {
+                    Some(self.starts.prepare_start(
+                        record.0 as usize * POOLS + pool,
+                        time,
+                        &mut census,
+                    )?)
+                } else {
+                    None
+                };
+                let releases_active =
+                    record.6.lifecycle_kind.is_some() && matches!(state, Active | ClosedPending);
+                if releases_active && self.spendable_reserved(ACTIVE, pool)? == 0 {
+                    return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
                 }
+                let retained = matches!(state, Retained | ClosedConditional | ClosedPending);
+                let c17 = self.c17.prepare_legacy_update(
+                    index,
+                    id.get(),
+                    record.6.physical_credit.get(),
+                    retained,
+                )?;
+                external_work.charge(migrated_legacy_witness(HotPathWorkWitness::new(base))?)?;
+
                 if before != after {
                     self.usage[before][pool] -= 1;
                     self.usage[after][pool] += 1;
                 }
-                if record.6.is_some() && (state == Active || state == ClosedPending) {
+                if releases_active {
                     self.reserved[ACTIVE][pool] -= 1;
                 }
-                let record = self.records.get_mut(index).expect("indexed support record");
-                record.3 = state;
-                record.4 = time;
+                if let Some(start) = start {
+                    self.starts.apply_start(start);
+                }
+                let stored = self.records.get_mut(index).expect("indexed support record");
+                stored.3 = state;
+                stored.4 = time;
+                self.c17.commit_legacy_update(c17);
             }
-        }
-        self.generation = next;
-        Ok(next)
-    }
-    fn transition_initial(
-        &mut self,
-        next: SupportLedgerGeneration,
-        record_index: u32,
-        ordinal: u8,
-        transition: SupportTransition,
-    ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
-        let bundle = self
-            .bundles
-            .get_record(record_index)
-            .ok_or(SupportLedgerError::InvalidTransition)?;
-        let item = *bundle
-            .initial
-            .get(usize::from(ordinal))
-            .ok_or(SupportLedgerError::InvalidTransition)?;
-        if !initial_semantic_envelope_is_valid(bundle.state, ordinal, item) {
-            return Err(SupportLedgerError::InvalidTransition);
-        }
-        let (state, time, release_pending, release_active) = match (item.state, transition) {
-            (Conditional, PredecessorEnded(id, at))
-                if id == item.predecessor && at >= item.state_time =>
-            {
-                (Pending, at, true, false)
+            ObligationOwner::InitialBundle {
+                record: record_index,
+                ordinal,
+            } => {
+                let bundle = self
+                    .bundles
+                    .get_record(record_index)
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                let item = *bundle
+                    .initial
+                    .get(usize::from(ordinal))
+                    .ok_or(SupportLedgerError::InvalidTransition)?;
+                if !initial_semantic_envelope_is_valid(bundle.state, ordinal, item) {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let (state, time, release_pending, release_active) = match (item.state, transition)
+                {
+                    (Conditional, PredecessorEnded(predecessor, at))
+                        if predecessor == item.predecessor && at >= item.state_time =>
+                    {
+                        (Pending, at, true, false)
+                    }
+                    (Pending, BeginSupport(at)) if at >= item.state_time => {
+                        (Active, at, false, true)
+                    }
+                    (Active, FinishSupport) => (Retained, item.state_time, false, false),
+                    (Conditional, CloseCausalCallImpossible) => {
+                        (ClosedConditional, item.state_time, true, true)
+                    }
+                    (Pending, CloseCausalCallImpossible) => {
+                        (ClosedPending, item.state_time, false, true)
+                    }
+                    _ => return Err(SupportLedgerError::InvalidTransition),
+                };
+                let pool = item.pool as usize;
+                if (release_pending && self.spendable_reserved(PENDING, pool)? == 0)
+                    || (release_active && self.spendable_reserved(ACTIVE, pool)? == 0)
+                {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let start =
+                    if state == Active {
+                        Some(self.starts.prepare_start_precharged(
+                            item.operation as usize * POOLS + pool,
+                            time,
+                        )?)
+                    } else {
+                        None
+                    };
+                let before = state_class(item.state);
+                let after = state_class(state);
+                if self.usage[before][pool] == 0 {
+                    return Err(SupportLedgerError::InvalidTransition);
+                }
+                let c17 = self.c17.prepare_c16_touch(record_index, bundle)?;
+                external_work.charge(migrated_legacy_witness(census.witness())?)?;
+
+                if before != after {
+                    self.usage[before][pool] -= 1;
+                    self.usage[after][pool] += 1;
+                }
+                self.reserved[PENDING][pool] -= u32::from(release_pending);
+                self.reserved[ACTIVE][pool] -= u32::from(release_active);
+                if let Some(start) = start {
+                    self.starts.apply_start(start);
+                }
+                let RecordSlot::Occupied(bundle) = &mut self.bundles.records[record_index as usize]
+                else {
+                    unreachable!("validated initial bundle owner")
+                };
+                let stored = &mut bundle.initial[usize::from(ordinal)];
+                stored.state = state;
+                stored.state_time = time;
+                if bundle.state == BundleState::LivePristine {
+                    bundle.state = BundleState::LiveConsumed;
+                }
+                self.c17.commit_c16_touch(c17);
             }
-            (Pending, BeginSupport(at)) if at >= item.state_time => (Active, at, false, true),
-            (Active, FinishSupport) => (Retained, item.state_time, false, false),
-            (Conditional, CloseCausalCallImpossible) => {
-                (ClosedConditional, item.state_time, true, true)
-            }
-            (Pending, CloseCausalCallImpossible) => (ClosedPending, item.state_time, false, true),
-            _ => return Err(SupportLedgerError::InvalidTransition),
-        };
-        let pool = item.pool as usize;
-        if (release_pending && self.reserved[PENDING][pool] == 0)
-            || (release_active && self.reserved[ACTIVE][pool] == 0)
-        {
-            return Err(SupportLedgerError::InvalidTransition);
-        }
-        let start = if state == Active {
-            Some(
-                self.starts
-                    .prepare_start_precharged(item.operation as usize * POOLS + pool, time)?,
-            )
-        } else {
-            None
-        };
-        let before = state_class(item.state);
-        let after = state_class(state);
-        if self.usage[before][pool] == 0 {
-            return Err(SupportLedgerError::InvalidTransition);
-        }
-        if before != after {
-            self.usage[before][pool] -= 1;
-            self.usage[after][pool] += 1;
-        }
-        self.reserved[PENDING][pool] -= u32::from(release_pending);
-        self.reserved[ACTIVE][pool] -= u32::from(release_active);
-        if let Some(start) = start {
-            self.starts.apply_start(start);
-        }
-        let RecordSlot::Occupied(bundle) = &mut self.bundles.records[record_index as usize] else {
-            unreachable!("validated initial bundle owner")
-        };
-        let item = &mut bundle.initial[usize::from(ordinal)];
-        item.state = state;
-        item.state_time = time;
-        if bundle.state == BundleState::LivePristine {
-            bundle.state = BundleState::LiveConsumed;
         }
         self.generation = next;
         Ok(next)
@@ -925,15 +3727,15 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         Ok((record_index, ordinal))
     }
-    fn find_obligation(
+    fn find_obligation<W: WorkRecorder + ?Sized>(
         &self,
         id: SupportOperationObligationId,
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<ObligationOwner, SupportLedgerError> {
         work.record(WorkDimension::CopiedBytes, 33)?;
         let lookup = key(TAG_OBLIGATION, id.get());
         let before = work.witness().value(WorkDimension::VisitedEntities);
-        if let Some(index) = self.records.find(lookup, work)? {
+        if let Some(index) = self.records.find_with(lookup, work)? {
             work.record(WorkDimension::InvariantChecks, 1)?;
             work.record(
                 WorkDimension::CopiedBytes,
@@ -970,13 +3772,13 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         Ok(ObligationOwner::InitialBundle { record, ordinal })
     }
-    fn find_record(
+    fn find_record<W: WorkRecorder + ?Sized>(
         &self,
         id: SupportOperationObligationId,
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<(usize, Record), SupportLedgerError> {
         work.record(WorkDimension::CopiedBytes, 33)?;
-        let found = self.records.find(key(0, id.get()), work)?;
+        let found = self.records.find_with(key(0, id.get()), work)?;
         work.record(WorkDimension::InvariantChecks, 1)?;
         let index = found.ok_or(SupportLedgerError::InvalidTransition)?;
         let record_bytes = std::mem::size_of::<Record>() as u64;
@@ -984,10 +3786,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let record = *self.records.get(index).expect("indexed support record");
         Ok((index, record))
     }
-    fn next(
+    fn next<W: WorkRecorder + ?Sized>(
         &self,
         expected: SupportLedgerGeneration,
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
         let current = expected == self.generation;
         check!(work, current, SupportLedgerError::Generation)?;
@@ -996,23 +3798,42 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .next()
             .map_err(|_| SupportLedgerError::Generation)
     }
-    fn available(&self, class: usize, pool: usize, added: u32) -> bool {
-        let reserved = self.reserved.get(class).map_or(0, |held| held[pool]);
-        self.usage[class][pool]
-            .checked_add(reserved)
+    fn pending_lifecycle_aggregate(&self) -> Result<c17::LifecycleAggregate, SupportLedgerError> {
+        Ok(self
+            .c17
+            .pending_lifecycle_aggregate()?
+            .unwrap_or(c17::LifecycleAggregate::ZERO))
+    }
+
+    fn spendable_reserved(&self, class: usize, pool: usize) -> Result<u32, SupportLedgerError> {
+        let withheld = self.pending_lifecycle_aggregate()?.reserved[class][pool];
+        self.reserved[class][pool]
+            .checked_sub(withheld)
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+    }
+
+    fn available(&self, class: usize, pool: usize, added: u32) -> Result<bool, SupportLedgerError> {
+        let attached = if class < 4 {
+            self.c17.attached(class, pool)?
+        } else {
+            0
+        };
+        Ok(self.usage[class][pool]
+            .checked_add(self.reserved[class][pool])
+            .and_then(|value| value.checked_add(attached))
             .and_then(|value| value.checked_add(added))
-            .is_some_and(|value| value <= self.capacities[class][pool])
+            .is_some_and(|value| value <= self.capacities[class][pool]))
     }
     /// Metered reciprocal absence preflight for one earlier-row insertion:
     /// both shared tagged identities must be absent from the C16
     /// request-bundle store. Live and retained-tombstone C16 leaves block
     /// later legacy reuse until pristine withdrawal or accepted C18 expiry
     /// removes them.
-    fn reciprocal_absent(
+    fn reciprocal_absent<W: WorkRecorder + ?Sized>(
         &self,
         obligation: [u8; 32],
         credit: [u8; 32],
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<(), SupportLedgerError> {
         for (tag, identity) in [(TAG_OBLIGATION, obligation), (TAG_CREDIT, credit)] {
             let absent = self.bundles.find(tag, &identity, work)?.is_none();
@@ -1090,6 +3911,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         work: &mut WorkMeter,
     ) -> Result<BundleLogicalDelta<H>, SupportLedgerError> {
         let delta = self.bundle_logical_delta(cells.iter().copied())?;
+        let withheld = self.pending_lifecycle_aggregate()?;
         for cell in cells {
             work.record(WorkDimension::VisitedEntities, H as u64 + 1)?;
             let axis = cell.operation as usize * POOLS + cell.pool as usize;
@@ -1099,7 +3921,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 .and_then(|bounds| bounds.iter().position(|bound| bound.0 == cell.horizon));
             work.record(WorkDimension::InvariantChecks, 1)?;
             let horizon = horizon.ok_or(SupportLedgerError::InvalidInput)?;
-            let updated = self.vector_usage[axis][horizon].checked_add(cell.max_outstanding);
+            let updated = self.vector_usage[axis][horizon]
+                .checked_add(withheld.vector[axis].get(horizon).copied().unwrap_or(0))
+                .and_then(|value| value.checked_add(cell.max_outstanding));
             work.record(WorkDimension::InvariantChecks, 1)?;
             let updated = updated.ok_or(SupportLedgerError::InvalidInput)?;
             check!(
@@ -1111,8 +3935,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         for class in 0..5 {
             for pool in 0..POOLS {
+                let attached = if class < 4 {
+                    self.c17.attached(class, pool)?
+                } else {
+                    0
+                };
                 let valid = self.usage[class][pool]
                     .checked_add(self.reserved[class][pool])
+                    .and_then(|value| value.checked_add(attached))
                     .and_then(|value| value.checked_add(delta.usage[class][pool]))
                     .and_then(|value| value.checked_add(delta.reserved[class][pool]))
                     .is_some_and(|value| value <= self.capacities[class][pool]);
@@ -1126,6 +3956,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         cells: &[OutstandingCreditCell],
     ) -> Result<(), SupportLedgerError> {
         let delta = self.bundle_logical_delta(cells.iter().copied())?;
+        let withheld = self.pending_lifecycle_aggregate()?;
         for cell in cells {
             let axis = cell.operation as usize * POOLS + cell.pool as usize;
             let horizon = self
@@ -1134,7 +3965,8 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 .and_then(|bounds| bounds.iter().position(|bound| bound.0 == cell.horizon))
                 .ok_or(SupportLedgerError::InvalidInput)?;
             let valid = self.vector_usage[axis][horizon]
-                .checked_add(cell.max_outstanding)
+                .checked_add(withheld.vector[axis].get(horizon).copied().unwrap_or(0))
+                .and_then(|value| value.checked_add(cell.max_outstanding))
                 .is_some_and(|value| value <= self.vector_capacity[axis][horizon]);
             if !valid {
                 return Err(CAPACITY_ERROR);
@@ -1142,8 +3974,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         for class in 0..5 {
             for pool in 0..POOLS {
+                let attached = if class < 4 {
+                    self.c17.attached(class, pool)?
+                } else {
+                    0
+                };
                 let valid = self.usage[class][pool]
                     .checked_add(self.reserved[class][pool])
+                    .and_then(|value| value.checked_add(attached))
                     .and_then(|value| value.checked_add(delta.usage[class][pool]))
                     .and_then(|value| value.checked_add(delta.reserved[class][pool]))
                     .is_some_and(|value| value <= self.capacities[class][pool]);
@@ -1223,14 +4061,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         record: &BundleRecord,
     ) -> Result<(), SupportLedgerError> {
         let delta = self.stored_bundle_logical_delta_precharged(record_index, record)?;
+        let withheld = self.pending_lifecycle_aggregate()?;
         for class in 0..5 {
             for pool in 0..POOLS {
-                if self.usage[class][pool]
-                    .checked_sub(delta.usage[class][pool])
-                    .is_none()
-                    || self.reserved[class][pool]
-                        .checked_sub(delta.reserved[class][pool])
-                        .is_none()
+                let usage_after = self.usage[class][pool].checked_sub(delta.usage[class][pool]);
+                let reserved_after =
+                    self.reserved[class][pool].checked_sub(delta.reserved[class][pool]);
+                if usage_after.is_none()
+                    || reserved_after.is_none_or(|value| value < withheld.reserved[class][pool])
                 {
                     return Err(SupportLedgerError::Generation);
                 }
@@ -1240,7 +4078,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             for horizon in 0..H {
                 if self.vector_usage[axis][horizon]
                     .checked_sub(delta.vector[axis][horizon])
-                    .is_none()
+                    .is_none_or(|value| {
+                        value < withheld.vector[axis].get(horizon).copied().unwrap_or(0)
+                    })
                 {
                     return Err(SupportLedgerError::Generation);
                 }
@@ -1292,8 +4132,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         input: &'input RequestSupportBundleInput<'input>,
         work: &'work mut WorkMeter,
     ) -> Result<BundleChange<'input, 'work, H>, SupportLedgerError> {
-        let height = self.records.maximum_identity_height()?;
-        work.charge(bundle_reserve_work::<H>(input.cells.len(), height)?)?;
         self.generation
             .next()
             .map_err(|_| SupportLedgerError::Generation)?;
@@ -1411,12 +4249,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         } else {
             K
         };
-        let height = self.records.maximum_identity_height()?;
-        change.work.charge(bundle_validate_commit_work::<H>(
-            change.vector.len(),
-            branches,
-            height,
-        )?)?;
         let stale = SupportLedgerError::Generation;
         if change.nonce != self.instance_nonce || change.snapshot != self.capacity_snapshot() {
             return Err(stale);
@@ -1441,9 +4273,17 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         self.bundles
             .validate_bundle_selection_precharged(change.vector.len(), branches)?;
+        let record_slot = self.bundles.selected_record_precharged()?;
+        let c17 = self
+            .c17
+            .prepare_c16_bundle(record_slot, &change.record, change.vector)?;
+        change
+            .work
+            .charge(HotPathWorkWitness::new(WORK_MIGRATED_C16))?;
         Ok(ValidatedBundleChange {
             ledger: self,
             change,
+            c17,
         })
     }
     /// Immutable metered capacity-facts snapshot of the sole ledger and its
@@ -1492,7 +4332,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         entitlement: FutureTurnSupportEntitlementId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedWithdrawal<'work, H>, SupportLedgerError> {
-        work.charge(bundle_target_work::<H>(1_344)?)?;
         self.generation
             .next()
             .map_err(|_| SupportLedgerError::Generation)?;
@@ -1532,16 +4371,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &'ledger mut self,
         mut change: PreparedWithdrawal<'work, H>,
     ) -> Result<ValidatedWithdrawal<'ledger, 'work, R, F, H>, SupportLedgerError> {
-        let len = usize::try_from(change.record.vector_len)
-            .map_err(|_| SupportLedgerError::InvalidTransition)?;
-        let branches = if change.snapshot.occupied_records == 1 {
-            K - 1
-        } else {
-            K
-        };
-        change
-            .work
-            .charge(withdraw_remainder_work::<H>(len, branches)?)?;
         let stale = SupportLedgerError::Generation;
         if change.nonce != self.instance_nonce
             || change.snapshot != self.capacity_snapshot()
@@ -1564,9 +4393,16 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             *slot = leaf;
         }
         self.validate_stored_bundle_aggregates_precharged(change.record_index, &change.record)?;
+        let c17 = self
+            .c17
+            .prepare_c16_withdrawal(change.record_index, &change.record)?;
+        change
+            .work
+            .charge(HotPathWorkWitness::new(WORK_TOMBSTONE))?;
         Ok(ValidatedWithdrawal {
             ledger: self,
             change,
+            c17,
         })
     }
     /// Read-only preparation of a live C16 bundle's retained terminal
@@ -1578,7 +4414,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         entitlement: FutureTurnSupportEntitlementId,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedTombstone<'work, H>, SupportLedgerError> {
-        work.charge(bundle_target_work::<H>(1_296)?)?;
         self.generation
             .next()
             .map_err(|_| SupportLedgerError::Generation)?;
@@ -1609,9 +4444,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &'ledger mut self,
         change: PreparedTombstone<'work, H>,
     ) -> Result<ValidatedTombstone<'ledger, 'work, R, F, H>, SupportLedgerError> {
-        let len = usize::try_from(change.record.vector_len)
-            .map_err(|_| SupportLedgerError::InvalidTransition)?;
-        change.work.charge(tombstone_remainder_work::<H>(len)?)?;
         let stale = SupportLedgerError::Generation;
         if change.nonce != self.instance_nonce
             || change.snapshot != self.capacity_snapshot()
@@ -1633,9 +4465,16 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             }
         }
         self.validate_stored_bundle_aggregates_precharged(change.record_index, &change.record)?;
+        let c17 = self
+            .c17
+            .prepare_c16_tombstone(change.record_index, &change.record)?;
+        change
+            .work
+            .charge(HotPathWorkWitness::new(WORK_TOMBSTONE))?;
         Ok(ValidatedTombstone {
             ledger: self,
             change,
+            c17,
         })
     }
 }
@@ -1650,9 +4489,13 @@ impl<'ledger, 'input, 'work, const R: usize, const F: usize, const H: usize>
     /// defenses for impossible owner corruption after validate proved
     /// capacity, absence, and local-slot selection.
     pub(crate) fn commit_bundle(self) -> SupportLedgerGeneration {
-        let change = self.change;
-        let ledger = self.ledger;
+        let ValidatedBundleChange {
+            ledger,
+            change,
+            c17,
+        } = self;
         ledger.bundles.commit_bundle(&change.record, change.vector);
+        ledger.c17.commit_c16_bundle(c17);
         ledger.apply_bundle_logical_delta(change.vector, true);
         let next = change
             .snapshot
@@ -1674,12 +4517,16 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
     /// defenses for impossible owner corruption after validate proved the
     /// exact record and chain.
     pub(crate) fn commit_withdraw(self) -> SupportLedgerGeneration {
-        let change = self.change;
-        let ledger = self.ledger;
+        let ValidatedWithdrawal {
+            ledger,
+            change,
+            c17,
+        } = self;
         ledger.remove_stored_bundle_logical_delta(change.record_index);
         ledger
             .bundles
             .withdraw_bundle_unmetered(change.record_index);
+        ledger.c17.commit_c16_withdrawal(c17);
         let next = change
             .snapshot
             .generation
@@ -1693,9 +4540,13 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
     ValidatedTombstone<'ledger, 'work, R, F, H>
 {
     pub(crate) fn commit_tombstone(self) -> SupportLedgerGeneration {
-        let change = self.change;
-        let ledger = self.ledger;
+        let ValidatedTombstone {
+            ledger,
+            change,
+            c17,
+        } = self;
         ledger.bundles.retain_bundle_unmetered(change.record_index);
+        ledger.c17.commit_c16_tombstone(c17, &change.record);
         let next = change
             .snapshot
             .generation
@@ -1780,7 +4631,9 @@ fn seal_backing_and_issue_nonce(
 ) -> Result<u64, SupportLedgerError> {
     if actual != expected
         || actual_support_storage_bytes(horizon_count, actual) != Some(expected_storage)
-        || expected_storage > 2_097_152
+        || expected_storage
+            .checked_add(c17::C17_PHYSICAL_BYTES)
+            .is_none_or(|whole| whole > crate::c17_generated::SUPPORT_LEDGER_CEILING_BYTES)
     {
         return Err(SupportLedgerError::Storage(FixedStorageError::Capacity));
     }
@@ -1820,13 +4673,23 @@ fn support_storage_bytes(
     let bundles = e
         .checked_mul(1_364)
         .and_then(|value| value.checked_sub(20))
-        .and_then(|value| c.checked_mul(44).and_then(|cells| value.checked_add(cells)))
+        .and_then(|value| c.checked_mul(52).and_then(|cells| value.checked_add(cells)))
         .ok_or(invalid)?;
     fixed
         .checked_add(legacy)
         .and_then(|value| value.checked_add(bundles))
         .ok_or(invalid)
 }
+fn apply_signed_u32(value: u32, delta: i32) -> Result<u32, SupportLedgerError> {
+    if delta >= 0 {
+        value.checked_add(delta as u32).ok_or(CAPACITY_ERROR)
+    } else {
+        value
+            .checked_sub(delta.unsigned_abs())
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+    }
+}
+
 #[allow(dead_code, reason = "used by the C08 adapter constructor")]
 fn total(values: impl IntoIterator<Item = u32>) -> u64 {
     values.into_iter().map(u64::from).sum()
@@ -2045,6 +4908,80 @@ fn tombstone_remainder_work<const H: usize>(
         .ok_or(invalid)?;
     Ok(HotPathWorkWitness::new([visits, copied, 0, 0, checks]))
 }
+fn plan_authority_key(plan: u128) -> [u8; 17] {
+    let mut key = [0; 17];
+    key[0] = 0x30;
+    key[1..].copy_from_slice(&plan.to_be_bytes());
+    key
+}
+
+fn standalone_authority_key(domain: crate::FormationDomainId) -> [u8; 17] {
+    let mut key = [0; 17];
+    key[0] = 0x31;
+    key[1..].copy_from_slice(&domain.get().to_be_bytes());
+    key
+}
+
+fn singleton_materialization_delta() -> c17::AggregateDelta {
+    let pool = SupportPool::MandatoryCompletion as usize;
+    let mut delta = c17::AggregateDelta {
+        usage: [[0; POOLS]; 5],
+        reserved: [[0; POOLS]; 5],
+        attached: [[0; POOLS]; 4],
+    };
+    for class in [CONDITIONAL, CREDITS, CLAIMS] {
+        delta.reserved[class][pool] = -1;
+        delta.usage[class][pool] = 1;
+    }
+    delta
+}
+
+fn encode_plan_identity(identity: crate::TurnPlanIdentity) -> [u8; c17::PLAN_IDENTITY_BYTES] {
+    let mut image = [0; c17::PLAN_IDENTITY_BYTES];
+    image[0..16].copy_from_slice(&identity.id.get().to_le_bytes());
+    image[16..32].copy_from_slice(&identity.candidate_id.get().to_le_bytes());
+    image[32..48].copy_from_slice(&identity.coordinates.model_id.get().to_le_bytes());
+    image[48] = match identity.coordinates.phase {
+        crate::ExecutionPhase::Prefill => 1,
+        crate::ExecutionPhase::Decode => 2,
+    };
+    image[49] = match identity.coordinates.service_class {
+        crate::ServiceClass::Interactive => 1,
+        crate::ServiceClass::Standard => 2,
+        crate::ServiceClass::Background => 3,
+    };
+    image[50..52].copy_from_slice(&identity.coordinates.batch_bucket.0.to_le_bytes());
+    image[52..84].copy_from_slice(&identity.capability_key.get());
+    for (ordinal, generation) in identity.generations.components().into_iter().enumerate() {
+        image[84 + ordinal * 8..92 + ordinal * 8].copy_from_slice(&generation.to_le_bytes());
+    }
+    image[116..148].copy_from_slice(&identity.bound_set.get());
+    image[148..156].copy_from_slice(
+        &identity
+            .budget
+            .target_engine_service
+            .as_micros()
+            .to_le_bytes(),
+    );
+    image[156..164].copy_from_slice(
+        &identity
+            .budget
+            .hard_execution_bound
+            .as_micros()
+            .to_le_bytes(),
+    );
+    image[164..196].copy_from_slice(&identity.budget.stale_disposition_bound.get());
+    image[196..204].copy_from_slice(
+        &identity
+            .budget
+            .stale_successor_ceiling
+            .as_micros()
+            .to_le_bytes(),
+    );
+    image[204..212].copy_from_slice(&identity.budget.phase_work_ceiling.get().to_le_bytes());
+    image
+}
+
 fn key(tag: u8, id: [u8; 32]) -> [u8; 33] {
     let mut key = [0; 33];
     key[0] = tag;
@@ -2229,6 +5166,7 @@ pub(crate) struct ValidatedBundleChange<
 > {
     ledger: &'ledger mut SupportChargeLedger<R, F, H>,
     change: BundleChange<'input, 'work, H>,
+    c17: c17::PreparedC16Bundle,
 }
 impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
     for ValidatedBundleChange<'_, '_, '_, R, F, H>
@@ -2290,6 +5228,7 @@ pub(crate) struct ValidatedWithdrawal<
 > {
     ledger: &'ledger mut SupportChargeLedger<R, F, H>,
     change: PreparedWithdrawal<'work, H>,
+    c17: c17::PreparedC16Withdrawal,
 }
 impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
     for ValidatedWithdrawal<'_, '_, R, F, H>
@@ -2319,6 +5258,7 @@ pub(crate) struct ValidatedTombstone<'ledger, 'work, const R: usize, const F: us
 {
     ledger: &'ledger mut SupportChargeLedger<R, F, H>,
     change: PreparedTombstone<'work, H>,
+    c17: c17::PreparedC16Tombstone,
 }
 impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
     for ValidatedTombstone<'_, '_, R, F, H>
@@ -2345,12 +5285,15 @@ enum CellSlot {
     Occupied {
         owner_record: u32,
         cell: OutstandingCreditCell,
+        current: u64,
         next_owned: u32,
     },
 }
 impl EntitlementCellArena {
     fn storage_bytes(capacity: u64) -> Option<u64> {
-        capacity.checked_mul(44).filter(|&total| total <= 2_097_152)
+        capacity
+            .checked_mul((std::mem::size_of::<CellSlot>() + std::mem::size_of::<u32>()) as u64)
+            .filter(|&total| total <= 2_097_152)
     }
     fn try_new(capacity: usize) -> Result<Self, FixedStorageError> {
         if capacity == 0 || capacity >= NO_NODE as usize {
@@ -2455,6 +5398,7 @@ impl EntitlementCellArena {
             self.slots[index as usize] = CellSlot::Occupied {
                 owner_record: owner,
                 cell: *cell,
+                current: 0,
                 next_owned: head,
             };
             head = index;
@@ -2485,13 +5429,18 @@ impl EntitlementCellArena {
             let CellSlot::Occupied {
                 owner_record,
                 cell,
+                current,
                 next_owned,
             } = *slot
             else {
                 return Err(FixedStorageError::NonCanonical);
             };
             check!(work, owner_record == owner, FixedStorageError::NonCanonical)?;
-            check!(work, cell == *expected, FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                cell == *expected && current <= cell.max_outstanding,
+                FixedStorageError::NonCanonical
+            )?;
             check!(
                 work,
                 (next_owned == NO_NODE) == (position + 1 == count),
@@ -2519,13 +5468,18 @@ impl EntitlementCellArena {
             work.record(WorkDimension::InvariantChecks, 1)?;
             let CellSlot::Occupied {
                 owner_record,
+                cell,
+                current,
                 next_owned,
-                ..
             } = *slot
             else {
                 return Err(FixedStorageError::NonCanonical);
             };
-            check!(work, owner_record == owner, FixedStorageError::NonCanonical)?;
+            check!(
+                work,
+                owner_record == owner && current <= cell.max_outstanding,
+                FixedStorageError::NonCanonical
+            )?;
             check!(
                 work,
                 (next_owned == NO_NODE) == (position + 1 == count),
@@ -2552,13 +5506,17 @@ impl EntitlementCellArena {
                 .ok_or(FixedStorageError::NonCanonical)?;
             let CellSlot::Occupied {
                 owner_record,
+                cell,
+                current,
                 next_owned,
-                ..
             } = *slot
             else {
                 return Err(FixedStorageError::NonCanonical);
             };
-            if owner_record != owner || (next_owned == NO_NODE) != (position + 1 == count) {
+            if owner_record != owner
+                || current > cell.max_outstanding
+                || (next_owned == NO_NODE) != (position + 1 == count)
+            {
                 return Err(FixedStorageError::NonCanonical);
             }
             index = next_owned;
@@ -2896,12 +5854,12 @@ impl TaggedIdentityIndex {
     /// leaf, independent of `E`. No key copy and no allocation; each visited
     /// branch and the visited leaf charge one VisitedEntities and one
     /// InvariantChecks.
-    fn find(
+    fn find<W: WorkRecorder + ?Sized>(
         &self,
         records: &[RecordSlot],
         tag: u8,
         identity: &[u8; 32],
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<Option<u32>, FixedStorageError> {
         if self.root != NO_NODE {
             let route = u64::from(IDENTITY_BITS) + 1;
@@ -2969,11 +5927,11 @@ impl TaggedIdentityIndex {
     /// VisitedEntities and one InvariantChecks per visited branch and one of
     /// each for the visited leaf. Returns the leaf index, or `NO_NODE` for an
     /// empty tree.
-    fn locate(
+    fn locate<W: WorkRecorder + ?Sized>(
         &self,
         tag: u8,
         identity: &[u8; 32],
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<u32, FixedStorageError> {
         let mut node = self.root;
         let mut prior = None;
@@ -3638,14 +6596,28 @@ impl RequestBundleStore {
     fn free_branch_len(&self) -> usize {
         self.identities.free_branch_len()
     }
+    fn selected_record_precharged(&self) -> Result<u32, FixedStorageError> {
+        let position = self
+            .free_records
+            .len()
+            .checked_sub(1)
+            .ok_or(FixedStorageError::Capacity)?;
+        let record = self.free_records[position];
+        matches!(
+            self.records.get(record as usize),
+            Some(RecordSlot::Vacant { free_position }) if *free_position == position as u32
+        )
+        .then_some(record)
+        .ok_or(FixedStorageError::NonCanonical)
+    }
     fn is_empty(&self) -> bool {
         self.occupied_records == 0
     }
-    fn find(
+    fn find<W: WorkRecorder + ?Sized>(
         &self,
         tag: u8,
         identity: &[u8; 32],
-        work: &mut WorkMeter,
+        work: &mut W,
     ) -> Result<Option<u32>, FixedStorageError> {
         if (self.identities.root == NO_NODE) != (self.occupied_records == 0) {
             return Err(FixedStorageError::NonCanonical);
@@ -3946,7 +6918,14 @@ impl RequestBundleStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Duration, HotPathWorkBudget, WorkBudgetError};
+    use crate::{
+        AuthorizedCapabilitySet, BackendGeneration, BatchBucket, CandidateCoordinates, CandidateId,
+        CandidateMember, CapabilityKey, Duration, ExecutionPhase, GenerationVector,
+        HotPathWorkBudget, ModelId, PlanMemberFunding, PlanSupportObligation,
+        PlanSupportObligations, RuntimeOverheadBoundSetId, RuntimeOverheadGeneration,
+        SafetyGeneration, SchedulerGeneration, SchedulingSnapshot, ServiceClass, TokenCount,
+        TurnBudget, TurnPlanId, WorkBudgetError, WorkCandidate,
+    };
     use FixedStorageError::{Duplicate, WindowExceeded};
     use SupportFundingClaim::{
         AdmissionInitial as Initial, LifecycleReserve as Lifecycle, OrdinaryReservation as Reserved,
@@ -3990,7 +6969,12 @@ mod tests {
         ledger.reserve(ledger.generation(), spec(n, c, pool, claims), &mut work())
     }
     fn add(ledger: &mut Ledger, n: u8, credit: u8) -> Result {
-        put(ledger, n, credit, Ordinary, &[Reserved([n; 32])])
+        let mut value = [credit; 32];
+        value[31] ^= 0x80;
+        let claims = [Reserved([n; 32])];
+        let mut input = spec(n, credit, Ordinary, &claims);
+        input.physical_credit = PhysicalStartCreditId::new(value).unwrap();
+        ledger.reserve(ledger.generation(), input, &mut work())
     }
     /// Generic-reserve fixture with the Ordinary pool carrying the same
     /// capacities the generic tests previously used on the Mandatory pool:
@@ -4026,15 +7010,15 @@ mod tests {
         assert_eq!(std::mem::size_of::<BundleState>(), 1);
         assert_eq!(
             support_storage_bytes(3, 1_025, 1_025, 21 * 1_025, 4, 8),
-            Ok(488_736)
+            Ok(488_800)
         );
         assert_eq!(
             support_storage_bytes(3, 7_211, 1_025, 21 * 1_025, 4, 8),
-            Ok(2_097_096)
+            Ok(2_097_160)
         );
         assert_eq!(
             support_storage_bytes(3, 7_212, 1_025, 21 * 1_025, 4, 8),
-            Ok(2_097_356)
+            Ok(2_097_420)
         );
         assert_eq!(
             bundle_reserve_work::<8>(168, 19),
@@ -4050,8 +7034,8 @@ mod tests {
         );
     }
     #[test]
-    fn c16_whole_ledger_storage_accepts_exact_boundary_and_rejects_first_invalid() {
-        type BoundaryLedger = SupportChargeLedger<8_192, 1_025, 3>;
+    fn c17_whole_ledger_storage_accepts_exact_boundary_and_rejects_first_invalid() {
+        type BoundaryLedger = SupportChargeLedger<16_531, 2_057, 3>;
         let generation = SupportLedgerGeneration::new(1).unwrap();
         let capacities = |records: u32| {
             [
@@ -4059,40 +7043,47 @@ mod tests {
                 [1, 0, 0],
                 [1, 0, 0],
                 [records, 0, 0],
-                [1_025, 0, 0],
+                [2_057, 0, 0],
             ]
         };
-        let starts = [[
-            FixedStartCountBound(Duration::from_micros(1), 1),
-            FixedStartCountBound(Duration::from_micros(2), 1),
-            FixedStartCountBound(Duration::from_micros(3), 1_025),
-        ]; 21];
-        let maxima = LifecycleReserveMaxima([1, 1_024, 1_024, 1, 1]);
+        let starts = std::array::from_fn(|row| {
+            let history = if row < 4 { 349 } else { 348 };
+            [
+                FixedStartCountBound(Duration::from_micros(1_000_000), 1),
+                FixedStartCountBound(Duration::from_micros(10_000_000), 1),
+                FixedStartCountBound(Duration::from_micros(20_000_000), history),
+            ]
+        });
+        let maxima = LifecycleReserveMaxima([1; 5]);
+        assert_eq!(
+            support_storage_bytes(3, 16_530, 2_057, 7_312, 1_152, 6_912),
+            Ok(6_372_556)
+        );
         let ledger = BoundaryLedger::try_new(
             generation,
-            capacities(7_211),
+            capacities(16_530),
             1_024,
             starts,
             maxima,
-            4,
-            8,
-            8,
+            1_152,
+            6_912,
+            63,
         )
-        .expect("2,097,096-byte whole ledger is valid");
-        assert_eq!(ledger.capacities[CREDITS], [7_211, 0, 0]);
-        assert_eq!(ledger.bundles.record_capacity(), 4);
+        .expect("63,942,176-byte whole ledger is valid");
+        assert_eq!(ledger.capacities[CREDITS], [16_530, 0, 0]);
+        assert_eq!(ledger.bundles.record_capacity(), 1_152);
         drop(ledger);
 
         assert_eq!(
             BoundaryLedger::try_new(
                 generation,
-                capacities(7_212),
+                capacities(16_531),
                 1_024,
                 starts,
                 maxima,
-                4,
-                8,
-                8,
+                1_152,
+                6_912,
+                63,
             )
             .unwrap_err(),
             SupportLedgerError::Storage(FixedStorageError::Capacity)
@@ -4263,35 +7254,33 @@ mod tests {
         fail(go(&mut ledger, 3, Begin(at(25))), CAPACITY_ERROR);
         let mut ledger = generic_ledger();
         let before = ledger.generation();
-        // Duplicate and reversed OrdinaryReservation claims reject with exact
-        // per-claim Work; the C16-only AdmissionInitial claim rejects at its
-        // first validity check.
+        // Duplicate and reversed OrdinaryReservation claims, plus the C16-only
+        // AdmissionInitial claim, reject without charging the authoritative
+        // meter.
         for claims in [
             [Reserved([1; 32]); 2],
             [Reserved([2; 32]), Reserved([1; 32])],
         ] {
             let mut measured = work();
-            let result = ledger.reserve(before, spec(7, 7, Ordinary, &claims), &mut measured);
+            let result = ledger.reserve(before, spec(7, 8, Ordinary, &claims), &mut measured);
             fail(result, InvalidInput);
-            assert_eq!(measured.witness().value(WorkDimension::VisitedEntities), 2);
-            assert_eq!(measured.witness().value(WorkDimension::InvariantChecks), 8);
+            assert_eq!(measured.witness(), HotPathWorkWitness::new([0; 5]));
         }
         let mut measured = work();
         let result = ledger.reserve(
             before,
-            spec(7, 7, Mandatory, &[Initial([7; 32])]),
+            spec(7, 8, Mandatory, &[Initial([7; 32])]),
             &mut measured,
         );
         fail(result, InvalidInput);
-        assert_eq!(measured.witness().value(WorkDimension::VisitedEntities), 1);
-        assert_eq!(measured.witness().value(WorkDimension::InvariantChecks), 7);
+        assert_eq!(measured.witness(), HotPathWorkWitness::new([0; 5]));
         assert_eq!((ledger.generation(), ledger.records.len()), (before, 0));
         let mut measured = work();
-        let valid = spec(7, 7, Ordinary, &[Reserved([7; 32])]);
+        let valid = spec(7, 8, Ordinary, &[Reserved([7; 32])]);
         ledger.reserve(before, valid, &mut measured).unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([75, 366, 0, 0, 20])
+            HotPathWorkWitness::new([1_134, 1_616_904, 0, 0, 1_060])
         );
         let mut ledger = generic_ledger();
         let before = ledger.generation();
@@ -4301,11 +7290,11 @@ mod tests {
             .unwrap();
         let result = ledger.reserve(
             before,
-            spec(7, 7, Ordinary, &[Reserved([7; 32])]),
+            spec(7, 8, Ordinary, &[Reserved([7; 32])]),
             &mut exhausted,
         );
         let error =
-            WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_704_575, 1_704_576);
+            WorkBudgetError::BudgetExceeded(WorkDimension::VisitedEntities, 1_704_575, 1_705_709);
         fail(result, error.into());
         assert_eq!((ledger.generation(), ledger.records.len()), (before, 0));
         // Generic reserve rejects the C16-only AdmissionInitial claim even on
@@ -4400,7 +7389,7 @@ mod tests {
         let next = ledger.commit(change, &mut measured).unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([74, 308, 0, 0, 22])
+            HotPathWorkWitness::new([1_133, 1_616_904, 0, 0, 1_062])
         );
         let mut rejected_work = work();
         rejected!(ledger, ledger.commit(replay, &mut rejected_work), Stale);
@@ -4435,7 +7424,7 @@ mod tests {
         );
         assert_eq!(
             finished.witness(),
-            HotPathWorkWitness::new([1, 177, 0, 0, 4])
+            HotPathWorkWitness::new([1_090, 1_616_904, 0, 0, 1_044])
         );
         assert_eq!(ledger.records.get(0).unwrap().3, Retained);
 
@@ -4545,8 +7534,8 @@ mod tests {
         assert_eq!(ledger.records.get(0).unwrap().3, Active);
         assert_eq!(ledger.records.get(1).unwrap().3, ClosedPending);
 
-        let resolved_work = HotPathWorkWitness::new([1, 144, 0, 0, 5]);
-        let rejected_work = HotPathWorkWitness::new([1, 144, 0, 0, 4]);
+        let resolved_work = HotPathWorkWitness::new([1_060, 1_616_904, 0, 0, 1_045]);
+        let rejected_work = HotPathWorkWitness::new([0; 5]);
         let run = |kind, result, state| {
             let mut spec = life(result as u8 + 10, kind);
             spec.expires_at = (kind == Next).then_some(at(3));
@@ -4930,6 +7919,4385 @@ mod tests {
         )
         .unwrap()
     }
+
+    type PlanLedger = SupportChargeLedger<512, 256, 1>;
+    type TopologyLedger = SupportChargeLedger<512, 256, 3>;
+
+    fn plan_ledger() -> PlanLedger {
+        PlanLedger::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            [[0, 128, 0]; 5],
+            4,
+            [[FixedStartCountBound(Duration::from_micros(10), 64); 1]; 21],
+            LifecycleReserveMaxima([1, 2, 2, 1, 1]),
+            8,
+            16,
+            4,
+        )
+        .unwrap()
+    }
+
+    fn topology_ledger() -> TopologyLedger {
+        TopologyLedger::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            [[0, 128, 0]; 5],
+            4,
+            std::array::from_fn(|_| {
+                std::array::from_fn(|horizon| {
+                    FixedStartCountBound(Duration::from_micros((horizon as u64 + 1) * 10), 64)
+                })
+            }),
+            LifecycleReserveMaxima([1, 2, 2, 1, 1]),
+            8,
+            16,
+            4,
+        )
+        .unwrap()
+    }
+
+    fn plan_identity_bytes(n: u8) -> [u8; 32] {
+        let mut identity = [0; 32];
+        identity[0] = n;
+        identity
+    }
+
+    fn reserve_plan_bundle<const RECORDS: usize, const HORIZONS: usize>(
+        ledger: &mut SupportChargeLedger<RECORDS, 256, HORIZONS>,
+        n: u8,
+    ) -> PlanMemberFunding {
+        let cells = [
+            OutstandingCreditCell {
+                operation: SupportOperation::FormCandidates,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 4,
+            },
+            OutstandingCreditCell {
+                operation: SupportOperation::ObserveTurnReceipt,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 4,
+            },
+        ];
+        let mut input = bundle_input(n, &cells);
+        input.timing.bound_set = RuntimeOverheadBoundSetId::new(plan_identity_bytes(200)).unwrap();
+        let funding = PlanMemberFunding {
+            request_id: input.request_owner,
+            entitlement: input.entitlement,
+            credit_vector: input.vector,
+        };
+        let mut measured = work();
+        let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
+        ledger.validate_bundle(change).unwrap().commit_bundle();
+        funding
+    }
+
+    fn turn_plan(funders: &[PlanMemberFunding; 4], plan_id: u128, phase_work: u64) -> TurnPlan<4> {
+        turn_plan_members(funders, plan_id, phase_work)
+    }
+
+    fn turn_plan_members(
+        funders: &[PlanMemberFunding],
+        plan_id: u128,
+        phase_work: u64,
+    ) -> TurnPlan<4> {
+        let capability = CapabilityKey::new(plan_identity_bytes(201)).unwrap();
+        let bound_set = RuntimeOverheadBoundSetId::new(plan_identity_bytes(200)).unwrap();
+        let overhead = RuntimeOverheadGeneration::new(1).unwrap();
+        let coordinates = CandidateCoordinates {
+            model_id: ModelId::new(1).unwrap(),
+            phase: ExecutionPhase::Decode,
+            service_class: ServiceClass::Interactive,
+            batch_bucket: BatchBucket(1),
+        };
+        let mut evidence = crate::BoundedVec::new();
+        let mut eligible = crate::BoundedSet::new();
+        let mut funding = crate::BoundedVec::new();
+        for member in funders {
+            let mut authorized = AuthorizedCapabilitySet::<1>::new();
+            authorized.try_insert(capability).unwrap();
+            evidence
+                .try_push(CandidateMember {
+                    request_id: member.request_id,
+                    coordinates,
+                    authorized_capabilities: authorized,
+                    bound_set,
+                    runtime_overhead_generation: overhead,
+                })
+                .unwrap();
+            eligible.try_insert(member.request_id).unwrap();
+            funding.try_push(*member).unwrap();
+        }
+        let candidate = WorkCandidate::try_new(
+            CandidateId::new(1).unwrap(),
+            coordinates,
+            capability,
+            evidence,
+        )
+        .unwrap();
+        let mut candidates = crate::BoundedVec::new();
+        candidates.try_push(candidate).unwrap();
+        let generations = GenerationVector::new(
+            SchedulerGeneration::new(1).unwrap(),
+            BackendGeneration::new(1).unwrap(),
+            SafetyGeneration::new(1).unwrap(),
+            overhead,
+        );
+        let snapshot = SchedulingSnapshot::<4, 1, 4>::try_new(
+            MonotonicTime::from_micros(1),
+            generations,
+            eligible,
+            candidates,
+            crate::BoundedVec::new(),
+        )
+        .unwrap();
+        let base = u8::try_from(plan_id).unwrap().checked_mul(20).unwrap();
+        let obligation = |n| PlanSupportObligation {
+            id: SupportOperationObligationId::new(plan_identity_bytes(base + n)).unwrap(),
+            physical_credit: PhysicalStartCreditId::new(plan_identity_bytes(base + n + 10))
+                .unwrap(),
+            funders: funding.clone(),
+        };
+        TurnPlan::try_new(
+            TurnPlanId::new(plan_id).unwrap(),
+            &snapshot,
+            CandidateId::new(1).unwrap(),
+            funding,
+            TurnBudget {
+                target_engine_service: Duration::from_micros(1),
+                hard_execution_bound: Duration::from_micros(2),
+                stale_disposition_bound: crate::StalePlanDispositionBoundId::new(
+                    plan_identity_bytes(220),
+                )
+                .unwrap(),
+                stale_successor_ceiling: Duration::from_micros(3),
+                phase_work_ceiling: TokenCount::new(phase_work),
+            },
+            PlanSupportObligations {
+                receipt_observation: obligation(1),
+                conditional_continuation_formation: obligation(2),
+                rejection_or_local_stale_formation: obligation(3),
+            },
+        )
+        .unwrap()
+    }
+    type LifecyclePlanLedger = SupportChargeLedger<256, 256, 3>;
+
+    fn lifecycle_plan_ledger() -> LifecyclePlanLedger {
+        let starts = std::array::from_fn(|_| {
+            [
+                FixedStartCountBound(Duration::from_micros(10), 16),
+                FixedStartCountBound(Duration::from_micros(20), 16),
+                FixedStartCountBound(Duration::from_micros(30), 16),
+            ]
+        });
+        LifecyclePlanLedger::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            [[4, 64, 0]; 5],
+            4,
+            starts,
+            LifecycleReserveMaxima([4; 5]),
+            8,
+            16,
+            4,
+        )
+        .unwrap()
+    }
+
+    fn reserve_exact_plan_bundle(ledger: &mut LifecyclePlanLedger, n: u8) -> PlanMemberFunding {
+        let cells = [
+            OutstandingCreditCell {
+                operation: SupportOperation::FormCandidates,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 2,
+            },
+            OutstandingCreditCell {
+                operation: SupportOperation::ObserveTurnReceipt,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 1,
+            },
+        ];
+        let mut input = bundle_input(n, &cells);
+        input.timing.bound_set = RuntimeOverheadBoundSetId::new(plan_identity_bytes(200)).unwrap();
+        let funding = PlanMemberFunding {
+            request_id: input.request_owner,
+            entitlement: input.entitlement,
+            credit_vector: input.vector,
+        };
+        let mut measured = work();
+        let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
+        ledger.validate_bundle(change).unwrap().commit_bundle();
+        funding
+    }
+
+    fn lifecycle_record(
+        n: u8,
+        class: usize,
+        pool: usize,
+        axis: usize,
+        horizon: usize,
+        amount: usize,
+    ) -> c17::LifecycleRecordInput {
+        assert!((1..=4).contains(&amount));
+        let mut final_owner = [n; 64];
+        final_owner[0] = n.max(1);
+        let mut obligation_raw = [0; 32];
+        obligation_raw[0] = 0xe0;
+        obligation_raw[31] = n;
+        let mut credit_raw = [0; 32];
+        credit_raw[0] = 0xe1;
+        credit_raw[31] = n;
+        let mut aggregate = [0; 21];
+        aggregate[..6].copy_from_slice(&[
+            class as u64,
+            pool as u64,
+            axis as u64,
+            horizon as u64,
+            amount as u64,
+            1,
+        ]);
+        let mut owners = [c17::LifecycleOwnerRow::ZERO; 4];
+        for (ordinal, owner) in owners[..amount].iter_mut().enumerate() {
+            let value = u64::from(n) * 8 + ordinal as u64 + 1;
+            *owner = c17::LifecycleOwnerRow {
+                owner: value,
+                request: value,
+                entitlement: value,
+                vector: value,
+                source: value,
+                group: value,
+                root: value,
+                formation: value,
+                link: value,
+                reserve: value,
+                class: class as u64,
+                pool: pool as u64,
+                amount: 1,
+                generation: 1,
+                state: 1,
+                zero: 0,
+            };
+        }
+        c17::LifecycleRecordInput {
+            final_owner,
+            owner_set_ref: [n.max(1); 8],
+            obligation_raw,
+            credit_raw,
+            predecessor: [n.wrapping_add(1).max(1); 32],
+            scope: [n.wrapping_add(2).max(1); 32],
+            claim: [n.wrapping_add(3).max(1); 32],
+            physical_credit: [n.wrapping_add(4).max(1); 32],
+            kind: 1,
+            occurred_at: u64::from(n.max(1)),
+            expires_at: None,
+            aggregate,
+            owners,
+        }
+    }
+
+    fn seed_lifecycle_reservation(
+        ledger: &mut LifecyclePlanLedger,
+        class: usize,
+        pool: usize,
+        amount: u32,
+    ) {
+        ledger.reserved[class][pool] = amount;
+        ledger.reserved[CREDITS][pool] = amount;
+        ledger.reserved[CLAIMS][pool] = amount;
+    }
+
+    type MaximumLifecycleLedger = SupportChargeLedger<8_192, 4_096, 3>;
+
+    fn maximum_lifecycle_ledger() -> MaximumLifecycleLedger {
+        let mut capacities = [[0; POOLS]; 5];
+        for row in &mut capacities {
+            row[Mandatory as usize] = 2_048;
+        }
+        let starts = std::array::from_fn(|_| {
+            [
+                FixedStartCountBound(Duration::from_micros(10), 4_096),
+                FixedStartCountBound(Duration::from_micros(20), 4_096),
+                FixedStartCountBound(Duration::from_micros(30), 4_096),
+            ]
+        });
+        let mut ledger = MaximumLifecycleLedger::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            capacities,
+            4,
+            starts,
+            LifecycleReserveMaxima([1, 1_023, 1_024, 1, 1]),
+            8,
+            16,
+            4,
+        )
+        .unwrap();
+        ledger.c17 = c17::SupportC17::try_new(c17::SupportC17Capacities::lifecycle_testing(
+            crate::c17_layout::LIFECYCLE_CAPACITY,
+        ))
+        .unwrap();
+        ledger
+    }
+
+    fn reserve_maximum_lifecycle_plan_bundle(
+        ledger: &mut MaximumLifecycleLedger,
+    ) -> PlanMemberFunding {
+        let cells = [
+            OutstandingCreditCell {
+                operation: SupportOperation::FormCandidates,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 1_200,
+            },
+            OutstandingCreditCell {
+                operation: SupportOperation::ObserveTurnReceipt,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 4,
+            },
+        ];
+        let mut input = bundle_input(4, &cells);
+        input.timing.bound_set = RuntimeOverheadBoundSetId::new(plan_identity_bytes(200)).unwrap();
+        let funding = PlanMemberFunding {
+            request_id: input.request_owner,
+            entitlement: input.entitlement,
+            credit_vector: input.vector,
+        };
+        let mut measured = work();
+        let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
+        ledger.validate_bundle(change).unwrap().commit_bundle();
+        funding
+    }
+
+    fn maximum_lifecycle_raw(prefix: u8, ordinal: usize) -> [u8; 32] {
+        let mut raw = [0; 32];
+        raw[0] = prefix;
+        raw[24..].copy_from_slice(&(ordinal as u64 + 1).to_be_bytes());
+        raw
+    }
+
+    fn maximum_lifecycle_spec(
+        identity: crate::TurnPlanIdentity,
+        ordinal: usize,
+    ) -> crate::core::C17LifecycleRecordSpec {
+        crate::core::C17LifecycleRecordSpec {
+            root: crate::core::C17LifecycleRootSpec::Plan {
+                identity,
+                branch: crate::PlanBranch::Continuation,
+            },
+            obligation: SupportOperationObligationId::new(maximum_lifecycle_raw(0x40, ordinal))
+                .unwrap(),
+            credit: PhysicalStartCreditId::new(maximum_lifecycle_raw(0x80, ordinal)).unwrap(),
+            predecessor: SupportCausalPredecessorId(maximum_lifecycle_raw(0x90, ordinal)),
+            scope: SupportCallScopeId(maximum_lifecycle_raw(0xa0, ordinal)),
+            claim: maximum_lifecycle_raw(0xb0, ordinal),
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            occurred_at: MonotonicTime::from_micros(ordinal as u64 + 3),
+            expires_at: None,
+            operation: SupportOperation::FormCandidates,
+            pool: Mandatory,
+            horizon: 0,
+        }
+    }
+
+    fn maximum_lifecycle_aggregate(total: usize) -> c17::LifecycleAggregate {
+        let axis = SupportOperation::FormCandidates as usize * POOLS + Mandatory as usize;
+        let records: Vec<_> = (0..total)
+            .map(|ordinal| {
+                lifecycle_record(
+                    (ordinal % 250 + 1) as u8,
+                    CONDITIONAL,
+                    Mandatory as usize,
+                    axis,
+                    0,
+                    1,
+                )
+            })
+            .collect();
+        c17::LifecycleAggregate::from_records(&records).unwrap()
+    }
+
+    #[inline(never)]
+    fn commit_maximum_lifecycle_plan(ledger: &mut MaximumLifecycleLedger, plan: &TurnPlan<4>) {
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+    }
+
+    #[inline(never)]
+    fn begin_maximum_lifecycle_batch(ledger: &mut MaximumLifecycleLedger, total: usize) {
+        let mut begin_work = work();
+        let begin = ledger
+            .prepare_c17_lifecycle_begin(
+                ledger.generation(),
+                total,
+                maximum_lifecycle_aggregate(total),
+                &mut begin_work,
+            )
+            .unwrap();
+        assert_eq!(
+            begin_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_LIFECYCLE_BEGIN)
+        );
+        ledger.commit_c17_lifecycle_begin(begin);
+    }
+
+    #[inline(never)]
+    fn stage_maximum_lifecycle_chunk(
+        ledger: &mut MaximumLifecycleLedger,
+        identity: crate::TurnPlanIdentity,
+        chunk_start: usize,
+        len: usize,
+    ) {
+        let specs: Vec<_> = (chunk_start..chunk_start + len)
+            .map(|ordinal| Some(maximum_lifecycle_spec(identity, ordinal)))
+            .collect();
+        let mut stage_work = work();
+        let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+            None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+            ledger,
+            &specs,
+            &mut stage_work,
+        )
+        .unwrap();
+        assert_eq!(
+            stage_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_LIFECYCLE_STAGE)
+        );
+        crate::transition_coordinator::commit_lifecycle_stage(
+            None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+            ledger,
+            stage,
+        );
+    }
+
+    #[inline(never)]
+    fn stage_maximum_lifecycle_batch(
+        ledger: &mut MaximumLifecycleLedger,
+        identity: crate::TurnPlanIdentity,
+        batch_start: usize,
+        total: usize,
+    ) {
+        for chunk_start in (batch_start..batch_start + total).step_by(8) {
+            let len = (batch_start + total - chunk_start).min(8);
+            stage_maximum_lifecycle_chunk(ledger, identity, chunk_start, len);
+        }
+    }
+
+    #[inline(never)]
+    fn finalize_maximum_lifecycle_batch(ledger: &mut MaximumLifecycleLedger) {
+        let generation_before_finalize = ledger.generation();
+        let mut finalize_work = work();
+        let finalize = ledger
+            .prepare_c17_lifecycle_finalize(&mut finalize_work)
+            .unwrap();
+        assert_eq!(
+            finalize_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_LIFECYCLE_FINALIZE)
+        );
+        let committed = ledger.commit_c17_lifecycle_finalize(finalize);
+        assert_eq!(committed.get(), generation_before_finalize.get() + 1);
+        assert_eq!(ledger.c17.pending_lifecycle_aggregate().unwrap(), None);
+        let pending = ledger.c17.pending_header_for_test();
+        assert_eq!(pending.0[0], 0);
+        assert_eq!(u16::from_le_bytes(pending.0[16..18].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(pending.0[18..20].try_into().unwrap()), 0);
+    }
+
+    #[inline(never)]
+    fn commit_maximum_lifecycle_batch(
+        ledger: &mut MaximumLifecycleLedger,
+        identity: crate::TurnPlanIdentity,
+        batch_start: usize,
+        total: usize,
+    ) {
+        begin_maximum_lifecycle_batch(ledger, total);
+        stage_maximum_lifecycle_batch(ledger, identity, batch_start, total);
+        finalize_maximum_lifecycle_batch(ledger);
+    }
+
+    #[inline(never)]
+    fn assert_maximum_lifecycle_publication(
+        ledger: &MaximumLifecycleLedger,
+        owner_before: u32,
+        support_before: SupportLedgerGeneration,
+        c17_before: u64,
+    ) {
+        assert_eq!(ledger.generation().get(), support_before.get() + 2);
+        assert_eq!(ledger.c17.generation(), c17_before + 148);
+        assert_eq!(ledger.c17.current_counts_for_test()[16], 1_152);
+        assert_eq!(
+            ledger.bundles.get_record(0).unwrap().linked_claims,
+            owner_before + 1_152
+        );
+        for ordinal in [0usize, 1_023, 1_024, 1_151] {
+            let image = ledger
+                .c17
+                .lifecycle_record_by_raw(maximum_lifecycle_raw(0x40, ordinal))
+                .unwrap()
+                .expect("finalized lifecycle record is directly visible");
+            assert_eq!(image[0], 1);
+            assert_eq!(image[96..128], maximum_lifecycle_raw(0x40, ordinal));
+        }
+    }
+
+    #[inline(never)]
+    fn reject_maximum_lifecycle_first_one_over(ledger: &MaximumLifecycleLedger) {
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.c17.current_counts_for_test(),
+            ledger.c17.pending_header_for_test(),
+        );
+        let mut rejected_work = work();
+        assert_eq!(
+            ledger
+                .prepare_c17_lifecycle_begin(
+                    ledger.generation(),
+                    1,
+                    maximum_lifecycle_aggregate(1),
+                    &mut rejected_work,
+                )
+                .unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::Capacity)
+        );
+        assert_eq!(rejected_work.witness(), HotPathWorkWitness::default());
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.c17.generation(),
+                ledger.c17.current_counts_for_test(),
+                ledger.c17.pending_header_for_test(),
+            ),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn c17_lifecycle_1024_stage_chunks_finalize_then_fill_128_headroom() {
+        let mut ledger = maximum_lifecycle_ledger();
+        let funding = reserve_maximum_lifecycle_plan_bundle(&mut ledger);
+        let plan = turn_plan_members(&[funding], 1, 1_200);
+        commit_maximum_lifecycle_plan(&mut ledger, &plan);
+        let owner_before = ledger.bundles.get_record(0).unwrap().linked_claims;
+        let support_before = ledger.generation();
+        let c17_before = ledger.c17.generation();
+        commit_maximum_lifecycle_batch(&mut ledger, plan.identity(), 0, 1_024);
+        commit_maximum_lifecycle_batch(&mut ledger, plan.identity(), 1_024, 128);
+        assert_maximum_lifecycle_publication(&ledger, owner_before, support_before, c17_before);
+        reject_maximum_lifecycle_first_one_over(&ledger);
+    }
+
+    #[test]
+    fn c17_lifecycle_1_8_9_immediate_partial_mixed_abort_and_reuse() {
+        let mut ledger = lifecycle_plan_ledger();
+        let funding = reserve_plan_bundle(&mut ledger, 4);
+        let plan = turn_plan_members(&[funding], 1, 16);
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+        let axis = SupportOperation::FormCandidates as usize * POOLS + Mandatory as usize;
+        ledger.reserved[CONDITIONAL][Mandatory as usize] = 16;
+        ledger.reserved[CREDITS][Mandatory as usize] = 16;
+        ledger.reserved[CLAIMS][Mandatory as usize] = 16;
+        ledger.vector_capacity[axis][0] = 16;
+        let baseline_counts = ledger.c17.current_counts_for_test();
+
+        for (total, staged, expected_abort_chunks) in [(1usize, 0usize, 1), (8, 3, 1), (9, 8, 2)] {
+            let begin = ledger
+                .prepare_c17_lifecycle_begin(
+                    ledger.generation(),
+                    total,
+                    maximum_lifecycle_aggregate(total),
+                    &mut work(),
+                )
+                .unwrap();
+            ledger.commit_c17_lifecycle_begin(begin);
+
+            for chunk_start in (0..staged).step_by(8) {
+                let len = (staged - chunk_start).min(8);
+                let specs: Vec<_> = (chunk_start..chunk_start + len)
+                    .map(|ordinal| Some(maximum_lifecycle_spec(plan.identity(), ordinal)))
+                    .collect();
+                let mut stage_work = work();
+                let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+                    None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+                    &ledger,
+                    &specs,
+                    &mut stage_work,
+                )
+                .unwrap();
+                assert_eq!(
+                    stage_work.witness(),
+                    HotPathWorkWitness::new(crate::c17_layout::WORK_LIFECYCLE_STAGE)
+                );
+                crate::transition_coordinator::commit_lifecycle_stage(
+                    None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+                    &mut ledger,
+                    stage,
+                );
+            }
+
+            let mut terminal = false;
+            let mut chunks = 0;
+            while !terminal {
+                let mut abort_work = work();
+                let abort = ledger.prepare_c17_lifecycle_abort(&mut abort_work).unwrap();
+                assert_eq!(
+                    abort_work.witness(),
+                    HotPathWorkWitness::new(crate::c17_layout::WORK_LIFECYCLE_ABORT)
+                );
+                terminal = ledger.commit_c17_lifecycle_abort(abort);
+                chunks += 1;
+            }
+            assert_eq!(chunks, expected_abort_chunks);
+            assert_eq!(ledger.c17.pending_lifecycle_aggregate().unwrap(), None);
+            assert_eq!(ledger.c17.current_counts_for_test(), baseline_counts);
+        }
+    }
+
+    #[test]
+    fn c17_lifecycle_withholding_blocks_plan_and_abort_releases_it() {
+        let mut ledger = lifecycle_plan_ledger();
+        let first = reserve_exact_plan_bundle(&mut ledger, 1);
+        let second = reserve_exact_plan_bundle(&mut ledger, 2);
+        let first_plan = turn_plan_members(&[first], 1, 1);
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                &first_plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+        let axis = SupportOperation::FormCandidates as usize * POOLS + Mandatory as usize;
+        let records = [lifecycle_record(
+            1,
+            CONDITIONAL,
+            Mandatory as usize,
+            axis,
+            0,
+            3,
+        )];
+        let aggregate = c17::LifecycleAggregate::from_records(&records).unwrap();
+        let begin = ledger
+            .prepare_c17_lifecycle_begin(ledger.generation(), records.len(), aggregate, &mut work())
+            .unwrap();
+        ledger.commit_c17_lifecycle_begin(begin);
+
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.usage,
+            ledger.reserved,
+            ledger.c17.current_counts_for_test(),
+        );
+        let second_plan = turn_plan_members(&[second], 2, 1);
+        assert_eq!(
+            ledger
+                .prepare_c17_plan_create(
+                    ledger.generation(),
+                    &second_plan,
+                    MonotonicTime::from_micros(3),
+                    &mut work(),
+                )
+                .unwrap_err(),
+            CAPACITY_ERROR
+        );
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.c17.generation(),
+                ledger.usage,
+                ledger.reserved,
+                ledger.c17.current_counts_for_test(),
+            ),
+            snapshot
+        );
+
+        let abort =
+            crate::transition_coordinator::prepare_lifecycle_abort(&ledger, &mut work()).unwrap();
+        assert!(crate::transition_coordinator::commit_lifecycle_abort(
+            &mut ledger,
+            abort
+        ));
+        assert!(
+            ledger
+                .prepare_c17_plan_create(
+                    ledger.generation(),
+                    &second_plan,
+                    MonotonicTime::from_micros(3),
+                    &mut work(),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn c17_lifecycle_withholding_blocks_c16_vector_and_terminal_abort_releases_it() {
+        let mut ledger = lifecycle_plan_ledger();
+        let axis = SupportOperation::DescribeModel as usize * POOLS + Ordinary as usize;
+        ledger.vector_capacity[axis][0] = 1;
+        seed_lifecycle_reservation(&mut ledger, CONDITIONAL, Ordinary as usize, 1);
+        let records = [lifecycle_record(
+            2,
+            CONDITIONAL,
+            Ordinary as usize,
+            axis,
+            0,
+            1,
+        )];
+        let aggregate = c17::LifecycleAggregate::from_records(&records).unwrap();
+        let begin = ledger
+            .prepare_c17_lifecycle_begin(ledger.generation(), records.len(), aggregate, &mut work())
+            .unwrap();
+        ledger.commit_c17_lifecycle_begin(begin);
+
+        let cells = [OutstandingCreditCell {
+            operation: SupportOperation::DescribeModel,
+            pool: Ordinary,
+            horizon: Duration::from_micros(10),
+            max_outstanding: 1,
+        }];
+        let input = bundle_input(3, &cells);
+        assert_eq!(
+            ledger.prepare_bundle(&input, &mut work()).unwrap_err(),
+            CAPACITY_ERROR
+        );
+        let abort = ledger.prepare_c17_lifecycle_abort(&mut work()).unwrap();
+        assert!(ledger.commit_c17_lifecycle_abort(abort));
+        assert!(ledger.prepare_bundle(&input, &mut work()).is_ok());
+    }
+
+    #[test]
+    fn c17_lifecycle_withholding_blocks_legacy_reserved_consumption() {
+        let mut ledger = lifecycle_plan_ledger();
+        let id = SupportOperationObligationId::new([40; 32]).unwrap();
+        let predecessor = SupportCausalPredecessorId([41; 32]);
+        let reserve = [LifecycleReserveSpec {
+            id,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            physical_credit: PhysicalStartCreditId::new([42; 32]).unwrap(),
+            predecessor,
+            scope: SupportCallScopeId([43; 32]),
+            claim: Lifecycle([44; 32]),
+            expires_at: None,
+        }];
+        ledger
+            .reserve_lifecycle(
+                ledger.generation(),
+                MonotonicTime::from_micros(1),
+                &reserve,
+                &mut work(),
+            )
+            .unwrap();
+        ledger
+            .resolve_lifecycle(
+                ledger.generation(),
+                predecessor,
+                MonotonicTime::from_micros(2),
+                &[id],
+                LifecycleTriggerResult::LoadSucceeded,
+                &mut work(),
+            )
+            .unwrap();
+        ledger.reserved[CREDITS][Mandatory as usize] = 1;
+        ledger.reserved[CLAIMS][Mandatory as usize] = 1;
+        let axis = SupportOperation::DescribeModel as usize * POOLS + Mandatory as usize;
+        let records = [lifecycle_record(3, ACTIVE, Mandatory as usize, axis, 0, 1)];
+        let aggregate = c17::LifecycleAggregate::from_records(&records).unwrap();
+        let begin = ledger
+            .prepare_c17_lifecycle_begin(ledger.generation(), records.len(), aggregate, &mut work())
+            .unwrap();
+        ledger.commit_c17_lifecycle_begin(begin);
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.usage,
+            ledger.reserved,
+            ledger.c17.current_counts_for_test(),
+        );
+        assert_eq!(
+            ledger
+                .transition(
+                    ledger.generation(),
+                    id,
+                    BeginSupport(MonotonicTime::from_micros(3)),
+                    &mut work(),
+                )
+                .unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.c17.generation(),
+                ledger.usage,
+                ledger.reserved,
+                ledger.c17.current_counts_for_test(),
+            ),
+            snapshot
+        );
+        let abort = ledger.prepare_c17_lifecycle_abort(&mut work()).unwrap();
+        assert!(ledger.commit_c17_lifecycle_abort(abort));
+        assert!(
+            ledger
+                .transition(
+                    ledger.generation(),
+                    id,
+                    BeginSupport(MonotonicTime::from_micros(3)),
+                    &mut work(),
+                )
+                .is_ok()
+        );
+    }
+
+    struct NonconflictingFinalizeFixture {
+        ledger: LifecyclePlanLedger,
+        raw_record: c17::LifecycleRecordInput,
+        axis: usize,
+    }
+
+    #[inline(never)]
+    fn nonconflicting_finalize_fixture() -> NonconflictingFinalizeFixture {
+        let mut ledger = lifecycle_plan_ledger();
+        let funding = reserve_plan_bundle(&mut ledger, 4);
+        let plan = turn_plan_members(&[funding], 1, 1);
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+        let axis = SupportOperation::FormCandidates as usize * POOLS + Mandatory as usize;
+        let raw_record = lifecycle_record(4, CONDITIONAL, Mandatory as usize, axis, 0, 1);
+        let aggregate = c17::LifecycleAggregate::from_records(&[raw_record]).unwrap();
+        let begin = ledger
+            .prepare_c17_lifecycle_begin(ledger.generation(), 1, aggregate, &mut work())
+            .unwrap();
+        ledger.commit_c17_lifecycle_begin(begin);
+        let specs = [Some(crate::core::C17LifecycleRecordSpec {
+            root: crate::core::C17LifecycleRootSpec::Plan {
+                identity: plan.identity(),
+                branch: crate::PlanBranch::Continuation,
+            },
+            obligation: SupportOperationObligationId::new(raw_record.obligation_raw).unwrap(),
+            credit: PhysicalStartCreditId::new(raw_record.credit_raw).unwrap(),
+            predecessor: SupportCausalPredecessorId(raw_record.predecessor),
+            scope: SupportCallScopeId(raw_record.scope),
+            claim: raw_record.claim,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            occurred_at: MonotonicTime::from_micros(raw_record.occurred_at),
+            expires_at: raw_record.expires_at.map(MonotonicTime::from_micros),
+            operation: SupportOperation::FormCandidates,
+            pool: Mandatory,
+            horizon: 0,
+        })];
+        let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+            None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+            &ledger,
+            &specs,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_lifecycle_stage(
+            None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+            &mut ledger,
+            stage,
+        );
+        NonconflictingFinalizeFixture {
+            ledger,
+            raw_record,
+            axis,
+        }
+    }
+
+    #[inline(never)]
+    fn advance_nonconflicting_support_and_raw(
+        fixture: &mut NonconflictingFinalizeFixture,
+    ) -> SupportLedgerGeneration {
+        let support_before = fixture.ledger.generation();
+        let raw_before = fixture.ledger.c17.raw_generation_for_test();
+        let claims = [Reserved([90; 32])];
+        fixture
+            .ledger
+            .reserve(
+                fixture.ledger.generation(),
+                spec(90, 91, Ordinary, &claims),
+                &mut work(),
+            )
+            .unwrap();
+        assert_eq!(fixture.ledger.generation().get(), support_before.get() + 1);
+        assert_eq!(fixture.ledger.c17.raw_generation_for_test(), raw_before + 1);
+        support_before
+    }
+
+    #[inline(never)]
+    fn finalize_after_nonconflicting_advance(
+        fixture: &mut NonconflictingFinalizeFixture,
+        support_before: SupportLedgerGeneration,
+    ) {
+        let finalize = fixture
+            .ledger
+            .prepare_c17_lifecycle_finalize(&mut work())
+            .unwrap();
+        let committed = fixture.ledger.commit_c17_lifecycle_finalize(finalize);
+        assert_eq!(committed.get(), support_before.get() + 2);
+        assert!(
+            fixture
+                .ledger
+                .c17
+                .lifecycle_record_by_raw(fixture.raw_record.obligation_raw)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            fixture.ledger.c17.pending_lifecycle_aggregate().unwrap(),
+            None
+        );
+        let owner = fixture.ledger.bundles.get_record(0).unwrap();
+        assert_eq!(owner.linked_claims, 4);
+        let cell = fixture
+            .ledger
+            .lifecycle_publication_cell(0, owner, fixture.axis, 0)
+            .unwrap();
+        assert!(matches!(
+            fixture.ledger.bundles.cells.slots[cell as usize],
+            CellSlot::Occupied { current: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn c17_lifecycle_finalize_rejects_corrupted_raw_header_after_image_without_burn() {
+        let fixture = nonconflicting_finalize_fixture();
+        let snapshot = (
+            fixture.ledger.generation(),
+            fixture.ledger.c17.generation(),
+            fixture.ledger.c17.raw_generation_for_test(),
+            fixture.ledger.c17.current_counts_for_test(),
+            fixture.ledger.c17.pending_header_for_test(),
+            fixture.ledger.usage,
+            fixture.ledger.reserved,
+            fixture.ledger.vector_usage,
+        );
+        let mut finalize_work = work();
+        let mut finalize = fixture
+            .ledger
+            .prepare_c17_lifecycle_finalize(&mut finalize_work)
+            .unwrap();
+        assert_eq!(
+            finalize_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_LIFECYCLE_FINALIZE)
+        );
+        let assignment = finalize.c17.raw_generation_assignment_for_test();
+        assert_eq!(assignment.destination_arena, 1);
+        assert_eq!(
+            assignment.destination_kind,
+            crate::c17_layout::DestinationKind::Header as u8
+        );
+        assert_eq!(assignment.image_len, 40);
+        assert_eq!(assignment.destination_slot, 0);
+        assert_eq!(
+            assignment.expected_generation,
+            fixture.ledger.c17.raw_generation_for_test()
+        );
+        assert_eq!(
+            u64::from_le_bytes(assignment.payload[..8].try_into().unwrap()),
+            assignment.expected_generation + 1
+        );
+
+        finalize.c17.corrupt_raw_generation_assignment_for_test();
+        assert_eq!(
+            fixture
+                .ledger
+                .validate_c17_lifecycle_finalize(&finalize)
+                .unwrap_err(),
+            SupportLedgerError::Generation
+        );
+        assert_eq!(
+            (
+                fixture.ledger.generation(),
+                fixture.ledger.c17.generation(),
+                fixture.ledger.c17.raw_generation_for_test(),
+                fixture.ledger.c17.current_counts_for_test(),
+                fixture.ledger.c17.pending_header_for_test(),
+                fixture.ledger.usage,
+                fixture.ledger.reserved,
+                fixture.ledger.vector_usage,
+            ),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn c17_lifecycle_finalize_rejects_direct_record_and_pointer_corruption_without_burn() {
+        let mut record_fixture = nonconflicting_finalize_fixture();
+        record_fixture
+            .ledger
+            .c17
+            .corrupt_inactive_lifecycle_record_for_test(0);
+        let record_before = record_fixture
+            .ledger
+            .c17
+            .inactive_lifecycle_image_for_test(0);
+        let record_snapshot = lifecycle_no_burn_snapshot(&record_fixture.ledger);
+        let mut record_work = work();
+        assert_eq!(
+            record_fixture
+                .ledger
+                .prepare_c17_lifecycle_finalize(&mut record_work)
+                .unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(record_work.witness(), HotPathWorkWitness::default());
+        assert_eq!(
+            lifecycle_no_burn_snapshot(&record_fixture.ledger),
+            record_snapshot
+        );
+        assert_eq!(
+            record_fixture
+                .ledger
+                .c17
+                .inactive_lifecycle_image_for_test(0),
+            record_before
+        );
+
+        let mut pointer_fixture = nonconflicting_finalize_fixture();
+        let raw_key = pointer_fixture.raw_record.obligation_raw;
+        pointer_fixture
+            .ledger
+            .c17
+            .corrupt_raw_owner_pointer_for_test(raw_key);
+        let pointer_before = pointer_fixture.ledger.c17.raw_owner_value_for_test(raw_key);
+        let pointer_snapshot = lifecycle_no_burn_snapshot(&pointer_fixture.ledger);
+        let mut pointer_work = work();
+        assert_eq!(
+            pointer_fixture
+                .ledger
+                .prepare_c17_lifecycle_finalize(&mut pointer_work)
+                .unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(pointer_work.witness(), HotPathWorkWitness::default());
+        assert_eq!(
+            lifecycle_no_burn_snapshot(&pointer_fixture.ledger),
+            pointer_snapshot
+        );
+        assert_eq!(
+            pointer_fixture.ledger.c17.raw_owner_value_for_test(raw_key),
+            pointer_before
+        );
+    }
+
+    #[test]
+    fn c17_lifecycle_finalize_survives_nonconflicting_support_and_raw_generation_advance() {
+        let mut fixture = nonconflicting_finalize_fixture();
+        let support_before = advance_nonconflicting_support_and_raw(&mut fixture);
+        finalize_after_nonconflicting_advance(&mut fixture, support_before);
+    }
+
+    struct ObservationLifecycleFixture {
+        ledger: LifecyclePlanLedger,
+        identity: crate::TurnPlanIdentity,
+        raw_record: c17::LifecycleRecordInput,
+        axis: usize,
+    }
+
+    #[inline(never)]
+    fn observation_lifecycle_fixture() -> ObservationLifecycleFixture {
+        let mut ledger = lifecycle_plan_ledger();
+        let funding = reserve_plan_bundle(&mut ledger, 4);
+        let plan = turn_plan_members(&[funding], 1, 1);
+        let identity = plan.identity();
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+        let axis = SupportOperation::FormCandidates as usize * POOLS + Mandatory as usize;
+        ObservationLifecycleFixture {
+            ledger,
+            identity,
+            raw_record: lifecycle_record(4, CONDITIONAL, Mandatory as usize, axis, 0, 1),
+            axis,
+        }
+    }
+
+    #[inline(never)]
+    fn begin_observation_lifecycle(fixture: &mut ObservationLifecycleFixture) {
+        let aggregate = c17::LifecycleAggregate::from_records(&[fixture.raw_record]).unwrap();
+        let begin = fixture
+            .ledger
+            .prepare_c17_lifecycle_begin(fixture.ledger.generation(), 1, aggregate, &mut work())
+            .unwrap();
+        fixture.ledger.commit_c17_lifecycle_begin(begin);
+    }
+
+    #[inline(never)]
+    fn observation_lifecycle_specs(
+        fixture: &ObservationLifecycleFixture,
+    ) -> [Option<crate::core::C17LifecycleRecordSpec>; 1] {
+        let raw_record = fixture.raw_record;
+        [Some(crate::core::C17LifecycleRecordSpec {
+            root: crate::core::C17LifecycleRootSpec::Plan {
+                identity: fixture.identity,
+                branch: crate::PlanBranch::Continuation,
+            },
+            obligation: SupportOperationObligationId::new(raw_record.obligation_raw).unwrap(),
+            credit: PhysicalStartCreditId::new(raw_record.credit_raw).unwrap(),
+            predecessor: SupportCausalPredecessorId(raw_record.predecessor),
+            scope: SupportCallScopeId(raw_record.scope),
+            claim: raw_record.claim,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            occurred_at: MonotonicTime::from_micros(raw_record.occurred_at),
+            expires_at: None,
+            operation: SupportOperation::FormCandidates,
+            pool: Mandatory,
+            horizon: 0,
+        })]
+    }
+
+    #[inline(never)]
+    fn stage_observation_lifecycle(fixture: &mut ObservationLifecycleFixture) {
+        let specs = observation_lifecycle_specs(fixture);
+        let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+            None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+            &fixture.ledger,
+            &specs,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_lifecycle_stage(
+            None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+            &mut fixture.ledger,
+            stage,
+        );
+    }
+
+    #[inline(never)]
+    fn finalize_observation_lifecycle(fixture: &mut ObservationLifecycleFixture) {
+        let finalize = fixture
+            .ledger
+            .prepare_c17_lifecycle_finalize(&mut work())
+            .unwrap();
+        fixture.ledger.commit_c17_lifecycle_finalize(finalize);
+    }
+
+    #[inline(never)]
+    fn commit_observation_receipt(fixture: &mut ObservationLifecycleFixture) {
+        let receipt = fixture
+            .ledger
+            .prepare_c17_plan_disposition(
+                fixture.ledger.generation(),
+                fixture.identity,
+                c17::PlanDisposition::Receipt,
+                MonotonicTime::from_micros(5),
+                &mut work(),
+            )
+            .unwrap();
+        fixture.ledger.commit_c17_root_batch(receipt);
+    }
+
+    #[inline(never)]
+    fn begin_observation_root(fixture: &mut ObservationLifecycleFixture) {
+        let begin = fixture
+            .ledger
+            .prepare_c17_plan_root_action(
+                fixture.ledger.generation(),
+                fixture.identity,
+                0,
+                c17::RootAction::Begin,
+                MonotonicTime::from_micros(6),
+                &mut work(),
+            )
+            .unwrap();
+        fixture.ledger.commit_c17_root_batch(begin);
+    }
+
+    #[inline(never)]
+    fn resolve_observation(
+        fixture: &mut ObservationLifecycleFixture,
+        resolution: c17::ObservationResolution,
+    ) {
+        let vector_before = fixture.ledger.vector_usage[fixture.axis][0];
+        let owner_before = fixture.ledger.bundles.get_record(0).unwrap().linked_claims;
+        let change = fixture
+            .ledger
+            .prepare_c17_observation_resolution(
+                fixture.ledger.generation(),
+                fixture.identity,
+                resolution,
+                MonotonicTime::from_micros(7),
+                &mut work(),
+            )
+            .unwrap();
+        fixture.ledger.commit_c17_root_batch(change);
+        match resolution {
+            c17::ObservationResolution::DescriptionsRequired => {
+                let image = fixture
+                    .ledger
+                    .c17
+                    .lifecycle_record_by_raw(fixture.raw_record.obligation_raw)
+                    .unwrap()
+                    .expect("transferred lifecycle record remains committed");
+                assert_eq!(image[41], crate::PlanBranch::Continuation.ordinal());
+                assert_eq!(image[42], c17::RootState::Pending as u8);
+                assert_eq!(fixture.ledger.vector_usage[fixture.axis][0], vector_before);
+                assert_eq!(
+                    fixture.ledger.bundles.get_record(0).unwrap().linked_claims,
+                    owner_before
+                );
+            }
+            c17::ObservationResolution::Other => {
+                assert!(
+                    fixture
+                        .ledger
+                        .c17
+                        .lifecycle_record_by_raw(fixture.raw_record.obligation_raw)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    fixture.ledger.vector_usage[fixture.axis][0],
+                    vector_before - 1
+                );
+                assert_eq!(
+                    fixture.ledger.bundles.get_record(0).unwrap().linked_claims,
+                    owner_before - 2
+                );
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn run_observation_resolution_case(resolution: c17::ObservationResolution) {
+        let mut fixture = observation_lifecycle_fixture();
+        begin_observation_lifecycle(&mut fixture);
+        stage_observation_lifecycle(&mut fixture);
+        finalize_observation_lifecycle(&mut fixture);
+        commit_observation_receipt(&mut fixture);
+        begin_observation_root(&mut fixture);
+        resolve_observation(&mut fixture, resolution);
+    }
+
+    #[test]
+    fn c17_observation_resolution_transfers_or_closes_committed_lifecycle_record() {
+        for resolution in [
+            c17::ObservationResolution::DescriptionsRequired,
+            c17::ObservationResolution::Other,
+        ] {
+            run_observation_resolution_case(resolution);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LifecycleNoBurnSnapshot {
+        support_generation: SupportLedgerGeneration,
+        c17_generation: u64,
+        raw_generation: u64,
+        counts: [usize; 18],
+        pending: crate::c17_layout::PendingLifecycleHeaderImage,
+        usage: [[u32; POOLS]; 5],
+        reserved: [[u32; POOLS]; 5],
+        vector_usage: [[u64; 3]; 21],
+    }
+
+    fn lifecycle_no_burn_snapshot(ledger: &LifecyclePlanLedger) -> LifecycleNoBurnSnapshot {
+        LifecycleNoBurnSnapshot {
+            support_generation: ledger.generation(),
+            c17_generation: ledger.c17.generation(),
+            raw_generation: ledger.c17.raw_generation_for_test(),
+            counts: ledger.c17.current_counts_for_test(),
+            pending: ledger.c17.pending_header_for_test(),
+            usage: ledger.usage,
+            reserved: ledger.reserved,
+            vector_usage: ledger.vector_usage,
+        }
+    }
+
+    fn one_under_lifecycle_meter(row: [u64; 5], dimension: WorkDimension) -> WorkMeter {
+        let mut limited = row;
+        limited[dimension as usize] -= 1;
+        WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(limited)))
+    }
+
+    #[inline(never)]
+    fn assert_lifecycle_stage_one_under(dimension: WorkDimension) {
+        let mut fixture = observation_lifecycle_fixture();
+        begin_observation_lifecycle(&mut fixture);
+        let specs = observation_lifecycle_specs(&fixture);
+        let snapshot = lifecycle_no_burn_snapshot(&fixture.ledger);
+        let mut limited =
+            one_under_lifecycle_meter(crate::c17_layout::WORK_LIFECYCLE_STAGE, dimension);
+        assert!(matches!(
+            crate::transition_coordinator::prepare_lifecycle_stage(
+                None::<&crate::request_book::RequestBook<1, 1, 1, 1>>,
+                &fixture.ledger,
+                &specs,
+                &mut limited,
+            ),
+            Err(crate::transition_coordinator::LifecycleStagePrepareError::Support(
+                SupportLedgerError::Storage(FixedStorageError::Work(
+                    WorkBudgetError::BudgetExceeded(actual, _, _)
+                ))
+            )) if actual == dimension
+        ));
+        assert_eq!(limited.witness(), HotPathWorkWitness::default());
+        assert_eq!(lifecycle_no_burn_snapshot(&fixture.ledger), snapshot);
+    }
+
+    #[inline(never)]
+    fn assert_lifecycle_finalize_one_under(dimension: WorkDimension) {
+        let fixture = nonconflicting_finalize_fixture();
+        let snapshot = lifecycle_no_burn_snapshot(&fixture.ledger);
+        let mut limited =
+            one_under_lifecycle_meter(crate::c17_layout::WORK_LIFECYCLE_FINALIZE, dimension);
+        assert!(matches!(
+            fixture
+                .ledger
+                .prepare_c17_lifecycle_finalize(&mut limited),
+            Err(SupportLedgerError::Storage(FixedStorageError::Work(
+                WorkBudgetError::BudgetExceeded(actual, _, _)
+            ))) if actual == dimension
+        ));
+        assert_eq!(limited.witness(), HotPathWorkWitness::default());
+        assert_eq!(lifecycle_no_burn_snapshot(&fixture.ledger), snapshot);
+    }
+
+    #[inline(never)]
+    fn assert_lifecycle_abort_one_under(dimension: WorkDimension) {
+        let mut fixture = observation_lifecycle_fixture();
+        begin_observation_lifecycle(&mut fixture);
+        let snapshot = lifecycle_no_burn_snapshot(&fixture.ledger);
+        let mut limited =
+            one_under_lifecycle_meter(crate::c17_layout::WORK_LIFECYCLE_ABORT, dimension);
+        assert!(matches!(
+            fixture.ledger.prepare_c17_lifecycle_abort(&mut limited),
+            Err(SupportLedgerError::Storage(FixedStorageError::Work(
+                WorkBudgetError::BudgetExceeded(actual, _, _)
+            ))) if actual == dimension
+        ));
+        assert_eq!(limited.witness(), HotPathWorkWitness::default());
+        assert_eq!(lifecycle_no_burn_snapshot(&fixture.ledger), snapshot);
+    }
+
+    #[test]
+    fn c17_lifecycle_stage_finalize_and_abort_every_axis_one_under_are_byte_stable() {
+        for dimension in [
+            WorkDimension::VisitedEntities,
+            WorkDimension::CopiedBytes,
+            WorkDimension::InvariantChecks,
+        ] {
+            assert_lifecycle_stage_one_under(dimension);
+            assert_lifecycle_finalize_one_under(dimension);
+            assert_lifecycle_abort_one_under(dimension);
+        }
+    }
+
+    #[test]
+    fn c17_lifecycle_begin_one_under_is_byte_stable() {
+        let mut ledger = lifecycle_plan_ledger();
+        let axis = SupportOperation::DescribeModel as usize * POOLS + Ordinary as usize;
+        seed_lifecycle_reservation(&mut ledger, CONDITIONAL, Ordinary as usize, 1);
+        let records = [lifecycle_record(
+            5,
+            CONDITIONAL,
+            Ordinary as usize,
+            axis,
+            0,
+            1,
+        )];
+        let aggregate = c17::LifecycleAggregate::from_records(&records).unwrap();
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.usage,
+            ledger.reserved,
+            ledger.vector_usage,
+            ledger.c17.current_counts_for_test(),
+            ledger.c17.pending_header_for_test(),
+        );
+        for dimension in [
+            WorkDimension::VisitedEntities,
+            WorkDimension::CopiedBytes,
+            WorkDimension::InvariantChecks,
+        ] {
+            let mut row = crate::c17_layout::WORK_LIFECYCLE_BEGIN;
+            row[dimension as usize] -= 1;
+            let mut limited =
+                WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(row)));
+            assert!(matches!(
+                ledger.prepare_c17_lifecycle_begin(
+                    ledger.generation(),
+                    records.len(),
+                    aggregate,
+                    &mut limited,
+                ),
+                Err(SupportLedgerError::Storage(FixedStorageError::Work(
+                    WorkBudgetError::BudgetExceeded(actual, _, _)
+                ))) if actual == dimension
+            ));
+            assert_eq!(
+                (
+                    ledger.generation(),
+                    ledger.c17.generation(),
+                    ledger.usage,
+                    ledger.reserved,
+                    ledger.vector_usage,
+                    ledger.c17.current_counts_for_test(),
+                    ledger.c17.pending_header_for_test(),
+                ),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn c17_create_standalone_coordinates_initial_fact_and_singleton_conservation() {
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(c17_create_standalone_coordinates_initial_fact_and_singleton_conservation_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn c17_create_standalone_coordinates_initial_fact_and_singleton_conservation_inner() {
+        use crate::model_descriptor::{ModelDescriptorHash, RawModelDescriptor, verify};
+        use crate::model_registry::{
+            ModelManifestId, ModelRegistry, ModelRevisionId, RegistrationIntent,
+            RegistryGeneration, RevisionSelection,
+        };
+        use crate::request_book::c17::{
+            CancellationKind, CancellationMarker, EligibilityMarker, InitialReadyKind,
+            InitialReadyMarker, MembershipDestination, MembershipEventInput, MembershipEventKind,
+            MembershipMutation, MergeInitialMarker,
+        };
+        use crate::request_book::{
+            AcceptanceInput, EffectiveSamplingSeed, GenerationParameters, RequestBook,
+            RequestBookGeneration, RequestError, RequestSelector, SamplingMode, SamplingSeedOrigin,
+            TokenRequest,
+        };
+        use crate::{ConnectionId, DaemonInstanceId, FormationDomainId};
+
+        const FRAME: [u8; 13] = [0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 1, b'x'];
+        const ID: [u8; 32] = [
+            0xc9, 0x1c, 0x14, 0x09, 0x1c, 0xea, 0x08, 0xf4, 0x58, 0xa4, 0xe2, 0x75, 0x96, 0xc1,
+            0x5b, 0x2c, 0xf0, 0xc8, 0x74, 0x34, 0x2d, 0x30, 0x3e, 0xad, 0xe8, 0x9f, 0x29, 0x0e,
+            0xd0, 0x13, 0x38, 0x21,
+        ];
+        const HASH: [u8; 32] = [
+            0xe2, 0x24, 0x6d, 0x47, 0x7f, 0x70, 0xd3, 0xe6, 0x58, 0x8b, 0xb5, 0x45, 0xe2, 0x14,
+            0xc0, 0xbb, 0xa1, 0x76, 0x6e, 0xf3, 0x39, 0x7a, 0x50, 0x71, 0x89, 0x29, 0xc9, 0x4f,
+            0xe9, 0x62, 0x1e, 0x9b,
+        ];
+
+        let revision = ModelRevisionId::new([1; 32]).unwrap();
+        let expected_hash = ModelDescriptorHash::from_manifest(1, HASH).unwrap();
+        let descriptor = verify(
+            RawModelDescriptor {
+                frame: &FRAME,
+                id: ID,
+                hash_schema_version: 1,
+                hash: HASH,
+                vocabulary: 7,
+            },
+            expected_hash,
+            &mut work(),
+        )
+        .unwrap();
+        let mut registry =
+            ModelRegistry::<2, 1, 26>::try_new(RegistryGeneration::new(1).unwrap()).unwrap();
+        let registration = RegistrationIntent {
+            model: ModelId::new(1).unwrap(),
+            revision,
+            manifest: ModelManifestId::new([2; 32]).unwrap(),
+            expected_descriptor_hash: expected_hash,
+            context_limit: TokenCount::new(8),
+        };
+        let description = registry
+            .prepare_description(registry.generation(), registration, &mut work())
+            .unwrap();
+        let registered = registry
+            .prepare_registration(description, &descriptor, &mut work())
+            .unwrap();
+        registry.commit(registered).unwrap();
+        let revision_fact = registry
+            .request_revision_fact(
+                registry.generation(),
+                RevisionSelection::Direct(revision),
+                &mut work(),
+            )
+            .unwrap()
+            .unwrap();
+        let mut requests = RequestBook::<6, 2, 1, 2>::try_new(
+            DaemonInstanceId::new(1).unwrap(),
+            RequestBookGeneration::new(1).unwrap(),
+        )
+        .unwrap();
+        let token_request = TokenRequest::try_new(
+            RequestSelector::Direct(revision),
+            &[],
+            GenerationParameters::try_new(
+                SamplingMode::Greedy,
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0,
+            )
+            .unwrap(),
+            ServiceClass::Interactive,
+            TokenCount::new(1),
+            &[],
+            EffectiveSamplingSeed::new(0, SamplingSeedOrigin::Caller),
+        )
+        .unwrap();
+        let accepted = requests
+            .prepare(
+                requests.generation(),
+                revision_fact.generation(),
+                AcceptanceInput {
+                    connection: ConnectionId::new(1).unwrap(),
+                    request: token_request,
+                    accepted_at: MonotonicTime::from_micros(1),
+                    preparation_timeout: Duration::from_micros(10),
+                },
+                revision_fact,
+                &mut work(),
+            )
+            .unwrap();
+        let request = accepted.accepted().id();
+        requests.commit(accepted).unwrap();
+        assert_eq!(request, request_owner(1));
+
+        let cells = [
+            OutstandingCreditCell {
+                operation: SupportOperation::FormCandidates,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 4,
+            },
+            OutstandingCreditCell {
+                operation: SupportOperation::ObserveTurnReceipt,
+                pool: Mandatory,
+                horizon: Duration::from_micros(10),
+                max_outstanding: 4,
+            },
+        ];
+        let mut support = topology_ledger();
+        let input = bundle_input(1, &cells);
+        let funding = PlanMemberFunding {
+            request_id: input.request_owner,
+            entitlement: input.entitlement,
+            credit_vector: input.vector,
+        };
+        let obligation = input.initial.materialize.obligation;
+        let credit = input.initial.materialize.credit;
+        let predecessor = input.initial.materialize.predecessor;
+        let mut bundle_work = work();
+        let reserved = support.prepare_bundle(&input, &mut bundle_work).unwrap();
+        support.validate_bundle(reserved).unwrap().commit_bundle();
+        support
+            .transition(
+                support.generation(),
+                obligation,
+                PredecessorEnded(predecessor, MonotonicTime::from_micros(2)),
+                &mut work(),
+            )
+            .unwrap();
+        support
+            .transition(
+                support.generation(),
+                obligation,
+                BeginSupport(MonotonicTime::from_micros(3)),
+                &mut work(),
+            )
+            .unwrap();
+        support
+            .transition(support.generation(), obligation, FinishSupport, &mut work())
+            .unwrap();
+
+        let marker = InitialReadyMarker {
+            request,
+            kind: InitialReadyKind::MaterializationCompleted,
+            identity: [7; 32],
+            domain: FormationDomainId::new(8).unwrap().get().to_be_bytes(),
+            occurred_at: MonotonicTime::from_micros(4),
+            funding,
+            obligation,
+            credit,
+        };
+        support.c17.set_retained_budget_for_test(
+            c17::SemanticOperation::CreateStandalone,
+            crate::c17_layout::CREATE_STANDALONE_BUDGET as u32 - 1,
+        );
+        let before = (
+            support.generation(),
+            support.c17.generation(),
+            support.c17.raw_generation_for_test(),
+            support.c17.current_counts_for_test(),
+            support.usage,
+            support.reserved,
+            requests.generation(),
+            support.c17.retained_budgets_for_test(),
+        );
+        let mut one_under = WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new([
+            crate::c17_layout::WORK_CREATE_STANDALONE[0] - 1,
+            crate::c17_layout::WORK_CREATE_STANDALONE[1],
+            0,
+            0,
+            crate::c17_layout::WORK_CREATE_STANDALONE[4],
+        ])));
+        assert!(matches!(
+            crate::transition_coordinator::prepare_create_standalone(
+                &requests,
+                &support,
+                marker,
+                &mut one_under,
+            ),
+            Err(
+                crate::transition_coordinator::CreateStandalonePrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::Work(_))
+                )
+            )
+        ));
+        assert_eq!(
+            (
+                support.generation(),
+                support.c17.generation(),
+                support.c17.raw_generation_for_test(),
+                support.c17.current_counts_for_test(),
+                support.usage,
+                support.reserved,
+                requests.generation(),
+                support.c17.retained_budgets_for_test(),
+            ),
+            before
+        );
+
+        let mut measured = work();
+        let change = crate::transition_coordinator::prepare_create_standalone(
+            &requests,
+            &support,
+            marker,
+            &mut measured,
+        )
+        .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_CREATE_STANDALONE)
+        );
+        crate::transition_coordinator::validate_create_standalone(&requests, &support, &change)
+            .unwrap();
+        crate::transition_coordinator::commit_create_standalone(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        let counts = support.c17.current_counts_for_test();
+        assert_eq!(
+            support.c17.retained_budgets_for_test(),
+            [crate::c17_layout::CREATE_STANDALONE_BUDGET as u32, 0, 0]
+        );
+        assert_eq!(
+            [
+                counts[0], counts[1], counts[2], counts[3], counts[5], counts[6], counts[7],
+                counts[8], counts[13], counts[14], counts[15]
+            ],
+            [11, 1, 8, 1, 1, 4, 4, 1, 1, 1, 1]
+        );
+        let pool = Mandatory as usize;
+        assert_eq!(
+            support.usage[CONDITIONAL][pool],
+            before.4[CONDITIONAL][pool] + 1
+        );
+        assert_eq!(support.usage[CREDITS][pool], before.4[CREDITS][pool] + 1);
+        assert_eq!(support.usage[CLAIMS][pool], before.4[CLAIMS][pool] + 1);
+        assert_eq!(
+            support.reserved[CONDITIONAL][pool] + 1,
+            before.5[CONDITIONAL][pool]
+        );
+        assert_eq!(support.reserved[CREDITS][pool] + 1, before.5[CREDITS][pool]);
+        assert_eq!(support.reserved[CLAIMS][pool] + 1, before.5[CLAIMS][pool]);
+        let owner = support.bundles.get_record(0).unwrap();
+        assert_eq!(
+            (owner.linked_claims, owner.state),
+            (1, BundleState::LiveConsumed)
+        );
+        let mut next = owner.vector_head;
+        let mut currents = Vec::new();
+        for _ in 0..owner.vector_len {
+            let CellSlot::Occupied {
+                cell,
+                current,
+                next_owned,
+                ..
+            } = support.bundles.cells.slots[next as usize]
+            else {
+                panic!("standalone funding cell must remain occupied")
+            };
+            currents.push((cell.operation, current));
+            next = next_owned;
+        }
+        assert_eq!(
+            currents,
+            vec![
+                (SupportOperation::FormCandidates, 1),
+                (SupportOperation::ObserveTurnReceipt, 0)
+            ]
+        );
+        assert_eq!(requests.generation().get(), before.6.get() + 1);
+        assert!(matches!(
+            crate::transition_coordinator::prepare_create_standalone(
+                &requests,
+                &support,
+                marker,
+                &mut work(),
+            ),
+            Err(
+                crate::transition_coordinator::CreateStandalonePrepareError::Request(
+                    RequestError::InvalidTransition
+                )
+            )
+        ));
+
+        let token_request = TokenRequest::try_new(
+            RequestSelector::Direct(revision),
+            &[],
+            GenerationParameters::try_new(
+                SamplingMode::Greedy,
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0,
+            )
+            .unwrap(),
+            ServiceClass::Interactive,
+            TokenCount::new(1),
+            &[],
+            EffectiveSamplingSeed::new(1, SamplingSeedOrigin::Caller),
+        )
+        .unwrap();
+        let accepted = requests
+            .prepare(
+                requests.generation(),
+                revision_fact.generation(),
+                AcceptanceInput {
+                    connection: ConnectionId::new(1).unwrap(),
+                    request: token_request,
+                    accepted_at: MonotonicTime::from_micros(5),
+                    preparation_timeout: Duration::from_micros(10),
+                },
+                revision_fact,
+                &mut work(),
+            )
+            .unwrap();
+        let request_two = accepted.accepted().id();
+        requests.commit(accepted).unwrap();
+
+        let mut input_two = bundle_input(2, &cells);
+        input_two.request_owner = request_two;
+        let funding_two = PlanMemberFunding {
+            request_id: request_two,
+            entitlement: input_two.entitlement,
+            credit_vector: input_two.vector,
+        };
+        let obligation_two = input_two.initial.materialize.obligation;
+        let credit_two = input_two.initial.materialize.credit;
+        let predecessor_two = input_two.initial.materialize.predecessor;
+        let mut bundle_work_two = work();
+        let reserved = support
+            .prepare_bundle(&input_two, &mut bundle_work_two)
+            .unwrap();
+        support.validate_bundle(reserved).unwrap().commit_bundle();
+        support
+            .transition(
+                support.generation(),
+                obligation_two,
+                PredecessorEnded(predecessor_two, MonotonicTime::from_micros(5)),
+                &mut work(),
+            )
+            .unwrap();
+        support
+            .transition(
+                support.generation(),
+                obligation_two,
+                BeginSupport(MonotonicTime::from_micros(6)),
+                &mut work(),
+            )
+            .unwrap();
+        support
+            .transition(
+                support.generation(),
+                obligation_two,
+                FinishSupport,
+                &mut work(),
+            )
+            .unwrap();
+        let marker_two = InitialReadyMarker {
+            request: request_two,
+            kind: InitialReadyKind::MaterializationCompleted,
+            identity: [8; 32],
+            domain: marker.domain,
+            occurred_at: MonotonicTime::from_micros(8),
+            funding: funding_two,
+            obligation: obligation_two,
+            credit: credit_two,
+        };
+        let create_limit_snapshot = (
+            support.generation(),
+            support.c17.generation(),
+            support.c17.current_counts_for_test(),
+            support.usage,
+            support.reserved,
+            requests.generation(),
+            support.c17.retained_budgets_for_test(),
+        );
+        let mut create_limit_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_create_standalone(
+                &requests,
+                &support,
+                marker_two,
+                &mut create_limit_work,
+            ),
+            Err(
+                crate::transition_coordinator::CreateStandalonePrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::Capacity)
+                )
+            )
+        ));
+        assert_eq!(create_limit_work.witness(), HotPathWorkWitness::default());
+        assert_eq!(
+            (
+                support.generation(),
+                support.c17.generation(),
+                support.c17.current_counts_for_test(),
+                support.usage,
+                support.reserved,
+                requests.generation(),
+                support.c17.retained_budgets_for_test(),
+            ),
+            create_limit_snapshot
+        );
+        support
+            .c17
+            .set_retained_budget_for_test(c17::SemanticOperation::CreateStandalone, 1);
+        let change = crate::transition_coordinator::prepare_create_standalone(
+            &requests,
+            &support,
+            marker_two,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_create_standalone(
+            &mut requests,
+            &mut support,
+            change,
+        );
+
+        let merge = MergeInitialMarker {
+            identities: [[7; 32], [8; 32], [0; 32]],
+            source_count: 2,
+            domain: marker.domain,
+            occurred_at: MonotonicTime::from_micros(10),
+        };
+        let (anchors, count) = requests.merge_initial_source_anchors(merge).unwrap();
+        assert_eq!(count, 2);
+        for anchor in anchors[..2].iter().copied() {
+            let root = c17::RootAnchor {
+                authority_key: anchor.authority_key(),
+                branch: anchor.branch(),
+                group: anchor.group(),
+                root: anchor.root(),
+                version: anchor.root_version(),
+            };
+            let change = support
+                .prepare_c17_root_action(
+                    support.generation(),
+                    root,
+                    c17::RootAction::MarkPredecessorEnded,
+                    MonotonicTime::from_micros(9),
+                    &mut work(),
+                )
+                .unwrap();
+            support.commit_c17_root_batch(change);
+        }
+        let links_before = [
+            support.c17.owner_active_link_for_test(0).unwrap(),
+            support.c17.owner_active_link_for_test(1).unwrap(),
+        ];
+        support.c17.set_retained_budget_for_test(
+            c17::SemanticOperation::MergeInitial,
+            crate::c17_layout::MERGE_INITIAL_BUDGET as u32 - 1,
+        );
+        let counts_before = support.c17.current_counts_for_test();
+        let raw_before_merge = support.c17.raw_generation_for_test();
+        let attached_before: [[u32; 3]; 4] = std::array::from_fn(|class| {
+            std::array::from_fn(|pool| support.c17.attached(class, pool).unwrap())
+        });
+        let aggregate_before = (support.usage, support.reserved, attached_before);
+        let request_generation_before = requests.generation();
+        let preview = support
+            .preview_c17_merge_initial(
+                support.generation(),
+                anchors,
+                count,
+                merge.domain,
+                merge.occurred_at,
+            )
+            .unwrap();
+        let destination = preview.destination();
+
+        let mut one_under_row = crate::c17_layout::WORK_MERGE_INITIAL;
+        one_under_row[WorkDimension::InvariantChecks as usize] -= 1;
+        let mut one_under = WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(
+            one_under_row,
+        )));
+        assert!(matches!(
+            crate::transition_coordinator::prepare_merge_initial(
+                &requests,
+                &support,
+                merge,
+                &mut one_under,
+            ),
+            Err(
+                crate::transition_coordinator::MergeInitialPrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::Work(_))
+                )
+            )
+        ));
+        assert_eq!(one_under.witness(), HotPathWorkWitness::new([0; 5]));
+        assert_eq!(support.c17.current_counts_for_test(), counts_before);
+        assert_eq!(
+            support.c17.retained_budgets_for_test()[1],
+            crate::c17_layout::MERGE_INITIAL_BUDGET as u32 - 1
+        );
+        assert_eq!(requests.generation(), request_generation_before);
+
+        let mut measured = work();
+        let change = crate::transition_coordinator::prepare_merge_initial(
+            &requests,
+            &support,
+            merge,
+            &mut measured,
+        )
+        .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_MERGE_INITIAL)
+        );
+        crate::transition_coordinator::validate_merge_initial(&requests, &support, &change)
+            .unwrap();
+        crate::transition_coordinator::commit_merge_initial(&mut requests, &mut support, change);
+        let counts_after = support.c17.current_counts_for_test();
+        assert_eq!(
+            support.c17.retained_budgets_for_test()[1],
+            crate::c17_layout::MERGE_INITIAL_BUDGET as u32
+        );
+        assert_eq!(counts_after[3], counts_before[3] + 1);
+        assert_eq!(counts_after[5], counts_before[5] + 3);
+        assert_eq!(counts_after[6], counts_before[6] + 12);
+        assert_eq!(counts_after[7], counts_before[7] + 4);
+        assert_eq!(counts_after[8], counts_before[8] + 3);
+        assert_eq!(counts_after[13], counts_before[13] + 2);
+        assert_eq!(counts_after[14], counts_before[14] + 1);
+        assert_eq!(counts_after[15], counts_before[15] + 3);
+        assert_eq!(support.c17.raw_generation_for_test(), raw_before_merge);
+        let mut expected_usage = aggregate_before.0;
+        expected_usage[PENDING][Mandatory as usize] -= 1;
+        expected_usage[CREDITS][Mandatory as usize] -= 1;
+        let mut expected_attached = aggregate_before.2;
+        expected_attached[PENDING][Mandatory as usize] += 1;
+        expected_attached[CREDITS][Mandatory as usize] += 1;
+        assert_eq!(support.usage, expected_usage);
+        assert_eq!(support.reserved, aggregate_before.1);
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|class| {
+                std::array::from_fn::<_, 3, _>(|pool| support.c17.attached(class, pool).unwrap())
+            }),
+            expected_attached
+        );
+        for anchor in anchors[..2].iter().copied() {
+            let facts = support
+                .c17
+                .root_facts_for_test(c17::RootAnchor {
+                    authority_key: anchor.authority_key(),
+                    branch: anchor.branch(),
+                    group: anchor.group(),
+                    root: anchor.root(),
+                    version: 3,
+                })
+                .unwrap();
+            assert_eq!((facts.0, facts.1), (c17::RootState::ClosedPending, 1));
+        }
+        let destination_facts = support
+            .c17
+            .root_facts_for_test(c17::RootAnchor {
+                authority_key: destination.authority_key(),
+                branch: destination.branch(),
+                group: destination.group(),
+                root: destination.root(),
+                version: destination.root_version(),
+            })
+            .unwrap();
+        assert_eq!(
+            (destination_facts.0, destination_facts.1),
+            (c17::RootState::Pending, 2)
+        );
+        for (index, before_link) in links_before.into_iter().enumerate() {
+            let after_link = support
+                .c17
+                .owner_active_link_for_test(index as u32)
+                .unwrap();
+            assert_ne!(after_link.0, before_link.0);
+            assert_eq!(after_link.1, destination.group());
+            assert_eq!(after_link.2, destination_facts.3);
+        }
+        assert_eq!(
+            requests.generation().get(),
+            request_generation_before.get() + 1
+        );
+        assert!(matches!(
+            crate::transition_coordinator::prepare_merge_initial(
+                &requests,
+                &support,
+                merge,
+                &mut work(),
+            ),
+            Err(
+                crate::transition_coordinator::MergeInitialPrepareError::Request(
+                    RequestError::InvalidTransition
+                )
+            )
+        ));
+
+        let axis = SupportOperation::FormCandidates as usize * POOLS + Mandatory as usize;
+        let lifecycle = lifecycle_record(51, PENDING, Mandatory as usize, axis, 0, 2);
+        let aggregate = c17::LifecycleAggregate::from_records(&[lifecycle]).unwrap();
+        let begin = support
+            .prepare_c17_lifecycle_begin(support.generation(), 1, aggregate, &mut work())
+            .unwrap();
+        support.commit_c17_lifecycle_begin(begin);
+        let specs = [Some(crate::core::C17LifecycleRecordSpec {
+            root: crate::core::C17LifecycleRootSpec::Membership {
+                request,
+                expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+            },
+            obligation: SupportOperationObligationId::new(lifecycle.obligation_raw).unwrap(),
+            credit: PhysicalStartCreditId::new(lifecycle.credit_raw).unwrap(),
+            predecessor: SupportCausalPredecessorId(lifecycle.predecessor),
+            scope: SupportCallScopeId(lifecycle.scope),
+            claim: lifecycle.claim,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            occurred_at: MonotonicTime::from_micros(lifecycle.occurred_at),
+            expires_at: None,
+            operation: SupportOperation::FormCandidates,
+            pool: Mandatory,
+            horizon: 0,
+        })];
+        let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+            Some(&requests),
+            &support,
+            &specs,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_lifecycle_stage(Some(&requests), &mut support, stage);
+        let finalize = support.prepare_c17_lifecycle_finalize(&mut work()).unwrap();
+        support.commit_c17_lifecycle_finalize(finalize);
+        let lifecycle_before_rebind = support
+            .c17
+            .lifecycle_record_by_raw(lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .expect("membership lifecycle record is committed");
+
+        let rebind = MembershipEventInput {
+            kind: MembershipEventKind::Rebind,
+            source_identity: None,
+            member_count: 2,
+            destination_count: 1,
+            members: [
+                Some(MembershipMutation {
+                    request,
+                    expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: request_two,
+                    expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                None,
+                None,
+            ],
+            occurred_at: MonotonicTime::from_micros(52),
+        };
+        support.c17.set_retained_budget_for_test(
+            c17::SemanticOperation::SourceFreeRebind,
+            crate::c17_layout::POST_CREATE_BUDGET as u32 - 1,
+        );
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            &requests,
+            &support,
+            rebind,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::validate_membership_topology(&requests, &support, &change)
+            .unwrap();
+        crate::transition_coordinator::commit_membership_topology(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        assert_eq!(
+            support.c17.retained_budgets_for_test()[2],
+            crate::c17_layout::POST_CREATE_BUDGET as u32
+        );
+        let rebind_anchor = requests
+            .c17_membership_anchor(request, crate::RequestStatusVersion::new(4).unwrap())
+            .unwrap();
+        assert_eq!(
+            rebind_anchor,
+            requests
+                .c17_membership_anchor(request_two, crate::RequestStatusVersion::new(4).unwrap(),)
+                .unwrap()
+        );
+        let lifecycle_after_rebind = support
+            .c17
+            .lifecycle_record_by_raw(lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .expect("rebound lifecycle record remains committed");
+        assert_ne!(lifecycle_after_rebind, lifecycle_before_rebind);
+        assert_eq!(
+            lifecycle_after_rebind[41],
+            crate::PlanBranch::Standalone.ordinal()
+        );
+        assert_eq!(lifecycle_after_rebind[42], c17::RootState::Pending as u8);
+
+        crate::transition_coordinator::newly_eligible(
+            &mut requests,
+            EligibilityMarker {
+                request,
+                identity: [52; 32],
+                previous_anchor: rebind_anchor,
+                occurred_at: MonotonicTime::from_micros(53),
+            },
+            &mut work(),
+        )
+        .unwrap();
+        let join = MembershipEventInput {
+            kind: MembershipEventKind::Join,
+            source_identity: Some([52; 32]),
+            member_count: 2,
+            destination_count: 1,
+            members: [
+                Some(MembershipMutation {
+                    request,
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: request_two,
+                    expected_status: crate::RequestStatusVersion::new(4).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                None,
+                None,
+            ],
+            occurred_at: MonotonicTime::from_micros(54),
+        };
+        let post_limit_snapshot = (
+            requests.generation(),
+            support.generation(),
+            support.c17.generation(),
+            support.c17.raw_generation_for_test(),
+            support.c17.current_counts_for_test(),
+            support.c17.retained_budgets_for_test(),
+            support.usage,
+            support.reserved,
+        );
+        let mut post_limit_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_membership_topology(
+                &requests,
+                &support,
+                join,
+                &mut post_limit_work,
+            ),
+            Err(
+                crate::transition_coordinator::MembershipTopologyPrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::Capacity)
+                )
+            )
+        ));
+        assert_eq!(post_limit_work.witness(), HotPathWorkWitness::default());
+        assert_eq!(
+            (
+                requests.generation(),
+                support.generation(),
+                support.c17.generation(),
+                support.c17.raw_generation_for_test(),
+                support.c17.current_counts_for_test(),
+                support.c17.retained_budgets_for_test(),
+                support.usage,
+                support.reserved,
+            ),
+            post_limit_snapshot
+        );
+        support
+            .c17
+            .set_retained_budget_for_test(c17::SemanticOperation::Join, 1);
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            &requests,
+            &support,
+            join,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_membership_topology(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        assert_eq!(support.c17.retained_budgets_for_test()[2], 2);
+        let join_anchor = requests
+            .c17_membership_anchor(request, crate::RequestStatusVersion::new(6).unwrap())
+            .unwrap();
+        assert_eq!(
+            join_anchor,
+            requests
+                .c17_membership_anchor(request_two, crate::RequestStatusVersion::new(5).unwrap(),)
+                .unwrap()
+        );
+        assert_ne!(join_anchor, rebind_anchor);
+        let lifecycle_after_join = support
+            .c17
+            .lifecycle_record_by_raw(lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .expect("joined lifecycle record remains committed");
+        assert_ne!(lifecycle_after_join, lifecycle_after_rebind);
+        assert_eq!(lifecycle_after_join[42], c17::RootState::Pending as u8);
+
+        let mut three_identities = [[0; 32]; 3];
+        let mut three_requests = [request; 3];
+        for offset in 0..3u8 {
+            let token_request = TokenRequest::try_new(
+                RequestSelector::Direct(revision),
+                &[],
+                GenerationParameters::try_new(
+                    SamplingMode::Greedy,
+                    0.0f32.to_bits(),
+                    1.0f32.to_bits(),
+                    0,
+                )
+                .unwrap(),
+                ServiceClass::Interactive,
+                TokenCount::new(1),
+                &[],
+                EffectiveSamplingSeed::new(u64::from(offset + 2), SamplingSeedOrigin::Caller),
+            )
+            .unwrap();
+            let accepted = requests
+                .prepare(
+                    requests.generation(),
+                    revision_fact.generation(),
+                    AcceptanceInput {
+                        connection: ConnectionId::new(1).unwrap(),
+                        request: token_request,
+                        accepted_at: MonotonicTime::from_micros(11 + u64::from(offset)),
+                        preparation_timeout: Duration::from_micros(20),
+                    },
+                    revision_fact,
+                    &mut work(),
+                )
+                .unwrap();
+            let request = accepted.accepted().id();
+            requests.commit(accepted).unwrap();
+            three_requests[usize::from(offset)] = request;
+            let seed = offset + 3;
+            let mut input = bundle_input(seed, &cells);
+            input.request_owner = request;
+            let funding = PlanMemberFunding {
+                request_id: request,
+                entitlement: input.entitlement,
+                credit_vector: input.vector,
+            };
+            let obligation = input.initial.materialize.obligation;
+            let credit = input.initial.materialize.credit;
+            let predecessor = input.initial.materialize.predecessor;
+            let mut bundle_work = work();
+            let reserved = support
+                .prepare_bundle(&input, &mut bundle_work)
+                .unwrap_or_else(|error| panic!("bundle seed {seed}: {error:?}"));
+            support.validate_bundle(reserved).unwrap().commit_bundle();
+            support
+                .transition(
+                    support.generation(),
+                    obligation,
+                    PredecessorEnded(predecessor, MonotonicTime::from_micros(12)),
+                    &mut work(),
+                )
+                .unwrap();
+            support
+                .transition(
+                    support.generation(),
+                    obligation,
+                    BeginSupport(MonotonicTime::from_micros(13)),
+                    &mut work(),
+                )
+                .unwrap();
+            support
+                .transition(support.generation(), obligation, FinishSupport, &mut work())
+                .unwrap();
+            let identity = [offset + 9; 32];
+            three_identities[usize::from(offset)] = identity;
+            let marker = InitialReadyMarker {
+                request,
+                kind: InitialReadyKind::MaterializationCompleted,
+                identity,
+                domain: merge.domain,
+                occurred_at: MonotonicTime::from_micros(20 + u64::from(offset)),
+                funding,
+                obligation,
+                credit,
+            };
+            let change = crate::transition_coordinator::prepare_create_standalone(
+                &requests,
+                &support,
+                marker,
+                &mut work(),
+            )
+            .unwrap();
+            crate::transition_coordinator::commit_create_standalone(
+                &mut requests,
+                &mut support,
+                change,
+            );
+        }
+        let merge_three = MergeInitialMarker {
+            identities: three_identities,
+            source_count: 3,
+            domain: merge.domain,
+            occurred_at: MonotonicTime::from_micros(24),
+        };
+        let (anchors, count) = requests.merge_initial_source_anchors(merge_three).unwrap();
+        for anchor in anchors {
+            let change = support
+                .prepare_c17_root_action(
+                    support.generation(),
+                    c17::RootAnchor {
+                        authority_key: anchor.authority_key(),
+                        branch: anchor.branch(),
+                        group: anchor.group(),
+                        root: anchor.root(),
+                        version: anchor.root_version(),
+                    },
+                    c17::RootAction::MarkPredecessorEnded,
+                    MonotonicTime::from_micros(23),
+                    &mut work(),
+                )
+                .unwrap();
+            support.commit_c17_root_batch(change);
+        }
+        let counts_before = support.c17.current_counts_for_test();
+        let preview = support
+            .preview_c17_merge_initial(
+                support.generation(),
+                anchors,
+                count,
+                merge_three.domain,
+                merge_three.occurred_at,
+            )
+            .unwrap();
+        let destination = preview.destination();
+        let merge_initial_limit_snapshot = (
+            requests.generation(),
+            support.generation(),
+            support.c17.generation(),
+            support.c17.current_counts_for_test(),
+            support.c17.retained_budgets_for_test(),
+            support.usage,
+            support.reserved,
+        );
+        let mut merge_initial_limit_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_merge_initial(
+                &requests,
+                &support,
+                merge_three,
+                &mut merge_initial_limit_work,
+            ),
+            Err(
+                crate::transition_coordinator::MergeInitialPrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::Capacity)
+                )
+            )
+        ));
+        assert_eq!(
+            merge_initial_limit_work.witness(),
+            HotPathWorkWitness::default()
+        );
+        assert_eq!(
+            (
+                requests.generation(),
+                support.generation(),
+                support.c17.generation(),
+                support.c17.current_counts_for_test(),
+                support.c17.retained_budgets_for_test(),
+                support.usage,
+                support.reserved,
+            ),
+            merge_initial_limit_snapshot
+        );
+        support
+            .c17
+            .set_retained_budget_for_test(c17::SemanticOperation::MergeInitial, 1);
+        let change = crate::transition_coordinator::prepare_merge_initial(
+            &requests,
+            &support,
+            merge_three,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_merge_initial(&mut requests, &mut support, change);
+        let counts_after = support.c17.current_counts_for_test();
+        assert_eq!(counts_after[3], counts_before[3] + 1);
+        assert_eq!(counts_after[5], counts_before[5] + 4);
+        assert_eq!(counts_after[6], counts_before[6] + 16);
+        assert_eq!(counts_after[7], counts_before[7] + 4);
+        assert_eq!(counts_after[8], counts_before[8] + 4);
+        assert_eq!(counts_after[13], counts_before[13] + 3);
+        assert_eq!(counts_after[14], counts_before[14] + 1);
+        assert_eq!(counts_after[15], counts_before[15] + 4);
+        for anchor in anchors {
+            assert_eq!(
+                support
+                    .c17
+                    .root_facts_for_test(c17::RootAnchor {
+                        authority_key: anchor.authority_key(),
+                        branch: anchor.branch(),
+                        group: anchor.group(),
+                        root: anchor.root(),
+                        version: 3,
+                    })
+                    .unwrap()
+                    .0,
+                c17::RootState::ClosedPending
+            );
+        }
+        assert_eq!(
+            support
+                .c17
+                .root_facts_for_test(c17::RootAnchor {
+                    authority_key: destination.authority_key(),
+                    branch: destination.branch(),
+                    group: destination.group(),
+                    root: destination.root(),
+                    version: destination.root_version(),
+                })
+                .unwrap()
+                .1,
+            3
+        );
+
+        let token_request = TokenRequest::try_new(
+            RequestSelector::Direct(revision),
+            &[],
+            GenerationParameters::try_new(
+                SamplingMode::Greedy,
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0,
+            )
+            .unwrap(),
+            ServiceClass::Interactive,
+            TokenCount::new(1),
+            &[],
+            EffectiveSamplingSeed::new(6, SamplingSeedOrigin::Caller),
+        )
+        .unwrap();
+        let accepted = requests
+            .prepare(
+                requests.generation(),
+                revision_fact.generation(),
+                AcceptanceInput {
+                    connection: ConnectionId::new(1).unwrap(),
+                    request: token_request,
+                    accepted_at: MonotonicTime::from_micros(55),
+                    preparation_timeout: Duration::from_micros(20),
+                },
+                revision_fact,
+                &mut work(),
+            )
+            .unwrap();
+        let request_six = accepted.accepted().id();
+        requests.commit(accepted).unwrap();
+        let mut input_six = bundle_input(6, &cells);
+        input_six.request_owner = request_six;
+        let funding_six = PlanMemberFunding {
+            request_id: request_six,
+            entitlement: input_six.entitlement,
+            credit_vector: input_six.vector,
+        };
+        let obligation_six = input_six.initial.materialize.obligation;
+        let credit_six = input_six.initial.materialize.credit;
+        let predecessor_six = input_six.initial.materialize.predecessor;
+        let mut bundle_work_six = work();
+        let reserved = support
+            .prepare_bundle(&input_six, &mut bundle_work_six)
+            .unwrap();
+        support.validate_bundle(reserved).unwrap().commit_bundle();
+        support
+            .transition(
+                support.generation(),
+                obligation_six,
+                PredecessorEnded(predecessor_six, MonotonicTime::from_micros(56)),
+                &mut work(),
+            )
+            .unwrap();
+        support
+            .transition(
+                support.generation(),
+                obligation_six,
+                BeginSupport(MonotonicTime::from_micros(57)),
+                &mut work(),
+            )
+            .unwrap();
+        support
+            .transition(
+                support.generation(),
+                obligation_six,
+                FinishSupport,
+                &mut work(),
+            )
+            .unwrap();
+        let marker_six = InitialReadyMarker {
+            request: request_six,
+            kind: InitialReadyKind::MaterializationCompleted,
+            identity: [20; 32],
+            domain: merge.domain,
+            occurred_at: MonotonicTime::from_micros(58),
+            funding: funding_six,
+            obligation: obligation_six,
+            credit: credit_six,
+        };
+        let change = crate::transition_coordinator::prepare_create_standalone(
+            &requests,
+            &support,
+            marker_six,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_create_standalone(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        let standalone_six = requests
+            .c17_membership_anchor(request_six, crate::RequestStatusVersion::new(2).unwrap())
+            .unwrap();
+        let pending_six = support
+            .prepare_c17_root_action(
+                support.generation(),
+                c17::RootAnchor {
+                    authority_key: standalone_six.authority_key(),
+                    branch: standalone_six.branch(),
+                    group: standalone_six.group(),
+                    root: standalone_six.root(),
+                    version: standalone_six.root_version(),
+                },
+                c17::RootAction::MarkPredecessorEnded,
+                MonotonicTime::from_micros(59),
+                &mut work(),
+            )
+            .unwrap();
+        support.commit_c17_root_batch(pending_six);
+
+        let merge_four = MembershipEventInput {
+            kind: MembershipEventKind::Merge,
+            source_identity: None,
+            member_count: 4,
+            destination_count: 1,
+            members: [
+                Some(MembershipMutation {
+                    request: three_requests[0],
+                    expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: three_requests[1],
+                    expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: three_requests[2],
+                    expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: request_six,
+                    expected_status: crate::RequestStatusVersion::new(2).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+            ],
+            occurred_at: MonotonicTime::from_micros(60),
+        };
+        let mut merge_work = work();
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            &requests,
+            &support,
+            merge_four,
+            &mut merge_work,
+        )
+        .unwrap();
+        assert_eq!(
+            merge_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_MERGE)
+        );
+        crate::transition_coordinator::commit_membership_topology(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        let merged_four_anchor = requests
+            .c17_membership_anchor(
+                three_requests[0],
+                crate::RequestStatusVersion::new(4).unwrap(),
+            )
+            .unwrap();
+        assert_ne!(merged_four_anchor, standalone_six);
+        for request in three_requests {
+            assert_eq!(
+                requests
+                    .c17_membership_anchor(request, crate::RequestStatusVersion::new(4).unwrap())
+                    .unwrap(),
+                merged_four_anchor
+            );
+        }
+        assert_eq!(
+            requests
+                .c17_membership_anchor(request_six, crate::RequestStatusVersion::new(3).unwrap(),)
+                .unwrap(),
+            merged_four_anchor
+        );
+
+        let split_lifecycle = lifecycle_record(59, PENDING, Mandatory as usize, axis, 0, 4);
+        let split_lifecycle_aggregate =
+            c17::LifecycleAggregate::from_records(&[split_lifecycle]).unwrap();
+        let begin = support
+            .prepare_c17_lifecycle_begin(
+                support.generation(),
+                1,
+                split_lifecycle_aggregate,
+                &mut work(),
+            )
+            .unwrap();
+        support.commit_c17_lifecycle_begin(begin);
+        let split_lifecycle_specs = [Some(crate::core::C17LifecycleRecordSpec {
+            root: crate::core::C17LifecycleRootSpec::Membership {
+                request: three_requests[0],
+                expected_status: crate::RequestStatusVersion::new(4).unwrap(),
+            },
+            obligation: SupportOperationObligationId::new(split_lifecycle.obligation_raw).unwrap(),
+            credit: PhysicalStartCreditId::new(split_lifecycle.credit_raw).unwrap(),
+            predecessor: SupportCausalPredecessorId(split_lifecycle.predecessor),
+            scope: SupportCallScopeId(split_lifecycle.scope),
+            claim: split_lifecycle.claim,
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            occurred_at: MonotonicTime::from_micros(split_lifecycle.occurred_at),
+            expires_at: None,
+            operation: SupportOperation::FormCandidates,
+            pool: Mandatory,
+            horizon: 0,
+        })];
+        let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+            Some(&requests),
+            &support,
+            &split_lifecycle_specs,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_lifecycle_stage(Some(&requests), &mut support, stage);
+        let finalize = support.prepare_c17_lifecycle_finalize(&mut work()).unwrap();
+        support.commit_c17_lifecycle_finalize(finalize);
+        assert!(
+            support
+                .c17
+                .lifecycle_record_by_raw(split_lifecycle.obligation_raw)
+                .unwrap()
+                .is_some()
+        );
+
+        let split = MembershipEventInput {
+            kind: MembershipEventKind::Split,
+            source_identity: None,
+            member_count: 4,
+            destination_count: 4,
+            members: [
+                Some(MembershipMutation {
+                    request: three_requests[0],
+                    expected_status: crate::RequestStatusVersion::new(4).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: three_requests[1],
+                    expected_status: crate::RequestStatusVersion::new(4).unwrap(),
+                    destination: MembershipDestination::Destination(1),
+                }),
+                Some(MembershipMutation {
+                    request: three_requests[2],
+                    expected_status: crate::RequestStatusVersion::new(4).unwrap(),
+                    destination: MembershipDestination::Destination(2),
+                }),
+                Some(MembershipMutation {
+                    request: request_six,
+                    expected_status: crate::RequestStatusVersion::new(3).unwrap(),
+                    destination: MembershipDestination::Destination(3),
+                }),
+            ],
+            occurred_at: MonotonicTime::from_micros(61),
+        };
+        let split_snapshot = (
+            requests.generation(),
+            support.generation(),
+            support.c17.generation(),
+            support.c17.current_counts_for_test(),
+        );
+        for dimension in [
+            WorkDimension::VisitedEntities,
+            WorkDimension::CopiedBytes,
+            WorkDimension::InvariantChecks,
+        ] {
+            let mut row = crate::c17_layout::WORK_SPLIT;
+            row[dimension as usize] -= 1;
+            let mut limited =
+                WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(row)));
+            assert!(matches!(
+                crate::transition_coordinator::prepare_membership_topology(
+                    &requests,
+                    &support,
+                    split,
+                    &mut limited,
+                ),
+                Err(
+                    crate::transition_coordinator::MembershipTopologyPrepareError::Support(
+                        SupportLedgerError::Storage(FixedStorageError::Work(_))
+                    )
+                )
+            ));
+            assert_eq!(limited.witness(), HotPathWorkWitness::new([0; 5]));
+            assert_eq!(
+                (
+                    requests.generation(),
+                    support.generation(),
+                    support.c17.generation(),
+                    support.c17.current_counts_for_test(),
+                ),
+                split_snapshot
+            );
+        }
+        let mut split_work = work();
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            &requests,
+            &support,
+            split,
+            &mut split_work,
+        )
+        .unwrap();
+        assert_eq!(
+            change.assignment_census(),
+            ([8, 28, 1, 4, 1, 0], [1, 1, 1, 1, 1, 0], 383)
+        );
+        assert_eq!(383 + 9 + 1, crate::c17_layout::ORDINARY_ASSIGNMENTS);
+        assert_eq!(
+            split_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_SPLIT)
+        );
+        crate::transition_coordinator::commit_membership_topology(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        assert!(
+            support
+                .c17
+                .lifecycle_record_by_raw(split_lifecycle.obligation_raw)
+                .unwrap()
+                .is_none()
+        );
+        let split_anchors = [
+            requests
+                .c17_membership_anchor(
+                    three_requests[0],
+                    crate::RequestStatusVersion::new(5).unwrap(),
+                )
+                .unwrap(),
+            requests
+                .c17_membership_anchor(
+                    three_requests[1],
+                    crate::RequestStatusVersion::new(5).unwrap(),
+                )
+                .unwrap(),
+            requests
+                .c17_membership_anchor(
+                    three_requests[2],
+                    crate::RequestStatusVersion::new(5).unwrap(),
+                )
+                .unwrap(),
+            requests
+                .c17_membership_anchor(request_six, crate::RequestStatusVersion::new(4).unwrap())
+                .unwrap(),
+        ];
+        assert!(
+            split_anchors.iter().enumerate().all(|(index, anchor)| {
+                split_anchors[..index].iter().all(|prior| prior != anchor)
+            })
+        );
+
+        let survivor_lifecycle = lifecycle_record(60, PENDING, Mandatory as usize, axis, 0, 1);
+        let removed_lifecycle = lifecycle_record(61, PENDING, Mandatory as usize, axis, 0, 1);
+        let lifecycle_aggregate =
+            c17::LifecycleAggregate::from_records(&[survivor_lifecycle, removed_lifecycle])
+                .unwrap();
+        let begin = support
+            .prepare_c17_lifecycle_begin(support.generation(), 2, lifecycle_aggregate, &mut work())
+            .unwrap();
+        support.commit_c17_lifecycle_begin(begin);
+        let lifecycle_specs = [
+            Some(crate::core::C17LifecycleRecordSpec {
+                root: crate::core::C17LifecycleRootSpec::Membership {
+                    request: three_requests[0],
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                },
+                obligation: SupportOperationObligationId::new(survivor_lifecycle.obligation_raw)
+                    .unwrap(),
+                credit: PhysicalStartCreditId::new(survivor_lifecycle.credit_raw).unwrap(),
+                predecessor: SupportCausalPredecessorId(survivor_lifecycle.predecessor),
+                scope: SupportCallScopeId(survivor_lifecycle.scope),
+                claim: survivor_lifecycle.claim,
+                kind: LifecycleReserveKind::PostLoadModelDescription,
+                occurred_at: MonotonicTime::from_micros(survivor_lifecycle.occurred_at),
+                expires_at: None,
+                operation: SupportOperation::FormCandidates,
+                pool: Mandatory,
+                horizon: 0,
+            }),
+            Some(crate::core::C17LifecycleRecordSpec {
+                root: crate::core::C17LifecycleRootSpec::Membership {
+                    request: three_requests[1],
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                },
+                obligation: SupportOperationObligationId::new(removed_lifecycle.obligation_raw)
+                    .unwrap(),
+                credit: PhysicalStartCreditId::new(removed_lifecycle.credit_raw).unwrap(),
+                predecessor: SupportCausalPredecessorId(removed_lifecycle.predecessor),
+                scope: SupportCallScopeId(removed_lifecycle.scope),
+                claim: removed_lifecycle.claim,
+                kind: LifecycleReserveKind::PostLoadModelDescription,
+                occurred_at: MonotonicTime::from_micros(removed_lifecycle.occurred_at),
+                expires_at: None,
+                operation: SupportOperation::FormCandidates,
+                pool: Mandatory,
+                horizon: 0,
+            }),
+        ];
+        let stage = crate::transition_coordinator::prepare_lifecycle_stage(
+            Some(&requests),
+            &support,
+            &lifecycle_specs,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_lifecycle_stage(Some(&requests), &mut support, stage);
+        let finalize = support.prepare_c17_lifecycle_finalize(&mut work()).unwrap();
+        support.commit_c17_lifecycle_finalize(finalize);
+        let survivor_lifecycle_before_merge = support
+            .c17
+            .lifecycle_record_by_raw(survivor_lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .unwrap();
+        let removed_lifecycle_before_merge = support
+            .c17
+            .lifecycle_record_by_raw(removed_lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .unwrap();
+
+        let merge_three_destinations = MembershipEventInput {
+            kind: MembershipEventKind::Merge,
+            source_identity: None,
+            member_count: 3,
+            destination_count: 1,
+            members: [
+                Some(MembershipMutation {
+                    request: three_requests[0],
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: three_requests[1],
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                Some(MembershipMutation {
+                    request: three_requests[2],
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                    destination: MembershipDestination::Destination(0),
+                }),
+                None,
+            ],
+            occurred_at: MonotonicTime::from_micros(62),
+        };
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            &requests,
+            &support,
+            merge_three_destinations,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_membership_topology(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        let remerged_anchor = requests
+            .c17_membership_anchor(
+                three_requests[0],
+                crate::RequestStatusVersion::new(6).unwrap(),
+            )
+            .unwrap();
+        for request in three_requests {
+            assert_eq!(
+                requests
+                    .c17_membership_anchor(request, crate::RequestStatusVersion::new(6).unwrap())
+                    .unwrap(),
+                remerged_anchor
+            );
+        }
+        assert_ne!(remerged_anchor, split_anchors[0]);
+        let survivor_lifecycle_after_merge = support
+            .c17
+            .lifecycle_record_by_raw(survivor_lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .unwrap();
+        let removed_lifecycle_after_merge = support
+            .c17
+            .lifecycle_record_by_raw(removed_lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .unwrap();
+        assert_ne!(
+            survivor_lifecycle_after_merge,
+            survivor_lifecycle_before_merge
+        );
+        assert_ne!(
+            removed_lifecycle_after_merge,
+            removed_lifecycle_before_merge
+        );
+
+        let close_joined = MembershipEventInput {
+            kind: MembershipEventKind::Close,
+            source_identity: None,
+            member_count: 2,
+            destination_count: 0,
+            members: [
+                Some(MembershipMutation {
+                    request,
+                    expected_status: crate::RequestStatusVersion::new(6).unwrap(),
+                    destination: MembershipDestination::Closed,
+                }),
+                Some(MembershipMutation {
+                    request: request_two,
+                    expected_status: crate::RequestStatusVersion::new(5).unwrap(),
+                    destination: MembershipDestination::Closed,
+                }),
+                None,
+                None,
+            ],
+            occurred_at: MonotonicTime::from_micros(63),
+        };
+        let lifecycle_vector_before_close = support.vector_usage[axis][0];
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            &requests,
+            &support,
+            close_joined,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_membership_topology(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        assert!(
+            support
+                .c17
+                .lifecycle_record_by_raw(lifecycle.obligation_raw)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            support.vector_usage[axis][0],
+            lifecycle_vector_before_close - 2
+        );
+        assert!(
+            requests
+                .c17_membership_anchor(request, crate::RequestStatusVersion::new(7).unwrap())
+                .is_err()
+        );
+        assert!(
+            requests
+                .c17_membership_anchor(request_two, crate::RequestStatusVersion::new(6).unwrap())
+                .is_err()
+        );
+        assert!(matches!(
+            crate::transition_coordinator::prepare_membership_topology(
+                &requests,
+                &support,
+                close_joined,
+                &mut work(),
+            ),
+            Err(
+                crate::transition_coordinator::MembershipTopologyPrepareError::Request(
+                    RequestError::InvalidTransition
+                )
+            )
+        ));
+
+        let cancellation_lifecycle_vector_before = support.vector_usage[axis][0];
+        let remove_from_group = CancellationMarker {
+            request: three_requests[1],
+            identity: [89; 32],
+            kind: CancellationKind::Deadline,
+            previous_anchor: remerged_anchor,
+            occurred_at: MonotonicTime::from_micros(64),
+        };
+        let request_preview = requests.prepare_cancellation(remove_from_group).unwrap();
+        assert_eq!(request_preview.source_count(), 1);
+        let support_preview = support
+            .preview_c17_cancellation_topology(support.generation(), &request_preview)
+            .unwrap();
+        assert!(!support_preview.terminal_destination());
+        let survivor_anchor = support_preview.cancellation_survivor();
+        assert!(!survivor_anchor.is_absent());
+        assert_eq!(support_preview.source_member_count(), 3);
+        let mut remove_work = work();
+        let remove = crate::transition_coordinator::prepare_cancellation_remove(
+            &requests,
+            &support,
+            remove_from_group,
+            &mut remove_work,
+        )
+        .unwrap();
+        assert_eq!(
+            remove_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_REMOVE_BOUND)
+        );
+        crate::transition_coordinator::validate_cancellation_remove(&requests, &support, &remove)
+            .unwrap();
+        crate::transition_coordinator::commit_cancellation_remove(
+            &mut requests,
+            &mut support,
+            remove,
+        );
+        let survivor_lifecycle_after_remove = support
+            .c17
+            .lifecycle_record_by_raw(survivor_lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .expect("survivor-only lifecycle record transfers");
+        assert_ne!(
+            survivor_lifecycle_after_remove,
+            survivor_lifecycle_after_merge
+        );
+        assert!(
+            support
+                .c17
+                .lifecycle_record_by_raw(removed_lifecycle.obligation_raw)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            support.vector_usage[axis][0],
+            cancellation_lifecycle_vector_before - 1
+        );
+        assert!(
+            requests
+                .c17_membership_anchor(
+                    three_requests[1],
+                    crate::RequestStatusVersion::new(7).unwrap(),
+                )
+                .is_err()
+        );
+        for survivor in [three_requests[0], three_requests[2]] {
+            assert_eq!(
+                requests
+                    .c17_membership_anchor(survivor, crate::RequestStatusVersion::new(7).unwrap(),)
+                    .unwrap(),
+                survivor_anchor
+            );
+        }
+        assert_eq!(
+            support
+                .c17
+                .root_facts_for_test(c17::RootAnchor {
+                    authority_key: survivor_anchor.authority_key(),
+                    branch: survivor_anchor.branch(),
+                    group: survivor_anchor.group(),
+                    root: survivor_anchor.root(),
+                    version: survivor_anchor.root_version(),
+                })
+                .unwrap()
+                .1,
+            2
+        );
+        assert_eq!(
+            support.c17.owner_currents_for_test(3).unwrap(),
+            (0, [0; 4], false)
+        );
+        for slot in [2, 4] {
+            let (_, group, _) = support.c17.owner_active_link_for_test(slot).unwrap();
+            assert_eq!(group, survivor_anchor.group());
+        }
+        assert!(matches!(
+            crate::transition_coordinator::prepare_cancellation_remove(
+                &requests,
+                &support,
+                remove_from_group,
+                &mut work(),
+            ),
+            Err(
+                crate::transition_coordinator::CancellationPrepareError::Request(
+                    RequestError::InvalidTransition
+                )
+            )
+        ));
+
+        let remove_to_singleton = CancellationMarker {
+            request: three_requests[2],
+            identity: [91; 32],
+            kind: CancellationKind::Client,
+            previous_anchor: survivor_anchor,
+            occurred_at: MonotonicTime::from_micros(65),
+        };
+        let remove = crate::transition_coordinator::prepare_cancellation_remove(
+            &requests,
+            &support,
+            remove_to_singleton,
+            &mut work(),
+        )
+        .unwrap();
+        crate::transition_coordinator::commit_cancellation_remove(
+            &mut requests,
+            &mut support,
+            remove,
+        );
+        let survivor_lifecycle_after_second_remove = support
+            .c17
+            .lifecycle_record_by_raw(survivor_lifecycle.obligation_raw)
+            .unwrap()
+            .copied()
+            .expect("survivor lifecycle transfers to singleton");
+        assert_ne!(
+            survivor_lifecycle_after_second_remove,
+            survivor_lifecycle_after_remove
+        );
+        let singleton_survivor = requests
+            .c17_membership_anchor(
+                three_requests[0],
+                crate::RequestStatusVersion::new(8).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            requests
+                .c17_membership_anchor(
+                    three_requests[2],
+                    crate::RequestStatusVersion::new(8).unwrap(),
+                )
+                .is_err()
+        );
+        crate::transition_coordinator::newly_eligible(
+            &mut requests,
+            EligibilityMarker {
+                request: three_requests[0],
+                identity: [92; 32],
+                previous_anchor: singleton_survivor,
+                occurred_at: MonotonicTime::from_micros(66),
+            },
+            &mut work(),
+        )
+        .unwrap();
+        let eligible_cancellation = CancellationMarker {
+            request: three_requests[0],
+            identity: [93; 32],
+            kind: CancellationKind::DaemonShutdown,
+            previous_anchor: singleton_survivor,
+            occurred_at: MonotonicTime::from_micros(67),
+        };
+        let eligible_preview = requests
+            .prepare_cancellation(eligible_cancellation)
+            .unwrap();
+        assert_eq!(eligible_preview.source_count(), 2);
+        let eligible_support_preview = support
+            .preview_c17_cancellation_topology(support.generation(), &eligible_preview)
+            .unwrap();
+        assert!(eligible_support_preview.terminal_destination());
+        let eligible_terminal = eligible_support_preview.destination_anchors()[0];
+        let eligible_lifecycle_vector_before = support.vector_usage[axis][0];
+        let eligible_snapshot = (
+            requests.generation(),
+            support.generation(),
+            support.c17.generation(),
+            support.c17.current_counts_for_test(),
+            support.usage,
+            support.reserved,
+        );
+        for dimension in [
+            WorkDimension::VisitedEntities,
+            WorkDimension::CopiedBytes,
+            WorkDimension::InvariantChecks,
+        ] {
+            let mut row = crate::c17_layout::WORK_REMOVE_ELIGIBLE;
+            row[dimension as usize] -= 1;
+            let mut limited =
+                WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(row)));
+            let error = crate::transition_coordinator::prepare_cancellation_remove(
+                &requests,
+                &support,
+                eligible_cancellation,
+                &mut limited,
+            )
+            .err()
+            .expect("one-under EligibleUnbound cancellation must fail");
+            assert!(matches!(
+                error,
+                crate::transition_coordinator::CancellationPrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::Work(_))
+                )
+            ));
+            assert_eq!(limited.witness(), HotPathWorkWitness::new([0; 5]));
+            assert_eq!(
+                (
+                    requests.generation(),
+                    support.generation(),
+                    support.c17.generation(),
+                    support.c17.current_counts_for_test(),
+                    support.usage,
+                    support.reserved,
+                ),
+                eligible_snapshot
+            );
+        }
+        let mut eligible_work = work();
+        let remove = crate::transition_coordinator::prepare_cancellation_remove(
+            &requests,
+            &support,
+            eligible_cancellation,
+            &mut eligible_work,
+        )
+        .unwrap();
+        assert_eq!(
+            eligible_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_REMOVE_ELIGIBLE)
+        );
+        crate::transition_coordinator::commit_cancellation_remove(
+            &mut requests,
+            &mut support,
+            remove,
+        );
+        assert!(
+            support
+                .c17
+                .lifecycle_record_by_raw(survivor_lifecycle.obligation_raw)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            support.vector_usage[axis][0],
+            eligible_lifecycle_vector_before - 1
+        );
+        assert!(
+            requests
+                .c17_membership_anchor(
+                    three_requests[0],
+                    crate::RequestStatusVersion::new(10).unwrap(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            support
+                .c17
+                .root_facts_for_test(c17::RootAnchor {
+                    authority_key: eligible_terminal.authority_key(),
+                    branch: eligible_terminal.branch(),
+                    group: eligible_terminal.group(),
+                    root: eligible_terminal.root(),
+                    version: eligible_terminal.root_version(),
+                })
+                .unwrap()
+                .0,
+            c17::RootState::Pending
+        );
+        assert_eq!(
+            support.c17.owner_currents_for_test(2).unwrap(),
+            (1, [0, 0, 0, 1], false)
+        );
+        let immutable_drift = CancellationMarker {
+            kind: CancellationKind::InternalFailure,
+            occurred_at: MonotonicTime::from_micros(68),
+            ..eligible_cancellation
+        };
+        assert!(matches!(
+            crate::transition_coordinator::prepare_cancellation_remove(
+                &requests,
+                &support,
+                immutable_drift,
+                &mut work(),
+            ),
+            Err(
+                crate::transition_coordinator::CancellationPrepareError::Request(
+                    RequestError::Storage(FixedStorageError::NonCanonical)
+                )
+            )
+        ));
+
+        let cancellation = CancellationMarker {
+            request: request_six,
+            identity: [90; 32],
+            kind: CancellationKind::Client,
+            previous_anchor: split_anchors[3],
+            occurred_at: MonotonicTime::from_micros(69),
+        };
+        let request_preview = requests.prepare_cancellation(cancellation).unwrap();
+        assert_eq!(request_preview.source_count(), 1);
+        let cancellation_event = request_preview.event_id();
+        let cancellation_fact = request_preview.fact_id();
+        let cancellation_request_generation = request_preview.event().generation_after;
+        let support_preview = support
+            .preview_c17_cancellation_topology(support.generation(), &request_preview)
+            .unwrap();
+        assert!(support_preview.terminal_destination());
+        let terminal_anchor = support_preview.destination_anchors()[0];
+        assert_eq!(
+            terminal_anchor.branch(),
+            crate::PlanBranch::Terminal.ordinal()
+        );
+        assert!(support_preview.cancellation_survivor().is_absent());
+
+        let cancellation_snapshot = (
+            requests.generation(),
+            support.generation(),
+            support.c17.generation(),
+            support.c17.current_counts_for_test(),
+            support.usage,
+            support.reserved,
+            *support.bundles.get_record(5).unwrap(),
+        );
+        for dimension in [
+            WorkDimension::VisitedEntities,
+            WorkDimension::CopiedBytes,
+            WorkDimension::InvariantChecks,
+        ] {
+            let mut row = crate::c17_layout::WORK_REMOVE_BOUND;
+            row[dimension as usize] -= 1;
+            let mut limited =
+                WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(row)));
+            let error = crate::transition_coordinator::prepare_cancellation_remove(
+                &requests,
+                &support,
+                cancellation,
+                &mut limited,
+            )
+            .err()
+            .expect("one-under CancellationRemove must fail");
+            assert!(
+                matches!(
+                    error,
+                    crate::transition_coordinator::CancellationPrepareError::Support(
+                        SupportLedgerError::Storage(FixedStorageError::Work(_))
+                    )
+                ),
+                "unexpected one-under cancellation error: {error:?}; counts={:?}",
+                support.c17.current_counts_for_test()
+            );
+            assert_eq!(limited.witness(), HotPathWorkWitness::new([0; 5]));
+            assert_eq!(
+                (
+                    requests.generation(),
+                    support.generation(),
+                    support.c17.generation(),
+                    support.c17.current_counts_for_test(),
+                    support.usage,
+                    support.reserved,
+                    *support.bundles.get_record(5).unwrap(),
+                ),
+                cancellation_snapshot
+            );
+        }
+        let mut cancellation_work = work();
+        let change = crate::transition_coordinator::prepare_cancellation_remove(
+            &requests,
+            &support,
+            cancellation,
+            &mut cancellation_work,
+        )
+        .unwrap();
+        assert_eq!(
+            cancellation_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_REMOVE_BOUND)
+        );
+        crate::transition_coordinator::commit_cancellation_remove(
+            &mut requests,
+            &mut support,
+            change,
+        );
+        assert_eq!(
+            requests.generation().get(),
+            cancellation_snapshot.0.get() + 1
+        );
+        assert!(
+            requests
+                .c17_membership_anchor(request_six, crate::RequestStatusVersion::new(5).unwrap())
+                .is_err()
+        );
+        let terminal_root = c17::RootAnchor {
+            authority_key: terminal_anchor.authority_key(),
+            branch: terminal_anchor.branch(),
+            group: terminal_anchor.group(),
+            root: terminal_anchor.root(),
+            version: terminal_anchor.root_version(),
+        };
+        assert_eq!(
+            support.c17.root_facts_for_test(terminal_root).unwrap().0,
+            c17::RootState::Pending
+        );
+        assert_eq!(
+            support.c17.owner_currents_for_test(5).unwrap(),
+            (1, [0, 0, 0, 1], false)
+        );
+        let terminal_formation = support.c17.root_formation_for_test(terminal_root).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(terminal_formation[8..16].try_into().unwrap()),
+            cancellation_event
+        );
+        assert_eq!(
+            u64::from_le_bytes(terminal_formation[16..24].try_into().unwrap()),
+            cancellation_fact
+        );
+        assert_eq!(
+            u64::from_le_bytes(terminal_formation[24..32].try_into().unwrap()),
+            cancellation_request_generation
+        );
+        assert_eq!(
+            terminal_formation[222],
+            c17::FormationCause::CancellationMembership as u8
+        );
+        assert!(matches!(
+            crate::transition_coordinator::prepare_cancellation_remove(
+                &requests,
+                &support,
+                cancellation,
+                &mut work(),
+            ),
+            Err(
+                crate::transition_coordinator::CancellationPrepareError::Request(
+                    RequestError::InvalidTransition
+                )
+            )
+        ));
+
+        let close_terminal = crate::TypedCloseInput {
+            group: terminal_anchor.group().slot,
+            branch: crate::PlanBranch::Terminal,
+            root: crate::RootRef::new(
+                terminal_anchor.root().slot,
+                terminal_anchor.root().generation,
+                terminal_anchor.root_version(),
+            )
+            .unwrap(),
+            occurred_at: MonotonicTime::from_micros(70),
+            reason: crate::TypedImpossible::new(7).unwrap(),
+            authority: crate::CloseAuthority::Cancellation {
+                fact: crate::CancellationFactId::new(cancellation_fact).unwrap(),
+                event: crate::MembershipEventId::new(cancellation_event).unwrap(),
+                request_generation: RequestBookGeneration::new(cancellation_request_generation)
+                    .unwrap(),
+            },
+        };
+        let mut close_work = work();
+        let close = crate::transition_coordinator::prepare_typed_close(
+            Some(&requests),
+            &support,
+            close_terminal,
+            &mut close_work,
+        )
+        .unwrap();
+        assert_eq!(
+            close_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_CLOSE)
+        );
+        crate::transition_coordinator::commit_typed_close(Some(&requests), &mut support, close);
+        assert_eq!(
+            support
+                .c17
+                .root_facts_for_test(c17::RootAnchor {
+                    version: 2,
+                    ..terminal_root
+                })
+                .unwrap()
+                .0,
+            c17::RootState::ClosedPending
+        );
+        assert_eq!(
+            support.c17.owner_currents_for_test(5).unwrap(),
+            (0, [0; 4], false)
+        );
+    }
+
+    #[test]
+    fn c17_plan_create_is_one_atomic_three_root_materialization() {
+        let mut ledger = plan_ledger();
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        let before_generation = ledger.generation();
+        let before_c17 = ledger.c17.generation();
+        let mut measured = work();
+        let change = ledger
+            .prepare_c17_plan_create(
+                before_generation,
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut measured,
+            )
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_PLAN_CREATE)
+        );
+        ledger.validate_c17_plan_create(&change).unwrap();
+        assert_eq!(
+            ledger.commit_c17_plan_create(change).get(),
+            before_generation.get() + 1
+        );
+        assert_eq!(ledger.c17.generation(), before_c17 + 1);
+        let mandatory = Mandatory as usize;
+        assert_eq!(ledger.usage[CONDITIONAL][mandatory], 15);
+        assert_eq!(ledger.usage[CREDITS][mandatory], 15);
+        assert_eq!(ledger.usage[CLAIMS][mandatory], 24);
+        assert_eq!(ledger.reserved[CONDITIONAL][mandatory], 20);
+        assert_eq!(ledger.reserved[CREDITS][mandatory], 20);
+        assert_eq!(ledger.reserved[CLAIMS][mandatory], 20);
+        assert_eq!(ledger.c17.attached(CONDITIONAL, mandatory).unwrap(), 9);
+        assert_eq!(ledger.c17.attached(CREDITS, mandatory).unwrap(), 9);
+        for slot in 0..4 {
+            let record = ledger.bundles.get_record(slot).unwrap();
+            assert_eq!(record.linked_claims, 3);
+            assert_eq!(record.state, BundleState::LiveConsumed);
+        }
+
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.usage,
+            ledger.reserved,
+            ledger.c17.current_counts_for_test(),
+        );
+        let mut replay_work = work();
+        assert!(matches!(
+            ledger.prepare_c17_plan_create(
+                ledger.generation(),
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut replay_work,
+            ),
+            Err(SupportLedgerError::InvalidTransition)
+        ));
+        assert_eq!(replay_work.witness(), HotPathWorkWitness::new([0; 5]));
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.c17.generation(),
+                ledger.usage,
+                ledger.reserved,
+                ledger.c17.current_counts_for_test(),
+            ),
+            snapshot
+        );
+
+        let drift = turn_plan(&funders, 1, 2);
+        assert!(matches!(
+            ledger.prepare_c17_plan_create(
+                ledger.generation(),
+                &drift,
+                MonotonicTime::from_micros(3),
+                &mut work(),
+            ),
+            Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical))
+        ));
+
+        let mut row = crate::c17_layout::WORK_PLAN_CREATE;
+        row[WorkDimension::CopiedBytes as usize] -= 1;
+        let mut limited = WorkMeter::new(
+            HotPathWorkBudget::try_new(HotPathWorkWitness::new([
+                1_000_000, row[1], row[2], row[3], row[4],
+            ]))
+            .unwrap(),
+        );
+        let mut limited_ledger = plan_ledger();
+        let limited_funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut limited_ledger, u8::try_from(index + 1).unwrap())
+        });
+        let limited_snapshot = (
+            limited_ledger.generation(),
+            limited_ledger.c17.generation(),
+            limited_ledger.usage,
+            limited_ledger.reserved,
+            limited_ledger.c17.current_counts_for_test(),
+        );
+        let fresh_plan = turn_plan(&limited_funders, 2, 1);
+        assert!(matches!(
+            limited_ledger.prepare_c17_plan_create(
+                limited_ledger.generation(),
+                &fresh_plan,
+                MonotonicTime::from_micros(4),
+                &mut limited,
+            ),
+            Err(SupportLedgerError::Storage(FixedStorageError::Work(
+                WorkBudgetError::BudgetExceeded(..)
+            )))
+        ));
+        assert_eq!(
+            (
+                limited_ledger.generation(),
+                limited_ledger.c17.generation(),
+                limited_ledger.usage,
+                limited_ledger.reserved,
+                limited_ledger.c17.current_counts_for_test(),
+            ),
+            limited_snapshot
+        );
+    }
+
+    #[inline(never)]
+    fn commit_plan_create_for_root_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+    }
+
+    #[inline(never)]
+    fn commit_plan_receipt_for_root_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let before = ledger.generation();
+        let mut disposition_work = work();
+        let disposition = ledger
+            .prepare_c17_plan_disposition(
+                before,
+                plan.identity(),
+                c17::PlanDisposition::Receipt,
+                MonotonicTime::from_micros(3),
+                &mut disposition_work,
+            )
+            .unwrap();
+        assert_eq!(
+            disposition_work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_PLAN_DISPOSITION)
+        );
+        ledger.validate_c17_root_batch(&disposition).unwrap();
+        assert_eq!(
+            ledger.commit_c17_root_batch(disposition).get(),
+            before.get() + 1
+        );
+        for slot in 0..4 {
+            assert_eq!(ledger.bundles.get_record(slot).unwrap().linked_claims, 2);
+        }
+        let mandatory = Mandatory as usize;
+        assert_eq!(ledger.usage[CONDITIONAL][mandatory], 13);
+        assert_eq!(ledger.usage[PENDING][mandatory], 1);
+        assert_eq!(ledger.reserved[CONDITIONAL][mandatory], 24);
+        assert_eq!(ledger.usage[CREDITS][mandatory], 14);
+        assert_eq!(ledger.reserved[CREDITS][mandatory], 24);
+        assert_eq!(ledger.usage[CLAIMS][mandatory], 20);
+        assert_eq!(ledger.reserved[CLAIMS][mandatory], 24);
+    }
+
+    #[inline(never)]
+    fn commit_plan_begin_for_root_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let begin = ledger
+            .prepare_c17_plan_root_action(
+                ledger.generation(),
+                plan.identity(),
+                0,
+                c17::RootAction::Begin,
+                MonotonicTime::from_micros(4),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_root_batch(begin);
+        let mandatory = Mandatory as usize;
+        assert_eq!(ledger.usage[PENDING][mandatory], 0);
+        assert_eq!(ledger.usage[ACTIVE][mandatory], 1);
+    }
+
+    #[inline(never)]
+    fn commit_plan_resolution_for_root_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let resolution = ledger
+            .prepare_c17_observation_resolution(
+                ledger.generation(),
+                plan.identity(),
+                c17::ObservationResolution::DescriptionsRequired,
+                MonotonicTime::from_micros(5),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_root_batch(resolution);
+        let mandatory = Mandatory as usize;
+        assert_eq!(ledger.usage[CONDITIONAL][mandatory], 12);
+        assert_eq!(ledger.usage[PENDING][mandatory], 1);
+        assert_eq!(ledger.usage[ACTIVE][mandatory], 1);
+        for slot in 0..4 {
+            assert_eq!(ledger.bundles.get_record(slot).unwrap().linked_claims, 2);
+        }
+    }
+
+    #[inline(never)]
+    fn reject_plan_resolution_replay_for_root_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.usage,
+            ledger.reserved,
+            ledger.c17.current_counts_for_test(),
+        );
+        let mut replay_work = work();
+        assert!(matches!(
+            ledger.prepare_c17_observation_resolution(
+                ledger.generation(),
+                plan.identity(),
+                c17::ObservationResolution::DescriptionsRequired,
+                MonotonicTime::from_micros(6),
+                &mut replay_work,
+            ),
+            Err(SupportLedgerError::InvalidTransition)
+        ));
+        assert_eq!(replay_work.witness(), HotPathWorkWitness::new([0; 5]));
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.c17.generation(),
+                ledger.usage,
+                ledger.reserved,
+                ledger.c17.current_counts_for_test(),
+            ),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn c17_plan_root_transitions_apply_one_public_generation_and_conserve_aggregates() {
+        let mut ledger = plan_ledger();
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        commit_plan_create_for_root_test(&mut ledger, &plan);
+        commit_plan_receipt_for_root_test(&mut ledger, &plan);
+        commit_plan_begin_for_root_test(&mut ledger, &plan);
+        commit_plan_resolution_for_root_test(&mut ledger, &plan);
+        reject_plan_resolution_replay_for_root_test(&mut ledger, &plan);
+    }
+
+    /// Each C17 plan route is driven through `transition_coordinator` itself, proving the
+    /// coordinator's prepare/validate/seal/one-charge/commit phase law rather than the ledger
+    /// seam the other plan tests use. A sealed coordinator value carries the fixed assignment
+    /// journal, so every route gets its own fixture and only the route under test uses the
+    /// coordinator; the prerequisites use the ledger seam.
+    #[inline(never)]
+    fn coordinator_plan_fixture() -> (Box<PlanLedger>, TurnPlan<4>) {
+        let mut ledger = Box::new(plan_ledger());
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        (ledger, plan)
+    }
+
+    #[test]
+    fn c17_plan_create_commits_atomically_through_the_coordinator_seam() {
+        let (mut ledger, plan) = coordinator_plan_fixture();
+        let before = ledger.generation();
+        let mut measured = work();
+        let create = crate::transition_coordinator::prepare_plan_create(
+            &ledger,
+            &plan,
+            MonotonicTime::from_micros(2),
+            &mut measured,
+        )
+        .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_PLAN_CREATE)
+        );
+        crate::transition_coordinator::validate_plan_create(&ledger, &create).unwrap();
+        crate::transition_coordinator::commit_plan_create(&mut ledger, create);
+        assert_eq!(ledger.generation().get(), before.get() + 1);
+    }
+
+    type NoTypedCloseRequests = crate::request_book::RequestBook<1, 1, 1, 1>;
+
+    struct TypedCloseFixture {
+        ledger: PlanLedger,
+        funders: [PlanMemberFunding; 4],
+        plan: TurnPlan<4>,
+        input: crate::TypedCloseInput,
+    }
+
+    fn typed_close_owner_cell_currents(ledger: &PlanLedger) -> [[u64; 2]; 4] {
+        std::array::from_fn(|slot| {
+            let record = ledger.bundles.get_record(slot as u32).unwrap();
+            assert_eq!(record.vector_len, 2);
+            let mut next = record.vector_head;
+            std::array::from_fn(|_| {
+                let CellSlot::Occupied {
+                    current,
+                    next_owned,
+                    ..
+                } = ledger.bundles.cells.slots[next as usize]
+                else {
+                    panic!("typed-close owner cell must remain occupied")
+                };
+                next = next_owned;
+                current
+            })
+        })
+    }
+
+    #[inline(never)]
+    fn typed_close_fixture() -> TypedCloseFixture {
+        let mut ledger = plan_ledger();
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        let create = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_plan_create(create);
+        let rejection = ledger
+            .prepare_c17_plan_disposition(
+                ledger.generation(),
+                plan.identity(),
+                c17::PlanDisposition::Rejection,
+                MonotonicTime::from_micros(3),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.commit_c17_root_batch(rejection);
+
+        let authority_key = plan_authority_key(plan.identity().id.get());
+        let identity = encode_plan_identity(plan.identity());
+        let anchor = ledger
+            .c17
+            .plan_root_anchor(authority_key, identity, 2)
+            .unwrap();
+        let root =
+            crate::RootRef::new(anchor.root.slot, anchor.root.generation, anchor.version).unwrap();
+        let input = crate::TypedCloseInput {
+            group: anchor.group.slot,
+            branch: crate::PlanBranch::Rejection,
+            root,
+            occurred_at: MonotonicTime::from_micros(4),
+            reason: crate::TypedImpossible::new(9).unwrap(),
+            authority: crate::CloseAuthority::Plan {
+                identity: plan.identity(),
+                event: crate::PlanCausalEventId::new(1).unwrap(),
+            },
+        };
+        TypedCloseFixture {
+            ledger,
+            funders,
+            plan,
+            input,
+        }
+    }
+
+    #[inline(never)]
+    fn assert_typed_close_initial_state(fixture: &TypedCloseFixture) {
+        for slot in 0..4 {
+            assert_eq!(
+                fixture
+                    .ledger
+                    .bundles
+                    .get_record(slot)
+                    .unwrap()
+                    .linked_claims,
+                1
+            );
+            assert_eq!(
+                fixture.ledger.c17.owner_currents_for_test(slot).unwrap(),
+                (1, [0, 0, 1, 0], true)
+            );
+        }
+        assert_eq!(
+            typed_close_owner_cell_currents(&fixture.ledger),
+            [[1, 0]; 4]
+        );
+    }
+
+    #[inline(never)]
+    fn reject_malformed_typed_close_authorities(fixture: &TypedCloseFixture) {
+        let no_requests: Option<&NoTypedCloseRequests> = None;
+        let malformed_cancellation = crate::TypedCloseInput {
+            group: fixture.input.group + 1,
+            authority: crate::CloseAuthority::Cancellation {
+                fact: crate::CancellationFactId::new(1).unwrap(),
+                event: crate::MembershipEventId::new(1).unwrap(),
+                request_generation: crate::request_book::RequestBookGeneration::new(1).unwrap(),
+            },
+            ..fixture.input
+        };
+        let mut malformed_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_typed_close(
+                no_requests,
+                &fixture.ledger,
+                malformed_cancellation,
+                &mut malformed_work,
+            ),
+            Err(
+                crate::transition_coordinator::TypedClosePrepareError::Support(
+                    SupportLedgerError::InvalidInput
+                )
+            )
+        ));
+        assert_eq!(malformed_work.witness(), HotPathWorkWitness::new([0; 5]));
+
+        let missing_source = crate::TypedCloseInput {
+            authority: crate::CloseAuthority::Standalone {
+                domain: crate::FormationDomainId::new(1).unwrap(),
+                source: crate::SourceRecordRef::default(),
+                event: crate::MembershipEventId::new(1).unwrap(),
+            },
+            ..fixture.input
+        };
+        let mut missing_source_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_typed_close(
+                no_requests,
+                &fixture.ledger,
+                missing_source,
+                &mut missing_source_work,
+            ),
+            Err(
+                crate::transition_coordinator::TypedClosePrepareError::Support(
+                    SupportLedgerError::InvalidInput
+                )
+            )
+        ));
+        assert_eq!(
+            missing_source_work.witness(),
+            HotPathWorkWitness::new([0; 5])
+        );
+    }
+
+    #[inline(never)]
+    fn reject_drifted_typed_close_authority(fixture: &TypedCloseFixture) {
+        let no_requests: Option<&NoTypedCloseRequests> = None;
+        let drift = turn_plan(&fixture.funders, 1, 2);
+        let drift_input = crate::TypedCloseInput {
+            authority: crate::CloseAuthority::Plan {
+                identity: drift.identity(),
+                event: crate::PlanCausalEventId::new(1).unwrap(),
+            },
+            ..fixture.input
+        };
+        let mut drift_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_typed_close(
+                no_requests,
+                &fixture.ledger,
+                drift_input,
+                &mut drift_work,
+            ),
+            Err(
+                crate::transition_coordinator::TypedClosePrepareError::Support(
+                    SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+                )
+            )
+        ));
+        assert_eq!(drift_work.witness(), HotPathWorkWitness::new([0; 5]));
+
+        let wrong_event = crate::TypedCloseInput {
+            authority: crate::CloseAuthority::Plan {
+                identity: fixture.plan.identity(),
+                event: crate::PlanCausalEventId::new(2).unwrap(),
+            },
+            ..fixture.input
+        };
+        let mut wrong_event_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_typed_close(
+                no_requests,
+                &fixture.ledger,
+                wrong_event,
+                &mut wrong_event_work,
+            ),
+            Err(
+                crate::transition_coordinator::TypedClosePrepareError::Support(
+                    SupportLedgerError::InvalidTransition
+                )
+            )
+        ));
+        assert_eq!(wrong_event_work.witness(), HotPathWorkWitness::new([0; 5]));
+    }
+
+    #[inline(never)]
+    fn reject_typed_close_work_one_under_without_burn(fixture: &TypedCloseFixture) {
+        let failure_snapshot = (
+            fixture.ledger.generation(),
+            fixture.ledger.c17.generation(),
+            fixture.ledger.c17.raw_generation_for_test(),
+            fixture.ledger.c17.current_counts_for_test(),
+            fixture.ledger.usage,
+            fixture.ledger.reserved,
+            std::array::from_fn::<_, 4, _>(|slot| {
+                *fixture.ledger.bundles.get_record(slot as u32).unwrap()
+            }),
+            typed_close_owner_cell_currents(&fixture.ledger),
+        );
+        for axis in [
+            WorkDimension::VisitedEntities as usize,
+            WorkDimension::CopiedBytes as usize,
+            WorkDimension::InvariantChecks as usize,
+        ] {
+            let mut limit = crate::c17_layout::WORK_CLOSE;
+            limit[axis] -= 1;
+            let mut one_under =
+                WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(limit)));
+            assert!(matches!(
+                fixture.ledger.prepare_c17_typed_close(
+                    fixture.ledger.generation(),
+                    fixture.input,
+                    &mut one_under,
+                ),
+                Err(SupportLedgerError::Storage(FixedStorageError::Work(
+                    WorkBudgetError::BudgetExceeded(..)
+                )))
+            ));
+            assert_eq!(one_under.witness(), HotPathWorkWitness::new([0; 5]));
+            assert_eq!(
+                (
+                    fixture.ledger.generation(),
+                    fixture.ledger.c17.generation(),
+                    fixture.ledger.c17.raw_generation_for_test(),
+                    fixture.ledger.c17.current_counts_for_test(),
+                    fixture.ledger.usage,
+                    fixture.ledger.reserved,
+                    std::array::from_fn::<_, 4, _>(|slot| {
+                        *fixture.ledger.bundles.get_record(slot as u32).unwrap()
+                    }),
+                    typed_close_owner_cell_currents(&fixture.ledger),
+                ),
+                failure_snapshot
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn commit_valid_typed_close(fixture: &mut TypedCloseFixture) {
+        let before_generation = fixture.ledger.generation();
+        let before_c17 = fixture.ledger.c17.generation();
+        let before_raw = fixture.ledger.c17.raw_generation_for_test();
+        let before_usage = fixture.ledger.usage;
+        let before_reserved = fixture.ledger.reserved;
+        let before_attached: [[u32; 3]; 4] = std::array::from_fn(|class| {
+            std::array::from_fn(|pool| fixture.ledger.c17.attached(class, pool).unwrap())
+        });
+        let mut measured = work();
+        let change = fixture
+            .ledger
+            .prepare_c17_typed_close(fixture.ledger.generation(), fixture.input, &mut measured)
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_CLOSE)
+        );
+        fixture.ledger.validate_c17_root_batch(&change).unwrap();
+        fixture.ledger.commit_c17_root_batch(change);
+
+        assert_eq!(
+            fixture.ledger.generation().get(),
+            before_generation.get() + 1
+        );
+        assert_eq!(fixture.ledger.c17.generation(), before_c17 + 1);
+        assert_eq!(fixture.ledger.c17.raw_generation_for_test(), before_raw);
+        let mandatory = Mandatory as usize;
+        let mut expected_usage = before_usage;
+        expected_usage[PENDING][mandatory] -= 1;
+        expected_usage[CREDITS][mandatory] -= 1;
+        expected_usage[CLAIMS][mandatory] -= 4;
+        let mut expected_reserved = before_reserved;
+        expected_reserved[PENDING][mandatory] += 4;
+        expected_reserved[CREDITS][mandatory] += 4;
+        expected_reserved[CLAIMS][mandatory] += 4;
+        let mut expected_attached = before_attached;
+        expected_attached[PENDING][mandatory] -= 3;
+        expected_attached[CREDITS][mandatory] -= 3;
+        assert_eq!(fixture.ledger.usage, expected_usage);
+        assert_eq!(fixture.ledger.reserved, expected_reserved);
+        assert_eq!(
+            std::array::from_fn::<_, 4, _>(|class| {
+                std::array::from_fn(|pool| fixture.ledger.c17.attached(class, pool).unwrap())
+            }),
+            expected_attached
+        );
+        assert_eq!(
+            typed_close_owner_cell_currents(&fixture.ledger),
+            [[0, 0]; 4]
+        );
+        for slot in 0..4 {
+            assert_eq!(
+                fixture
+                    .ledger
+                    .bundles
+                    .get_record(slot)
+                    .unwrap()
+                    .linked_claims,
+                0
+            );
+            assert_eq!(
+                fixture.ledger.c17.owner_currents_for_test(slot).unwrap(),
+                (0, [0; 4], false)
+            );
+        }
+    }
+
+    #[inline(never)]
+    fn assert_typed_close_after_image_and_replay(fixture: &TypedCloseFixture) {
+        let no_requests: Option<&NoTypedCloseRequests> = None;
+        let authority_key = plan_authority_key(fixture.plan.identity().id.get());
+        let identity = encode_plan_identity(fixture.plan.identity());
+        let current_anchor = fixture
+            .ledger
+            .c17
+            .plan_root_anchor(authority_key, identity, 2)
+            .unwrap();
+        let formation = fixture
+            .ledger
+            .c17
+            .root_formation_for_test(current_anchor)
+            .unwrap();
+        assert_eq!(formation[40], fixture.input.reason.get());
+        assert_eq!(formation[41], c17::SemanticOperation::TypedCloseR as u8);
+        assert_eq!(formation[72], 1);
+        assert!(formation[73..80].iter().all(|byte| *byte == 0));
+        assert_eq!(u64::from_le_bytes(formation[80..88].try_into().unwrap()), 1);
+        assert!(formation[88..104].iter().all(|byte| *byte == 0));
+        assert_eq!(formation[221], c17::RootState::ClosedPending as u8);
+        assert_eq!(formation[222], c17::FormationCause::TypedImpossible as u8);
+
+        let mut stale_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_typed_close(
+                no_requests,
+                &fixture.ledger,
+                fixture.input,
+                &mut stale_work,
+            ),
+            Err(
+                crate::transition_coordinator::TypedClosePrepareError::Support(
+                    SupportLedgerError::Generation
+                )
+            )
+        ));
+        assert_eq!(stale_work.witness(), HotPathWorkWitness::new([0; 5]));
+
+        let current_input = crate::TypedCloseInput {
+            root: crate::RootRef::new(
+                current_anchor.root.slot,
+                current_anchor.root.generation,
+                current_anchor.version,
+            )
+            .unwrap(),
+            authority: crate::CloseAuthority::Plan {
+                identity: fixture.plan.identity(),
+                event: crate::PlanCausalEventId::new(2).unwrap(),
+            },
+            occurred_at: MonotonicTime::from_micros(5),
+            ..fixture.input
+        };
+        let post_close_snapshot = (
+            fixture.ledger.generation(),
+            fixture.ledger.c17.generation(),
+            fixture.ledger.c17.current_counts_for_test(),
+            fixture.ledger.usage,
+            fixture.ledger.reserved,
+            typed_close_owner_cell_currents(&fixture.ledger),
+        );
+        let mut replay_work = work();
+        assert!(matches!(
+            crate::transition_coordinator::prepare_typed_close(
+                no_requests,
+                &fixture.ledger,
+                current_input,
+                &mut replay_work,
+            ),
+            Err(
+                crate::transition_coordinator::TypedClosePrepareError::Support(
+                    SupportLedgerError::InvalidTransition
+                )
+            )
+        ));
+        assert_eq!(replay_work.witness(), HotPathWorkWitness::new([0; 5]));
+        assert_eq!(
+            (
+                fixture.ledger.generation(),
+                fixture.ledger.c17.generation(),
+                fixture.ledger.c17.current_counts_for_test(),
+                fixture.ledger.usage,
+                fixture.ledger.reserved,
+                typed_close_owner_cell_currents(&fixture.ledger),
+            ),
+            post_close_snapshot
+        );
+    }
+
+    #[test]
+    fn c17_typed_close_validates_plan_authority_and_exactly_dematerializes_pending_root() {
+        let mut fixture = typed_close_fixture();
+        assert_typed_close_initial_state(&fixture);
+        reject_malformed_typed_close_authorities(&fixture);
+        reject_drifted_typed_close_authority(&fixture);
+        reject_typed_close_work_one_under_without_burn(&fixture);
+        commit_valid_typed_close(&mut fixture);
+        assert_typed_close_after_image_and_replay(&fixture);
+    }
+
+    #[inline(never)]
+    fn commit_plan_other_resolution_for_root_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let before = ledger.generation();
+        let mut measured = work();
+        let resolution = ledger
+            .prepare_c17_observation_resolution(
+                before,
+                plan.identity(),
+                c17::ObservationResolution::Other,
+                MonotonicTime::from_micros(5),
+                &mut measured,
+            )
+            .unwrap();
+        assert_eq!(
+            measured.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_RESOLVE_OBSERVATION)
+        );
+        ledger.validate_c17_root_batch(&resolution).unwrap();
+        assert_eq!(
+            ledger.commit_c17_root_batch(resolution).get(),
+            before.get() + 1
+        );
+
+        let mandatory = Mandatory as usize;
+        assert_eq!(ledger.usage[CONDITIONAL][mandatory], 12);
+        assert_eq!(ledger.usage[PENDING][mandatory], 0);
+        assert_eq!(ledger.usage[ACTIVE][mandatory], 1);
+        assert_eq!(ledger.reserved[CONDITIONAL][mandatory], 28);
+        assert_eq!(ledger.usage[CREDITS][mandatory], 13);
+        assert_eq!(ledger.reserved[CREDITS][mandatory], 28);
+        assert_eq!(ledger.usage[CLAIMS][mandatory], 16);
+        assert_eq!(ledger.reserved[CLAIMS][mandatory], 28);
+        for slot in 0..4 {
+            assert_eq!(ledger.bundles.get_record(slot).unwrap().linked_claims, 1);
+        }
+    }
+
+    #[inline(never)]
+    fn reject_plan_other_resolution_replay_for_root_test(
+        ledger: &mut PlanLedger,
+        plan: &TurnPlan<4>,
+    ) {
+        let snapshot = (
+            ledger.generation(),
+            ledger.c17.generation(),
+            ledger.usage,
+            ledger.reserved,
+            ledger.c17.current_counts_for_test(),
+        );
+        let mut replay_work = work();
+        assert!(matches!(
+            ledger.prepare_c17_observation_resolution(
+                ledger.generation(),
+                plan.identity(),
+                c17::ObservationResolution::Other,
+                MonotonicTime::from_micros(6),
+                &mut replay_work,
+            ),
+            Err(SupportLedgerError::InvalidTransition)
+        ));
+        assert_eq!(replay_work.witness(), HotPathWorkWitness::new([0; 5]));
+        assert_eq!(
+            (
+                ledger.generation(),
+                ledger.c17.generation(),
+                ledger.usage,
+                ledger.reserved,
+                ledger.c17.current_counts_for_test(),
+            ),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn c17_observation_other_retires_resolver_and_closes_continuation() {
+        let mut ledger = plan_ledger();
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        commit_plan_create_for_root_test(&mut ledger, &plan);
+        commit_plan_receipt_for_root_test(&mut ledger, &plan);
+        commit_plan_begin_for_root_test(&mut ledger, &plan);
+        commit_plan_other_resolution_for_root_test(&mut ledger, &plan);
+        reject_plan_other_resolution_replay_for_root_test(&mut ledger, &plan);
+    }
+
     fn bundle_snapshot(ledger: &Ledger) -> (SupportLedgerGeneration, usize, usize, usize, usize) {
         (
             ledger.generation(),
@@ -5026,13 +12394,7 @@ mod tests {
         let input = bundle_input(1, &cells);
         let mut measured = work();
         let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
-        // Empty C16 and legacy indexes cost nothing: only the fixed preflight
-        // (next 2, identity validation 18, extra facts 3, absence comparisons
-        // 17, free capacity 4).
-        assert_eq!(
-            change.work.witness(),
-            HotPathWorkWitness::new([2_984, 1_664, 0, 0, 3_061])
-        );
+        assert_eq!(change.work.witness(), HotPathWorkWitness::new([0; 5]));
         assert_eq!(ledger.generation(), before, "prepare is read-only");
         assert_eq!(change.nonce, ledger.instance_nonce);
         assert_eq!(change.snapshot.generation, before);
@@ -5072,7 +12434,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 1>>(), 1_632);
         assert_eq!(
             std::mem::size_of::<ValidatedTombstone<'static, 'static, 64, 64, 1>>(),
-            1_648
+            2_704
         );
         assert_eq!(std::mem::size_of::<BundleRecord>(), 1_008);
         assert_eq!(
@@ -5085,15 +12447,12 @@ mod tests {
         );
         assert_eq!(
             std::mem::size_of::<ValidatedBundleChange<'static, 'static, 'static, 12, 12, 1>>(),
-            1_680
+            2_688
         );
         // The same input prepares again against the same before-image.
         let mut measured = work();
         ledger.prepare_bundle(&input, &mut measured).unwrap();
-        assert_eq!(
-            measured.witness(),
-            HotPathWorkWitness::new([2_984, 1_664, 0, 0, 3_061])
-        );
+        assert_eq!(measured.witness(), HotPathWorkWitness::new([0; 5]));
     }
     #[test]
     fn c16_terminal_phase_formulas_and_layouts_are_exact() {
@@ -5116,12 +12475,12 @@ mod tests {
         assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 8>>(), 4_032);
         assert_eq!(
             std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 8>>(),
-            4_048
+            4_480
         );
         assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 8>>(), 3_984);
         assert_eq!(
             std::mem::size_of::<ValidatedTombstone<'static, 'static, 12, 12, 8>>(),
-            4_000
+            5_056
         );
         assert_eq!(
             bundle_target_work::<3>(1_344).unwrap(),
@@ -5151,39 +12510,6 @@ mod tests {
 
     #[test]
     fn c16_terminal_phase_charges_are_atomic_one_under() {
-        for (prepared, target) in [
-            (1_344, bundle_target_work::<1>(1_344).unwrap()),
-            (1_296, bundle_target_work::<1>(1_296).unwrap()),
-        ] {
-            for (dimension, maximum) in [
-                (WorkDimension::VisitedEntities, 1_704_575),
-                (WorkDimension::CopiedBytes, 2_097_152),
-                (WorkDimension::InvariantChecks, 28_708),
-            ] {
-                let ledger = bundle_ledger(4, 8);
-                let mut meter = work();
-                let entry = maximum - target.value(dimension) + 1;
-                meter.record(dimension, entry).unwrap();
-                let before = meter.witness();
-                let result = if prepared == 1_344 {
-                    ledger
-                        .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
-                        .map(|_| ())
-                } else {
-                    ledger
-                        .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
-                        .map(|_| ())
-                };
-                assert_eq!(
-                    result.unwrap_err(),
-                    SupportLedgerError::Storage(FixedStorageError::Work(
-                        WorkBudgetError::BudgetExceeded(dimension, maximum, maximum + 1)
-                    ))
-                );
-                assert_eq!(meter.witness(), before, "target charge is all-or-none");
-            }
-        }
-
         for tombstone in [false, true] {
             for (dimension, maximum) in [
                 (WorkDimension::VisitedEntities, 1_704_575),
@@ -5192,31 +12518,41 @@ mod tests {
             ] {
                 let mut ledger = bundle_ledger(4, 8);
                 reserve_bundle(&mut ledger, 1, 3);
-                let target =
-                    bundle_target_work::<1>(if tombstone { 1_296 } else { 1_344 }).unwrap();
-                let remainder = if tombstone {
-                    tombstone_remainder_work::<1>(3).unwrap()
-                } else {
-                    withdraw_remainder_work::<1>(3, K - 1).unwrap()
-                };
+                let before = bundle_snapshot(&ledger);
+                let before_usage = ledger.usage;
+                let before_reserved = ledger.reserved;
+                let before_vector_usage = ledger.vector_usage;
+                let before_c17 = ledger.c17.generation();
+                let required = WORK_TOMBSTONE[dimension as usize];
                 let mut meter = work();
-                let entry = maximum - target.value(dimension) - remainder.value(dimension) + 1;
-                meter.record(dimension, entry).unwrap();
-                if tombstone {
+                meter.record(dimension, maximum - required + 1).unwrap();
+                let before_work = meter.witness();
+
+                let error = if tombstone {
                     let change = ledger
                         .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
                         .unwrap();
-                    let after_target = change.work.witness();
-                    assert!(ledger.validate_tombstone(change).is_err());
-                    assert_eq!(meter.witness(), after_target);
+                    assert_eq!(change.work.witness(), before_work);
+                    ledger.validate_tombstone(change).unwrap_err()
                 } else {
                     let change = ledger
                         .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
                         .unwrap();
-                    let after_target = change.work.witness();
-                    assert!(ledger.validate_withdraw(change).is_err());
-                    assert_eq!(meter.witness(), after_target);
-                }
+                    assert_eq!(change.work.witness(), before_work);
+                    ledger.validate_withdraw(change).unwrap_err()
+                };
+                assert_eq!(
+                    error,
+                    SupportLedgerError::Storage(FixedStorageError::Work(
+                        WorkBudgetError::BudgetExceeded(dimension, maximum, maximum + 1)
+                    ))
+                );
+                assert_eq!(meter.witness(), before_work, "fixed charge is all-or-none");
+                assert_eq!(bundle_snapshot(&ledger), before);
+                assert_eq!(ledger.usage, before_usage);
+                assert_eq!(ledger.reserved, before_reserved);
+                assert_eq!(ledger.vector_usage, before_vector_usage);
+                assert_eq!(ledger.c17.generation(), before_c17);
             }
         }
     }
@@ -5325,73 +12661,43 @@ mod tests {
         );
     }
     #[test]
-    fn c16_bundle_prepare_work_exhaustion_rolls_back() {
+    fn c17_migrated_bundle_work_exhaustion_rolls_back() {
         let cells = configured_cells(3, 1);
         let input = bundle_input(1, &cells);
-        let ledger = bundle_ledger(4, 8);
-        let before = bundle_snapshot(&ledger);
-        let mut exhausted = work();
-        exhausted
-            .record(WorkDimension::VisitedEntities, 1_704_575)
-            .unwrap();
-        let fault = ledger.prepare_bundle(&input, &mut exhausted);
-        let error = WorkBudgetError::BudgetExceeded(
-            WorkDimension::VisitedEntities,
-            1_704_575,
-            1_704_575 + 2_984,
-        );
-        assert_eq!(
-            fault.err(),
-            Some(SupportLedgerError::Storage(FixedStorageError::Work(error)))
-        );
-        assert_eq!(bundle_snapshot(&ledger), before);
-        let ledger = bundle_ledger(4, 8);
-        let mut exhausted = work();
-        exhausted
-            .record(WorkDimension::CopiedBytes, 2_095_489)
-            .unwrap();
-        let fault = ledger.prepare_bundle(&input, &mut exhausted);
-        let error =
-            WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 2_097_152, 2_097_153);
-        assert_eq!(
-            fault.err(),
-            Some(SupportLedgerError::Storage(FixedStorageError::Work(error)))
-        );
-        assert_eq!(
-            exhausted.witness().value(WorkDimension::CopiedBytes),
-            2_095_489
-        );
-        assert_eq!(bundle_snapshot(&ledger), before);
-        let ledger = bundle_ledger(4, 8);
-        let mut exhausted = work();
-        exhausted
-            .record(WorkDimension::InvariantChecks, 25_648)
-            .unwrap();
-        let fault = ledger.prepare_bundle(&input, &mut exhausted);
-        let error = WorkBudgetError::BudgetExceeded(WorkDimension::InvariantChecks, 28_708, 28_709);
-        assert_eq!(
-            fault.err(),
-            Some(SupportLedgerError::Storage(FixedStorageError::Work(error)))
-        );
-        assert_eq!(
-            exhausted.witness().value(WorkDimension::InvariantChecks),
-            25_648
-        );
-        assert_eq!(bundle_snapshot(&ledger), before);
-    }
-    #[test]
-    fn c16_bundle_validate_phase_charge_is_atomic_one_under() {
-        let cells = configured_cells(3, 1);
-        let input = bundle_input(1, &cells);
-        let prepare = bundle_reserve_work::<1>(3, 7).unwrap();
-        let validate = bundle_validate_commit_work::<1>(3, 10, 7).unwrap();
         for (dimension, maximum) in [
             (WorkDimension::VisitedEntities, 1_704_575),
             (WorkDimension::CopiedBytes, 2_097_152),
             (WorkDimension::InvariantChecks, 28_708),
         ] {
             let mut ledger = bundle_ledger(4, 8);
-            let initial = maximum - prepare.value(dimension) - validate.value(dimension) + 1;
+            let before = bundle_snapshot(&ledger);
+            let required = WORK_MIGRATED_C16[dimension as usize];
+            let initial = maximum - required + 1;
+            let mut exhausted = work();
+            exhausted.record(dimension, initial).unwrap();
+            let change = ledger.prepare_bundle(&input, &mut exhausted).unwrap();
+            let before_charge = change.work.witness();
+            assert_eq!(
+                ledger.validate_bundle(change).unwrap_err(),
+                SupportLedgerError::Storage(FixedStorageError::Work(
+                    WorkBudgetError::BudgetExceeded(dimension, maximum, maximum + 1)
+                ))
+            );
+            assert_eq!(exhausted.witness(), before_charge);
+            assert_eq!(bundle_snapshot(&ledger), before);
+        }
+    }
+    #[test]
+    fn c17_migrated_bundle_charge_is_atomic_one_under() {
+        let cells = configured_cells(3, 1);
+        let input = bundle_input(1, &cells);
+        for (dimension, maximum) in [
+            (WorkDimension::VisitedEntities, 1_704_575),
+            (WorkDimension::CopiedBytes, 2_097_152),
+            (WorkDimension::InvariantChecks, 28_708),
+        ] {
+            let mut ledger = bundle_ledger(4, 8);
+            let initial = maximum - WORK_MIGRATED_C16[dimension as usize] + 1;
             let mut meter = work();
             meter.record(dimension, initial).unwrap();
             let change = ledger.prepare_bundle(&input, &mut meter).unwrap();
@@ -5403,11 +12709,7 @@ mod tests {
                     WorkBudgetError::BudgetExceeded(dimension, maximum, maximum + 1)
                 ))
             );
-            assert_eq!(
-                meter.witness(),
-                after_prepare,
-                "phase charge is all-or-none"
-            );
+            assert_eq!(meter.witness(), after_prepare, "charge is all-or-none");
             assert!(ledger.bundles.is_empty());
         }
     }
@@ -5515,21 +12817,18 @@ mod tests {
         let before = ledger.generation();
         let mut measured = work();
         let change = ledger.prepare_bundle(&input, &mut measured).unwrap();
-        assert_eq!(
-            change.work.witness(),
-            HotPathWorkWitness::new([2_984, 1_664, 0, 0, 3_061])
-        );
+        assert_eq!(change.work.witness(), HotPathWorkWitness::default());
         let validated = ledger
             .validate_bundle(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([11_987, 4_936, 0, 0, 6_218])
+            HotPathWorkWitness::new(WORK_MIGRATED_C16)
         );
         let next = validated.commit_bundle();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([11_987, 4_936, 0, 0, 6_218]),
+            HotPathWorkWitness::new(WORK_MIGRATED_C16),
             "commit performs no Work call"
         );
         assert_eq!(next, before.next().unwrap());
@@ -5567,6 +12866,13 @@ mod tests {
         assert_eq!(record.state, BundleState::LivePristine);
         assert_eq!(record.vector_len, 3);
         assert_ne!(record.vector_head, NO_NODE);
+        for key in record.tagged_keys() {
+            ledger
+                .c17
+                .validate_c16_raw_reciprocity(key.identity, owner.unwrap(), record)
+                .unwrap();
+        }
+        assert_eq!(ledger.c17.generation(), 2);
         assert_eq!(
             (
                 ledger.bundles.free_record_len(),
@@ -5834,13 +13140,13 @@ mod tests {
         // store, and the complete witness is frozen.
         let mut ledger = generic_ledger();
         let mut measured = work();
-        let valid = spec(7, 7, Ordinary, &[Reserved([7; 32])]);
+        let valid = spec(7, 8, Ordinary, &[Reserved([7; 32])]);
         ledger
             .reserve(ledger.generation(), valid, &mut measured)
             .unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([75, 366, 0, 0, 20])
+            HotPathWorkWitness::new([1_134, 1_616_904, 0, 0, 1_060])
         );
         // Lifecycle reserve m = 1 with the reciprocal preflight frozen.
         let mut ledger = new_ledger();
@@ -5867,7 +13173,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             measured.witness(),
-            HotPathWorkWitness::new([75, 300, 0, 0, 29])
+            HotPathWorkWitness::new([1_134, 1_616_904, 0, 0, 1_069])
         );
     }
     fn reserve_bundle(ledger: &mut Ledger, n: u8, v: usize) -> SupportOperationObligationId {
@@ -5896,7 +13202,7 @@ mod tests {
                 &mut meter,
             )
             .unwrap();
-        assert_eq!(meter.witness(), witness([274, 65, 0, 0, 286]));
+        assert_eq!(meter.witness(), witness([1_333, 1_616_904, 0, 0, 1_326]));
         let pending = *ledger.bundles.get_record(0).unwrap();
         assert_eq!(pending.state, BundleState::LiveConsumed);
         assert_eq!(pending.initial[0].state, Pending);
@@ -5914,7 +13220,7 @@ mod tests {
                 &mut meter,
             )
             .unwrap();
-        assert_eq!(meter.witness(), witness([274, 65, 0, 0, 286]));
+        assert_eq!(meter.witness(), witness([1_333, 1_616_904, 0, 0, 1_326]));
         let active = *ledger.bundles.get_record(0).unwrap();
         assert_eq!(active.initial[0].state, Active);
         assert_eq!(active.initial[0].state_time, MonotonicTime::from_micros(6));
@@ -5945,9 +13251,10 @@ mod tests {
                 &mut meter,
             )
             .unwrap();
-        assert_eq!(meter.witness(), witness([274, 65, 0, 0, 286]));
+        assert_eq!(meter.witness(), witness([0; 5]));
         ledger.validate(&change).unwrap();
         ledger.commit(change, &mut meter).unwrap();
+        assert_eq!(meter.witness(), witness([1_333, 1_616_904, 0, 0, 1_326]));
         assert_eq!(
             ledger.bundles.get_record(0).unwrap().initial[0].state,
             Retained
@@ -5964,7 +13271,7 @@ mod tests {
             ),
             Err(SupportLedgerError::InvalidTransition)
         );
-        assert_eq!(missing.witness(), witness([274, 65, 0, 0, 286]));
+        assert_eq!(missing.witness(), witness([0; 5]));
         assert_eq!(bundle_snapshot(&ledger), snapshot);
     }
 
@@ -6011,7 +13318,7 @@ mod tests {
                     Err(InvalidTransition),
                     "ordinal {ordinal}, corruption {corruption}"
                 );
-                assert_eq!(measured.witness(), witness([274, 65, 0, 0, 286]));
+                assert_eq!(measured.witness(), witness([0; 5]));
                 assert_eq!(ledger.generation(), before_generation);
                 assert_eq!(ledger.usage, before_usage);
                 assert_eq!(ledger.reserved, before_reserved);
@@ -6121,6 +13428,75 @@ mod tests {
     }
 
     #[test]
+    fn c16_committed_tombstone_retains_raw_owners_and_advances_once() {
+        let mut ledger = bundle_ledger(4, 8);
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        let before_generation = ledger.generation();
+        let before_c17 = ledger.c17.generation();
+        let before_usage = ledger.usage;
+        let before_reserved = ledger.reserved;
+        let before_vector_usage = ledger.vector_usage;
+        let before_free = (
+            ledger.bundles.free_record_len(),
+            ledger.bundles.free_cell_len(),
+            ledger.bundles.free_leaf_len(),
+            ledger.bundles.free_branch_len(),
+        );
+
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+            .unwrap();
+        assert_eq!(change.work.witness(), HotPathWorkWitness::default());
+        let validated = ledger.validate_tombstone(change).unwrap();
+        assert_eq!(
+            validated.change.work.witness(),
+            HotPathWorkWitness::new(WORK_TOMBSTONE)
+        );
+        let committed = validated.commit_tombstone();
+        assert_eq!(meter.witness(), HotPathWorkWitness::new(WORK_TOMBSTONE));
+        assert_eq!(committed, before_generation.next().unwrap());
+        assert_eq!(ledger.generation(), committed);
+        assert_eq!(ledger.c17.generation(), before_c17 + 1);
+        assert_eq!(ledger.usage, before_usage);
+        assert_eq!(ledger.reserved, before_reserved);
+        assert_eq!(ledger.vector_usage, before_vector_usage);
+        assert_eq!(
+            (
+                ledger.bundles.free_record_len(),
+                ledger.bundles.free_cell_len(),
+                ledger.bundles.free_leaf_len(),
+                ledger.bundles.free_branch_len(),
+            ),
+            before_free
+        );
+
+        let owner = ledger
+            .bundles
+            .find(TAG_OBLIGATION, &obligation.get(), &mut work())
+            .unwrap()
+            .expect("retained obligation owner");
+        let record = *ledger.bundles.get_record(owner).unwrap();
+        assert_eq!(record.state, BundleState::RetainedTombstone);
+        for key in record.tagged_keys() {
+            ledger
+                .c17
+                .validate_c16_raw_reciprocity(key.identity, owner, &record)
+                .unwrap();
+        }
+
+        let mut rejected_work = work();
+        let rejected = ledger
+            .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut rejected_work)
+            .unwrap();
+        assert_eq!(
+            ledger.validate_withdraw(rejected).unwrap_err(),
+            SupportLedgerError::InvalidTransition
+        );
+        assert_eq!(rejected_work.witness(), HotPathWorkWitness::default());
+    }
+
+    #[test]
     fn c16_bundle_pristine_withdraw_commits_once_and_releases() {
         let mut ledger = bundle_ledger(4, 8);
         let obligation = reserve_bundle(&mut ledger, 1, 3);
@@ -6129,21 +13505,18 @@ mod tests {
         let change = ledger
             .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut measured)
             .unwrap();
-        assert_eq!(
-            change.work.witness(),
-            HotPathWorkWitness::new([267, 1_680, 0, 0, 274])
-        );
+        assert_eq!(change.work.witness(), HotPathWorkWitness::default());
         let validated = ledger
             .validate_withdraw(change)
             .expect("same-instance same-state validation");
         assert_eq!(
             validated.change.work.witness(),
-            HotPathWorkWitness::new([6_253, 4_968, 0, 0, 3_481])
+            HotPathWorkWitness::new(WORK_TOMBSTONE)
         );
         assert_eq!(std::mem::size_of::<PreparedWithdrawal<'static, 1>>(), 1_680);
         assert_eq!(
             std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 1>>(),
-            1_696
+            2_128
         );
         let next = validated.commit_withdraw();
         assert_eq!(next, before.next().unwrap());
@@ -6295,12 +13668,6 @@ mod tests {
             let mut ledger = bundle_ledger(4, 8);
             reserve_bundle(&mut ledger, 1, 3);
             let before = bundle_snapshot(&ledger);
-            let target = bundle_target_work::<1>(if tombstone { 1_296 } else { 1_344 }).unwrap();
-            let remainder = if tombstone {
-                tombstone_remainder_work::<1>(3).unwrap()
-            } else {
-                withdraw_remainder_work::<1>(3, K - 1).unwrap()
-            };
             let mut meter = work();
             let error = if tombstone {
                 let change = ledger
@@ -6314,7 +13681,7 @@ mod tests {
                 ledger.validate_withdraw(change).unwrap_err()
             };
             assert_eq!(error, SupportLedgerError::InvalidTransition);
-            assert_eq!(meter.witness(), target.checked_add(remainder).unwrap());
+            assert_eq!(meter.witness(), HotPathWorkWitness::default());
             assert_eq!(bundle_snapshot(&ledger), before);
         }
     }
@@ -6361,14 +13728,6 @@ mod tests {
                 let before_usage = ledger.usage;
                 let before_reserved = ledger.reserved;
                 let before_vector_usage = ledger.vector_usage;
-                let target =
-                    bundle_target_work::<1>(if tombstone { 1_296 } else { 1_344 }).unwrap();
-                let remainder = if tombstone {
-                    tombstone_remainder_work::<1>(3).unwrap()
-                } else {
-                    withdraw_remainder_work::<1>(3, K - 1).unwrap()
-                };
-                let expected_work = target.checked_add(remainder).unwrap();
                 let expected_error = SupportLedgerError::InvalidTransition;
                 let mut meter = work();
                 let error = if tombstone {
@@ -6394,8 +13753,8 @@ mod tests {
                 );
                 assert_eq!(
                     meter.witness(),
-                    expected_work,
-                    "tombstone {tombstone}, corruption {corruption} retains exact Work"
+                    HotPathWorkWitness::default(),
+                    "tombstone {tombstone}, corruption {corruption} burns no Work"
                 );
                 assert_eq!(ledger.generation(), before_generation);
                 assert_eq!(ledger.usage, before_usage);
@@ -6414,16 +13773,12 @@ mod tests {
                     owner_record,
                     cell,
                     next_owned,
+                    ..
                 } => (owner_record, cell, next_owned),
                 CellSlot::Vacant { .. } => unreachable!("fixture chain is occupied"),
             };
         let reject = |ledger: &mut Ledger| {
             let before = bundle_snapshot(ledger);
-            let len = ledger.bundles.get_record(0).unwrap().vector_len as usize;
-            let expected = bundle_target_work::<1>(1_344)
-                .unwrap()
-                .checked_add(withdraw_remainder_work::<1>(len, K - 1).unwrap())
-                .unwrap();
             let mut meter = work();
             let change = ledger
                 .prepare_withdraw(request_owner(1), bundle_entitlement(1), &mut meter)
@@ -6431,8 +13786,8 @@ mod tests {
             assert!(ledger.validate_withdraw(change).is_err());
             assert_eq!(
                 meter.witness(),
-                expected,
-                "post-target corruption retains both charged phases"
+                HotPathWorkWitness::default(),
+                "semantic corruption burns no Work"
             );
             assert_eq!(bundle_snapshot(ledger), before);
         };
@@ -6462,6 +13817,7 @@ mod tests {
                     ledger.bundles.cells.slots[first as usize] = CellSlot::Occupied {
                         owner_record,
                         cell,
+                        current: 0,
                         next_owned: NO_NODE,
                     };
                 }
@@ -6470,6 +13826,7 @@ mod tests {
                     ledger.bundles.cells.slots[tail as usize] = CellSlot::Occupied {
                         owner_record,
                         cell,
+                        current: 0,
                         next_owned: first,
                     };
                 }
@@ -6478,6 +13835,7 @@ mod tests {
                     ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
                         owner_record: 1,
                         cell,
+                        current: 0,
                         next_owned,
                     };
                 }
@@ -6490,6 +13848,7 @@ mod tests {
                     ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
                         owner_record,
                         cell,
+                        current: 0,
                         next_owned: middle,
                     };
                 }
@@ -6499,6 +13858,7 @@ mod tests {
                     ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
                         owner_record,
                         cell: first_cell,
+                        current: 0,
                         next_owned,
                     };
                 }
@@ -6508,6 +13868,7 @@ mod tests {
                     ledger.bundles.cells.slots[first as usize] = CellSlot::Occupied {
                         owner_record,
                         cell,
+                        current: 0,
                         next_owned,
                     };
                 }
@@ -6535,6 +13896,7 @@ mod tests {
         ledger.bundles.cells.slots[middle as usize] = CellSlot::Occupied {
             owner_record,
             cell: first_cell,
+            current: 0,
             next_owned,
         };
         let mut meter = work();
@@ -6566,11 +13928,13 @@ mod tests {
         // Generic reserve keys block a later C16 bundle in both namespaces.
         let mut ledger = bundle_ledger(4, 8);
         add(&mut ledger, 1, 1).unwrap();
-        legacy_blocks(&mut ledger, [1; 32], [1; 32]);
+        let mut legacy_credit = [1; 32];
+        legacy_credit[31] ^= 0x80;
+        legacy_blocks(&mut ledger, [1; 32], legacy_credit);
         // Prepared ordinary keys block a later C16 bundle.
         let mut ledger = ordinary_ledger();
-        begin(&mut ledger, ordinary((1, 1, 3, Reserved([4; 32]))), at(1)).unwrap();
-        legacy_blocks(&mut ledger, [1; 32], [1; 32]);
+        begin(&mut ledger, ordinary((1, 2, 3, Reserved([4; 32]))), at(1)).unwrap();
+        legacy_blocks(&mut ledger, [1; 32], [2; 32]);
         // Lifecycle reserve keys block a later C16 bundle.
         let mut ledger = bundle_ledger(4, 8);
         for capacity in &mut ledger.capacities {
@@ -6856,7 +14220,7 @@ mod tests {
         let sealed = seal_exact_capacity(&slots, &free, 8).unwrap_err();
         assert_eq!(sealed, FixedStorageError::Capacity);
         let arena = EntitlementCellArena::try_new(8).unwrap();
-        assert_eq!(std::mem::size_of::<CellSlot>(), 40);
+        assert_eq!(std::mem::size_of::<CellSlot>(), 48);
         assert_eq!(std::mem::size_of::<EntitlementCellArena>(), 48);
         assert_eq!(arena.capacity(), 8);
         assert_eq!(arena.free_len(), 8);
@@ -6880,6 +14244,7 @@ mod tests {
             let expected = CellSlot::Occupied {
                 owner_record: 7,
                 cell,
+                current: 0,
                 next_owned: next.unwrap_or(NO_NODE),
             };
             assert_eq!(arena.slots[index], expected);
@@ -7305,8 +14670,8 @@ mod tests {
             );
             assert_eq!(
                 measured.witness(),
-                bundle_reserve_work::<1>(3, 7).unwrap(),
-                "corruption at ancestor position {position} retains exact preflight work"
+                HotPathWorkWitness::default(),
+                "corruption at ancestor position {position} burns no Work"
             );
             assert_eq!(ledger.bundles, before, "rejection is read-only");
         }
