@@ -1484,6 +1484,252 @@ impl SupportC17 {
             retired_link_after,
             new_link_images,
             resolution_journals,
+            raw_updates,
+            raw_update_count,
+            header_after,
+            raw_plan,
+            local_plan,
+        })
+    }
+
+    fn prepare_resolution_journals(
+        &self,
+        preview: &RootBatchPreview,
+        formations: &ArenaSelection<ROOT_BATCH_MAX>,
+        funders: &ArenaSelection<ROOT_BATCH_FUNDER_MAX>,
+        links: &ArenaSelection<PLAN_MEMBERS_MAX>,
+        root_journals: &mut [Option<RootJournal>; ROOT_BATCH_MAX],
+        owner_references: &[[ArenaRef; 4]; PLAN_MEMBERS_MAX],
+        owner_records_after: &mut [Option<BundleRecord>; PLAN_MEMBERS_MAX],
+        owner_rows_after: &mut [[u8; OWNER_ROW_BYTES]; PLAN_MEMBERS_MAX],
+        owners_after: &mut [[u8; OWNER_BYTES]; PLAN_MEMBERS_MAX],
+    ) -> Result<
+        (
+            [Option<ResolutionRecordJournal>; RESOLUTION_RECORD_MAX],
+            [Option<ResolutionRawUpdate>; RESOLUTION_RAW_MAX],
+            usize,
+        ),
+        SupportLedgerError,
+    > {
+        let mut resolution_journals = [None; RESOLUTION_RECORD_MAX];
+        let mut raw_updates = [None; RESOLUTION_RAW_MAX];
+        let mut raw_update_count = 0usize;
+        if preview.resolution_record_count == 0 {
+            return Ok((resolution_journals, raw_updates, raw_update_count));
         }
+        if !matches!(
+            preview.operation,
+            SemanticOperation::ResolveObservationDescriptions
+                | SemanticOperation::ResolveObservationOther
+        ) || preview.resolution_records[..preview.resolution_record_count]
+            .iter()
+            .any(Option::is_none)
+            || preview.resolution_records[preview.resolution_record_count..]
+                .iter()
+                .any(Option::is_some)
+            || preview.transition_count != 2
+        {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        self.lifecycle.validate_advance_generation()?;
+
+        let target_spec = preview.transitions[1].ok_or(SupportLedgerError::InvalidInput)?;
+        let target_journal = root_journals[1].ok_or(SupportLedgerError::InvalidInput)?;
+        let mut target = target_spec.before;
+        target.state = target_spec.after;
+        target.version = target.version.checked_add(1).ok_or_else(capacity_error)?;
+        target.occurred_at = target_spec.occurred_at;
+        target.formation = formations[1];
+        target.locator = target_journal.locator_after_ref;
+        target.group_image = target_journal.group_after;
+        target.formation_image = target_journal.formation_after;
+        target.locator_image = target_journal.locator_after;
+        for ordinal in 0..target.member_count {
+            target.members[ordinal].funder = funders[PLAN_MEMBERS_MAX + ordinal];
+        }
+
+        for record_index in 0..preview.resolution_record_count {
+            let snapshot =
+                preview.resolution_records[record_index].ok_or(SupportLedgerError::InvalidInput)?;
+            if self.lifecycle.image(snapshot.reference, &[1])? != &snapshot.image
+                || snapshot.image[488] != 0
+            {
+                return Err(SupportLedgerError::Generation);
+            }
+            let owner_count = snapshot
+                .record
+                .owners
+                .iter()
+                .position(|owner| *owner == LifecycleOwnerRow::ZERO)
+                .unwrap_or(PLAN_MEMBERS_MAX);
+            let mut after_image = snapshot.image;
+            if preview.operation == SemanticOperation::ResolveObservationDescriptions {
+                let mut transferred = snapshot.record;
+                transferred.final_owner = encode_lifecycle_final_owner(target);
+                transferred.owner_set_ref = encode_arena_ref_value(target.members[0].owner);
+                transferred.aggregate[0] = 1;
+                for owner in &mut transferred.owners[..owner_count] {
+                    let owner_ref = decode_arena_ref(&owner.owner.to_le_bytes())?;
+                    let owner_index = preview.owners[..preview.owner_count]
+                        .iter()
+                        .position(|candidate| candidate.owner == owner_ref)
+                        .ok_or_else(noncanonical_error)?;
+                    if owner_references[owner_index][0] != owner_ref {
+                        return Err(noncanonical_error());
+                    }
+                    let old_group = decode_arena_ref(&owner.group.to_le_bytes())?;
+                    let old_transition = preview.transitions[..preview.transition_count]
+                        .iter()
+                        .position(|transition| {
+                            transition
+                                .is_some_and(|transition| transition.before.group == old_group)
+                        })
+                        .ok_or_else(noncanonical_error)?;
+                    let target_ordinal = target.members[..target.member_count]
+                        .iter()
+                        .position(|member| member.owner == owner_ref)
+                        .ok_or_else(noncanonical_error)?;
+                    if old_transition != 1 {
+                        adjust_resolution_funder(root_journals, old_transition, owner_ref, -1)?;
+                        adjust_resolution_funder(root_journals, 1, owner_ref, 1)?;
+                    }
+                    let old_branch = usize::from(snapshot.record.final_owner[17]);
+                    let target_branch = usize::from(target.branch);
+                    let row = &mut owner_rows_after[owner_index];
+                    if old_branch != target_branch {
+                        let old_offset = OWNER_ROW_BRANCH_CURRENT + old_branch * 8;
+                        let new_offset = OWNER_ROW_BRANCH_CURRENT + target_branch * 8;
+                        let old_after = read_u64(row, old_offset)
+                            .checked_sub(1)
+                            .ok_or_else(noncanonical_error)?;
+                        let new_after = read_u64(row, new_offset)
+                            .checked_add(1)
+                            .ok_or_else(capacity_error)?;
+                        write_u64(row, old_offset, old_after);
+                        write_u64(row, new_offset, new_after);
+                    }
+                    owner.source = arena_ref_word(target.members[target_ordinal].member);
+                    owner.group = arena_ref_word(target.group);
+                    owner.root = arena_ref_word(target.locator);
+                    owner.formation = arena_ref_word(target.formation);
+                    owner.link = arena_ref_word(links[owner_index]);
+                    owner.class = 1;
+                }
+                let batch = read_u64(&snapshot.image, 8);
+                let ordinal = usize::from(read_u16(&snapshot.image, 16));
+                after_image = transferred.encode(snapshot.reference, batch, ordinal)?;
+                after_image[..24].copy_from_slice(&snapshot.image[..24]);
+                after_image[480..488].copy_from_slice(&snapshot.image[480..488]);
+            } else {
+                after_image[488..512].fill(0);
+                after_image[488] = LIFECYCLE_CLOSE_ACTION;
+                after_image[489] = NO_CONTINUATION_AFTER_OBSERVATION;
+                write_u64(
+                    &mut after_image,
+                    496,
+                    preview.transitions[0]
+                        .ok_or(SupportLedgerError::InvalidInput)?
+                        .occurred_at,
+                );
+                write_u64(&mut after_image, 504, self.generation() + 1);
+                validate_closed_lifecycle_image(&after_image)?;
+                for owner in snapshot.record.owners[..owner_count].iter().copied() {
+                    let owner_ref = decode_arena_ref(&owner.owner.to_le_bytes())?;
+                    let owner_index = preview.owners[..preview.owner_count]
+                        .iter()
+                        .position(|candidate| candidate.owner == owner_ref)
+                        .ok_or_else(noncanonical_error)?;
+                    if owner_references[owner_index][0] != owner_ref {
+                        return Err(noncanonical_error());
+                    }
+                    let old_group = decode_arena_ref(&owner.group.to_le_bytes())?;
+                    let old_transition = preview.transitions[..preview.transition_count]
+                        .iter()
+                        .position(|transition| {
+                            transition
+                                .is_some_and(|transition| transition.before.group == old_group)
+                        })
+                        .ok_or_else(noncanonical_error)?;
+                    adjust_resolution_funder(root_journals, old_transition, owner_ref, -1)?;
+                    let record = owner_records_after[owner_index]
+                        .as_mut()
+                        .ok_or(SupportLedgerError::InvalidTransition)?;
+                    record.linked_claims = record
+                        .linked_claims
+                        .checked_sub(1)
+                        .ok_or_else(noncanonical_error)?;
+                    let row = &mut owner_rows_after[owner_index];
+                    let linked = read_u32(row, OWNER_ROW_LINKED_CLAIMS)
+                        .checked_sub(1)
+                        .ok_or_else(noncanonical_error)?;
+                    let current = read_u64(row, OWNER_ROW_CURRENT)
+                        .checked_sub(1)
+                        .ok_or_else(noncanonical_error)?;
+                    let branch_offset =
+                        OWNER_ROW_BRANCH_CURRENT + usize::from(snapshot.record.final_owner[17]) * 8;
+                    let branch = read_u64(row, branch_offset)
+                        .checked_sub(1)
+                        .ok_or_else(noncanonical_error)?;
+                    write_u32(row, OWNER_ROW_LINKED_CLAIMS, linked);
+                    write_u64(row, OWNER_ROW_CURRENT, current);
+                    write_u64(row, branch_offset, branch);
+                    write_u32(
+                        &mut owners_after[owner_index],
+                        OWNER_IMAGE_LINKED_CLAIMS,
+                        linked,
+                    );
+                }
+                for (kind, key) in [
+                    (
+                        RawOwnerKind::LifecycleObligation,
+                        snapshot.record.obligation_raw,
+                    ),
+                    (RawOwnerKind::LifecycleCredit, snapshot.record.credit_raw),
+                ] {
+                    let handle = self.raw.find_handle(&key)?.ok_or_else(noncanonical_error)?;
+                    let before = self.raw.value_at(handle)?;
+                    let (actual_kind, state, owner) = decode_raw_owner(before)?;
+                    if actual_kind != kind
+                        || state != RawOwnerState::Committed
+                        || owner != snapshot.reference
+                        || raw_update_count == RESOLUTION_RAW_MAX
+                    {
+                        return Err(noncanonical_error());
+                    }
+                    raw_updates[raw_update_count] = Some(ResolutionRawUpdate {
+                        key,
+                        handle,
+                        before,
+                        after: encode_raw_owner(kind, RawOwnerState::Retained, snapshot.reference)?,
+                    });
+                    raw_update_count += 1;
+                }
+            }
+            resolution_journals[record_index] = Some(ResolutionRecordJournal {
+                snapshot,
+                after: after_image,
+            });
+        }
+        raw_updates[..raw_update_count]
+            .sort_unstable_by_key(|update| update.expect("active Raw update").key);
+        if raw_updates[..raw_update_count].windows(2).any(|pair| {
+            pair[0].expect("active Raw update").key >= pair[1].expect("active Raw update").key
+        }) {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        if raw_update_count > 0 {
+            let mut updates = [([0; 32], NodeHandle::SENTINEL, [0; 8]); RESOLUTION_RAW_MAX];
+            for (index, update) in raw_updates[..raw_update_count]
+                .iter()
+                .copied()
+                .flatten()
+                .enumerate()
+            {
+                updates[index] = (update.key, update.handle, update.after);
+            }
+            self.raw
+                .validate_update_batch(&updates[..raw_update_count])?;
+        }
+        Ok((resolution_journals, raw_updates, raw_update_count))
     }
 }
