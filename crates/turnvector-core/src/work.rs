@@ -42,6 +42,11 @@ impl HotPathWorkBudget {
     pub const fn binary_maximum() -> Self {
         Self(HotPathWorkWitness::new([1_704_575, 2_097_152, 0, 2, 28_708]))
     }
+    #[cfg(test)]
+    pub(crate) const fn testing(maxima: HotPathWorkWitness) -> Self {
+        Self(maxima)
+    }
+
     pub fn try_new(maxima: HotPathWorkWitness) -> Result<Self, WorkBudgetError> {
         let binary = Self::binary_maximum().0;
         for dimension in DIMENSIONS {
@@ -63,6 +68,44 @@ pub enum WorkBudgetError {
     CounterOverflow(WorkDimension),
     BudgetExceeded(WorkDimension, u64, u64),
 }
+pub(crate) trait WorkRecorder {
+    fn record(&mut self, dimension: WorkDimension, amount: u64) -> Result<(), WorkBudgetError>;
+    fn charge(&mut self, witness: HotPathWorkWitness) -> Result<(), WorkBudgetError>;
+    fn ensure(&self, required: HotPathWorkWitness) -> Result<(), WorkBudgetError>;
+    fn witness(&self) -> HotPathWorkWitness;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ExactWorkCensus(HotPathWorkWitness);
+
+impl ExactWorkCensus {
+    pub(crate) const fn new() -> Self {
+        Self(HotPathWorkWitness::new([0; 5]))
+    }
+}
+
+impl WorkRecorder for ExactWorkCensus {
+    fn record(&mut self, dimension: WorkDimension, amount: u64) -> Result<(), WorkBudgetError> {
+        let mut delta = [0; 5];
+        delta[dimension as usize] = amount;
+        self.0 = self.0.checked_add(HotPathWorkWitness::new(delta))?;
+        Ok(())
+    }
+
+    fn charge(&mut self, witness: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
+        self.0 = self.0.checked_add(witness)?;
+        Ok(())
+    }
+
+    fn ensure(&self, required: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
+        self.0.checked_add(required).map(|_| ())
+    }
+
+    fn witness(&self) -> HotPathWorkWitness {
+        self.0
+    }
+}
+
 pub struct WorkMeter(HotPathWorkBudget, HotPathWorkWitness);
 impl WorkMeter {
     pub const fn new(budget: HotPathWorkBudget) -> Self {
@@ -115,6 +158,24 @@ impl WorkMeter {
     }
     pub const fn witness(&self) -> HotPathWorkWitness {
         self.1
+    }
+}
+
+impl WorkRecorder for WorkMeter {
+    fn record(&mut self, dimension: WorkDimension, amount: u64) -> Result<(), WorkBudgetError> {
+        WorkMeter::record(self, dimension, amount)
+    }
+
+    fn charge(&mut self, witness: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
+        WorkMeter::charge(self, witness)
+    }
+
+    fn ensure(&self, required: HotPathWorkWitness) -> Result<(), WorkBudgetError> {
+        WorkMeter::ensure(self, required)
+    }
+
+    fn witness(&self) -> HotPathWorkWitness {
+        WorkMeter::witness(self)
     }
 }
 

@@ -1,5 +1,7 @@
 #![allow(dead_code, reason = "later C11 rows consume bounded token requests")]
 
+pub(crate) mod c17;
+
 use crate::WorkDimension::{CopiedBytes, InvariantChecks, VisitedEntities};
 use crate::model_registry::{
     MODEL_REGISTRY_LIMIT, ModelAliasId, ModelRevisionId, RegistryGeneration, RequestRevision,
@@ -113,6 +115,8 @@ pub(crate) enum RequestError {
     StopTokenCapacity,
     UnknownRequest,
     DescriptionState,
+    Storage(crate::FixedStorageError),
+    InvalidTransition,
 }
 impl From<WorkBudgetError> for RequestError {
     fn from(error: WorkBudgetError) -> Self {
@@ -120,13 +124,7 @@ impl From<WorkBudgetError> for RequestError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RequestBookGeneration(u64);
-#[rustfmt::skip]
-impl RequestBookGeneration {
-    pub(crate) fn new(value: u64) -> RequestResult<Self> { (value != 0).then_some(Self(value)).ok_or(RequestError::InvalidGeneration) }
-    fn next(self) -> RequestResult<Self> { self.0.checked_add(1).map(Self).ok_or(RequestError::GenerationOverflow) }
-}
+pub(crate) use crate::RequestBookGeneration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TokenRequest<const INPUT: usize, const STOPS: usize, const STOP_TOKENS: usize> {
@@ -225,7 +223,7 @@ impl<const I: usize, const S: usize, const T: usize> AcceptedRequest<I, S, T> {
 struct Cursor { connection: ConnectionId, last: RequestSequence }
 #[rustfmt::skip]
 #[derive(Debug)]
-pub(crate) struct RequestChange<const I: usize, const S: usize, const T: usize> { expected: RequestBookGeneration, before: usize, cursor_slot: usize, cursor_before: Option<Cursor>, accepted: AcceptedRequest<I, S, T> }
+pub(crate) struct RequestChange<const I: usize, const S: usize, const T: usize> { expected: RequestBookGeneration, before: usize, cursor_slot: usize, cursor_before: Option<Cursor>, accepted: AcceptedRequest<I, S, T>, c17: c17::PreparedRequestInstall }
 #[rustfmt::skip]
 impl<const I: usize, const S: usize, const T: usize> RequestChange<I, S, T> {
     pub(crate) const fn accepted(&self) -> &AcceptedRequest<I, S, T> { &self.accepted }
@@ -242,6 +240,42 @@ pub(crate) struct RequestBook<const R: usize, const I: usize, const S: usize, co
     connections: [Option<Cursor>; CONNECTION_LIMIT],
     described: u16,
     warming: [Option<(ModelRevisionId, u16)>; MODEL_REGISTRY_LIMIT],
+    c17: c17::RequestBookC17,
+}
+
+pub(crate) const C17_LANDED_PREFIX_BYTES: usize =
+    std::mem::offset_of!(RequestBook<REQUEST_LIMIT, 0, 0, 0>, c17);
+
+#[cfg(turnvector_c17_probe)]
+pub(crate) fn b03_probe_rows() -> Vec<(&'static str, usize)> {
+    use std::mem::{align_of, offset_of, size_of};
+    vec![
+        ("request_book.landed_prefix", C17_LANDED_PREFIX_BYTES),
+        (
+            "request_book.c17_offset",
+            offset_of!(RequestBook<REQUEST_LIMIT, 0, 0, 0>, c17),
+        ),
+        (
+            "request_book.inline_size",
+            size_of::<RequestBook<REQUEST_LIMIT, 0, 0, 0>>(),
+        ),
+        (
+            "request_book.inline_align",
+            align_of::<RequestBook<REQUEST_LIMIT, 0, 0, 0>>(),
+        ),
+        (
+            "request_book.accepted_request",
+            size_of::<AcceptedRequest<0, 0, 0>>(),
+        ),
+        (
+            "request_book.optional_description_facts",
+            size_of::<Option<RequestDescriptionFacts>>(),
+        ),
+        (
+            "request_book.c17_inline_size",
+            size_of::<c17::RequestBookC17>(),
+        ),
+    ]
 }
 impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook<R, I, S, T> {
     #[cfg(test)]
@@ -258,6 +292,12 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         if R == 0 || R > REQUEST_LIMIT {
             return Err(RequestError::RequestCapacity);
         }
+        #[cfg(test)]
+        let c17 =
+            c17::RequestBookC17::try_new(c17::RequestBookC17Capacities::testing(R), generation)?;
+        #[cfg(not(test))]
+        let c17 =
+            c17::RequestBookC17::try_new(c17::RequestBookC17Capacities::production(), generation)?;
         let mut requests = Vec::new();
         requests
             .try_reserve_exact(R)
@@ -274,10 +314,17 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
             connections: [None; CONNECTION_LIMIT],
             described: 0,
             warming: [None; MODEL_REGISTRY_LIMIT],
+            c17,
         })
     }
     #[rustfmt::skip]
     pub(crate) const fn generation(&self) -> RequestBookGeneration { self.generation }
+    pub(crate) fn commit_c17_assignment_direct(
+        &mut self,
+        assignment: &crate::c17_layout::Assignment,
+    ) {
+        self.c17.commit_assignment_direct(assignment);
+    }
     #[rustfmt::skip]
     pub(crate) fn len(&self) -> usize { self.requests.len() }
     #[cfg(test)]
@@ -293,11 +340,352 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         }
         Ok(self.find(id, work)?.map(|index| &self.requests[index]))
     }
+    pub(crate) fn c17_membership_anchor(
+        &self,
+        request: RequestId,
+        expected_status: RequestStatusVersion,
+    ) -> RequestResult<c17::SupportMembershipAnchor> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        let (_, membership) = self.c17.membership(request, expected_status)?;
+        if !matches!(
+            membership.tag,
+            c17::MembershipTag::Bound | c17::MembershipTag::EligibleUnbound
+        ) || membership.anchor.is_absent()
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        Ok(membership.anchor)
+    }
+
+    pub(crate) fn prepare_newly_eligible<W: crate::work::WorkRecorder>(
+        &self,
+        marker: c17::EligibilityMarker,
+        work: &mut W,
+    ) -> RequestResult<c17::PreparedNewlyEligible> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        let accepted = self
+            .requests
+            .iter()
+            .find(|request| request.id() == marker.request)
+            .ok_or(RequestError::UnknownRequest)?;
+        let change = self.c17.prepare_newly_eligible(accepted, marker)?;
+        work.charge(crate::HotPathWorkWitness::new(
+            crate::c17_layout::WORK_NEWLY_ELIGIBLE,
+        ))?;
+        Ok(change)
+    }
+
+    pub(crate) fn validate_newly_eligible(
+        &self,
+        change: &c17::PreparedNewlyEligible,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.validate_newly_eligible(change)
+    }
+
+    pub(crate) fn commit_newly_eligible(&mut self, change: c17::PreparedNewlyEligible) {
+        self.validate_newly_eligible(&change)
+            .expect("validated NewlyEligible transaction");
+        self.commit_newly_eligible_prevalidated(change, true);
+    }
+
+    pub(crate) fn commit_newly_eligible_prevalidated(
+        &mut self,
+        change: c17::PreparedNewlyEligible,
+        apply_index_plans: bool,
+    ) {
+        let generation_after = change.generation_after();
+        self.c17
+            .commit_newly_eligible_prevalidated(&mut self.requests, change, apply_index_plans);
+        self.generation = generation_after;
+    }
+
+    pub(crate) fn prepare_cancellation(
+        &self,
+        marker: c17::CancellationMarker,
+    ) -> RequestResult<c17::PreparedCancellation> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        let accepted = self
+            .requests
+            .iter()
+            .find(|request| request.id() == marker.request)
+            .ok_or(RequestError::UnknownRequest)?;
+        self.c17.prepare_cancellation(accepted, marker)
+    }
+
+    pub(crate) fn seal_cancellation(
+        &self,
+        change: c17::PreparedCancellation,
+        member_keys: [[u8; 40]; 4],
+        member_count: u8,
+        survivor: c17::SupportMembershipAnchor,
+    ) -> RequestResult<c17::PreparedCancellation> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17
+            .seal_cancellation(change, member_keys, member_count, survivor)
+    }
+
+    pub(crate) fn validate_cancellation(
+        &self,
+        change: &c17::PreparedCancellation,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.validate_cancellation(change)
+    }
+
+    pub(crate) fn commit_cancellation(
+        &mut self,
+        change: c17::PreparedCancellation,
+    ) -> c17::MembershipEventRecord {
+        self.validate_cancellation(&change)
+            .expect("validated Cancellation transaction");
+        let expected = self.generation;
+        let generation_after = change.generation_after();
+        self.commit_cancellation_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_cancellation_prevalidated(
+        &mut self,
+        change: c17::PreparedCancellation,
+        expected: RequestBookGeneration,
+        generation_after: RequestBookGeneration,
+        apply_index_plans: bool,
+    ) -> c17::MembershipEventRecord {
+        assert_eq!(self.generation, expected, "sealed Cancellation generation");
+        assert_eq!(
+            change.generation_after(),
+            generation_after,
+            "prepared Cancellation generation after"
+        );
+        let event = self.c17.commit_cancellation_prevalidated(
+            &mut self.requests,
+            change,
+            apply_index_plans,
+        );
+        self.generation = generation_after;
+        event
+    }
+
+    pub(crate) fn validate_cancellation_close_authority(
+        &self,
+        fact: crate::CancellationFactId,
+        event: crate::MembershipEventId,
+        request_generation: RequestBookGeneration,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        let (_, record) = self.c17.event(event.get())?;
+        if record.kind != c17::MembershipEventKind::CancellationRemove
+            || record.cancellation_fact != fact.get()
+            || record.generation_after != request_generation.get()
+        {
+            return Err(RequestError::InvalidTransition);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_create_standalone(
+        &self,
+        marker: c17::InitialReadyMarker,
+        anchor: c17::SupportMembershipAnchor,
+    ) -> RequestResult<c17::PreparedCreateStandalone> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        let accepted = self
+            .requests
+            .iter()
+            .find(|request| request.id() == marker.request)
+            .ok_or(RequestError::UnknownRequest)?;
+        self.c17.prepare_create_standalone(accepted, marker, anchor)
+    }
+
+    pub(crate) fn validate_create_standalone(
+        &self,
+        change: &c17::PreparedCreateStandalone,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.validate_create_standalone(change)
+    }
+
+    pub(crate) fn commit_create_standalone(
+        &mut self,
+        change: c17::PreparedCreateStandalone,
+    ) -> crate::SourceRecordRef {
+        self.validate_create_standalone(&change)
+            .expect("validated CreateStandalone transaction");
+        let expected = self.generation;
+        let generation_after = change.generation_after();
+        self.commit_create_standalone_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_create_standalone_prevalidated(
+        &mut self,
+        change: c17::PreparedCreateStandalone,
+        expected: RequestBookGeneration,
+        generation_after: RequestBookGeneration,
+        apply_index_plans: bool,
+    ) -> crate::SourceRecordRef {
+        assert_eq!(
+            self.generation, expected,
+            "sealed CreateStandalone generation"
+        );
+        assert_eq!(
+            change.generation_after(),
+            generation_after,
+            "prepared CreateStandalone generation after"
+        );
+        let source = self.c17.commit_create_standalone_prevalidated(
+            &mut self.requests,
+            change,
+            apply_index_plans,
+        );
+        self.generation = generation_after;
+        source
+    }
+
+    pub(crate) fn merge_initial_source_anchors(
+        &self,
+        marker: c17::MergeInitialMarker,
+    ) -> RequestResult<([c17::SupportMembershipAnchor; 3], u8)> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.merge_initial_source_anchors(marker)
+    }
+
+    pub(crate) fn prepare_merge_initial(
+        &self,
+        marker: c17::MergeInitialMarker,
+        destination_anchor: c17::SupportMembershipAnchor,
+    ) -> RequestResult<c17::PreparedMergeInitial> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.prepare_merge_initial(marker, destination_anchor)
+    }
+
+    pub(crate) fn validate_merge_initial(
+        &self,
+        change: &c17::PreparedMergeInitial,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.validate_merge_initial(change)
+    }
+
+    pub(crate) fn commit_merge_initial(
+        &mut self,
+        change: c17::PreparedMergeInitial,
+    ) -> c17::MembershipEventRecord {
+        self.validate_merge_initial(&change)
+            .expect("validated MergeInitial transaction");
+        let expected = self.generation;
+        let generation_after = change.generation_after();
+        self.commit_merge_initial_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_merge_initial_prevalidated(
+        &mut self,
+        change: c17::PreparedMergeInitial,
+        expected: RequestBookGeneration,
+        generation_after: RequestBookGeneration,
+        apply_index_plans: bool,
+    ) -> c17::MembershipEventRecord {
+        assert_eq!(self.generation, expected, "sealed MergeInitial generation");
+        assert_eq!(
+            change.generation_after(),
+            generation_after,
+            "prepared MergeInitial generation after"
+        );
+        let event = self.c17.commit_merge_initial_prevalidated(
+            &mut self.requests,
+            change,
+            apply_index_plans,
+        );
+        self.generation = generation_after;
+        event
+    }
+
+    pub(crate) fn prepare_membership_event(
+        &self,
+        input: c17::MembershipEventInput,
+    ) -> RequestResult<c17::PreparedMembershipIntent> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.prepare_membership_event(input)
+    }
+
+    pub(crate) fn validate_membership_intent(
+        &self,
+        change: &c17::PreparedMembershipIntent,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.validate_membership_intent(change)
+    }
+
+    pub(crate) fn seal_membership_event(
+        &self,
+        intent: c17::PreparedMembershipIntent,
+        destinations: [c17::SupportMembershipAnchor; 4],
+        destination_count: u8,
+    ) -> RequestResult<c17::PreparedMembershipEvent> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17
+            .seal_membership_event(intent, destinations, destination_count)
+    }
+
+    pub(crate) fn validate_membership_event(
+        &self,
+        change: &c17::PreparedMembershipEvent,
+    ) -> RequestResult<()> {
+        self.c17.validate_request_book_generation(self.generation)?;
+        self.c17.validate_membership_event(change)
+    }
+
+    pub(crate) fn commit_membership_event(
+        &mut self,
+        change: c17::PreparedMembershipEvent,
+    ) -> c17::MembershipEventRecord {
+        self.validate_membership_event(&change)
+            .expect("validated membership event transaction");
+        let expected = self.generation;
+        let generation_after = change.generation_after();
+        self.commit_membership_event_prevalidated(change, expected, generation_after, true)
+    }
+
+    pub(crate) fn commit_membership_event_prevalidated(
+        &mut self,
+        change: c17::PreparedMembershipEvent,
+        expected: RequestBookGeneration,
+        generation_after: RequestBookGeneration,
+        apply_index_plans: bool,
+    ) -> c17::MembershipEventRecord {
+        assert_eq!(
+            self.generation, expected,
+            "sealed membership-event generation"
+        );
+        assert_eq!(
+            change.generation_after(),
+            generation_after,
+            "prepared membership-event generation after"
+        );
+        let event = self.c17.commit_membership_event_prevalidated(
+            &mut self.requests,
+            change,
+            apply_index_plans,
+        );
+        self.generation = generation_after;
+        event
+    }
+
+    #[cfg(test)]
+    fn bind_initial_for_test(
+        &mut self,
+        marker: c17::InitialReadyMarker,
+        anchor: c17::SupportMembershipAnchor,
+    ) -> RequestResult<crate::SourceRecordRef> {
+        let change = self.prepare_create_standalone(marker, anchor)?;
+        Ok(self.commit_create_standalone(change))
+    }
+
     #[rustfmt::skip]
     pub(crate) fn prepare(&self, expected: RequestBookGeneration, registry: RegistryGeneration, input: AcceptanceInput<I, S, T>, revision: RequestRevision, work: &mut WorkMeter) -> RequestResult<RequestChange<I, S, T>> {
         require(work, expected == self.generation, RequestError::PreparedChangeStale)?;
+        self.c17.validate_request_book_generation(expected)?;
         work.record(InvariantChecks, 1)?;
-        expected.next()?;
+        let next = expected.next()?;
         require(work, registry == revision.generation(), RequestError::RegistryGeneration)?;
         let selector = match (input.request.selector(), revision.selection()) {
             (RequestSelector::Direct(selected), RevisionSelection::Direct(resolved)) => selected == resolved,
@@ -321,18 +709,22 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         let unused = self.find(id, work)?.is_none();
         require(work, unused, RequestError::Continuity)?;
         let accepted = AcceptedRequest { id, revision, request: input.request, status: RequestStatusVersion::new(1).expect("one is nonzero"), lifecycle: RequestLifecycle::Preparing, deadline, description: DescriptionState::Missing };
+        let c17 = self.c17.prepare_request_install(&accepted, expected, next)?;
         let copied = size_of::<RequestChange<I, S, T>>() as u64;
         work.ensure(crate::HotPathWorkWitness::new([0, copied, 0, 0, 1]))?;
         work.record(CopiedBytes, copied)?;
         work.record(InvariantChecks, 1)?;
-        Ok(RequestChange { expected, before: self.requests.len(), cursor_slot, cursor_before, accepted })
+        Ok(RequestChange { expected, before: self.requests.len(), cursor_slot, cursor_before, accepted, c17 })
     }
     pub(crate) fn validate(&self, change: &RequestChange<I, S, T>) -> RequestResult<()> {
         (self.generation == change.expected
             && self.requests.len() == change.before
             && self.connections.get(change.cursor_slot).copied() == Some(change.cursor_before))
         .then_some(())
-        .ok_or(RequestError::PreparedChangeStale)
+        .ok_or(RequestError::PreparedChangeStale)?;
+        self.c17.validate_request_book_generation(change.expected)?;
+        self.c17
+            .validate_request_install(&change.accepted, &change.c17)
     }
     pub(crate) fn commit(
         &mut self,
@@ -344,6 +736,7 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
             connection: change.accepted.id.connection(),
             last: change.accepted.id.sequence(),
         });
+        self.c17.commit_request_install(change.c17);
         self.requests.push(change.accepted);
         self.description_facts.push(None);
         self.generation = next;
@@ -525,7 +918,8 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
                 request.lifecycle == change.before_lifecycle && request.description == change.before
             }))
         .then_some(())
-        .ok_or(RequestError::PreparedChangeStale)
+        .ok_or(RequestError::PreparedChangeStale)?;
+        self.c17.validate_request_book_generation(change.expected)
     }
     pub(crate) fn description_request(
         &self,
@@ -549,6 +943,9 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         change: DescriptionChange<'_>,
     ) -> RequestResult<RequestBookGeneration> {
         self.validate_description(&change)?;
+        let next = change.expected.next()?;
+        self.c17
+            .commit_request_book_generation(change.expected, next);
         self.requests[change.index].lifecycle = change.after_lifecycle;
         self.requests[change.index].description = change.after;
         self.description_facts[change.index] = change.after_facts.copied();
@@ -556,7 +953,7 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         if let Some((slot, _, after)) = change.warming {
             self.warming[slot] = after;
         }
-        self.generation = change.expected.next()?;
+        self.generation = next;
         Ok(self.generation)
     }
     fn description_change<'a>(
@@ -568,6 +965,7 @@ impl<const R: usize, const I: usize, const S: usize, const T: usize> RequestBook
         after_facts: Option<&'a RequestDescriptionFacts>,
         work: &mut WorkMeter,
     ) -> RequestResult<DescriptionChange<'a>> {
+        self.c17.validate_request_book_generation(expected)?;
         let request = &self.requests[index];
         let was_described = request.lifecycle == RequestLifecycle::Preparing
             && request.description != DescriptionState::Missing;
@@ -738,6 +1136,48 @@ mod tests {
     #[rustfmt::skip]
     fn rejected<const R: usize>(book: &Book<R>, expected: RequestBookGeneration, registry: RegistryGeneration, input: AcceptanceInput<2, 1, 2>, fact: crate::model_registry::RequestRevision, mut work: WorkMeter) -> (RequestError, HotPathWorkWitness) { let before = snapshot(book); let error = book.prepare(expected, registry, input, fact, &mut work).unwrap_err(); assert_eq!(snapshot(book), before); (error, work.witness()) }
 
+    fn bound_request() -> (Book<2>, RequestId, c17::SupportMembershipAnchor) {
+        let revision = ModelRevisionId::new([1; 32]).unwrap();
+        let fact = revision_fact(
+            RevisionSelection::Direct(revision),
+            RevisionLifecycle::Available,
+        );
+        let mut requests = book::<2>();
+        let change = requests
+            .prepare(
+                requests.generation(),
+                fact.generation(),
+                acceptance(RequestSelector::Direct(revision), &[], 1, 0, 2, 1, 10),
+                fact,
+                &mut meter(),
+            )
+            .unwrap();
+        let id = change.accepted().id();
+        requests.commit(change).unwrap();
+        let anchor = c17::SupportMembershipAnchor::try_new([1; 17], 1, 1, 1, 1, 1, 1).unwrap();
+        requests
+            .bind_initial_for_test(
+                c17::InitialReadyMarker {
+                    request: id,
+                    kind: c17::InitialReadyKind::MaterializationCompleted,
+                    identity: [7; 32],
+                    domain: [8; 16],
+                    occurred_at: MonotonicTime::from_micros(2),
+                    funding: crate::PlanMemberFunding {
+                        request_id: id,
+                        entitlement: crate::FutureTurnSupportEntitlementId::new([9; 32]).unwrap(),
+                        credit_vector: crate::SupportOutstandingCreditVectorId::new([10; 32])
+                            .unwrap(),
+                    },
+                    obligation: crate::SupportOperationObligationId::new([11; 32]).unwrap(),
+                    credit: crate::PhysicalStartCreditId::new([12; 32]).unwrap(),
+                },
+                anchor,
+            )
+            .unwrap();
+        (requests, id, anchor)
+    }
+
     #[test]
     #[rustfmt::skip]
     fn selectors_and_values_are_closed_and_retained() {
@@ -808,8 +1248,8 @@ mod tests {
         requests.validate(&change).unwrap(); requests.commit(change).unwrap();
         let accepted = requests.get(id, &mut meter()).unwrap().unwrap();
         assert_eq!((accepted.id(), accepted.revision_fact().revision(), accepted.status().get(), accepted.lifecycle(), accepted.deadline().as_micros()), (id, ModelRevisionId::new([1; 32]).unwrap(), 1, RequestLifecycle::Preparing, 15));
-        assert_eq!(work.witness(), HotPathWorkWitness::new([1, 512, 0, 0, 13]));
-        let alias = ModelAliasId::new([3; 32]).unwrap(); let fact = revision_fact(RevisionSelection::Alias(alias), RevisionLifecycle::Available); let mut alias_book = book::<1>(); let mut alias_work = meter(); let change = alias_book.prepare(alias_book.generation(), fact.generation(), acceptance(RequestSelector::Alias(alias), &[], 8, 0, 3, 20, 1), fact, &mut alias_work).unwrap(); alias_book.commit(change).unwrap(); assert_eq!((alias_book.requests[0].revision_fact().selection(), alias_work.witness()), (RevisionSelection::Alias(alias), HotPathWorkWitness::new([1, 512, 0, 0, 13])));
+        assert_eq!(work.witness(), HotPathWorkWitness::new([1, 8000, 0, 0, 13]));
+        let alias = ModelAliasId::new([3; 32]).unwrap(); let fact = revision_fact(RevisionSelection::Alias(alias), RevisionLifecycle::Available); let mut alias_book = book::<1>(); let mut alias_work = meter(); let change = alias_book.prepare(alias_book.generation(), fact.generation(), acceptance(RequestSelector::Alias(alias), &[], 8, 0, 3, 20, 1), fact, &mut alias_work).unwrap(); alias_book.commit(change).unwrap(); assert_eq!((alias_book.requests[0].revision_fact().selection(), alias_work.witness()), (RevisionSelection::Alias(alias), HotPathWorkWitness::new([1, 8000, 0, 0, 13])));
     }
 
     #[test]
@@ -828,6 +1268,387 @@ mod tests {
         assert_eq!(case(acceptance(selector, &[], 1, 0, 2, u64::MAX, 1), direct), (RequestError::PreparationTimeout, HotPathWorkWitness::new([0, 0, 0, 0, 10])));
     }
 
+    fn two_bound_requests() -> (
+        Book<4>,
+        [(
+            RequestId,
+            c17::SupportMembershipAnchor,
+            crate::SourceRecordRef,
+        ); 2],
+    ) {
+        let revision = ModelRevisionId::new([1; 32]).unwrap();
+        let fact = revision_fact(
+            RevisionSelection::Direct(revision),
+            RevisionLifecycle::Available,
+        );
+        let mut requests = book::<4>();
+        let mut ids = [None; 2];
+        for index in 0..2 {
+            let change = requests
+                .prepare(
+                    requests.generation(),
+                    fact.generation(),
+                    acceptance(
+                        RequestSelector::Direct(revision),
+                        &[],
+                        1,
+                        0,
+                        2,
+                        index as u64 + 1,
+                        10,
+                    ),
+                    fact,
+                    &mut meter(),
+                )
+                .unwrap();
+            ids[index] = Some(change.accepted().id());
+            requests.commit(change).unwrap();
+        }
+        let identities = [[9; 32], [1; 32]];
+        let rows = std::array::from_fn(|index| {
+            let id = ids[index].unwrap();
+            let anchor = c17::SupportMembershipAnchor::try_new(
+                [index as u8 + 1; 17],
+                3,
+                index as u32,
+                1,
+                index as u32,
+                1,
+                1,
+            )
+            .unwrap();
+            let source = requests
+                .bind_initial_for_test(
+                    c17::InitialReadyMarker {
+                        request: id,
+                        kind: c17::InitialReadyKind::InitialFormationCompleted,
+                        identity: identities[index],
+                        domain: [7; 16],
+                        occurred_at: MonotonicTime::from_micros(index as u64 + 3),
+                        funding: crate::PlanMemberFunding {
+                            request_id: id,
+                            entitlement: crate::FutureTurnSupportEntitlementId::new(
+                                [index as u8 + 10; 32],
+                            )
+                            .unwrap(),
+                            credit_vector: crate::SupportOutstandingCreditVectorId::new(
+                                [index as u8 + 20; 32],
+                            )
+                            .unwrap(),
+                        },
+                        obligation: crate::SupportOperationObligationId::new(
+                            [index as u8 + 30; 32],
+                        )
+                        .unwrap(),
+                        credit: crate::PhysicalStartCreditId::new([index as u8 + 40; 32]).unwrap(),
+                    },
+                    anchor,
+                )
+                .unwrap();
+            (id, anchor, source)
+        });
+        (requests, rows)
+    }
+
+    #[test]
+    fn merge_initial_and_membership_events_use_fact_and_request_key_order() {
+        let (mut requests, rows) = two_bound_requests();
+        let destination = c17::SupportMembershipAnchor::try_new([8; 17], 3, 8, 1, 8, 1, 1).unwrap();
+        let marker = c17::MergeInitialMarker {
+            identities: [[9; 32], [1; 32], [0; 32]],
+            source_count: 2,
+            domain: [7; 16],
+            occurred_at: MonotonicTime::from_micros(8),
+        };
+        let before = requests.clone();
+        let prepared = requests.prepare_merge_initial(marker, destination).unwrap();
+        assert_eq!(requests, before);
+        requests.validate_merge_initial(&prepared).unwrap();
+        let merged = requests.commit_merge_initial(prepared);
+        assert_eq!(merged.kind, c17::MembershipEventKind::MergeInitial);
+        assert_eq!(merged.sources[..2], [rows[1].2, rows[0].2]);
+        assert_eq!(
+            merged.affected[..2]
+                .iter()
+                .map(|address| address.unwrap().key)
+                .collect::<Vec<_>>(),
+            vec![c17::request_key(rows[0].0), c17::request_key(rows[1].0)]
+        );
+        assert_eq!(requests.c17.current_counts(), [2, 3, 2, 2]);
+        assert_eq!(requests.c17.event(merged.id).unwrap().1, merged);
+        for (id, _, _) in rows {
+            let accepted = requests
+                .requests
+                .iter()
+                .find(|request| request.id() == id)
+                .unwrap();
+            let (_, membership) = requests.c17.membership(id, accepted.status()).unwrap();
+            assert_eq!(membership.tag, c17::MembershipTag::Bound);
+            assert_eq!(membership.anchor, destination);
+            assert_eq!(membership.epoch, 2);
+        }
+        let committed = requests.clone();
+        assert_eq!(
+            requests
+                .prepare_merge_initial(marker, destination)
+                .unwrap_err(),
+            RequestError::InvalidTransition
+        );
+        assert_eq!(requests, committed);
+        assert!(matches!(
+            requests.prepare_merge_initial(
+                c17::MergeInitialMarker {
+                    domain: [6; 16],
+                    ..marker
+                },
+                destination,
+            ),
+            Err(RequestError::Storage(
+                crate::FixedStorageError::NonCanonical
+            ))
+        ));
+
+        let eligibility = c17::EligibilityMarker {
+            request: rows[0].0,
+            identity: [5; 32],
+            previous_anchor: destination,
+            occurred_at: MonotonicTime::from_micros(9),
+        };
+        let change = requests
+            .prepare_newly_eligible(eligibility, &mut meter())
+            .unwrap();
+        requests.commit_newly_eligible(change);
+        let joined = c17::SupportMembershipAnchor::try_new([6; 17], 3, 9, 1, 9, 1, 1).unwrap();
+        let statuses = [requests.requests[0].status(), requests.requests[1].status()];
+        let join = c17::MembershipEventInput {
+            kind: c17::MembershipEventKind::Join,
+            source_identity: Some([5; 32]),
+            member_count: 2,
+            destination_count: 1,
+            members: [
+                Some(c17::MembershipMutation {
+                    request: rows[1].0,
+                    expected_status: statuses[1],
+                    destination: c17::MembershipDestination::Destination(0),
+                }),
+                Some(c17::MembershipMutation {
+                    request: rows[0].0,
+                    expected_status: statuses[0],
+                    destination: c17::MembershipDestination::Destination(0),
+                }),
+                None,
+                None,
+            ],
+            occurred_at: MonotonicTime::from_micros(10),
+        };
+        let intent = requests.prepare_membership_event(join).unwrap();
+        requests.validate_membership_intent(&intent).unwrap();
+        let prepared = requests
+            .seal_membership_event(
+                intent,
+                [
+                    joined,
+                    c17::SupportMembershipAnchor::ABSENT,
+                    c17::SupportMembershipAnchor::ABSENT,
+                    c17::SupportMembershipAnchor::ABSENT,
+                ],
+                1,
+            )
+            .unwrap();
+        requests.validate_membership_event(&prepared).unwrap();
+        let joined_event = requests.commit_membership_event(prepared);
+        assert_eq!(joined_event.kind, c17::MembershipEventKind::Join);
+        assert_eq!(joined_event.source_count, 1);
+        assert!(joined_event.affected[0].unwrap().key < joined_event.affected[1].unwrap().key);
+        assert_eq!(
+            requests.prepare_membership_event(join).unwrap_err(),
+            RequestError::InvalidTransition
+        );
+
+        let close = c17::MembershipEventInput {
+            kind: c17::MembershipEventKind::Close,
+            source_identity: None,
+            member_count: 2,
+            destination_count: 0,
+            members: [
+                Some(c17::MembershipMutation {
+                    request: rows[0].0,
+                    expected_status: requests.requests[0].status(),
+                    destination: c17::MembershipDestination::Closed,
+                }),
+                Some(c17::MembershipMutation {
+                    request: rows[1].0,
+                    expected_status: requests.requests[1].status(),
+                    destination: c17::MembershipDestination::Closed,
+                }),
+                None,
+                None,
+            ],
+            occurred_at: MonotonicTime::from_micros(11),
+        };
+        let intent = requests.prepare_membership_event(close).unwrap();
+        let prepared = requests
+            .seal_membership_event(intent, [c17::SupportMembershipAnchor::ABSENT; 4], 0)
+            .unwrap();
+        let closed = requests.commit_membership_event(prepared);
+        assert_eq!(closed.kind, c17::MembershipEventKind::Close);
+        assert_eq!(closed.source_count, 0);
+        for request in &requests.requests {
+            let (_, membership) = requests
+                .c17
+                .membership(request.id(), request.status())
+                .unwrap();
+            assert_eq!(membership.tag, c17::MembershipTag::Closed);
+        }
+    }
+
+    #[test]
+    fn newly_eligible_is_source_only_exactly_charged_and_replay_closed() {
+        let (mut requests, id, anchor) = bound_request();
+        assert_eq!(requests.generation().get(), 3);
+        assert_eq!(requests.c17.current_counts(), [1, 1, 1, 1]);
+        let marker = c17::EligibilityMarker {
+            request: id,
+            identity: [9; 32],
+            previous_anchor: anchor,
+            occurred_at: MonotonicTime::from_micros(3),
+        };
+        let before_prepare = requests.clone();
+        let mut work = meter();
+        let change = requests.prepare_newly_eligible(marker, &mut work).unwrap();
+        assert_eq!(requests, before_prepare);
+        assert_eq!(
+            work.witness(),
+            HotPathWorkWitness::new(crate::c17_layout::WORK_NEWLY_ELIGIBLE)
+        );
+        requests.validate_newly_eligible(&change).unwrap();
+        requests.commit_newly_eligible(change);
+        assert_eq!(requests.generation().get(), 4);
+        assert_eq!(requests.c17.current_counts(), [1, 1, 2, 1]);
+        let accepted = &requests.requests[0];
+        assert_eq!(accepted.status().get(), 3);
+        let (_, membership) = requests.c17.membership(id, accepted.status()).unwrap();
+        assert_eq!(membership.tag, c17::MembershipTag::EligibleUnbound);
+
+        let committed = requests.clone();
+        assert!(matches!(
+            requests.prepare_newly_eligible(marker, &mut meter()),
+            Err(RequestError::InvalidTransition)
+        ));
+        assert_eq!(requests, committed);
+        let drift = c17::EligibilityMarker {
+            occurred_at: MonotonicTime::from_micros(4),
+            ..marker
+        };
+        assert!(matches!(
+            requests.prepare_newly_eligible(drift, &mut meter()),
+            Err(RequestError::Storage(
+                crate::FixedStorageError::NonCanonical
+            ))
+        ));
+        assert_eq!(requests, committed);
+
+        for axis in [0, 1, 4] {
+            let (book, id, anchor) = bound_request();
+            let marker = c17::EligibilityMarker {
+                request: id,
+                identity: [10; 32],
+                previous_anchor: anchor,
+                occurred_at: MonotonicTime::from_micros(3),
+            };
+            let mut row = crate::c17_layout::WORK_NEWLY_ELIGIBLE;
+            row[axis] -= 1;
+            let mut limited =
+                WorkMeter::new(HotPathWorkBudget::testing(HotPathWorkWitness::new(row)));
+            let before = book.clone();
+            assert!(matches!(
+                book.prepare_newly_eligible(marker, &mut limited),
+                Err(RequestError::Work(WorkBudgetError::BudgetExceeded(..)))
+            ));
+            assert_eq!(book, before);
+        }
+    }
+
+    #[test]
+    fn cancellation_consumes_one_or_two_sorted_sources_and_replay_is_closed() {
+        let (mut eligible, id, anchor) = bound_request();
+        let eligibility = c17::EligibilityMarker {
+            request: id,
+            identity: [9; 32],
+            previous_anchor: anchor,
+            occurred_at: MonotonicTime::from_micros(3),
+        };
+        let change = eligible
+            .prepare_newly_eligible(eligibility, &mut meter())
+            .unwrap();
+        eligible.commit_newly_eligible(change);
+        let cancellation = c17::CancellationMarker {
+            request: id,
+            identity: [10; 32],
+            kind: c17::CancellationKind::Client,
+            previous_anchor: anchor,
+            occurred_at: MonotonicTime::from_micros(4),
+        };
+        let prepared = eligible.prepare_cancellation(cancellation).unwrap();
+        assert_eq!(
+            (
+                prepared.source_count(),
+                prepared.event_id(),
+                prepared.fact_id()
+            ),
+            (2, 2, 1)
+        );
+        let before = eligible.clone();
+        eligible.validate_cancellation(&prepared).unwrap();
+        let event = eligible.commit_cancellation(prepared);
+        assert_eq!(event.source_count, 2);
+        assert!(event.sources[0] < event.sources[1]);
+        assert_eq!(event.kind, c17::MembershipEventKind::CancellationRemove);
+        assert_eq!(eligible.c17.current_counts(), [1, 2, 3, 1]);
+        assert_ne!(eligible, before);
+        let accepted = &eligible.requests[0];
+        assert_eq!(accepted.status().get(), 4);
+        let (_, membership) = eligible.c17.membership(id, accepted.status()).unwrap();
+        assert_eq!(membership.tag, c17::MembershipTag::Cancelled);
+
+        let committed = eligible.clone();
+        assert!(matches!(
+            eligible.prepare_cancellation(cancellation),
+            Err(RequestError::InvalidTransition)
+        ));
+        assert_eq!(eligible, committed);
+        assert!(matches!(
+            eligible.prepare_newly_eligible(eligibility, &mut meter()),
+            Err(RequestError::InvalidTransition)
+        ));
+        let drift = c17::CancellationMarker {
+            kind: c17::CancellationKind::Deadline,
+            ..cancellation
+        };
+        assert!(matches!(
+            eligible.prepare_cancellation(drift),
+            Err(RequestError::Storage(
+                crate::FixedStorageError::NonCanonical
+            ))
+        ));
+        assert_eq!(eligible, committed);
+
+        let (mut bound, bound_id, bound_anchor) = bound_request();
+        let bound_change = bound
+            .prepare_cancellation(c17::CancellationMarker {
+                request: bound_id,
+                identity: [11; 32],
+                kind: c17::CancellationKind::DaemonShutdown,
+                previous_anchor: bound_anchor,
+                occurred_at: MonotonicTime::from_micros(3),
+            })
+            .unwrap();
+        assert_eq!(bound_change.source_count(), 1);
+        let event = bound.commit_cancellation(bound_change);
+        assert_eq!(event.source_count, 1);
+        assert!(event.sources[1].is_absent());
+    }
+
     #[test]
     #[rustfmt::skip]
     fn capacities_generations_ids_and_work_are_atomic() {
@@ -837,8 +1658,8 @@ mod tests {
         let mut connections = book::<65>(); for connection in 1..=64 { let change = connections.prepare(connections.generation(), fact.generation(), acceptance(selector, &[], 1, 0, connection, 1, 1), fact, &mut meter()).unwrap(); connections.commit(change).unwrap(); } assert_eq!(rejected(&connections, connections.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 65, 1, 1), fact, meter()), (RequestError::ConnectionCapacity, HotPathWorkWitness::new([64, 0, 0, 0, 11])));
         let mut exhausted = book::<2>(); exhausted.connections[0] = Some(Cursor { connection: ConnectionId::new(2).unwrap(), last: RequestSequence::new(u64::MAX).unwrap() }); assert_eq!(rejected(&exhausted, exhausted.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, meter()), (RequestError::RequestIdExhausted, HotPathWorkWitness::new([1, 0, 0, 0, 12])));
         let mut corrupt = book::<2>(); corrupt.connections[0] = Some(Cursor { connection: ConnectionId::new(2).unwrap(), last: RequestSequence::new(1).unwrap() }); assert_eq!(rejected(&corrupt, corrupt.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, meter()), (RequestError::Continuity, HotPathWorkWitness::new([1, 0, 0, 0, 12])));
-        let mut overflow = book::<2>(); overflow.generation = RequestBookGeneration(u64::MAX); assert_eq!(rejected(&overflow, overflow.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, meter()), (RequestError::GenerationOverflow, HotPathWorkWitness::new([0, 0, 0, 0, 2])));
+        let mut overflow = book::<2>(); overflow.generation = RequestBookGeneration(u64::MAX); overflow.c17.force_generation_for_test(u64::MAX); assert_eq!(rejected(&overflow, overflow.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, meter()), (RequestError::GenerationOverflow, HotPathWorkWitness::new([0, 0, 0, 0, 2])));
         let mut stale = book::<2>(); let first = stale.prepare(stale.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, &mut meter()).unwrap(); let old = stale.prepare(stale.generation(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, &mut meter()).unwrap(); stale.commit(first).unwrap(); let before = snapshot(&stale); assert_eq!(stale.validate(&old), Err(RequestError::PreparedChangeStale)); assert_eq!(stale.commit(old), Err(RequestError::PreparedChangeStale)); assert_eq!(snapshot(&stale), before);
-        let constrained = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); assert_eq!(rejected(&book::<2>(), RequestBookGeneration::new(1).unwrap(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, WorkMeter::new(constrained)), (RequestError::Work(WorkBudgetError::BudgetExceeded(CopiedBytes, 0, 512)), HotPathWorkWitness::new([1, 0, 0, 0, 12])));
+        let constrained = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); assert_eq!(rejected(&book::<2>(), RequestBookGeneration::new(1).unwrap(), fact.generation(), acceptance(selector, &[], 1, 0, 2, 1, 1), fact, WorkMeter::new(constrained)), (RequestError::Work(WorkBudgetError::BudgetExceeded(CopiedBytes, 0, 8000)), HotPathWorkWitness::new([1, 0, 0, 0, 12])));
     }
 }

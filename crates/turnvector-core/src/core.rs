@@ -6,20 +6,27 @@ use crate::model_registry::{
     DescriptionPlan, MODEL_REGISTRY_LIMIT, ModelRegistry, ModelRevisionId, RegisteredDescriptor,
     RegistrationIntent, RegistryError, RevisionSelection,
 };
+use crate::request_book::c17::{
+    CancellationMarker, EligibilityMarker, InitialReadyMarker, MembershipEventInput,
+    MembershipEventKind, MergeInitialMarker,
+};
 use crate::request_book::{
     AcceptanceInput, AcceptedRequest, DescriptionRefreshScope, EffectiveSamplingSeed,
     REQUEST_LIMIT, RequestBook, RequestBookGeneration, RequestDescriptionFacts, RequestError,
     RequestLifecycle, RequestSelector, TokenRequest,
 };
+use crate::support::c17::{LifecycleAggregate, ObservationResolution, PlanDisposition, RootAction};
 use crate::support::{
-    LifecycleReserveKind, LifecycleTriggerResult, OrdinarySupportSpec, SupportCausalPredecessorId,
-    SupportChangeInput, SupportChargeLedger, SupportLedgerError, SupportOperation,
+    LifecycleReserveKind, LifecycleTriggerResult, OrdinarySupportSpec, SupportCallScopeId,
+    SupportCausalPredecessorId, SupportChangeInput, SupportChargeLedger, SupportLedgerError,
+    SupportOperation, SupportPool,
 };
 use crate::work::WorkMeter;
 use crate::{
     BackendGeneration, BoundedVec, DaemonInstanceId, EventSequence, FixedIndexError,
     FixedStorageError, GenerationVector, HotPathWorkBudget, HotPathWorkWitness, MonotonicTime,
-    OperationId, RequestId, RequestStatusVersion, SupportOperationObligationId, WorkBudgetError,
+    OperationId, PhysicalStartCreditId, PlanBranch, RequestId, RequestStatusVersion,
+    SupportOperationObligationId, TurnPlan, TurnPlanIdentity, TypedCloseInput, WorkBudgetError,
     WorkDimension,
 };
 const TRANSITION_EFFECT_CAPACITY: usize = 2;
@@ -43,6 +50,38 @@ type CoreRegistry = ModelRegistry<MODEL_REGISTRY_LIMIT, MODEL_REGISTRY_LIMIT>;
 type CoreRequests<const I: usize, const S: usize, const T: usize> =
     RequestBook<REQUEST_LIMIT, I, S, T>;
 type DescriptionObligations = BoundedVec<SupportOperationObligationId, { REQUEST_LIMIT + 1 }>;
+
+#[allow(
+    dead_code,
+    reason = "daemon event adapters construct both C17 lifecycle root authorities"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum C17LifecycleRootSpec {
+    Plan {
+        identity: TurnPlanIdentity,
+        branch: PlanBranch,
+    },
+    Membership {
+        request: RequestId,
+        expected_status: RequestStatusVersion,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct C17LifecycleRecordSpec {
+    pub(crate) root: C17LifecycleRootSpec,
+    pub(crate) obligation: SupportOperationObligationId,
+    pub(crate) credit: PhysicalStartCreditId,
+    pub(crate) predecessor: SupportCausalPredecessorId,
+    pub(crate) scope: SupportCallScopeId,
+    pub(crate) claim: [u8; 32],
+    pub(crate) kind: LifecycleReserveKind,
+    pub(crate) occurred_at: MonotonicTime,
+    pub(crate) expires_at: Option<MonotonicTime>,
+    pub(crate) operation: SupportOperation,
+    pub(crate) pool: SupportPool,
+    pub(crate) horizon: u8,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OwnedRawModelDescriptor {
@@ -77,6 +116,25 @@ enum CoreAction<const I: usize, const S: usize, const T: usize> {
     PostLoadDescriptorResult(OperationId, OwnedRawModelDescriptor),
     Refresh(DescriptionRefresh),
     DriveDescription(OperationId, MonotonicTime),
+    C17PlanCreate(TurnPlan<4>, MonotonicTime),
+    C17PlanDisposition(TurnPlanIdentity, PlanDisposition, MonotonicTime),
+    C17PlanRootAction(TurnPlanIdentity, u8, RootAction, MonotonicTime),
+    C17TypedClose(TypedCloseInput),
+    C17CreateStandalone(InitialReadyMarker),
+    C17MergeInitial(MergeInitialMarker),
+    C17Join(MembershipEventInput),
+    C17Rebind(MembershipEventInput),
+    C17Split(MembershipEventInput),
+    C17Merge(MembershipEventInput),
+    C17MembershipClose(MembershipEventInput),
+    C17NewlyEligible(EligibilityMarker),
+    C17MembershipRootAction(RequestId, RequestStatusVersion, RootAction, MonotonicTime),
+    C17Cancellation(CancellationMarker),
+    C17ResolveObservation(TurnPlanIdentity, ObservationResolution, MonotonicTime),
+    C17LifecycleBegin(u16, LifecycleAggregate),
+    C17LifecycleStage([Option<C17LifecycleRecordSpec>; 8], u8),
+    C17LifecycleFinalize,
+    C17LifecycleAbort,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DescriptionRefresh {
@@ -144,6 +202,44 @@ impl<const I: usize, const S: usize, const T: usize> CoreEvent<I, S, T> {
     pub(crate) const fn refresh_request_descriptions(sequence: EventSequence, predecessor: SupportCausalPredecessorId, at: MonotonicTime, obligations: DescriptionObligations, result: LifecycleTriggerResult, next_backend: Option<BackendGeneration>, loaded_revision: Option<ModelRevisionId>) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::Refresh(DescriptionRefresh { predecessor, at, obligations, result, next_backend, loaded_revision })), request: None } }
     #[rustfmt::skip]
     pub(crate) const fn drive_request_description(sequence: EventSequence, operation: OperationId, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::DriveDescription(operation, at)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_plan_create(sequence: EventSequence, plan: TurnPlan<4>, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17PlanCreate(plan, at)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_plan_disposition(sequence: EventSequence, identity: TurnPlanIdentity, disposition: PlanDisposition, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17PlanDisposition(identity, disposition, at)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_plan_root_action(sequence: EventSequence, identity: TurnPlanIdentity, branch: u8, root_action: RootAction, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17PlanRootAction(identity, branch, root_action, at)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_typed_close(sequence: EventSequence, input: TypedCloseInput) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17TypedClose(input)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_create_standalone(sequence: EventSequence, marker: InitialReadyMarker) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17CreateStandalone(marker)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_merge_initial(sequence: EventSequence, marker: MergeInitialMarker) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17MergeInitial(marker)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_join(sequence: EventSequence, input: MembershipEventInput) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17Join(input)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_rebind(sequence: EventSequence, input: MembershipEventInput) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17Rebind(input)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_split(sequence: EventSequence, input: MembershipEventInput) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17Split(input)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_merge(sequence: EventSequence, input: MembershipEventInput) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17Merge(input)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_membership_close(sequence: EventSequence, input: MembershipEventInput) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17MembershipClose(input)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_newly_eligible(sequence: EventSequence, marker: EligibilityMarker) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17NewlyEligible(marker)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_membership_root_action(sequence: EventSequence, request: RequestId, expected_status: RequestStatusVersion, action: RootAction, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17MembershipRootAction(request, expected_status, action, at)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_cancellation(sequence: EventSequence, marker: CancellationMarker) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17Cancellation(marker)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_resolve_observation(sequence: EventSequence, identity: TurnPlanIdentity, resolution: ObservationResolution, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17ResolveObservation(identity, resolution, at)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_lifecycle_begin(sequence: EventSequence, total: u16, aggregate: LifecycleAggregate) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17LifecycleBegin(total, aggregate)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_lifecycle_stage(sequence: EventSequence, records: [Option<C17LifecycleRecordSpec>; 8], count: u8) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17LifecycleStage(records, count)), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_lifecycle_finalize(sequence: EventSequence) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17LifecycleFinalize), request: None } }
+    #[rustfmt::skip]
+    pub(crate) const fn c17_lifecycle_abort(sequence: EventSequence) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::C17LifecycleAbort), request: None } }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Effect {
@@ -577,8 +673,428 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             CoreAction::DriveDescription(operation, at) => self
                 .drive_request_description(*operation, *at, work)
                 .map(none),
+            CoreAction::C17PlanCreate(plan, at) => self.c17_plan_create(plan, *at, work).map(none),
+            CoreAction::C17PlanDisposition(identity, disposition, at) => self
+                .c17_plan_disposition(*identity, *disposition, *at, work)
+                .map(none),
+            CoreAction::C17PlanRootAction(identity, branch, root_action, at) => self
+                .c17_plan_root_action(*identity, *branch, *root_action, *at, work)
+                .map(none),
+            CoreAction::C17TypedClose(input) => self.c17_typed_close(*input, work).map(none),
+            CoreAction::C17CreateStandalone(marker) => {
+                self.c17_create_standalone(*marker, work).map(none)
+            }
+            CoreAction::C17MergeInitial(marker) => self.c17_merge_initial(*marker, work).map(none),
+            CoreAction::C17Join(input) => self
+                .c17_membership_topology(MembershipEventKind::Join, *input, work)
+                .map(none),
+            CoreAction::C17Rebind(input) => self
+                .c17_membership_topology(MembershipEventKind::Rebind, *input, work)
+                .map(none),
+            CoreAction::C17Split(input) => self
+                .c17_membership_topology(MembershipEventKind::Split, *input, work)
+                .map(none),
+            CoreAction::C17Merge(input) => self
+                .c17_membership_topology(MembershipEventKind::Merge, *input, work)
+                .map(none),
+            CoreAction::C17MembershipClose(input) => self
+                .c17_membership_topology(MembershipEventKind::Close, *input, work)
+                .map(none),
+            CoreAction::C17NewlyEligible(marker) => {
+                self.c17_newly_eligible(*marker, work).map(none)
+            }
+            CoreAction::C17MembershipRootAction(request, status, action, at) => self
+                .c17_membership_root_action(*request, *status, *action, *at, work)
+                .map(none),
+            CoreAction::C17Cancellation(marker) => self.c17_cancellation(*marker, work).map(none),
+            CoreAction::C17ResolveObservation(identity, resolution, at) => self
+                .c17_resolve_observation(*identity, *resolution, *at, work)
+                .map(none),
+            CoreAction::C17LifecycleBegin(total, aggregate) => self
+                .c17_lifecycle_begin(usize::from(*total), *aggregate, work)
+                .map(none),
+            CoreAction::C17LifecycleStage(records, count) => self
+                .c17_lifecycle_stage(records, usize::from(*count), work)
+                .map(none),
+            CoreAction::C17LifecycleFinalize => self.c17_lifecycle_finalize(work).map(none),
+            CoreAction::C17LifecycleAbort => self.c17_lifecycle_abort(work).map(none),
         }
     }
+    fn c17_plan_create(
+        &mut self,
+        plan: &TurnPlan<4>,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let change = crate::transition_coordinator::prepare_plan_create(
+            &registration.support,
+            plan,
+            at,
+            work,
+        )
+        .map_err(c17_support_failure)?;
+        let support = &mut self
+            .registration
+            .as_mut()
+            .expect("C17 Plan preparation checked registration")
+            .support;
+        crate::transition_coordinator::commit_plan_create(support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_plan_disposition(
+        &mut self,
+        identity: TurnPlanIdentity,
+        disposition: PlanDisposition,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let change = crate::transition_coordinator::prepare_plan_disposition(
+            &registration.support,
+            identity,
+            disposition,
+            at,
+            work,
+        )
+        .map_err(c17_support_failure)?;
+        crate::transition_coordinator::commit_plan_transition(
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_plan_root_action(
+        &mut self,
+        identity: TurnPlanIdentity,
+        branch: u8,
+        root_action: RootAction,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let change = crate::transition_coordinator::prepare_plan_root_action(
+            &registration.support,
+            identity,
+            branch,
+            root_action,
+            at,
+            work,
+        )
+        .map_err(c17_support_failure)?;
+        crate::transition_coordinator::commit_plan_transition(
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_typed_close(
+        &mut self,
+        input: TypedCloseInput,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let change = crate::transition_coordinator::prepare_typed_close(
+            self.requests.as_ref(),
+            &registration.support,
+            input,
+            work,
+        )
+        .map_err(c17_typed_close_failure)?;
+        let requests = self.requests.as_ref();
+        let support = &mut self
+            .registration
+            .as_mut()
+            .expect("typed-close preparation checked registration")
+            .support;
+        crate::transition_coordinator::commit_typed_close(requests, support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_create_standalone(
+        &mut self,
+        marker: InitialReadyMarker,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestAcceptanceUnavailable))?;
+        let change = crate::transition_coordinator::prepare_create_standalone(
+            requests,
+            &registration.support,
+            marker,
+            work,
+        )
+        .map_err(c17_create_standalone_failure)?;
+        let requests = self.requests.as_mut().expect("prepared RequestBook");
+        let support = &mut self
+            .registration
+            .as_mut()
+            .expect("prepared Support ledger")
+            .support;
+        crate::transition_coordinator::commit_create_standalone(requests, support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_merge_initial(
+        &mut self,
+        marker: MergeInitialMarker,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestAcceptanceUnavailable))?;
+        let change = crate::transition_coordinator::prepare_merge_initial(
+            requests,
+            &registration.support,
+            marker,
+            work,
+        )
+        .map_err(c17_merge_initial_failure)?;
+        let requests = self.requests.as_mut().expect("prepared RequestBook");
+        let support = &mut self
+            .registration
+            .as_mut()
+            .expect("prepared Support ledger")
+            .support;
+        crate::transition_coordinator::commit_merge_initial(requests, support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_membership_topology(
+        &mut self,
+        expected_kind: MembershipEventKind,
+        input: MembershipEventInput,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        if input.kind != expected_kind {
+            return Err(c17_request_failure(RequestError::InvalidTransition));
+        }
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestAcceptanceUnavailable))?;
+        let change = crate::transition_coordinator::prepare_membership_topology(
+            requests,
+            &registration.support,
+            input,
+            work,
+        )
+        .map_err(c17_membership_topology_failure)?;
+        let requests = self.requests.as_mut().expect("prepared RequestBook");
+        let support = &mut self
+            .registration
+            .as_mut()
+            .expect("prepared Support ledger")
+            .support;
+        crate::transition_coordinator::commit_membership_topology(requests, support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_newly_eligible(
+        &mut self,
+        marker: EligibilityMarker,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let requests = self
+            .requests
+            .as_mut()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestAcceptanceUnavailable))?;
+        crate::transition_coordinator::newly_eligible(requests, marker, work)
+            .map_err(c17_request_failure)?;
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_membership_root_action(
+        &mut self,
+        request: RequestId,
+        expected_status: RequestStatusVersion,
+        action: RootAction,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestAcceptanceUnavailable))?;
+        let change = crate::transition_coordinator::prepare_membership_root_action(
+            requests,
+            &registration.support,
+            request,
+            expected_status,
+            action,
+            at,
+            work,
+        )
+        .map_err(c17_membership_root_failure)?;
+        let requests = self.requests.as_ref().expect("prepared RequestBook");
+        let support = &mut self
+            .registration
+            .as_mut()
+            .expect("prepared Support ledger")
+            .support;
+        crate::transition_coordinator::commit_membership_root_action(requests, support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_cancellation(
+        &mut self,
+        marker: CancellationMarker,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let requests = self
+            .requests
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestAcceptanceUnavailable))?;
+        let change = crate::transition_coordinator::prepare_cancellation_remove(
+            requests,
+            &registration.support,
+            marker,
+            work,
+        )
+        .map_err(c17_cancellation_failure)?;
+        let requests = self.requests.as_mut().unwrap();
+        let support = &mut self.registration.as_mut().unwrap().support;
+        crate::transition_coordinator::commit_cancellation_remove(requests, support, change);
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_resolve_observation(
+        &mut self,
+        identity: TurnPlanIdentity,
+        resolution: ObservationResolution,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            registration_rejection(DomainRejection::RequestDescriptionUnavailable)
+        })?;
+        let change = crate::transition_coordinator::prepare_observation_resolution(
+            &registration.support,
+            identity,
+            resolution,
+            at,
+            work,
+        )
+        .map_err(c17_support_failure)?;
+        crate::transition_coordinator::commit_plan_transition(
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_lifecycle_begin(
+        &mut self,
+        total: usize,
+        aggregate: LifecycleAggregate,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        let support = &self
+            .registration
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?
+            .support;
+        let change =
+            crate::transition_coordinator::prepare_lifecycle_begin(support, total, aggregate, work)
+                .map_err(c17_support_failure)?;
+        crate::transition_coordinator::commit_lifecycle_begin(
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_lifecycle_stage(
+        &mut self,
+        records: &[Option<C17LifecycleRecordSpec>; 8],
+        count: usize,
+        work: &mut WorkMeter,
+    ) -> Result<Effects, StageFailure> {
+        if !(1..=records.len()).contains(&count)
+            || records[..count].iter().any(Option::is_none)
+            || records[count..].iter().any(Option::is_some)
+        {
+            return Err(c17_support_failure(SupportLedgerError::InvalidInput));
+        }
+        let support = &self
+            .registration
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?
+            .support;
+        let change = crate::transition_coordinator::prepare_lifecycle_stage(
+            self.requests.as_ref(),
+            support,
+            &records[..count],
+            work,
+        )
+        .map_err(c17_lifecycle_stage_failure)?;
+        crate::transition_coordinator::commit_lifecycle_stage(
+            self.requests.as_ref(),
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_lifecycle_finalize(&mut self, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+        let support = &self
+            .registration
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?
+            .support;
+        let change = crate::transition_coordinator::prepare_lifecycle_finalize(support, work)
+            .map_err(c17_support_failure)?;
+        crate::transition_coordinator::commit_lifecycle_finalize(
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
+    fn c17_lifecycle_abort(&mut self, work: &mut WorkMeter) -> Result<Effects, StageFailure> {
+        let support = &self
+            .registration
+            .as_ref()
+            .ok_or_else(|| registration_rejection(DomainRejection::RequestDescriptionUnavailable))?
+            .support;
+        let change = crate::transition_coordinator::prepare_lifecycle_abort(support, work)
+            .map_err(c17_support_failure)?;
+        crate::transition_coordinator::commit_lifecycle_abort(
+            &mut self.registration.as_mut().unwrap().support,
+            change,
+        );
+        Ok(BoundedVec::new())
+    }
+
     fn stage(
         &self,
         operation: OperationId,
@@ -1379,6 +1895,24 @@ fn support_failure(error: SupportLedgerError) -> StageFailure { match error { Su
 #[rustfmt::skip]
 fn request_support_failure(error: SupportLedgerError) -> StageFailure { match error { SupportLedgerError::Storage(FixedStorageError::Work(error)) => error.into(), _ => registration_rejection(DomainRejection::RequestDescriptionSupport) } }
 #[rustfmt::skip]
+fn c17_support_failure(error: SupportLedgerError) -> StageFailure { request_support_failure(error) }
+#[rustfmt::skip]
+fn c17_request_failure(error: RequestError) -> StageFailure { match error { RequestError::Work(error) => error.into(), RequestError::RegistryGeneration | RequestError::PreparedChangeStale | RequestError::InvalidGeneration => registration_rejection(DomainRejection::RequestAcceptanceStale), _ => registration_rejection(DomainRejection::RequestAcceptanceState) } }
+#[rustfmt::skip]
+fn c17_typed_close_failure(error: crate::transition_coordinator::TypedClosePrepareError) -> StageFailure { match error { crate::transition_coordinator::TypedClosePrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::TypedClosePrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
+fn c17_create_standalone_failure(error: crate::transition_coordinator::CreateStandalonePrepareError) -> StageFailure { match error { crate::transition_coordinator::CreateStandalonePrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::CreateStandalonePrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
+fn c17_merge_initial_failure(error: crate::transition_coordinator::MergeInitialPrepareError) -> StageFailure { match error { crate::transition_coordinator::MergeInitialPrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::MergeInitialPrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
+fn c17_membership_topology_failure(error: crate::transition_coordinator::MembershipTopologyPrepareError) -> StageFailure { match error { crate::transition_coordinator::MembershipTopologyPrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::MembershipTopologyPrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
+fn c17_membership_root_failure(error: crate::transition_coordinator::MembershipRootPrepareError) -> StageFailure { match error { crate::transition_coordinator::MembershipRootPrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::MembershipRootPrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
+fn c17_lifecycle_stage_failure(error: crate::transition_coordinator::LifecycleStagePrepareError) -> StageFailure { match error { crate::transition_coordinator::LifecycleStagePrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::LifecycleStagePrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
+fn c17_cancellation_failure(error: crate::transition_coordinator::CancellationPrepareError) -> StageFailure { match error { crate::transition_coordinator::CancellationPrepareError::Request(error) => c17_request_failure(error), crate::transition_coordinator::CancellationPrepareError::Support(error) => c17_support_failure(error) } }
+#[rustfmt::skip]
 fn descriptor_failure(error: ModelDescriptorError) -> StageFailure { match error { ModelDescriptorError::Work(error) => error.into(), _ => registration_rejection(DomainRejection::ModelRegistrationDescriptor) } }
 #[rustfmt::skip]
 fn registry_failure(error: RegistryError) -> StageFailure { match error { RegistryError::Work(error) | RegistryError::Index(FixedIndexError::Work(error)) => error.into(), _ => registration_rejection(DomainRejection::ModelRegistrationRegistry) } }
@@ -1424,6 +1958,10 @@ mod tests {
     use crate::model_registry::{
         ModelAliasId, ModelManifestId, ModelRevisionId, RegistryCommand, RegistryGeneration,
     };
+    use crate::request_book::c17::{
+        CancellationKind, InitialReadyKind, MembershipDestination, MembershipMutation,
+        SupportMembershipAnchor,
+    };
     use crate::request_book::{
         AcceptanceInput, CapabilityRequirement, DescriptionState, EffectiveSamplingSeed,
         GenerationParameters, RequestBookGeneration, RequestDescriptionFacts, RequestLifecycle,
@@ -1452,11 +1990,11 @@ mod tests {
     #[rustfmt::skip]
     fn registration(hash: [u8; 32]) -> RegistrationIntent { RegistrationIntent { model: ModelId::new(1).unwrap(), revision: ModelRevisionId::new([2; 32]).unwrap(), manifest: ModelManifestId::new([3; 32]).unwrap(), expected_descriptor_hash: ModelDescriptorHash::from_manifest(1, hash).unwrap(), context_limit: TokenCount::new(8) } }
     #[rustfmt::skip]
-    fn ordinary(n: u8) -> OrdinarySupportSpec { OrdinarySupportSpec { id: SupportOperationObligationId::new([n; 32]).unwrap(), operation: SupportOperation::DescribeModel, physical_credit: PhysicalStartCreditId::new([n + 1; 32]).unwrap(), scope: SupportCallScopeId([n + 2; 32]), claim: SupportFundingClaim::OrdinaryReservation([n + 3; 32]) } }
+    fn ordinary(n: u8) -> OrdinarySupportSpec { OrdinarySupportSpec { id: SupportOperationObligationId::new([n; 32]).unwrap(), operation: SupportOperation::DescribeModel, physical_credit: PhysicalStartCreditId::new([n + 100; 32]).unwrap(), scope: SupportCallScopeId([n + 150; 32]), claim: SupportFundingClaim::OrdinaryReservation([n + 200; 32]) } }
     #[rustfmt::skip]
     fn ordinary_request(n: u8) -> OrdinarySupportSpec { OrdinarySupportSpec { operation: SupportOperation::DescribeRequest, ..ordinary(n) } }
     #[rustfmt::skip]
-    fn reserve_descriptions<const O: usize, const N: usize>(core: &mut Core<O, 2, 1, 2>, n: u8, kinds: [LifecycleReserveKind; N]) -> (SupportCausalPredecessorId, DescriptionObligations) { let predecessor = SupportCausalPredecessorId([n + 1; 32]); let specs: [LifecycleReserveSpec; N] = std::array::from_fn(|offset| { let value = n + offset as u8; LifecycleReserveSpec { id: SupportOperationObligationId::new([value; 32]).unwrap(), kind: kinds[offset], physical_credit: PhysicalStartCreditId::new([value + 2; 32]).unwrap(), predecessor, scope: SupportCallScopeId([value + 3; 32]), claim: SupportFundingClaim::LifecycleReserve([value + 4; 32]), expires_at: None } }); let state = core.registration.as_mut().unwrap(); state.support.reserve_lifecycle(state.support.generation(), MonotonicTime::from_micros(5), &specs, &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap(); let mut ids = BoundedVec::new(); for spec in specs { ids.try_push(spec.id).unwrap(); } (predecessor, ids) }
+    fn reserve_descriptions<const O: usize, const N: usize>(core: &mut Core<O, 2, 1, 2>, n: u8, kinds: [LifecycleReserveKind; N]) -> (SupportCausalPredecessorId, DescriptionObligations) { let predecessor = SupportCausalPredecessorId([n + 1; 32]); let specs: [LifecycleReserveSpec; N] = std::array::from_fn(|offset| { let value = n + offset as u8; LifecycleReserveSpec { id: SupportOperationObligationId::new([value; 32]).unwrap(), kind: kinds[offset], physical_credit: PhysicalStartCreditId::new([value + 100; 32]).unwrap(), predecessor, scope: SupportCallScopeId([value + 150; 32]), claim: SupportFundingClaim::LifecycleReserve([value + 200; 32]), expires_at: None } }); let state = core.registration.as_mut().unwrap(); state.support.reserve_lifecycle(state.support.generation(), MonotonicTime::from_micros(5), &specs, &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap(); let mut ids = BoundedVec::new(); for spec in specs { ids.try_push(spec.id).unwrap(); } (predecessor, ids) }
     #[rustfmt::skip]
     fn raw<'a>(frame: &'a [u8], id: [u8; 32], hash: [u8; 32], vocabulary: u32) -> RawModelDescriptor<'a> { RawModelDescriptor { frame, id, hash_schema_version: 1, hash, vocabulary } }
     #[rustfmt::skip]
@@ -1545,6 +2083,447 @@ mod tests {
     fn install_revision<const O: usize>(core: &mut Core<O, 2, 1, 2>, intent: RegistrationIntent) { let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum()); let descriptor = verify(raw(&FRAME, ID, HASH, 7), intent.expected_descriptor_hash, &mut work).unwrap(); let registry = &mut core.registration.as_mut().unwrap().registry; let plan = registry.prepare_description(registry.generation(), intent, &mut work).unwrap(); let change = registry.prepare_registration(plan, &descriptor, &mut work).unwrap(); registry.commit(change).unwrap(); }
     #[rustfmt::skip]
     fn accepted<const O: usize>(core: &Core<O, 2, 1, 2>, id: RequestId) -> AcceptedRequest<2, 1, 2> { core.requests.as_ref().unwrap().get(id, &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap().unwrap().clone() }
+
+    fn c17_route_request(sequence: u64) -> RequestId {
+        RequestId::new(
+            DaemonInstanceId::new(1).unwrap(),
+            ConnectionId::new(1).unwrap(),
+            RequestSequence::new(sequence).unwrap(),
+        )
+    }
+
+    fn c17_route_plan() -> TurnPlan<4> {
+        let request = c17_route_request(1);
+        let member_funding = crate::PlanMemberFunding {
+            request_id: request,
+            entitlement: crate::FutureTurnSupportEntitlementId::new([11; 32]).unwrap(),
+            credit_vector: crate::SupportOutstandingCreditVectorId::new([12; 32]).unwrap(),
+        };
+        let capability = crate::CapabilityKey::new([13; 32]).unwrap();
+        let bound_set = crate::RuntimeOverheadBoundSetId::new([14; 32]).unwrap();
+        let coordinates = crate::CandidateCoordinates {
+            model_id: ModelId::new(1).unwrap(),
+            phase: ExecutionPhase::Decode,
+            service_class: ServiceClass::Interactive,
+            batch_bucket: BatchBucket(1),
+        };
+        let mut authorized = crate::AuthorizedCapabilitySet::<1>::new();
+        authorized.try_insert(capability).unwrap();
+        let mut evidence = BoundedVec::new();
+        evidence
+            .try_push(crate::CandidateMember {
+                request_id: request,
+                coordinates,
+                authorized_capabilities: authorized,
+                bound_set,
+                runtime_overhead_generation: RuntimeOverheadGeneration::new(1).unwrap(),
+            })
+            .unwrap();
+        let candidate = crate::WorkCandidate::try_new(
+            crate::CandidateId::new(1).unwrap(),
+            coordinates,
+            capability,
+            evidence,
+        )
+        .unwrap();
+        let mut candidates = BoundedVec::new();
+        candidates.try_push(candidate).unwrap();
+        let mut eligible = crate::BoundedSet::new();
+        eligible.try_insert(request).unwrap();
+        let mut funding = BoundedVec::new();
+        funding.try_push(member_funding).unwrap();
+        let snapshot = crate::SchedulingSnapshot::<4, 1, 4>::try_new(
+            MonotonicTime::from_micros(1),
+            generations(),
+            eligible,
+            candidates,
+            BoundedVec::new(),
+        )
+        .unwrap();
+        let obligation = |value: u8| crate::PlanSupportObligation {
+            id: SupportOperationObligationId::new([value; 32]).unwrap(),
+            physical_credit: PhysicalStartCreditId::new([value + 10; 32]).unwrap(),
+            funders: funding.clone(),
+        };
+        TurnPlan::try_new(
+            crate::TurnPlanId::new(1).unwrap(),
+            &snapshot,
+            crate::CandidateId::new(1).unwrap(),
+            funding,
+            crate::TurnBudget {
+                target_engine_service: Duration::from_micros(1),
+                hard_execution_bound: Duration::from_micros(2),
+                stale_disposition_bound: crate::StalePlanDispositionBoundId::new([15; 32]).unwrap(),
+                stale_successor_ceiling: Duration::from_micros(3),
+                phase_work_ceiling: TokenCount::new(1),
+            },
+            crate::PlanSupportObligations {
+                receipt_observation: obligation(20),
+                conditional_continuation_formation: obligation(21),
+                rejection_or_local_stale_formation: obligation(22),
+            },
+        )
+        .unwrap()
+    }
+
+    fn c17_route_anchor() -> SupportMembershipAnchor {
+        let mut authority = [0; 17];
+        authority[0] = 0x31;
+        authority[16] = 1;
+        SupportMembershipAnchor::try_new(authority, 3, 0, 1, 0, 1, 1).unwrap()
+    }
+
+    fn assert_c17_unavailable(event: CoreEvent, rejection: DomainRejection) {
+        let mut core = Core::<4>::bootstrap(EventSequence::new(1).unwrap(), generations());
+        let transition = core.handle(event);
+        assert_eq!(transition.outcome(), &CoreOutcome::Rejected(rejection));
+        assert!(transition.effects().is_empty());
+        assert!(transition.request_acceptance().is_none());
+        assert_eq!(transition.work(), HotPathWorkWitness::new([1, 0, 0, 0, 0]));
+    }
+
+    #[inline(never)]
+    fn assert_typed_close_core_rejection(
+        core: &mut Core<4>,
+        input: TypedCloseInput,
+        support_generation: SupportLedgerGeneration,
+    ) {
+        let transition = core.handle(CoreEvent::c17_typed_close(
+            EventSequence::new(1).unwrap(),
+            input,
+        ));
+
+        assert_eq!(
+            transition.outcome(),
+            &CoreOutcome::Rejected(DomainRejection::RequestDescriptionSupport)
+        );
+        assert!(transition.effects().is_empty());
+        assert!(transition.request_acceptance().is_none());
+        assert_eq!(transition.work(), HotPathWorkWitness::new([1, 0, 0, 0, 0]));
+        assert_eq!(
+            core.registration.as_ref().unwrap().support.generation(),
+            support_generation
+        );
+    }
+
+    #[test]
+    fn c17_typed_close_core_event_routes_support_rejection_without_effects() {
+        let mut core = registration_core(2);
+        let support_generation = core.registration.as_ref().unwrap().support.generation();
+        let input = TypedCloseInput {
+            group: 0,
+            branch: crate::PlanBranch::Standalone,
+            root: crate::RootRef::new(0, 1, 1).unwrap(),
+            occurred_at: MonotonicTime::from_micros(1),
+            reason: crate::TypedImpossible::CAUSAL_CALL,
+            authority: crate::CloseAuthority::Standalone {
+                domain: crate::FormationDomainId::new(1).unwrap(),
+                source: crate::SourceRecordRef::from_canonical_parts(0, 1),
+                event: crate::MembershipEventId::new(1).unwrap(),
+            },
+        };
+
+        assert_typed_close_core_rejection(&mut core, input, support_generation);
+    }
+
+    #[inline(never)]
+    fn assert_c17_plan_core_routes() {
+        let sequence = EventSequence::new(1).unwrap();
+        let unavailable = DomainRejection::RequestDescriptionUnavailable;
+        let plan = c17_route_plan();
+        let identity = plan.identity();
+        let at = MonotonicTime::from_micros(2);
+        assert_c17_unavailable(CoreEvent::c17_plan_create(sequence, plan, at), unavailable);
+        for disposition in [
+            PlanDisposition::Receipt,
+            PlanDisposition::Rejection,
+            PlanDisposition::LocalStale,
+        ] {
+            assert_c17_unavailable(
+                CoreEvent::c17_plan_disposition(sequence, identity, disposition, at),
+                unavailable,
+            );
+        }
+        for action in [
+            RootAction::MarkPredecessorEnded,
+            RootAction::Begin,
+            RootAction::Finish,
+        ] {
+            assert_c17_unavailable(
+                CoreEvent::c17_plan_root_action(sequence, identity, 0, action, at),
+                unavailable,
+            );
+        }
+        for resolution in [
+            ObservationResolution::DescriptionsRequired,
+            ObservationResolution::Other,
+        ] {
+            assert_c17_unavailable(
+                CoreEvent::c17_resolve_observation(sequence, identity, resolution, at),
+                unavailable,
+            );
+        }
+        assert_c17_unavailable(
+            CoreEvent::c17_typed_close(
+                sequence,
+                TypedCloseInput {
+                    group: 0,
+                    branch: PlanBranch::Standalone,
+                    root: crate::RootRef::new(0, 1, 1).unwrap(),
+                    occurred_at: at,
+                    reason: crate::TypedImpossible::CAUSAL_CALL,
+                    authority: crate::CloseAuthority::Standalone {
+                        domain: crate::FormationDomainId::new(1).unwrap(),
+                        source: crate::SourceRecordRef::from_canonical_parts(0, 1),
+                        event: crate::MembershipEventId::new(1).unwrap(),
+                    },
+                },
+            ),
+            unavailable,
+        );
+    }
+
+    #[inline(never)]
+    fn assert_c17_causal_core_routes() {
+        let sequence = EventSequence::new(1).unwrap();
+        let unavailable = DomainRejection::RequestDescriptionUnavailable;
+        let request = c17_route_request(1);
+        let status = RequestStatusVersion::new(1).unwrap();
+        let anchor = c17_route_anchor();
+        let at = MonotonicTime::from_micros(2);
+        let initial = InitialReadyMarker {
+            request,
+            kind: InitialReadyKind::MaterializationCompleted,
+            identity: [33; 32],
+            domain: crate::FormationDomainId::new(1)
+                .unwrap()
+                .get()
+                .to_be_bytes(),
+            occurred_at: at,
+            funding: crate::PlanMemberFunding {
+                request_id: request,
+                entitlement: crate::FutureTurnSupportEntitlementId::new([31; 32]).unwrap(),
+                credit_vector: crate::SupportOutstandingCreditVectorId::new([32; 32]).unwrap(),
+            },
+            obligation: SupportOperationObligationId::new([34; 32]).unwrap(),
+            credit: PhysicalStartCreditId::new([35; 32]).unwrap(),
+        };
+        assert_c17_unavailable(
+            CoreEvent::c17_create_standalone(sequence, initial),
+            unavailable,
+        );
+        assert_c17_unavailable(
+            CoreEvent::c17_merge_initial(
+                sequence,
+                MergeInitialMarker {
+                    identities: [[33; 32], [36; 32], [0; 32]],
+                    source_count: 2,
+                    domain: initial.domain,
+                    occurred_at: at,
+                },
+            ),
+            unavailable,
+        );
+        assert_c17_unavailable(
+            CoreEvent::c17_newly_eligible(
+                sequence,
+                EligibilityMarker {
+                    request,
+                    identity: [39; 32],
+                    previous_anchor: anchor,
+                    occurred_at: at,
+                },
+            ),
+            DomainRejection::RequestAcceptanceUnavailable,
+        );
+        for action in [
+            RootAction::MarkPredecessorEnded,
+            RootAction::Begin,
+            RootAction::Finish,
+        ] {
+            assert_c17_unavailable(
+                CoreEvent::c17_membership_root_action(sequence, request, status, action, at),
+                unavailable,
+            );
+        }
+        assert_c17_unavailable(
+            CoreEvent::c17_cancellation(
+                sequence,
+                CancellationMarker {
+                    request,
+                    identity: [40; 32],
+                    kind: CancellationKind::Client,
+                    previous_anchor: anchor,
+                    occurred_at: at,
+                },
+            ),
+            unavailable,
+        );
+    }
+
+    #[inline(never)]
+    fn assert_c17_topology_core_routes() {
+        let sequence = EventSequence::new(1).unwrap();
+        let unavailable = DomainRejection::RequestDescriptionUnavailable;
+        let at = MonotonicTime::from_micros(2);
+        let requests = [
+            c17_route_request(1),
+            c17_route_request(2),
+            c17_route_request(3),
+            c17_route_request(4),
+        ];
+        let status = RequestStatusVersion::new(1).unwrap();
+        let mutation = |index, destination| {
+            Some(MembershipMutation {
+                request: requests[index],
+                expected_status: status,
+                destination,
+            })
+        };
+        assert_c17_unavailable(
+            CoreEvent::c17_join(
+                sequence,
+                MembershipEventInput {
+                    kind: MembershipEventKind::Join,
+                    source_identity: Some([37; 32]),
+                    member_count: 2,
+                    destination_count: 1,
+                    members: [
+                        mutation(0, MembershipDestination::Destination(0)),
+                        mutation(1, MembershipDestination::Destination(0)),
+                        None,
+                        None,
+                    ],
+                    occurred_at: at,
+                },
+            ),
+            unavailable,
+        );
+        for source_identity in [None, Some([38; 32])] {
+            assert_c17_unavailable(
+                CoreEvent::c17_rebind(
+                    sequence,
+                    MembershipEventInput {
+                        kind: MembershipEventKind::Rebind,
+                        source_identity,
+                        member_count: 1,
+                        destination_count: 1,
+                        members: [
+                            mutation(0, MembershipDestination::Destination(0)),
+                            None,
+                            None,
+                            None,
+                        ],
+                        occurred_at: at,
+                    },
+                ),
+                unavailable,
+            );
+        }
+        assert_c17_unavailable(
+            CoreEvent::c17_split(
+                sequence,
+                MembershipEventInput {
+                    kind: MembershipEventKind::Split,
+                    source_identity: None,
+                    member_count: 4,
+                    destination_count: 4,
+                    members: [
+                        mutation(0, MembershipDestination::Destination(0)),
+                        mutation(1, MembershipDestination::Destination(1)),
+                        mutation(2, MembershipDestination::Destination(2)),
+                        mutation(3, MembershipDestination::Destination(3)),
+                    ],
+                    occurred_at: at,
+                },
+            ),
+            unavailable,
+        );
+        assert_c17_unavailable(
+            CoreEvent::c17_merge(
+                sequence,
+                MembershipEventInput {
+                    kind: MembershipEventKind::Merge,
+                    source_identity: None,
+                    member_count: 2,
+                    destination_count: 1,
+                    members: [
+                        mutation(0, MembershipDestination::Destination(0)),
+                        mutation(1, MembershipDestination::Destination(0)),
+                        None,
+                        None,
+                    ],
+                    occurred_at: at,
+                },
+            ),
+            unavailable,
+        );
+        assert_c17_unavailable(
+            CoreEvent::c17_membership_close(
+                sequence,
+                MembershipEventInput {
+                    kind: MembershipEventKind::Close,
+                    source_identity: None,
+                    member_count: 1,
+                    destination_count: 0,
+                    members: [mutation(0, MembershipDestination::Closed), None, None, None],
+                    occurred_at: at,
+                },
+            ),
+            unavailable,
+        );
+    }
+
+    #[inline(never)]
+    fn assert_c17_lifecycle_core_routes() {
+        let sequence = EventSequence::new(1).unwrap();
+        let unavailable = DomainRejection::RequestDescriptionUnavailable;
+        let at = MonotonicTime::from_micros(2);
+        let identity = {
+            let plan = c17_route_plan();
+            plan.identity()
+        };
+        assert_c17_unavailable(
+            CoreEvent::c17_lifecycle_begin(sequence, 1, LifecycleAggregate::ZERO),
+            unavailable,
+        );
+        let lifecycle = C17LifecycleRecordSpec {
+            root: C17LifecycleRootSpec::Plan {
+                identity,
+                branch: PlanBranch::Continuation,
+            },
+            obligation: SupportOperationObligationId::new([41; 32]).unwrap(),
+            credit: PhysicalStartCreditId::new([42; 32]).unwrap(),
+            predecessor: SupportCausalPredecessorId([43; 32]),
+            scope: SupportCallScopeId([44; 32]),
+            claim: [45; 32],
+            kind: LifecycleReserveKind::PostLoadModelDescription,
+            occurred_at: at,
+            expires_at: None,
+            operation: SupportOperation::FormCandidates,
+            pool: SupportPool::MandatoryCompletion,
+            horizon: 0,
+        };
+        assert_c17_unavailable(
+            CoreEvent::c17_lifecycle_stage(
+                sequence,
+                [Some(lifecycle), None, None, None, None, None, None, None],
+                1,
+            ),
+            unavailable,
+        );
+        assert_c17_unavailable(CoreEvent::c17_lifecycle_finalize(sequence), unavailable);
+        assert_c17_unavailable(CoreEvent::c17_lifecycle_abort(sequence), unavailable);
+    }
+
+    #[test]
+    fn c17_core_event_inventory_routes_every_private_constructor_without_effects() {
+        assert_c17_plan_core_routes();
+        assert_c17_causal_core_routes();
+        assert_c17_topology_core_routes();
+        assert_c17_lifecycle_core_routes();
+    }
+
     #[test]
     fn candidate_invariant_failure_preserves_state_and_latches_fault() {
         let sequence = EventSequence::new(1).unwrap();
@@ -1590,7 +2569,7 @@ mod tests {
         );
         assert_eq!(
             transition.work(),
-            HotPathWorkWitness::new([59, 468, 0, 1, 33])
+            HotPathWorkWitness::new([1_134, 1_617_064, 0, 1, 1_071])
         );
         let result = core.handle(CoreEvent::model_descriptor_result(
             EventSequence::new(2).unwrap(),
@@ -1602,7 +2581,10 @@ mod tests {
             (result.outcome(), result.effects().is_empty()),
             (&CoreOutcome::Accepted, true)
         );
-        assert_eq!(result.work(), HotPathWorkWitness::new([832, 823, 0, 2, 29]));
+        assert_eq!(
+            result.work(),
+            HotPathWorkWitness::new([1_921, 1_617_550, 0, 2, 1_069])
+        );
         let state = core.registration.as_ref().unwrap();
         assert_eq!(
             (
@@ -1649,11 +2631,11 @@ mod tests {
         let transition = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), input));
         let accepted = transition.request_acceptance().unwrap();
         assert_eq!((transition.outcome(), transition.effects().len()), (&CoreOutcome::Accepted, 0));
-        assert_eq!(transition.work(), HotPathWorkWitness::new([3, 736, 0, 0, 14]));
+        assert_eq!(transition.work(), HotPathWorkWitness::new([3, 8224, 0, 0, 14]));
         assert_eq!((accepted.id().sequence().get(), accepted.revision(), accepted.seed().value(), accepted.seed().origin(), accepted.status().get(), accepted.lifecycle()), (1, revision, 9, SamplingSeedOrigin::Caller, 1, RequestLifecycle::Preparing));
         let alias = ModelAliasId::new([4; 32]).unwrap(); { let registry = &mut core.registration.as_mut().unwrap().registry; let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum()); let change = registry.prepare(registry.generation(), RegistryCommand::BindAlias(alias, revision), &mut work).unwrap(); registry.commit(change).unwrap(); }
         let next = core.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), request_input(RequestSelector::Alias(alias), 2, &[1], 1, 0, 10, 5))); let accepted = next.request_acceptance().unwrap();
-        assert_eq!(next.work(), HotPathWorkWitness::new([5, 736, 0, 0, 16]));
+        assert_eq!(next.work(), HotPathWorkWitness::new([5, 8224, 0, 0, 16]));
         assert_eq!((accepted.id().sequence().get(), accepted.revision(), accepted.seed().value(), core.requests.as_ref().unwrap().len()), (2, revision, 10, 2));
     }
     #[test]
@@ -1674,18 +2656,17 @@ mod tests {
             ordinary_request(6),
             MonotonicTime::from_micros(4),
         ));
+        assert_eq!(started.outcome(), &CoreOutcome::Accepted);
         assert_eq!(
             (
-                started.outcome(),
                 started.effects().len(),
                 started.effects().get(0).unwrap().request_description(),
                 started.work()
             ),
             (
-                &CoreOutcome::Accepted,
                 1,
                 Some(accepted.id()),
-                HotPathWorkWitness::new([83, 689, 0, 1, 33])
+                HotPathWorkWitness::new([1_138, 1_617_285, 0, 1, 1_071])
             )
         );
         let facts = description_facts();
@@ -1794,7 +2775,7 @@ mod tests {
                 &CoreOutcome::Accepted,
                 0,
                 None,
-                HotPathWorkWitness::new([8, 28_049, 0, 0, 35])
+                HotPathWorkWitness::new([1_096, 1_644_776, 0, 0, 1_075])
             )
         );
         let refreshed = core.handle(CoreEvent::drive_request_description(
@@ -1810,10 +2791,10 @@ mod tests {
                 refreshed.work()
             ),
             (
-                HotPathWorkWitness::new([7, 353, 0, 0, 6]),
+                HotPathWorkWitness::new([1_066, 1_617_113, 0, 0, 1_046]),
                 &CoreOutcome::Accepted,
                 Some(accepted.id()),
-                HotPathWorkWitness::new([9, 566, 0, 1, 17])
+                HotPathWorkWitness::new([1_099, 1_617_285, 0, 1, 1_057])
             )
         );
         let result = core
@@ -1836,7 +2817,7 @@ mod tests {
                 &CoreOutcome::Accepted,
                 0,
                 None,
-                HotPathWorkWitness::new([9, 28_049, 0, 0, 35])
+                HotPathWorkWitness::new([1_096, 1_644_776, 0, 0, 1_075])
             )
         );
     }
@@ -1859,7 +2840,7 @@ mod tests {
         for (selector, rejection) in [(RequestSelector::Direct(revision), DomainRejection::UnknownRequestRevision), (RequestSelector::Alias(alias), DomainRejection::UnknownRequestAlias)] { let mut core = request_core(); let transition = core.handle(CoreEvent::accept_request(EventSequence::new(1).unwrap(), request_input(selector, 2, &[1], 1, 0, 9, 5))); assert_eq!(transition.outcome(), &CoreOutcome::Rejected(rejection)); assert!(transition.request_acceptance().is_none()); assert_eq!(core.requests.as_ref().unwrap().len(), 0); }
         for (input, rejection) in [(request_input(RequestSelector::Direct(revision), 2, &[1], 1, 7, 9, 5), DomainRejection::RequestTopK), (request_input(RequestSelector::Direct(revision), 2, &[1], 8, 0, 9, 5), DomainRejection::RequestContextLimit), (request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 0), DomainRejection::RequestPreparationTimeout)] { let mut core = registered_request_core(); let before = (core.requests.as_ref().unwrap().generation(), core.requests.as_ref().unwrap().len()); let rejected = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), input)); assert_eq!((rejected.outcome(), rejected.request_acceptance()), (&CoreOutcome::Rejected(rejection), None)); assert_eq!((core.requests.as_ref().unwrap().generation(), core.requests.as_ref().unwrap().len()), before); let accepted = core.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap(); assert_eq!(accepted.id().sequence().get(), 1); }
         let mut unavailable = registered_request_core(); { let registry = &mut unavailable.registration.as_mut().unwrap().registry; let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum()); let change = registry.prepare(registry.generation(), RegistryCommand::BindAlias(alias, revision), &mut work).unwrap(); registry.commit(change).unwrap(); let change = registry.prepare(registry.generation(), RegistryCommand::MarkUnavailable(revision), &mut work).unwrap(); registry.commit(change).unwrap(); } for (offset, selector) in [RequestSelector::Direct(revision), RequestSelector::Alias(alias)].into_iter().enumerate() { let rejected = unavailable.handle(CoreEvent::accept_request(EventSequence::new(3 + offset as u64).unwrap(), request_input(selector, 2, &[1], 1, 0, 9, 5))); assert_eq!((rejected.outcome(), rejected.request_acceptance(), unavailable.requests.as_ref().unwrap().len()), (&CoreOutcome::Rejected(DomainRejection::RequestRevisionUnavailable), None, 0)); }
-        let input = request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5); let mut constrained = registered_request_core(); constrained.work_budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); let rejected = constrained.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), input)); assert_eq!(rejected.outcome(), &CoreOutcome::Rejected(DomainRejection::HotPathWorkBudget(WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 0, 224)))); assert_eq!((rejected.work(), rejected.request_acceptance(), constrained.requests.as_ref().unwrap().len()), (HotPathWorkWitness::new([2, 0, 0, 0, 1]), None, 0)); constrained.work_budget = HotPathWorkBudget::binary_maximum(); let retried = constrained.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), input)); assert_eq!((retried.request_acceptance().unwrap().id().sequence().get(), retried.work(), constrained.requests.as_ref().unwrap().len()), (1, HotPathWorkWitness::new([3, 736, 0, 0, 14]), 1));
+        let input = request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5); let mut constrained = registered_request_core(); constrained.work_budget = HotPathWorkBudget::try_new(HotPathWorkWitness::new([1_000_000, 0, 0, 2, 2_100])).unwrap(); let rejected = constrained.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), input)); assert_eq!(rejected.outcome(), &CoreOutcome::Rejected(DomainRejection::HotPathWorkBudget(WorkBudgetError::BudgetExceeded(WorkDimension::CopiedBytes, 0, 224)))); assert_eq!((rejected.work(), rejected.request_acceptance(), constrained.requests.as_ref().unwrap().len()), (HotPathWorkWitness::new([2, 0, 0, 0, 1]), None, 0)); constrained.work_budget = HotPathWorkBudget::binary_maximum(); let retried = constrained.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), input)); assert_eq!((retried.request_acceptance().unwrap().id().sequence().get(), retried.work(), constrained.requests.as_ref().unwrap().len()), (1, HotPathWorkWitness::new([3, 8224, 0, 0, 14]), 1));
     }
     #[test]
     fn request_capacity_and_internal_rejections_are_closed() {
@@ -1918,18 +2899,18 @@ mod tests {
                     })
                     .collect();
                 let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
-                ledger
-                    .reserve_lifecycle(
-                        ledger.generation(),
+                let before = ledger.generation();
+                assert_eq!(
+                    ledger.reserve_lifecycle(
+                        before,
                         MonotonicTime::from_micros(5),
                         &specs,
                         &mut work,
-                    )
-                    .unwrap();
-                assert_eq!(
-                    work.witness(),
-                    HotPathWorkWitness::new([158_875, 307_500, 0, 0, 16_413])
+                    ),
+                    Err(SupportLedgerError::InvalidInput)
                 );
+                assert_eq!(ledger.generation(), before);
+                assert_eq!(work.witness(), HotPathWorkWitness::default());
             })
             .unwrap()
             .join()
