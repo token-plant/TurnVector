@@ -283,6 +283,10 @@ impl PreparedC17MembershipTopology {
 
 pub(crate) struct PreparedC17RootBatch {
     expected: SupportLedgerGeneration,
+    // The lifecycle transitions advance the C17 generation without advancing the outer
+    // ledger generation, so a seal must bind and revalidate the inner one as well or a
+    // stale seal could write its header after-image back over newer state.
+    expected_c17: u64,
     generation_after: SupportLedgerGeneration,
     owner_count: usize,
     owner_slots: [u32; 4],
@@ -2009,10 +2013,12 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             branch_deltas,
             preview.retractions(),
         )?;
+        let expected_c17 = self.c17.generation();
         let c17 = self.c17.prepare_root_batch(preview, owner_records, work)?;
         let owner_records_after = c17.owner_records_after();
         Ok(PreparedC17RootBatch {
             expected,
+            expected_c17,
             generation_after,
             owner_count,
             owner_slots,
@@ -2033,6 +2039,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         change: &PreparedC17RootBatch,
     ) -> Result<(), SupportLedgerError> {
         if self.generation != change.expected
+            || self.c17.generation() != change.expected_c17
             || change
                 .expected
                 .next()
@@ -2109,8 +2116,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             self.generation, change.expected,
             "sealed C17 root-batch generation"
         );
+        assert_eq!(
+            self.c17.generation(),
+            change.expected_c17,
+            "sealed C17 root-batch inner generation"
+        );
         let PreparedC17RootBatch {
             expected: _,
+            expected_c17: _,
             generation_after,
             owner_count,
             owner_slots,
