@@ -472,7 +472,7 @@ fn combined_commit_permit(
 
 pub(crate) struct PreparedPlanCreate {
     support: PreparedC17PlanCreate,
-    journal: Box<CombinedAssignmentJournal>,
+    journal: CombinedAssignmentJournal,
 }
 
 pub(crate) fn prepare_plan_create<
@@ -485,18 +485,18 @@ pub(crate) fn prepare_plan_create<
     plan: &TurnPlan<MEMBERS>,
     occurred_at: MonotonicTime,
     work: &mut WorkMeter,
-) -> Result<Box<PreparedPlanCreate>, SupportLedgerError> {
+) -> Result<PreparedPlanCreate, SupportLedgerError> {
     let mut census = ExactWorkCensus::new();
     let change =
         support.prepare_c17_plan_create(support.generation(), plan, occurred_at, &mut census)?;
     support.validate_c17_plan_create(&change)?;
     let journal =
-        Box::new(CombinedAssignmentJournal::single(&change).map_err(SupportLedgerError::Storage)?);
+        CombinedAssignmentJournal::single(&change).map_err(SupportLedgerError::Storage)?;
     work.charge(census.witness())?;
-    Ok(Box::new(PreparedPlanCreate {
+    Ok(PreparedPlanCreate {
         support: change,
         journal,
-    }))
+    })
 }
 
 pub(crate) fn validate_plan_create<
@@ -519,7 +519,7 @@ pub(crate) fn commit_plan_create<
     const HORIZONS: usize,
 >(
     support: &mut SupportChargeLedger<RECORDS, CLAIMS, HORIZONS>,
-    change: Box<PreparedPlanCreate>,
+    change: PreparedPlanCreate,
 ) {
     assert_eq!(
         support.generation(),
@@ -529,7 +529,7 @@ pub(crate) fn commit_plan_create<
     let PreparedPlanCreate {
         support: change,
         journal,
-    } = *change;
+    } = change;
     journal.commit_support_direct(support);
     support.commit_c17_plan_create_prevalidated(change, false);
 }
