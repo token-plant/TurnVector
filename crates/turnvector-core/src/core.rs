@@ -1480,7 +1480,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
                     .transition(
                         generation,
                         obligation,
-                        crate::support::SupportTransition::CloseCausalCallImpossible,
+                        crate::support::SupportTransition::CloseCausalCallImpossible(at),
                         work,
                     )
                     .map_err(request_support_failure)?;
@@ -2022,6 +2022,7 @@ mod tests {
             4,
             8,
             6,
+            crate::support::c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap();
         let registry = CoreRegistry::try_new(RegistryGeneration::new(1).unwrap()).unwrap();
@@ -2058,6 +2059,7 @@ mod tests {
             4,
             8,
             6,
+            crate::support::c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap();
         let registry = CoreRegistry::try_new(RegistryGeneration::new(1).unwrap()).unwrap();
@@ -2874,6 +2876,7 @@ mod tests {
                     4,
                     8,
                     6,
+                    crate::support::c18::SupportHistoryLimits::testing(starts),
                 )
                 .unwrap();
                 let identity = |tag: u8, value: usize| {

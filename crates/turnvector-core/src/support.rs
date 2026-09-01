@@ -1,4 +1,5 @@
 pub(crate) mod c17;
+pub(crate) mod c18;
 
 use crate::bounded::FixedWindowStart;
 use crate::c17_layout::{Assignment, WORK_MIGRATED_C16, WORK_TOMBSTONE, legacy_migrated};
@@ -490,8 +491,8 @@ pub(crate) enum LifecycleTriggerResult {
 pub enum SupportTransition {
     PredecessorEnded(SupportCausalPredecessorId, MonotonicTime),
     BeginSupport(MonotonicTime),
-    FinishSupport,
-    CloseCausalCallImpossible,
+    FinishSupport(MonotonicTime),
+    CloseCausalCallImpossible(MonotonicTime),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportLedgerError {
@@ -581,6 +582,57 @@ pub struct SupportChargeLedger<const R: usize, const F: usize, const H: usize> {
     vector_usage: [[u64; H]; 21],
     instance_nonce: u64,
     c17: c17::SupportC17,
+    c18: c18::SupportC18<H>,
+}
+
+/// The exclusive validated expiry capability. It holds the sole mutable ledger
+/// borrow; dropping it without committing changes nothing.
+pub(crate) struct ValidatedSupportExpiry<
+    'ledger,
+    'work,
+    const R: usize,
+    const F: usize,
+    const H: usize,
+    const E_GROUPS: usize,
+> {
+    ledger: &'ledger mut SupportChargeLedger<R, F, H>,
+    prepared: c18::PreparedSupportExpiry<'work, E_GROUPS>,
+}
+
+impl<const R: usize, const F: usize, const H: usize, const E_GROUPS: usize>
+    ValidatedSupportExpiry<'_, '_, R, F, H, E_GROUPS>
+{
+    /// Consuming and infallible after validation. It frees complete groups and
+    /// advances the generation exactly once when the batch is nonempty; a
+    /// zero-group batch leaves the generation unchanged.
+    pub(crate) fn commit(self) -> c18::ExpiryCommit {
+        let Self { ledger, prepared } = self;
+        // Free the authoritative group before the retry ticket is destroyed:
+        // occupancy, the one physical start credit, every funding claim, both
+        // raw owner keys and the record slot itself all return together, so a
+        // reported release is an actual release.
+        let mut units = 0u32;
+        for position in 0..prepared.count {
+            let ticket = prepared.selected[position];
+            units += ticket.units;
+            ledger.release_group(&ticket);
+        }
+        let (released_groups, released_units) =
+            ledger.c18.commit_expiry(prepared.at, prepared.count, units);
+        if released_groups > 0 {
+            ledger.generation = ledger
+                .generation
+                .next()
+                .expect("validated expiry generation");
+        }
+        c18::ExpiryCommit {
+            generation: ledger.generation,
+            released_groups,
+            released_units,
+            more_due: prepared.more_due,
+            next_expiry_at: ledger.c18.next_release(),
+        }
+    }
 }
 
 pub(crate) const C17_LANDED_PREFIX_BYTES: usize =
@@ -655,6 +707,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         bundle_records: usize,
         bundle_cells: usize,
         bundle_vector_max: usize,
+        limits: c18::SupportHistoryLimits<H>,
     ) -> Result<Self, SupportLedgerError> {
         let records = usize::try_from(total(capacities[CREDITS]))
             .map_err(|_| SupportLedgerError::InvalidInput)?;
@@ -746,7 +799,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .checked_mul(K)
             .ok_or(SupportLedgerError::InvalidInput)?;
         let expected_backing = SupportBackingCapacities {
-            legacy: [records, claims, records, identity_capacity, claims + 1, claims],
+            legacy: [
+                records,
+                claims,
+                records,
+                identity_capacity,
+                claims + 1,
+                claims,
+            ],
             history: starts.each_ref().map(|row| row[H - 1].1 as usize),
             bundles: [
                 bundle_records,
@@ -763,6 +823,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let vector_capacity = std::array::from_fn(|cell| {
             std::array::from_fn(|horizon| u64::from(starts[cell][horizon].1))
         });
+        let c18 = c18::SupportC18::try_new(limits, &starts)?;
         let starts = FixedWindowCounter::try_new(starts)?;
         let bundles = RequestBundleStore::try_new(bundle_records, bundle_cells)?;
         let c17 = c17::SupportC17::try_new(c17_capacities)?;
@@ -796,10 +857,41 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             vector_usage: [[0; H]; 21],
             instance_nonce,
             c17,
+            c18,
         })
     }
     pub const fn generation(&self) -> SupportLedgerGeneration {
         self.generation
+    }
+
+    /// Releases one whole retained group. Every unit of occupancy the group
+    /// holds is returned in the same step, so no caller can observe a partially
+    /// freed group. Validation already proved the group is present and
+    /// occupied, so a violated count here is internal noncanonical state and
+    /// fails stop rather than saturating.
+    fn release_group(&mut self, ticket: &c18::ExpiryTicket) {
+        let index = ticket.slot_index as usize;
+        let Some(record) = self.records.get(index).copied() else {
+            return;
+        };
+        let pool = record.1 as usize;
+        let claims = self.records.claims(index).map_or(0, <[_]>::len) as u32;
+        let credit = record.6.physical_credit.get();
+        // The raw owner directory releases both keys, then the arena releases
+        // the record slot, its claim span and its identities.
+        let change = self
+            .c17
+            .prepare_legacy_release(ticket.identity, credit)
+            .expect("validated retained group raw owners");
+        self.c17.commit_legacy_release(change);
+        self.records
+            .remove(index, [key(0, ticket.identity), key(1, credit)]);
+        let occupied = state_class(record.3);
+        for (class, released) in [(occupied, 1), (CREDITS, 1), (CLAIMS, claims)] {
+            self.usage[class][pool] = self.usage[class][pool]
+                .checked_sub(released)
+                .expect("validated retained group occupancy");
+        }
     }
 
     pub(crate) fn commit_c17_assignment_direct(
@@ -3560,22 +3652,32 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             ObligationOwner::Legacy { index, record } => {
                 census.record(WorkDimension::InvariantChecks, 1)?;
                 let generic = record.6.lifecycle_kind.is_none();
-                let (state, time, base) = match (record.3, transition) {
+                let (state, time, terminal_at, base) = match (record.3, transition) {
                     (Conditional, PredecessorEnded(predecessor, at))
                         if predecessor == record.2 && generic =>
                     {
-                        (Pending, at, [31, 177, 0, 0, 5])
+                        (Pending, at, None, [31, 177, 0, 0, 5])
                     }
                     (Pending, BeginSupport(at)) if at >= record.4 => {
-                        (Active, at, [34, 185, 0, 0, 10])
+                        (Active, at, None, [34, 185, 0, 0, 10])
                     }
-                    (Active, FinishSupport) => (Retained, record.4, [31, 177, 0, 0, 4]),
-                    (Conditional, CloseCausalCallImpossible) if generic => {
-                        (ClosedConditional, record.4, [31, 177, 0, 0, 4])
+                    // A started record keeps its start instant: the retention
+                    // boundary lives in the release ticket, not in the record.
+                    (Active, FinishSupport(terminal_at)) if terminal_at >= record.4 => {
+                        (Retained, record.4, Some(terminal_at), [31, 177, 0, 0, 4])
                     }
-                    (Pending, CloseCausalCallImpossible) => {
-                        (ClosedPending, record.4, [31, 177, 0, 0, 4])
-                    }
+                    (Conditional, CloseCausalCallImpossible(terminal_at)) if generic => (
+                        ClosedConditional,
+                        record.4,
+                        Some(terminal_at),
+                        [31, 177, 0, 0, 4],
+                    ),
+                    (Pending, CloseCausalCallImpossible(terminal_at)) => (
+                        ClosedPending,
+                        record.4,
+                        Some(terminal_at),
+                        [31, 177, 0, 0, 4],
+                    ),
                     _ => return Err(SupportLedgerError::InvalidTransition),
                 };
                 let pool = record.1 as usize;
@@ -3608,6 +3710,20 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
                 }
                 let retained = matches!(state, Retained | ClosedConditional | ClosedPending);
+                // A started group releases its record, its one physical credit
+                // and every linked claim together at
+                // `max(terminal_at, start_at + R_cat)`. A typed-impossible
+                // close consumed no start, so its whole group is due at its
+                // terminal instant.
+                let release_at = match terminal_at {
+                    Some(terminal) if record.3 == Active => Some(c18::started_release_at(
+                        record.4,
+                        terminal,
+                        self.c18.limits().retention(),
+                    )?),
+                    Some(terminal) => Some(c18::unstarted_release_at(terminal)),
+                    None => None,
+                };
                 let c17 = self.c17.prepare_legacy_update(
                     index,
                     id.get(),
@@ -3615,6 +3731,20 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     retained,
                 )?;
                 external_work.charge(migrated_legacy_witness(HotPathWorkWitness::new(base))?)?;
+                // The dormant ticket was reserved for this root at creation, so
+                // scheduling cannot need new capacity. It runs before any
+                // mutation so a rejection leaves the ledger byte-identical.
+                if let Some(release_at) = release_at {
+                    self.c18.schedule(c18::ExpiryTicket {
+                        release_at,
+                        family: c18::OwnerFamily::LegacyRecord,
+                        slot_index: u32::try_from(index).map_err(|_| {
+                            SupportLedgerError::Storage(FixedStorageError::Capacity)
+                        })?,
+                        units: 1,
+                        identity: id.get(),
+                    })?;
+                }
 
                 if before != after {
                     self.usage[before][pool] -= 1;
@@ -3656,11 +3786,13 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     (Pending, BeginSupport(at)) if at >= item.state_time => {
                         (Active, at, false, true)
                     }
-                    (Active, FinishSupport) => (Retained, item.state_time, false, false),
-                    (Conditional, CloseCausalCallImpossible) => {
+                    (Active, FinishSupport(terminal)) if terminal >= item.state_time => {
+                        (Retained, item.state_time, false, false)
+                    }
+                    (Conditional, CloseCausalCallImpossible(_)) => {
                         (ClosedConditional, item.state_time, true, true)
                     }
-                    (Pending, CloseCausalCallImpossible) => {
+                    (Pending, CloseCausalCallImpossible(_)) => {
                         (ClosedPending, item.state_time, false, true)
                     }
                     _ => return Err(SupportLedgerError::InvalidTransition),
@@ -4333,6 +4465,137 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             occupied_records: self.bundles.occupied_records,
         }
     }
+    /// The complete immutable C18 observation Admission consumes: the C16
+    /// capacity facts plus every retention, interference, expiry and carry
+    /// fact. Creating it never advances the generation and returns no Effect,
+    /// so repeating it on unchanged state reproduces the same value.
+    pub(crate) fn ledger_snapshot(
+        &self,
+        expected: SupportLedgerGeneration,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<c18::SupportLedgerSnapshot<H>, SupportLedgerError> {
+        self.observe(expected, at, work)?;
+        Ok(c18::SupportLedgerSnapshot {
+            capacity: self.capacity_snapshot(),
+            retention: self.c18.facts(self.instance_nonce, self.generation, at),
+        })
+    }
+
+    /// The complete immutable carry input the later C26 work consumes. It
+    /// borrows the ledger, copies no whole state, and cannot outlive that
+    /// borrow; any mutation afterwards invalidates it. C18 creates no carry
+    /// token and advances no generation here.
+    pub(crate) fn carry_input(
+        &self,
+        expected: SupportLedgerGeneration,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<c18::SupportCarryInput<'_, H>, SupportLedgerError> {
+        let snapshot = self.ledger_snapshot(expected, at, work)?;
+        let (scheduled, accumulator, carry) = self.c18.views();
+        let history = std::array::from_fn(|cell| self.starts.len(cell).unwrap_or(0) as u64);
+        Ok(c18::SupportCarryInput::new(
+            snapshot,
+            scheduled,
+            accumulator,
+            history,
+            &self.vector_usage,
+            &self.reserved,
+            carry,
+        ))
+    }
+
+    /// Shared read-only observation preflight: exact generation, a `at` that
+    /// does not move the ledger backwards, and the complete metered charge.
+    fn observe(
+        &self,
+        expected: SupportLedgerGeneration,
+        at: MonotonicTime,
+        work: &mut WorkMeter,
+    ) -> Result<(), SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c18.check_floor(at)?;
+        let copied = u64::try_from(H)
+            .ok()
+            .and_then(|horizon| horizon.checked_mul(352))
+            .and_then(|bytes| bytes.checked_add(400))
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        work.charge(HotPathWorkWitness::new([0, copied, 0, 0, 2]))?;
+        Ok(())
+    }
+
+    /// Read-only, non-allocating selection of the bounded due prefix in exact
+    /// `(release_at, family_tag, slot_index)` order. It never splits a release
+    /// group: a group whose units do not fit stops the selection and stays
+    /// fully charged. The sealed quota pair must be used exactly.
+    pub(crate) fn prepare_expiry<'work, const E_GROUPS: usize, const E_UNITS: usize>(
+        &self,
+        expected: SupportLedgerGeneration,
+        at: MonotonicTime,
+        work: &'work mut WorkMeter,
+    ) -> Result<c18::PreparedSupportExpiry<'work, E_GROUPS>, SupportLedgerError> {
+        if expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        let (selected, count, more_due, visited) =
+            self.c18.select_expiry::<E_GROUPS, E_UNITS>(at)?;
+        // Charge exactly what the bounded walk touched. The walk allocates
+        // nothing and never scans the owner set, so Allocations and Candidate
+        // Work stay zero by construction rather than by assertion.
+        work.charge(HotPathWorkWitness::new([
+            visited,
+            (std::mem::size_of::<c18::ExpiryTicket>() * count) as u64,
+            0,
+            0,
+            2,
+        ]))?;
+        Ok(c18::PreparedSupportExpiry {
+            work,
+            nonce: self.instance_nonce,
+            expected,
+            at,
+            before: *self.c18.accumulator(),
+            selected,
+            count,
+            more_due,
+        })
+    }
+
+    /// Takes the sole mutable borrow and rechecks every selected root against
+    /// the exact instance, generation and aggregate before-image.
+    pub(crate) fn validate_expiry<'ledger, 'work, const E_GROUPS: usize>(
+        &'ledger mut self,
+        prepared: c18::PreparedSupportExpiry<'work, E_GROUPS>,
+    ) -> Result<ValidatedSupportExpiry<'ledger, 'work, R, F, H, E_GROUPS>, SupportLedgerError> {
+        if prepared.nonce != self.instance_nonce || prepared.expected != self.generation {
+            return Err(SupportLedgerError::Generation);
+        }
+        if prepared.before != *self.c18.accumulator() {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.c18.check_floor(prepared.at)?;
+        // A nonempty batch must be able to publish its next generation before
+        // it mutates: exhaustion rejects here, never inside the commit.
+        if !prepared.selected.is_empty() {
+            self.generation
+                .next()
+                .map_err(|_| SupportLedgerError::Generation)?;
+        }
+        // The selection must still be the heap's exact smallest prefix, which
+        // is what makes releasing it `count` minimum extractions.
+        let (current, count) = self.c18.reselect::<E_GROUPS>(prepared.at);
+        if count != prepared.count || current[..count] != prepared.selected[..count] {
+            return Err(SupportLedgerError::Storage(FixedStorageError::NonCanonical));
+        }
+        Ok(ValidatedSupportExpiry {
+            ledger: self,
+            prepared,
+        })
+    }
+
     /// Read-only metered preparation of one pristine C16 bundle withdrawal:
     /// locates the exact live record by its entitlement, proves the record and
     /// its complete owned cell chain, and preflights the complete removal Work
@@ -4707,8 +4970,13 @@ fn apply_signed_u32(value: u32, delta: i32) -> Result<u32, SupportLedgerError> {
 fn total(values: impl IntoIterator<Item = u32>) -> u64 {
     values.into_iter().map(u64::from).sum()
 }
+const STATE_CLASSES: [usize; 6] = [CONDITIONAL, PENDING, ACTIVE, ACTIVE, CONDITIONAL, PENDING];
 fn state_class(state: SupportObligationState) -> usize {
-    [CONDITIONAL, PENDING, ACTIVE, ACTIVE, CONDITIONAL, PENDING][state as usize]
+    STATE_CLASSES[state as usize]
+}
+#[cfg(test)]
+fn state_class_index(state: usize) -> usize {
+    STATE_CLASSES[state]
 }
 use SupportOperation::{DescribeModel, DescribeRequest, SampleBackendResources};
 use SupportPool::{MandatoryCompletion, SafetySampling};
@@ -6956,7 +7224,18 @@ mod tests {
         let capacities = [[1, 2, 1], [0, 1, 0], [1, 2, 1], [1, 4, 1], [1, 4, 1]];
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
-        Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 8, 6).unwrap()
+        Ledger::try_new(
+            generation,
+            capacities,
+            2,
+            starts,
+            maxima,
+            4,
+            8,
+            6,
+            c18::SupportHistoryLimits::testing(starts),
+        )
+        .unwrap()
     }
     fn ordinary_ledger() -> Ledger {
         let mut ledger = new_ledger();
@@ -7081,6 +7360,7 @@ mod tests {
             1_152,
             6_912,
             63,
+            c18::SupportHistoryLimits::testing(starts),
         )
         .expect("63,942,176-byte whole ledger is valid");
         assert_eq!(ledger.capacities[CREDITS], [16_530, 0, 0]);
@@ -7097,6 +7377,7 @@ mod tests {
                 1_152,
                 6_912,
                 63,
+                c18::SupportHistoryLimits::testing(starts),
             )
             .unwrap_err(),
             SupportLedgerError::Storage(FixedStorageError::Capacity)
@@ -7163,7 +7444,7 @@ mod tests {
             .transition(
                 ledger.generation(),
                 obligation,
-                CloseCausalCallImpossible,
+                CloseCausalCallImpossible(MonotonicTime::from_micros(1_000)),
                 &mut work(),
             )
             .unwrap();
@@ -7223,7 +7504,7 @@ mod tests {
                     .transition(
                         ledger.generation(),
                         obligation,
-                        CloseCausalCallImpossible,
+                        CloseCausalCallImpossible(MonotonicTime::from_micros(1_000)),
                         &mut work(),
                     )
                     .unwrap();
@@ -7257,7 +7538,7 @@ mod tests {
         fail(go(&mut ledger, 1, end(2, 1)), InvalidTransition);
         go(&mut ledger, 1, end(1, 5)).unwrap();
         go(&mut ledger, 1, Begin(at(5))).unwrap();
-        go(&mut ledger, 1, Finish).unwrap();
+        go(&mut ledger, 1, Finish(at(1_000))).unwrap();
         add(&mut ledger, 2, 2).unwrap();
         go(&mut ledger, 2, end(2, 5)).unwrap();
         fail(go(&mut ledger, 2, Begin(at(14))), WindowExceeded.into());
@@ -7320,12 +7601,12 @@ mod tests {
         let lifecycle = [Lifecycle([9; 32])];
         fail(put(&mut ledger, 9, 9, Safety, &lifecycle), InvalidInput);
         assert_eq!(ledger.records.get(0).unwrap().5.0, [0; 32]);
-        go(&mut ledger, 1, Close).unwrap();
+        go(&mut ledger, 1, Close(at(1_000))).unwrap();
         fail(add(&mut ledger, 2, 1), Duplicate.into());
         add(&mut ledger, 2, 2).unwrap();
         fail(add(&mut ledger, 3, 3), CAPACITY_ERROR);
         go(&mut ledger, 2, end(2, 1)).unwrap();
-        go(&mut ledger, 2, Close).unwrap();
+        go(&mut ledger, 2, Close(at(1_000))).unwrap();
         add(&mut ledger, 3, 3).unwrap();
         fail(go(&mut ledger, 3, end(3, 1)), CAPACITY_ERROR);
         fail(put(&mut ledger, 7, 7, Safety, &[]), InvalidInput);
@@ -7541,7 +7822,7 @@ mod tests {
             (0, Some(0))
         );
         go(&mut ledger, 1, Begin(at(5))).unwrap();
-        go(&mut ledger, 2, Close).unwrap();
+        go(&mut ledger, 2, Close(at(1_000))).unwrap();
         assert_eq!(ledger.generation(), pending.next().unwrap().next().unwrap());
         assert_eq!(ledger.reserved[ACTIVE][1], 0);
         assert_eq!(ledger.records.get(0).unwrap().3, Active);
@@ -7609,7 +7890,19 @@ mod tests {
             FixedStartCountBound(Duration::from_micros(20), 1),
             FixedStartCountBound(Duration::from_micros(30), 1),
         ]; 21];
-        let build = |maxima| Wide::try_new(generation, capacities, 2, starts, maxima, 4, 8, 6);
+        let build = |maxima| {
+            Wide::try_new(
+                generation,
+                capacities,
+                2,
+                starts,
+                maxima,
+                4,
+                8,
+                6,
+                c18::SupportHistoryLimits::testing(starts),
+            )
+        };
         build(LifecycleReserveMaxima([1, 1_024, 1_024, 1, 1])).unwrap();
         build(LifecycleReserveMaxima([1, 1_792, 1_792, 1, 1])).unwrap();
         assert_eq!(
@@ -7929,6 +8222,7 @@ mod tests {
             records,
             cells,
             cells.clamp(1, 6),
+            c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap()
     }
@@ -7937,33 +8231,37 @@ mod tests {
     type TopologyLedger = SupportChargeLedger<512, 256, 3>;
 
     fn plan_ledger() -> PlanLedger {
+        let starts = [[FixedStartCountBound(Duration::from_micros(10), 64); 1]; 21];
         PlanLedger::try_new(
             SupportLedgerGeneration::new(1).unwrap(),
             [[0, 128, 0]; 5],
             4,
-            [[FixedStartCountBound(Duration::from_micros(10), 64); 1]; 21],
+            starts,
             LifecycleReserveMaxima([1, 2, 2, 1, 1]),
             8,
             16,
             4,
+            c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap()
     }
 
     fn topology_ledger() -> TopologyLedger {
+        let starts = std::array::from_fn(|_| {
+            std::array::from_fn(|horizon| {
+                FixedStartCountBound(Duration::from_micros((horizon as u64 + 1) * 10), 64)
+            })
+        });
         TopologyLedger::try_new(
             SupportLedgerGeneration::new(1).unwrap(),
             [[0, 128, 0]; 5],
             4,
-            std::array::from_fn(|_| {
-                std::array::from_fn(|horizon| {
-                    FixedStartCountBound(Duration::from_micros((horizon as u64 + 1) * 10), 64)
-                })
-            }),
+            starts,
             LifecycleReserveMaxima([1, 2, 2, 1, 1]),
             8,
             16,
             4,
+            c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap()
     }
@@ -8113,6 +8411,7 @@ mod tests {
             8,
             16,
             4,
+            c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap()
     }
@@ -8244,6 +8543,7 @@ mod tests {
             8,
             16,
             4,
+            c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap();
         ledger.c17 = c17::SupportC17::try_new(c17::SupportC17Capacities::lifecycle_testing(
@@ -9547,7 +9847,12 @@ mod tests {
             )
             .unwrap();
         support
-            .transition(support.generation(), obligation, FinishSupport, &mut work())
+            .transition(
+                support.generation(),
+                obligation,
+                FinishSupport(MonotonicTime::from_micros(1_000)),
+                &mut work(),
+            )
             .unwrap();
 
         let marker = InitialReadyMarker {
@@ -9762,7 +10067,7 @@ mod tests {
             .transition(
                 support.generation(),
                 obligation_two,
-                FinishSupport,
+                FinishSupport(MonotonicTime::from_micros(1_000)),
                 &mut work(),
             )
             .unwrap();
@@ -10284,7 +10589,12 @@ mod tests {
                 )
                 .unwrap();
             support
-                .transition(support.generation(), obligation, FinishSupport, &mut work())
+                .transition(
+                    support.generation(),
+                    obligation,
+                    FinishSupport(MonotonicTime::from_micros(1_000)),
+                    &mut work(),
+                )
                 .unwrap();
             let identity = [offset + 9; 32];
             three_identities[usize::from(offset)] = identity;
@@ -10504,7 +10814,7 @@ mod tests {
             .transition(
                 support.generation(),
                 obligation_six,
-                FinishSupport,
+                FinishSupport(MonotonicTime::from_micros(1_000)),
                 &mut work(),
             )
             .unwrap();
@@ -12393,7 +12703,11 @@ mod tests {
             Err(SupportLedgerError::Generation)
         ));
         assert!(matches!(
-            ledger.prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut work()),
+            ledger.prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                &mut work()
+            ),
             Err(SupportLedgerError::Generation)
         ));
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -12543,7 +12857,11 @@ mod tests {
 
                 let error = if tombstone {
                     let change = ledger
-                        .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+                        .prepare_tombstone(
+                            request_owner(1),
+                            bundle_entitlement(1),
+                            &mut meter,
+                        )
                         .unwrap();
                     assert_eq!(change.work.witness(), before_work);
                     ledger.validate_tombstone(change).unwrap_err()
@@ -12927,15 +13245,17 @@ mod tests {
             FixedStartCountBound(Duration::from_micros(10), 10),
             FixedStartCountBound(Duration::from_micros(20), 10),
         ];
+        let starts = [bounds; 21];
         let mut ledger = H2Ledger::try_new(
             SupportLedgerGeneration::new(1).unwrap(),
             [[6; POOLS]; 5],
             2,
-            [bounds; 21],
+            starts,
             LifecycleReserveMaxima([1, 2, 2, 1, 1]),
             4,
             8,
             6,
+            c18::SupportHistoryLimits::testing(starts),
         )
         .unwrap();
         let cells = [
@@ -13057,7 +13377,18 @@ mod tests {
         let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
         let maxima = LifecycleReserveMaxima([1, 2, 2, 1, 1]);
         assert_eq!(
-            Ledger::try_new(generation, capacities, 2, starts, maxima, 4, 4_000, 22).unwrap_err(),
+            Ledger::try_new(
+                generation,
+                capacities,
+                2,
+                starts,
+                maxima,
+                4,
+                4_000,
+                22,
+                c18::SupportHistoryLimits::testing(starts),
+            )
+            .unwrap_err(),
             SupportLedgerError::InvalidInput
         );
     }
@@ -13245,7 +13576,7 @@ mod tests {
             .transition(
                 ledger.generation(),
                 sibling,
-                CloseCausalCallImpossible,
+                CloseCausalCallImpossible(MonotonicTime::from_micros(1_000)),
                 &mut work(),
             )
             .unwrap();
@@ -13279,7 +13610,7 @@ mod tests {
             ledger.transition(
                 ledger.generation(),
                 SupportOperationObligationId::new([250; 32]).unwrap(),
-                CloseCausalCallImpossible,
+                CloseCausalCallImpossible(MonotonicTime::from_micros(1_000)),
                 &mut missing,
             ),
             Err(SupportLedgerError::InvalidTransition)
@@ -13408,7 +13739,11 @@ mod tests {
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(request_owner(n), bundle_entitlement(n), &mut meter)
+            .prepare_tombstone(
+                request_owner(n),
+                bundle_entitlement(n),
+                &mut meter,
+            )
             .unwrap();
         ledger
             .validate_tombstone(change)
@@ -13422,7 +13757,11 @@ mod tests {
         let before = bundle_snapshot(&ledger);
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                &mut meter,
+            )
             .unwrap();
         ledger.validate_tombstone(change).unwrap();
         assert_eq!(bundle_snapshot(&ledger), before);
@@ -13431,7 +13770,11 @@ mod tests {
         reserve_bundle(&mut ledger, 1, 3);
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                &mut meter,
+            )
             .unwrap();
         add(&mut ledger, 9, 9).unwrap();
         assert_eq!(
@@ -13458,7 +13801,11 @@ mod tests {
 
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                &mut meter,
+            )
             .unwrap();
         assert_eq!(change.work.witness(), HotPathWorkWitness::default());
         let validated = ledger.validate_tombstone(change).unwrap();
@@ -13684,7 +14031,11 @@ mod tests {
             let mut meter = work();
             let error = if tombstone {
                 let change = ledger
-                    .prepare_tombstone(request_owner(2), bundle_entitlement(1), &mut meter)
+                    .prepare_tombstone(
+                        request_owner(2),
+                        bundle_entitlement(1),
+                        &mut meter,
+                    )
                     .unwrap();
                 ledger.validate_tombstone(change).unwrap_err()
             } else {
@@ -13745,7 +14096,11 @@ mod tests {
                 let mut meter = work();
                 let error = if tombstone {
                     let change = ledger
-                        .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+                        .prepare_tombstone(
+                            request_owner(1),
+                            bundle_entitlement(1),
+                            &mut meter,
+                        )
                         .unwrap();
                     ledger
                         .validate_tombstone(change)
@@ -13914,7 +14269,11 @@ mod tests {
         };
         let mut meter = work();
         let change = ledger
-            .prepare_tombstone(request_owner(1), bundle_entitlement(1), &mut meter)
+            .prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                &mut meter,
+            )
             .unwrap();
         assert!(ledger.validate_tombstone(change).is_err());
     }
