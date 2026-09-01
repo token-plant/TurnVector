@@ -564,6 +564,60 @@ impl SupportC17 {
         self.advance_generation();
     }
 
+    /// Read-only preparation of one terminal group's release: both raw owner
+    /// keys leave the directory so the record slot and its identities can be
+    /// reused. Preparing mutates nothing.
+    pub(super) fn prepare_legacy_release(
+        &self,
+        obligation: [u8; 32],
+        credit: [u8; 32],
+    ) -> Result<PreparedLegacyRelease, SupportLedgerError> {
+        if obligation == [0; 32] || credit == [0; 32] || obligation == credit {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut keys = [[0; 32]; LEGACY_RAW_EDIT_MAX];
+        let (low, high) = if obligation < credit {
+            (obligation, credit)
+        } else {
+            (credit, obligation)
+        };
+        keys[0] = low;
+        keys[1] = high;
+        self.raw.validate_remove_batch(&keys[..2])?;
+        Ok(PreparedLegacyRelease {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            keys,
+            key_count: 2,
+        })
+    }
+
+    pub(super) fn validate_legacy_release(
+        &self,
+        change: &PreparedLegacyRelease,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || change.key_count != 2
+            || change.keys[change.key_count..]
+                .iter()
+                .any(|key| *key != [0; 32])
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw
+            .validate_remove_batch(&change.keys[..change.key_count])?;
+        Ok(())
+    }
+
+    pub(super) fn commit_legacy_release(&mut self, change: PreparedLegacyRelease) {
+        self.validate_legacy_release(&change)
+            .expect("validated legacy Raw release");
+        self.raw
+            .remove_batch_prevalidated(&change.keys[..change.key_count]);
+        self.advance_generation();
+    }
+
     pub(super) fn prepare_legacy_update(
         &self,
         record_slot: usize,
@@ -3856,6 +3910,13 @@ pub(super) struct PreparedLegacyInsert {
 }
 
 #[derive(Debug)]
+pub(super) struct PreparedLegacyRelease {
+    expected_c17: u64,
+    expected_raw: u64,
+    keys: [[u8; 32]; LEGACY_RAW_EDIT_MAX],
+    key_count: usize,
+}
+
 pub(super) struct PreparedLegacyUpdate {
     expected_c17: u64,
     expected_raw: u64,
