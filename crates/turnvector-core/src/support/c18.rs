@@ -969,3 +969,358 @@ impl<const H: usize> SupportHistoryLimits<H> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MICRO: fn(u64) -> MonotonicTime = MonotonicTime::from_micros;
+
+    fn bounds<const H: usize>() -> [[FixedStartCountBound; H]; CELLS] {
+        std::array::from_fn(|_| {
+            std::array::from_fn(|horizon| {
+                FixedStartCountBound(Duration::from_micros((horizon as u64 + 1) * 10), 4)
+            })
+        })
+    }
+
+    fn limits<const H: usize>() -> SupportHistoryLimits<H> {
+        SupportHistoryLimits::testing(bounds())
+    }
+
+    fn ticket(release_at: u64, family: u8, slot_index: u32, units: u32) -> ExpiryTicket {
+        ExpiryTicket {
+            release_at: MICRO(release_at),
+            family: [
+                OwnerFamily::LegacyRecord,
+                OwnerFamily::InitialBundle,
+                OwnerFamily::Tombstone,
+            ][family as usize],
+            slot_index,
+            units,
+            identity: [slot_index as u8 + 1; 32],
+        }
+    }
+
+    /// T01 — only the complete sealed value constructs, and every named
+    /// rejection class returns its exact error without a usable ledger.
+    #[test]
+    fn constructor_accepts_only_the_complete_sealed_catalog_value() {
+        limits::<3>().validate().expect("sealed limits are valid");
+
+        let mut reversed = limits::<3>();
+        reversed.horizons.reverse();
+        assert_eq!(
+            reversed.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut short = limits::<3>();
+        short.retention_horizon = short.horizons[0];
+        assert_eq!(
+            short.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut zero_identity = limits::<3>();
+        zero_identity.catalog = CatalogIdentity([0; 32]);
+        assert_eq!(
+            zero_identity.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut tickets = limits::<3>();
+        tickets.expiry_ticket_capacity += 1;
+        assert_eq!(
+            tickets.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut quota = limits::<3>();
+        quota.largest_atomic_release_group_units = NonZeroU32::new(2).unwrap();
+        assert_eq!(
+            quota.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut decreasing = limits::<3>();
+        decreasing.active_start_bound[0][1].1 = 0;
+        assert_eq!(
+            decreasing.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut above_capacity = limits::<3>();
+        above_capacity.start_history_capacity[0] = 1;
+        assert_eq!(
+            above_capacity.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut reset = limits::<3>();
+        reset.mandatory_pair_capacity.0[0].history_reset = true;
+        assert_eq!(
+            reset.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
+        let mut duplicated = limits::<3>();
+        duplicated.safety_pair_capacity.0[1] = duplicated.safety_pair_capacity.0[0];
+        assert_eq!(
+            duplicated.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+    }
+
+    /// A zero horizon cannot form the typed value at all.
+    #[test]
+    fn a_zero_horizon_is_not_constructible() {
+        assert_eq!(
+            NonZeroDuration::new(Duration::from_micros(0)).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        assert_eq!(
+            NonZeroDuration::new(Duration::from_micros(1))
+                .unwrap()
+                .get(),
+            Duration::from_micros(1)
+        );
+    }
+
+    /// T03/T13 — the started retention equation is `max(terminal, start + R)`
+    /// and no outcome shortens it. Equality is eligible.
+    #[test]
+    fn started_retention_never_refunds_and_equality_is_eligible() {
+        let retention = Duration::from_micros(30);
+        // A short call still retains for the whole catalog horizon.
+        assert_eq!(
+            started_release_at(MICRO(5), MICRO(6), retention).unwrap(),
+            MICRO(35)
+        );
+        // A late finish extends past the horizon rather than truncating.
+        assert_eq!(
+            started_release_at(MICRO(5), MICRO(100), retention).unwrap(),
+            MICRO(100)
+        );
+        // Exact equality at the boundary.
+        assert_eq!(
+            started_release_at(MICRO(5), MICRO(35), retention).unwrap(),
+            MICRO(35)
+        );
+        // T18 — overflow rejects rather than saturating.
+        assert_eq!(
+            started_release_at(MICRO(u64::MAX), MICRO(0), retention).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+    }
+
+    /// T08 — a tombstone is unschedulable while any link remains, and
+    /// otherwise releases at `max(tombstone + R, latest link release)`.
+    #[test]
+    fn tombstone_retention_waits_for_every_link() {
+        let retention = Duration::from_micros(30);
+        assert_eq!(
+            tombstone_release_at(MICRO(10), None, retention).unwrap(),
+            MICRO(40)
+        );
+        assert_eq!(
+            tombstone_release_at(MICRO(10), Some(MICRO(20)), retention).unwrap(),
+            MICRO(40)
+        );
+        assert_eq!(
+            tombstone_release_at(MICRO(10), Some(MICRO(400)), retention).unwrap(),
+            MICRO(400)
+        );
+        assert_eq!(
+            tombstone_release_at(MICRO(u64::MAX), None, retention).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+    }
+
+    /// T14 — a typed-impossible close consumed no start, so its whole group is
+    /// due at its terminal instant.
+    #[test]
+    fn an_unstarted_close_is_due_at_its_terminal_instant() {
+        assert_eq!(unstarted_release_at(MICRO(7)), MICRO(7));
+    }
+
+    /// T07 — the due prefix is taken in exact key order, never splits a group,
+    /// and reports `more_due` when a due group did not fit.
+    #[test]
+    fn the_due_prefix_is_ordered_bounded_and_never_split() {
+        let mut heap = ExpiryHeap::try_new(8).unwrap();
+        // Deliberately scheduled out of order, including an exact key tie
+        // broken by family tag then slot index.
+        for entry in [
+            ticket(30, 0, 1, 1),
+            ticket(10, 1, 9, 1),
+            ticket(10, 0, 5, 1),
+            ticket(10, 0, 2, 1),
+            ticket(20, 0, 3, 4),
+        ] {
+            heap.schedule(entry).unwrap();
+        }
+        assert_eq!(heap.next_release(), Some(MICRO(10)));
+
+        let (selected, count, more, visited) = heap.due_prefix::<8>(MICRO(25), 8);
+        assert_eq!(
+            &selected[..count],
+            &[
+                ticket(10, 0, 2, 1),
+                ticket(10, 0, 5, 1),
+                ticket(10, 1, 9, 1),
+                ticket(20, 0, 3, 4),
+            ]
+        );
+        assert!(!more);
+        // The walk visits only the due prefix and its frontier, never the
+        // whole ticket set.
+        assert!(visited <= 16, "bounded visits, saw {visited}");
+
+        // A group quota of two stops after two whole groups.
+        let (_, bounded, more, _) = heap.due_prefix::<2>(MICRO(25), 8);
+        assert_eq!(bounded, 2);
+        assert!(more);
+
+        // A unit quota that cannot fit the four-unit group stops before it
+        // rather than releasing part of it.
+        let (_, partial, more, _) = heap.due_prefix::<8>(MICRO(25), 5);
+        assert_eq!(partial, 3);
+        assert!(more);
+
+        // Nothing is due before the earliest release instant.
+        let (_, none, more, _) = heap.due_prefix::<8>(MICRO(9), 8);
+        assert_eq!(none, 0);
+        assert!(!more);
+    }
+
+    /// Releasing the selected prefix removes exactly those tickets and leaves
+    /// the remaining groups scheduled and ordered.
+    #[test]
+    fn releasing_a_prefix_keeps_the_remainder_charged_and_ordered() {
+        let mut heap = ExpiryHeap::try_new(4).unwrap();
+        for entry in [
+            ticket(30, 0, 1, 1),
+            ticket(10, 0, 2, 1),
+            ticket(20, 0, 3, 1),
+        ] {
+            heap.schedule(entry).unwrap();
+        }
+        let (_, count, _, _) = heap.due_prefix::<4>(MICRO(20), 4);
+        assert_eq!(count, 2);
+        heap.release_prefix(count);
+        assert_eq!(heap.len(), 1);
+        assert_eq!(heap.next_release(), Some(MICRO(30)));
+    }
+
+    /// A sealed heap never grows: one dormant ticket exists per releasable
+    /// root, and a further schedule rejects instead of allocating.
+    #[test]
+    fn the_heap_rejects_rather_than_growing() {
+        let mut heap = ExpiryHeap::try_new(1).unwrap();
+        heap.schedule(ticket(10, 0, 1, 1)).unwrap();
+        assert_eq!(
+            heap.schedule(ticket(20, 0, 2, 1)).unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::Capacity)
+        );
+        assert_eq!(heap.len(), 1);
+    }
+
+    /// T11 — the sealed pair proof answers only tuples B04 generated, and the
+    /// mandatory and safety suballocations are separate and nonfungible.
+    #[test]
+    fn only_a_catalog_proved_activation_pair_is_activatable() {
+        let sealed = limits::<3>();
+        let (old, new) = (BudgetIdentity([1; 32]), BudgetIdentity([2; 32]));
+        assert_eq!(
+            sealed.mandatory_pair_capacity.lookup(old, new, 0),
+            Some((7_297, 8))
+        );
+        // An activation sequence the Catalog never proved is not activatable.
+        assert_eq!(sealed.mandatory_pair_capacity.lookup(old, new, 1), None);
+        // An unknown Budget identity is not activatable either.
+        assert_eq!(
+            sealed
+                .safety_pair_capacity
+                .lookup(BudgetIdentity([9; 32]), new, 0),
+            None
+        );
+    }
+
+    /// D7 — the carry slot is exactly one, outside every pool, and C18 only
+    /// ever observes it vacant with ordinary reservations running.
+    #[test]
+    fn the_dedicated_carry_slot_is_exactly_one_and_starts_vacant() {
+        assert_eq!(CARRY_SLOTS, 1);
+        let state = SupportC18::<3>::try_new(limits(), &bounds()).unwrap();
+        let facts = state.facts(7, SupportLedgerGeneration::new(1).unwrap(), MICRO(0));
+        assert_eq!(facts.carry_slot, CarrySlot::Vacant);
+        assert_eq!(facts.carry_capacity, 1);
+        assert_eq!(facts.ordinary_reservations, OrdinaryReservations::Running);
+        assert_eq!(facts.expiry_due, 0);
+        assert_eq!(facts.next_expiry_at, None);
+        assert_eq!(facts.accumulator, Accumulator::default());
+    }
+
+    /// The sealed limits must be the ledger's own start bounds.
+    #[test]
+    fn sealed_bounds_must_match_the_ledger_history() {
+        let mut other = bounds::<3>();
+        other[0][0].1 = 3;
+        assert_eq!(
+            SupportC18::<3>::try_new(limits(), &other).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+    }
+
+    /// Every `prepare_expiry` must use the exact sealed quota pair, and a
+    /// backward `at` cannot move the ledger's time floor.
+    #[test]
+    fn expiry_selection_requires_the_sealed_quotas() {
+        let state = SupportC18::<3>::try_new(limits(), &bounds()).unwrap();
+        assert_eq!(
+            state.select_expiry::<2, 1>(MICRO(0)).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        assert_eq!(
+            state.select_expiry::<1, 2>(MICRO(0)).unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        let (_, count, more, _) = state.select_expiry::<1, 1>(MICRO(0)).unwrap();
+        assert_eq!(count, 0);
+        assert!(!more);
+    }
+
+    /// T18 — the accumulator is checked: underflow is internal noncanonical
+    /// state and fails closed rather than saturating.
+    #[test]
+    fn accumulator_underflow_fails_closed() {
+        let mut counter = 0u32;
+        assert_eq!(
+            Accumulator::apply(&mut counter, -1).unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+        );
+        assert_eq!(counter, 0);
+        Accumulator::apply(&mut counter, 2).unwrap();
+        Accumulator::apply(&mut counter, -1).unwrap();
+        assert_eq!(counter, 1);
+        let mut maximum = u32::MAX;
+        assert_eq!(
+            Accumulator::apply(&mut maximum, 1).unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::NonCanonical)
+        );
+    }
+
+    /// The interference headroom is checked against the active-Budget limit.
+    #[test]
+    fn interference_headroom_is_checked_against_the_active_limit() {
+        let mut state = SupportC18::<3>::try_new(limits(), &bounds()).unwrap();
+        state.accumulator_mut().interference_us[0] = 5;
+        let mut facts = state.facts(7, SupportLedgerGeneration::new(1).unwrap(), MICRO(0));
+        assert_eq!(facts.interference_headroom(0), Some(u64::MAX - 5));
+        facts.interference_limit_us[0] = 4;
+        assert_eq!(facts.interference_headroom(0), None);
+        assert_eq!(facts.interference_headroom(H_OUT_OF_RANGE), None);
+    }
+
+    const H_OUT_OF_RANGE: usize = 3;
+}
