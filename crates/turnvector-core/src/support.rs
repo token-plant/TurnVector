@@ -746,7 +746,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             .checked_mul(K)
             .ok_or(SupportLedgerError::InvalidInput)?;
         let expected_backing = SupportBackingCapacities {
-            legacy: [records, claims, records, identity_capacity],
+            legacy: [records, claims, records, identity_capacity, claims + 1, claims],
             history: starts.each_ref().map(|row| row[H - 1].1 as usize),
             bundles: [
                 bundle_records,
@@ -3084,7 +3084,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         work.charge(mutation)?;
         work.record(WorkDimension::CopiedBytes, 66)?;
         let c17 = self.c17.prepare_legacy_insert(
-            self.records.len(),
+            self.records.next_slot(),
             spec.id.get(),
             spec.physical_credit.get(),
         )?;
@@ -3432,7 +3432,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             0,
             4 + 2 * members,
         ]))?;
-        let first_record = self.records.len();
+        let first_record = self.records.next_slot();
         u32::try_from(first_record)
             .map_err(|_| SupportLedgerError::Storage(FixedStorageError::Capacity))?;
         let raw_record = |offset: usize| {
@@ -4578,7 +4578,7 @@ struct BundleLogicalDelta<const H: usize> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SupportBackingCapacities {
-    legacy: [usize; 4],
+    legacy: [usize; 6],
     history: [usize; 21],
     bundles: [usize; 8],
 }
@@ -12323,7 +12323,7 @@ mod tests {
     #[test]
     fn c16_complete_actual_backing_seals_before_nonce_issuance() {
         let expected = SupportBackingCapacities {
-            legacy: [18, 18, 18, 36],
+            legacy: [18, 18, 18, 36, 19, 18],
             history: [1; 21],
             bundles: [4, 4, 44, 44, 43, 43, 8, 8],
         };

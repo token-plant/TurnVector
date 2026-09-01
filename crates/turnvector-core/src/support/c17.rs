@@ -5152,8 +5152,8 @@ mod tests {
 
     #[test]
     fn production_physical_equation_and_every_first_one_over_are_exact() {
-        assert_eq!(super::super::C17_LANDED_PREFIX_BYTES, 3_248);
-        assert_eq!(SUPPORT_LEDGER_CEILING_BYTES, 63_942_176);
+        assert_eq!(super::super::C17_LANDED_PREFIX_BYTES, 3_328);
+        assert_eq!(SUPPORT_LEDGER_CEILING_BYTES, 63_942_256);
         assert_eq!(
             SupportC17::physical_bytes(SupportC17Capacities::production()),
             Some(C17_PHYSICAL_BYTES)

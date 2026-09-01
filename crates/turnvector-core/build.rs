@@ -18,7 +18,7 @@ const E_HISTORY: u64 = 1_152;
 const C_CELLS: u64 = 6_912;
 const V_AXES: u64 = 6;
 const HORIZONS: [u64; 3] = [1_000_000, 10_000_000, 20_000_000];
-const EXPECTED_CEILING: u64 = 63_942_176;
+const EXPECTED_CEILING: u64 = 63_942_256;
 const S3_SOURCES: &[&str] = &[
     "Cargo.toml",
     "src/admission.rs",
