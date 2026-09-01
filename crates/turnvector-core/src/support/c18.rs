@@ -487,3 +487,485 @@ impl ExpiryHeap {
         }
     }
 }
+
+/// The one dedicated Prepared Carry slot. C18 only ever observes `Vacant`; the
+/// `Prepared` variant exists so C26 and C27 extend this owner instead of
+/// adding a parallel one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CarrySlot {
+    #[default]
+    Vacant,
+    Prepared(CarrySummary),
+}
+
+/// The exact old/new Budget pair and both nonfungible suballocations a later
+/// Prepared carry accounts simultaneously.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CarrySummary {
+    pub(crate) predecessor: BudgetIdentity,
+    pub(crate) successor: BudgetIdentity,
+    pub(crate) sequence: u32,
+    pub(crate) mandatory: u32,
+    pub(crate) safety: u32,
+}
+
+/// Ordinary reservations are paused by C26 around a carry, never by C18.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum OrdinaryReservations {
+    #[default]
+    Running,
+    Paused,
+}
+
+/// The incremental conservation accumulator. Every typed support transition
+/// updates it atomically with owner state; a full fold over occupied owners is
+/// a test, bootstrap, and replay diagnostic only, never a hot-path operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Accumulator {
+    /// Occupied obligations by state and pool.
+    pub(crate) obligations: [[u32; POOLS]; STATES],
+    /// Consumed physical start credits, one per started call.
+    pub(crate) physical_credits: u32,
+    /// Funding claims by typed claim kind and pool.
+    pub(crate) claims: [[u32; POOLS]; CLAIM_KINDS],
+    /// Live entitlements and retained terminal tombstones.
+    pub(crate) entitlements: u32,
+    pub(crate) tombstones: u32,
+    /// Unreleased links held by retained tombstones.
+    pub(crate) links: u32,
+    /// Accumulated support interference per horizon, in microseconds.
+    pub(crate) interference_us: [u64; 8],
+}
+
+impl Accumulator {
+    /// Applies one signed occupancy delta. Underflow is internal noncanonical
+    /// state and fails closed rather than saturating.
+    pub(crate) fn apply(counter: &mut u32, delta: i32) -> Result<(), SupportLedgerError> {
+        let next = if delta >= 0 {
+            counter.checked_add(delta.unsigned_abs())
+        } else {
+            counter.checked_sub(delta.unsigned_abs())
+        };
+        *counter = next.ok_or(SupportLedgerError::Storage(FixedStorageError::NonCanonical))?;
+        Ok(())
+    }
+}
+
+/// The complete immutable observation Admission consumes. It is an owned
+/// fixed-size value: copying it is legal, but it is authority only while its
+/// instance seal, generation, identities, and `at` are revalidated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RetentionFacts<const H: usize> {
+    pub(crate) nonce: u64,
+    pub(crate) generation: SupportLedgerGeneration,
+    pub(crate) at: MonotonicTime,
+    pub(crate) catalog: CatalogIdentity,
+    pub(crate) configuration: ConfigurationIdentity,
+    pub(crate) budget: BudgetIdentity,
+    pub(crate) retention_horizon: Duration,
+    pub(crate) horizons: [Duration; H],
+    pub(crate) accumulator: Accumulator,
+    pub(crate) interference_limit_us: [u64; H],
+    /// Groups already due at `at` but not yet reclaimed. They remain fully
+    /// charged in every used count until a bounded expiry commit releases them.
+    pub(crate) expiry_due: u32,
+    pub(crate) expiry_scheduled: u32,
+    pub(crate) next_expiry_at: Option<MonotonicTime>,
+    pub(crate) carry_slot: CarrySlot,
+    pub(crate) carry_capacity: u32,
+    pub(crate) ordinary_reservations: OrdinaryReservations,
+}
+
+impl<const H: usize> RetentionFacts<H> {
+    /// Checked interference headroom for one horizon.
+    pub(crate) fn interference_headroom(&self, horizon: usize) -> Option<u64> {
+        self.interference_limit_us
+            .get(horizon)?
+            .checked_sub(*self.accumulator.interference_us.get(horizon)?)
+    }
+}
+
+/// The result of one bounded expiry transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExpiryCommit {
+    /// Unchanged exactly when `released_groups` is zero.
+    pub(crate) generation: SupportLedgerGeneration,
+    pub(crate) released_groups: u32,
+    pub(crate) released_units: u32,
+    /// More groups were due at `at` than one bounded batch could release.
+    pub(crate) more_due: bool,
+    pub(crate) next_expiry_at: Option<MonotonicTime>,
+}
+
+/// The retention boundary of a started record: its credit and every linked
+/// claim release together at `max(terminal_at, start_at + R_cat)`.
+pub(crate) fn started_release_at(
+    start_at: MonotonicTime,
+    terminal_at: MonotonicTime,
+    retention: Duration,
+) -> Result<MonotonicTime, SupportLedgerError> {
+    let horizon = start_at.checked_add(retention).map_err(|_| invalid())?;
+    Ok(terminal_at.max(horizon))
+}
+
+/// The retention boundary of a terminal entitlement tombstone: it is
+/// unschedulable while any link remains, and otherwise releases at
+/// `max(tombstone_at + R_cat, latest_link_release_at)`.
+pub(crate) fn tombstone_release_at(
+    tombstone_at: MonotonicTime,
+    latest_link_release_at: Option<MonotonicTime>,
+    retention: Duration,
+) -> Result<MonotonicTime, SupportLedgerError> {
+    let horizon = tombstone_at.checked_add(retention).map_err(|_| invalid())?;
+    Ok(latest_link_release_at.map_or(horizon, |link| horizon.max(link)))
+}
+
+/// A typed-impossible close consumes no start, so the whole group becomes due
+/// at its terminal instant rather than at a start-anchored horizon.
+pub(crate) fn unstarted_release_at(terminal_at: MonotonicTime) -> MonotonicTime {
+    terminal_at
+}
+
+#[allow(dead_code, reason = "C19 consumes the ordinary-claim axis")]
+pub(crate) const ORDINARY_CLAIM_CLASS: usize = CLAIMS;
+
+/// The complete C18 state owned by the sole support ledger: the sealed Catalog
+/// limits, the preallocated expiry heap, the incremental accumulator, the one
+/// dedicated carry slot, and the ledger time floor.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct SupportC18<const H: usize> {
+    /// Boxed once at construction: the sealed tensors are large, immutable,
+    /// and read only through a reference, so keeping them out of the inline
+    /// ledger keeps every prepare/commit frame small. This is the constructor
+    /// reservation the error algebra already maps to `Storage(Allocation)`,
+    /// not a hot-path allocation.
+    limits: Box<[SupportHistoryLimits<H>]>,
+    expiry: ExpiryHeap,
+    accumulator: Accumulator,
+    carry: CarrySlot,
+    ordinary: OrdinaryReservations,
+    time_floor: MonotonicTime,
+}
+
+impl<const H: usize> SupportC18<H> {
+    /// Seeds empty histories, dormant tickets, and the sole `Vacant` carry
+    /// slot after validating every sealed Catalog fact.
+    pub(crate) fn try_new(
+        limits: SupportHistoryLimits<H>,
+        starts: &[[FixedStartCountBound; H]; CELLS],
+    ) -> Result<Self, SupportLedgerError> {
+        limits.validate()?;
+        // The sealed active bounds must be the ledger's own bounds: a ledger
+        // whose history disagrees with its Catalog seal is not constructible.
+        (limits.active_start_bound == *starts)
+            .then_some(())
+            .ok_or_else(invalid)?;
+        let expiry = ExpiryHeap::try_new(limits.expiry_ticket_capacity)?;
+        let mut sealed = Vec::new();
+        sealed
+            .try_reserve_exact(1)
+            .map_err(|_| SupportLedgerError::Storage(FixedStorageError::Allocation))?;
+        sealed.push(limits);
+        Ok(Self {
+            limits: sealed.into_boxed_slice(),
+            expiry,
+            accumulator: Accumulator::default(),
+            carry: CarrySlot::Vacant,
+            ordinary: OrdinaryReservations::Running,
+            time_floor: MonotonicTime::from_micros(0),
+        })
+    }
+
+    pub(crate) fn limits(&self) -> &SupportHistoryLimits<H> {
+        &self.limits[0]
+    }
+
+    pub(crate) fn accumulator_mut(&mut self) -> &mut Accumulator {
+        &mut self.accumulator
+    }
+
+    /// Schedules the whole-group release ticket a terminal transition owes.
+    /// The dormant ticket was reserved at creation, so this never allocates.
+    pub(crate) fn schedule(&mut self, ticket: ExpiryTicket) -> Result<(), SupportLedgerError> {
+        self.expiry.schedule(ticket)
+    }
+
+    /// A time-bearing mutation may not move the ledger backwards.
+    pub(crate) fn check_floor(&self, at: MonotonicTime) -> Result<(), SupportLedgerError> {
+        (at >= self.time_floor)
+            .then_some(())
+            .ok_or(SupportLedgerError::Storage(FixedStorageError::InvalidTime))
+    }
+
+    /// The complete immutable retention observation at `at`. Creating it never
+    /// advances the generation and returns no Effect.
+    pub(crate) fn facts(
+        &self,
+        nonce: u64,
+        generation: SupportLedgerGeneration,
+        at: MonotonicTime,
+    ) -> RetentionFacts<H> {
+        // Bounded on purpose: the observation must not scan the owner set, so
+        // the due count saturates at the sealed group quota and the caller
+        // learns "more are due" from `next_expiry_at` together with this cap.
+        let (_, due, _, _) = self
+            .expiry
+            .due_prefix::<EXPIRY_OBSERVATION_GROUPS>(at, u32::MAX);
+        RetentionFacts {
+            nonce,
+            generation,
+            at,
+            catalog: self.limits().catalog,
+            configuration: self.limits().configuration,
+            budget: self.limits().budget,
+            retention_horizon: self.limits().retention(),
+            horizons: std::array::from_fn(|index| self.limits().horizons[index].get()),
+            accumulator: self.accumulator,
+            interference_limit_us: self.limits().interference_limit_us,
+            expiry_due: u32::try_from(due).expect("quota-bounded due count"),
+            expiry_scheduled: self.expiry.len(),
+            next_expiry_at: self.expiry.next_release(),
+            carry_slot: self.carry,
+            carry_capacity: CARRY_SLOTS,
+            ordinary_reservations: self.ordinary,
+        }
+    }
+
+    /// Read-only selection of the bounded due prefix. It mutates nothing, so
+    /// dropping the returned selection changes no state.
+    pub(crate) fn select_expiry<const E_GROUPS: usize, const E_UNITS: usize>(
+        &self,
+        at: MonotonicTime,
+    ) -> Result<([ExpiryTicket; E_GROUPS], usize, bool, u64), SupportLedgerError> {
+        let (sealed_groups, sealed_units) = self.limits().quotas();
+        // The sealed quota pair must be used exactly; any other const pair is
+        // rejected before any state is read.
+        (u32::try_from(E_GROUPS) == Ok(sealed_groups)
+            && u32::try_from(E_UNITS) == Ok(sealed_units))
+        .then_some(())
+        .ok_or_else(invalid)?;
+        self.check_floor(at)?;
+        Ok(self.expiry.due_prefix::<E_GROUPS>(at, sealed_units))
+    }
+
+    /// Re-derives the due prefix under the sealed quotas, for revalidating a
+    /// prepared selection against the current heap.
+    pub(crate) fn reselect<const E_GROUPS: usize>(
+        &self,
+        at: MonotonicTime,
+    ) -> ([ExpiryTicket; E_GROUPS], usize) {
+        let (_, units) = self.limits().quotas();
+        let (selected, count, _, _) = self.expiry.due_prefix::<E_GROUPS>(at, units);
+        (selected, count)
+    }
+
+    /// Releases exactly the validated whole groups and advances the time floor.
+    /// The caller advances the ledger generation once when the batch is
+    /// nonempty; a zero-group batch leaves the generation unchanged.
+    pub(crate) fn commit_expiry(
+        &mut self,
+        at: MonotonicTime,
+        count: usize,
+        units: u32,
+    ) -> (u32, u32) {
+        self.expiry.release_prefix(count);
+        self.time_floor = at;
+        (
+            u32::try_from(count).expect("constructor-bounded group count"),
+            units,
+        )
+    }
+
+    pub(crate) fn next_release(&self) -> Option<MonotonicTime> {
+        self.expiry.next_release()
+    }
+
+    pub(crate) fn accumulator(&self) -> &Accumulator {
+        &self.accumulator
+    }
+
+    pub(crate) fn scheduled(&self) -> &[ExpiryTicket] {
+        self.expiry.scheduled()
+    }
+
+    /// The borrowed canonical views a carry input exposes.
+    pub(crate) fn views(&self) -> (&[ExpiryTicket], &Accumulator, &CarrySlot) {
+        (self.expiry.scheduled(), &self.accumulator, &self.carry)
+    }
+}
+
+impl<'ledger, const H: usize> SupportCarryInput<'ledger, H> {
+    pub(crate) fn new(
+        snapshot: SupportLedgerSnapshot<H>,
+        scheduled: &'ledger [ExpiryTicket],
+        accumulator: &'ledger Accumulator,
+        history: [u64; CELLS],
+        vectors: &'ledger [[u64; H]; CELLS],
+        reserved: &'ledger [[u32; POOLS]; 5],
+        carry: &'ledger CarrySlot,
+    ) -> Self {
+        Self {
+            snapshot,
+            scheduled,
+            accumulator,
+            history,
+            vectors,
+            reserved,
+            carry,
+        }
+    }
+}
+
+/// The complete immutable observation Admission consumes: the existing C16
+/// capacity facts plus every C18 retention, interference, expiry and carry
+/// fact. It is an owned fixed-size value; it is authority only while its seal,
+/// generation, identities and `at` are revalidated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupportLedgerSnapshot<const H: usize> {
+    pub(crate) capacity: super::SupportCapacitySnapshot<H>,
+    pub(crate) retention: RetentionFacts<H>,
+}
+
+/// The complete immutable carry input C26 later consumes. It borrows the
+/// ledger, so it cannot be cloned, copied, sent to another thread, stored in
+/// Control state, or outlive the immutable borrow; creating it copies no whole
+/// state and advances no generation.
+#[derive(Debug)]
+pub(crate) struct SupportCarryInput<'ledger, const H: usize> {
+    snapshot: SupportLedgerSnapshot<H>,
+    /// Every scheduled release group, in heap storage order. This is the
+    /// retention view, not the operation inventory.
+    scheduled: &'ledger [ExpiryTicket],
+    /// The canonical occupancy inventory: obligations by state and pool,
+    /// physical start credits, funding claims by typed kind and pool, live
+    /// entitlements, retained tombstones and unreleased links.
+    accumulator: &'ledger Accumulator,
+    /// Retained catalog-wide start count per `(operation, pool)` cell, so a
+    /// later carry evaluates short-to-long activation without a second copy.
+    history: [u64; CELLS],
+    /// Support Outstanding Credit Vector occupancy on every
+    /// `(operation, pool, horizon)` axis.
+    vectors: &'ledger [[u64; H]; CELLS],
+    /// Held lifecycle reserves by capacity class and pool. The ledger tracks
+    /// reserves on this axis; it holds no per-kind occupancy tensor, and this
+    /// view does not invent one.
+    reserved: &'ledger [[u32; POOLS]; 5],
+    carry: &'ledger CarrySlot,
+}
+
+impl<const H: usize> SupportCarryInput<'_, H> {
+    pub(crate) fn snapshot(&self) -> &SupportLedgerSnapshot<H> {
+        &self.snapshot
+    }
+
+    /// The canonical scheduled-release view. It exposes vacancy and length and
+    /// cannot filter.
+    pub(crate) fn scheduled(&self) -> &[ExpiryTicket] {
+        self.scheduled
+    }
+
+    /// Retained catalog-wide start count per `(operation, pool)` cell.
+    pub(crate) fn history(&self) -> &[u64; CELLS] {
+        &self.history
+    }
+
+    /// Support Outstanding Credit Vector occupancy on the same axes.
+    pub(crate) fn vectors(&self) -> &[[u64; H]; CELLS] {
+        self.vectors
+    }
+
+    /// Held reserves by capacity class and pool.
+    pub(crate) fn reserved(&self) -> &[[u32; POOLS]; 5] {
+        self.reserved
+    }
+
+    pub(crate) fn accumulator(&self) -> &Accumulator {
+        self.accumulator
+    }
+
+    pub(crate) fn carry_slot(&self) -> &CarrySlot {
+        self.carry
+    }
+}
+
+/// The non-forgeable read-only expiry selection. It is bound to the exact
+/// ledger instance, expected generation, aggregate before-image and borrowed
+/// Work charge; dropping it changes no state.
+pub(crate) struct PreparedSupportExpiry<'work, const E_GROUPS: usize> {
+    pub(crate) work: &'work mut crate::WorkMeter,
+    pub(crate) nonce: u64,
+    pub(crate) expected: SupportLedgerGeneration,
+    pub(crate) at: MonotonicTime,
+    pub(crate) before: Accumulator,
+    /// A caller-owned fixed selection: preparing allocates nothing.
+    pub(crate) selected: [ExpiryTicket; E_GROUPS],
+    pub(crate) count: usize,
+    pub(crate) more_due: bool,
+}
+
+impl<const E_GROUPS: usize> PreparedSupportExpiry<'_, E_GROUPS> {
+    /// The selected whole groups, in exact key order.
+    pub(crate) fn groups(&self) -> &[ExpiryTicket] {
+        &self.selected[..self.count]
+    }
+}
+
+impl<const E_GROUPS: usize> std::fmt::Debug for PreparedSupportExpiry<'_, E_GROUPS> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedSupportExpiry")
+            .field("nonce", &self.nonce)
+            .field("expected", &self.expected)
+            .field("at", &self.at)
+            .field("selected", &self.count)
+            .field("more_due", &self.more_due)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl<const H: usize> SupportHistoryLimits<H> {
+    /// Sealed limits consistent with one test ledger's own start bounds.
+    /// Production limits are supplied by the C08 Catalog adapter; this builder
+    /// only keeps the fixture self-consistent.
+    pub(crate) fn testing(starts: [[FixedStartCountBound; H]; CELLS]) -> Self {
+        let horizons = std::array::from_fn(|index| NonZeroDuration(starts[0][index].0));
+        let pair = |predecessor: u8, successor: u8| PairCell {
+            predecessor: BudgetIdentity([predecessor; 32]),
+            successor: BudgetIdentity([successor; 32]),
+            sequence: 0,
+            mandatory: 7_297,
+            safety: 8,
+            history_reset: false,
+        };
+        let cells = [pair(1, 1), pair(1, 2), pair(2, 1), pair(2, 2)];
+        Self {
+            catalog: CatalogIdentity([1; 32]),
+            configuration: ConfigurationIdentity([1; 32]),
+            budget: BudgetIdentity([1; 32]),
+            retention_horizon: horizons[H - 1],
+            horizons,
+            start_history_capacity: std::array::from_fn(|cell| starts[cell][H - 1].1),
+            active_start_bound: starts,
+            interference_limit_us: [u64::MAX; H],
+            operation_capacity: [[1; POOLS]; STATES],
+            physical_credit_capacity: [u32::MAX; CELLS],
+            funding_claim_capacity: [[u32::MAX; POOLS]; CLAIM_KINDS],
+            ordinary_claim_capacity: [u32::MAX; POOLS],
+            owner_capacity: u32::MAX,
+            link_capacity: u32::MAX,
+            entitlement_capacity: 1,
+            vector_capacity: std::array::from_fn(|cell| {
+                std::array::from_fn(|horizon| u64::from(starts[cell][horizon].1))
+            }),
+            lifecycle_capacity: [[[u32::MAX; POOLS]; STATES]; LIFECYCLE_KINDS],
+            mandatory_pair_capacity: PairCapacity(cells),
+            safety_pair_capacity: PairCapacity(cells),
+            expiry_ticket_capacity: (STATES * POOLS) as u32 + 1,
+            expiry_groups_per_transition: NonZeroU32::new(1).expect("positive quota"),
+            expiry_units_per_transition: NonZeroU32::new(1).expect("positive quota"),
+            largest_atomic_release_group_units: NonZeroU32::new(1).expect("positive group"),
+        }
+    }
+}
+
