@@ -870,6 +870,12 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     /// occupied, so a violated count here is internal noncanonical state and
     /// fails stop rather than saturating.
     fn release_group(&mut self, ticket: &c18::ExpiryTicket) {
+        if ticket.family == c18::OwnerFamily::Tombstone {
+            // The bundle is the release group: its record, identity leaves,
+            // owned cells, claims and vector all return together.
+            self.bundles.withdraw_bundle_unmetered(ticket.slot_index);
+            return;
+        }
         let index = ticket.slot_index as usize;
         let Some(record) = self.records.get(index).copied() else {
             return;
@@ -4688,6 +4694,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &self,
         expected_request_owner: RequestId,
         entitlement: FutureTurnSupportEntitlementId,
+        terminal_at: MonotonicTime,
         work: &'work mut WorkMeter,
     ) -> Result<PreparedTombstone<'work, H>, SupportLedgerError> {
         self.generation
@@ -4707,6 +4714,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         {
             return Err(invalid);
         }
+        // The retained tombstone releases at its own Catalog horizon or with
+        // its last linked claim, whichever is later.
+        let release_at =
+            c18::tombstone_release_at(terminal_at, None, self.c18.limits().retention())?;
         Ok(PreparedTombstone {
             work,
             nonce: self.instance_nonce,
@@ -4714,6 +4725,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             expected_request_owner,
             record_index,
             record,
+            release_at,
         })
     }
     pub(crate) fn validate_tombstone<'ledger, 'work>(
@@ -4822,6 +4834,19 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
             c17,
         } = self;
         ledger.bundles.retain_bundle_unmetered(change.record_index);
+        // The retained bundle now owns a scheduled release: without this the
+        // record, its identities, cells, claims and vector stay occupied for
+        // the life of the process.
+        ledger
+            .c18
+            .schedule(c18::ExpiryTicket {
+                release_at: change.release_at,
+                family: c18::OwnerFamily::Tombstone,
+                slot_index: change.record_index,
+                units: 1,
+                identity: change.record.entitlement.get(),
+            })
+            .expect("dormant tombstone ticket reserved at creation");
         ledger.c17.commit_c16_tombstone(c17, &change.record);
         let next = change
             .snapshot
@@ -5521,6 +5546,7 @@ impl<const R: usize, const F: usize, const H: usize> std::fmt::Debug
     }
 }
 pub(crate) struct PreparedTombstone<'work, const H: usize> {
+    pub(crate) release_at: MonotonicTime,
     work: &'work mut WorkMeter,
     nonce: u64,
     snapshot: SupportCapacitySnapshot<H>,
@@ -12706,6 +12732,7 @@ mod tests {
             ledger.prepare_tombstone(
                 request_owner(1),
                 bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
                 &mut work()
             ),
             Err(SupportLedgerError::Generation)
@@ -12758,10 +12785,10 @@ mod tests {
         assert_eq!(change.record.support_budget, input.timing.support_budget);
         assert_eq!(change.record.bound_set, input.timing.bound_set);
         assert_eq!(change.record.linked_claims, 0);
-        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 1>>(), 1_632);
+        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 1>>(), 1_648);
         assert_eq!(
             std::mem::size_of::<ValidatedTombstone<'static, 'static, 64, 64, 1>>(),
-            2_704
+            2_720
         );
         assert_eq!(std::mem::size_of::<BundleRecord>(), 1_008);
         assert_eq!(
@@ -12804,10 +12831,10 @@ mod tests {
             std::mem::size_of::<ValidatedWithdrawal<'static, 'static, 12, 12, 8>>(),
             4_480
         );
-        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 8>>(), 3_984);
+        assert_eq!(std::mem::size_of::<PreparedTombstone<'static, 8>>(), 4_000);
         assert_eq!(
             std::mem::size_of::<ValidatedTombstone<'static, 'static, 12, 12, 8>>(),
-            5_056
+            5_072
         );
         assert_eq!(
             bundle_target_work::<3>(1_344).unwrap(),
@@ -12860,6 +12887,7 @@ mod tests {
                         .prepare_tombstone(
                             request_owner(1),
                             bundle_entitlement(1),
+                            MonotonicTime::from_micros(1_000),
                             &mut meter,
                         )
                         .unwrap();
@@ -13742,6 +13770,7 @@ mod tests {
             .prepare_tombstone(
                 request_owner(n),
                 bundle_entitlement(n),
+                MonotonicTime::from_micros(1_000),
                 &mut meter,
             )
             .unwrap();
@@ -13760,6 +13789,7 @@ mod tests {
             .prepare_tombstone(
                 request_owner(1),
                 bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
                 &mut meter,
             )
             .unwrap();
@@ -13773,6 +13803,7 @@ mod tests {
             .prepare_tombstone(
                 request_owner(1),
                 bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
                 &mut meter,
             )
             .unwrap();
@@ -13804,6 +13835,7 @@ mod tests {
             .prepare_tombstone(
                 request_owner(1),
                 bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
                 &mut meter,
             )
             .unwrap();
@@ -13974,6 +14006,7 @@ mod tests {
             .prepare_tombstone(
                 request_owner(1),
                 bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
                 &mut tombstone_meter,
             )
             .unwrap();
@@ -14034,6 +14067,7 @@ mod tests {
                     .prepare_tombstone(
                         request_owner(2),
                         bundle_entitlement(1),
+                        MonotonicTime::from_micros(1_000),
                         &mut meter,
                     )
                     .unwrap();
@@ -14099,6 +14133,7 @@ mod tests {
                         .prepare_tombstone(
                             request_owner(1),
                             bundle_entitlement(1),
+                            MonotonicTime::from_micros(1_000),
                             &mut meter,
                         )
                         .unwrap();
@@ -14272,6 +14307,7 @@ mod tests {
             .prepare_tombstone(
                 request_owner(1),
                 bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
                 &mut meter,
             )
             .unwrap();
