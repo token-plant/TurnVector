@@ -231,3 +231,259 @@ impl<const H: usize> SupportHistoryLimits<H> {
     }
 }
 
+/// Which owner store holds the group a ticket releases. This is cleanup
+/// ownership, deliberately distinct from the record's terminal state: records
+/// in different stores can share a terminal state, and one store's slot index
+/// means nothing to another.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub(crate) enum OwnerFamily {
+    /// A legacy ordinary or lifecycle record in the sole record arena.
+    LegacyRecord = 0,
+    /// A C16 request-bundle initial obligation.
+    InitialBundle = 1,
+    /// A retained terminal entitlement tombstone.
+    Tombstone = 2,
+}
+
+impl OwnerFamily {
+    const fn tag(self) -> u8 {
+        self as u8
+    }
+}
+
+/// One dormant or scheduled whole-group release ticket. Ordering is exactly
+/// `(release_at, owner family, slot_index)`, which is total because a slot
+/// index is unique within its family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExpiryTicket {
+    pub(crate) release_at: MonotonicTime,
+    pub(crate) family: OwnerFamily,
+    pub(crate) slot_index: u32,
+    /// The whole-group unit count charged when this ticket is released. A
+    /// group is released in full or not at all.
+    pub(crate) units: u32,
+    /// The group's owning identity. The record does not carry it and releasing
+    /// the group must delete its identity keys, so the ticket binds it at
+    /// terminalization.
+    pub(crate) identity: [u8; 32],
+}
+
+/// The vacant entry of a fixed selection array. It is never due, never
+/// selected, and never released: `count` bounds every read.
+pub(crate) const DORMANT_TICKET: ExpiryTicket = ExpiryTicket {
+    release_at: MonotonicTime::from_micros(u64::MAX),
+    family: OwnerFamily::LegacyRecord,
+    slot_index: u32::MAX,
+    units: 0,
+    identity: [0; 32],
+};
+
+impl ExpiryTicket {
+    fn key(&self) -> (u64, u8, u32) {
+        (
+            self.release_at.as_micros(),
+            self.family.tag(),
+            self.slot_index,
+        )
+    }
+}
+
+impl Ord for ExpiryTicket {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for ExpiryTicket {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The fixed preallocated min-heap that orders due release groups. Capacity is
+/// reserved once at construction; no push after construction can allocate,
+/// because one dormant ticket exists for every releasable root.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ExpiryHeap {
+    tickets: Vec<ExpiryTicket>,
+    capacity: u32,
+}
+
+impl ExpiryHeap {
+    pub(crate) fn try_new(tickets: u32) -> Result<Self, SupportLedgerError> {
+        let slots = usize::try_from(tickets).map_err(|_| capacity())?;
+        let mut heap = Vec::new();
+        heap.try_reserve_exact(slots)
+            .map_err(|_| SupportLedgerError::Storage(FixedStorageError::Allocation))?;
+        (heap.capacity() >= slots)
+            .then_some(())
+            .ok_or_else(capacity)?;
+        Ok(Self {
+            tickets: heap,
+            capacity: tickets,
+        })
+    }
+
+    pub(crate) fn len(&self) -> u32 {
+        u32::try_from(self.tickets.len()).expect("constructor-bounded ticket count")
+    }
+
+    /// Schedules one whole-group ticket. Rejects rather than allocates when the
+    /// sealed ticket capacity is already exhausted.
+    pub(crate) fn schedule(&mut self, ticket: ExpiryTicket) -> Result<(), SupportLedgerError> {
+        (self.len() < self.capacity)
+            .then_some(())
+            .ok_or_else(capacity)?;
+        let mut child = self.tickets.len();
+        self.tickets.push(ticket);
+        while child > 0 {
+            let parent = (child - 1) / 2;
+            if self.tickets[parent] <= self.tickets[child] {
+                break;
+            }
+            self.tickets.swap(parent, child);
+            child = parent;
+        }
+        Ok(())
+    }
+
+    /// The earliest scheduled release time, or `None` when no ticket is active.
+    pub(crate) fn next_release(&self) -> Option<MonotonicTime> {
+        self.tickets.first().map(|ticket| ticket.release_at)
+    }
+
+    /// The due prefix in exact key order, bounded componentwise by the sealed
+    /// group and unit quotas. A group whose units do not fit is not split: the
+    /// selection stops and the remaining groups stay fully charged.
+    ///
+    /// The walk is a bounded best-first descent over the implicit heap, so it
+    /// visits only the due prefix and a frontier of at most `G + 1` nodes. It
+    /// allocates nothing: the selection lands in a caller-owned fixed array and
+    /// the frontier is a fixed array too.
+    pub(crate) fn due_prefix<const G: usize>(
+        &self,
+        at: MonotonicTime,
+        max_units: u32,
+    ) -> ([ExpiryTicket; G], usize, bool, u64)
+    where
+        ExpiryTicket: Copy,
+    {
+        let mut selected = [DORMANT_TICKET; G];
+        let mut frontier = [u32::MAX; G];
+        let mut frontier_len = 0usize;
+        let mut visited = 0u64;
+        if !self.tickets.is_empty() && G > 0 {
+            frontier[0] = 0;
+            frontier_len = 1;
+        }
+        let (mut count, mut units) = (0usize, 0u32);
+        let mut more_due = false;
+        while count < G && frontier_len > 0 {
+            // The smallest frontier node is the next candidate in exact
+            // (release_at, family, slot) order.
+            let mut best = 0usize;
+            for position in 1..frontier_len {
+                visited += 1;
+                if self.tickets[frontier[position] as usize] < self.tickets[frontier[best] as usize]
+                {
+                    best = position;
+                }
+            }
+            let node = frontier[best] as usize;
+            let ticket = self.tickets[node];
+            visited += 1;
+            if ticket.release_at > at {
+                break;
+            }
+            if units
+                .checked_add(ticket.units)
+                .is_none_or(|total| total > max_units)
+            {
+                more_due = true;
+                break;
+            }
+            selected[count] = ticket;
+            units += ticket.units;
+            count += 1;
+            // Replace the consumed node with its children; the frontier can
+            // hold them because each step removes one and adds at most two.
+            frontier[best] = frontier[frontier_len - 1];
+            frontier_len -= 1;
+            for child in [2 * node + 1, 2 * node + 2] {
+                if child < self.tickets.len() && frontier_len < G {
+                    frontier[frontier_len] = child as u32;
+                    frontier_len += 1;
+                }
+            }
+        }
+        if !more_due {
+            more_due = (0..frontier_len)
+                .any(|position| self.tickets[frontier[position] as usize].release_at <= at);
+        }
+        (selected, count, more_due, visited)
+    }
+
+    /// Removes the exact due prefix the selection named. Because the selection
+    /// is the heap's smallest `count` entries in key order, removing it is
+    /// `count` ordinary minimum extractions, each `O(log n)` and allocating
+    /// nothing.
+    pub(crate) fn release_prefix(&mut self, count: usize) {
+        for _ in 0..count {
+            self.pop_min();
+        }
+    }
+
+    fn pop_min(&mut self) -> Option<ExpiryTicket> {
+        if self.tickets.is_empty() {
+            return None;
+        }
+        let smallest = self.tickets.swap_remove(0);
+        let len = self.tickets.len();
+        let mut parent = 0usize;
+        loop {
+            let (left, right) = (2 * parent + 1, 2 * parent + 2);
+            let mut next = parent;
+            if left < len && self.tickets[left] < self.tickets[next] {
+                next = left;
+            }
+            if right < len && self.tickets[right] < self.tickets[next] {
+                next = right;
+            }
+            if next == parent {
+                break;
+            }
+            self.tickets.swap(parent, next);
+            parent = next;
+        }
+        Some(smallest)
+    }
+
+    /// The complete canonical scheduled view in heap storage order.
+    pub(crate) fn scheduled(&self) -> &[ExpiryTicket] {
+        &self.tickets
+    }
+
+    pub(crate) fn release(&mut self, selected: &[ExpiryTicket]) {
+        self.tickets.retain(|ticket| !selected.contains(ticket));
+        let len = self.tickets.len();
+        for start in (0..len / 2).rev() {
+            let mut parent = start;
+            loop {
+                let (left, right) = (2 * parent + 1, 2 * parent + 2);
+                let mut smallest = parent;
+                if left < len && self.tickets[left] < self.tickets[smallest] {
+                    smallest = left;
+                }
+                if right < len && self.tickets[right] < self.tickets[smallest] {
+                    smallest = right;
+                }
+                if smallest == parent {
+                    break;
+                }
+                self.tickets.swap(parent, smallest);
+                parent = smallest;
+            }
+        }
+    }
+}
