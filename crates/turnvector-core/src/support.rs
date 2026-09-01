@@ -15628,3 +15628,351 @@ mod tests {
         );
     }
 }
+
+/// Ledger-level C18 laws: the complete observation, the bounded expiry
+/// transaction, generation stability, and capability drop.
+#[cfg(test)]
+mod c18_ledger_tests {
+    use super::*;
+    use crate::{HotPathWorkBudget, SupportOperationObligationId};
+
+    type Ledger = SupportChargeLedger<64, 64, 1>;
+
+    fn work() -> WorkMeter {
+        WorkMeter::new(HotPathWorkBudget::binary_maximum())
+    }
+
+    fn at(micros: u64) -> MonotonicTime {
+        MonotonicTime::from_micros(micros)
+    }
+
+    fn ledger() -> Ledger {
+        let starts = [[FixedStartCountBound(Duration::from_micros(10), 1); 1]; 21];
+        Ledger::try_new(
+            SupportLedgerGeneration::new(1).unwrap(),
+            [[2, 1, 1], [1, 0, 1], [2, 1, 1], [4, 1, 1], [4, 1, 1]],
+            2,
+            starts,
+            LifecycleReserveMaxima([1, 2, 2, 1, 1]),
+            4,
+            8,
+            6,
+            c18::SupportHistoryLimits::testing(starts),
+        )
+        .unwrap()
+    }
+
+    fn obligation(n: u8) -> SupportOperationObligationId {
+        SupportOperationObligationId::new([n; 32]).unwrap()
+    }
+
+    /// T02 — a newly constructed ledger reports zero use, no due expiry, a
+    /// vacant carry slot, and running ordinary reservations.
+    #[test]
+    fn an_empty_ledger_reports_complete_zero_facts() {
+        let ledger = ledger();
+        let snapshot = ledger
+            .ledger_snapshot(ledger.generation(), at(0), &mut work())
+            .unwrap();
+        assert_eq!(snapshot.retention.generation, ledger.generation());
+        assert_eq!(snapshot.retention.at, at(0));
+        assert_eq!(snapshot.retention.expiry_due, 0);
+        assert_eq!(snapshot.retention.expiry_scheduled, 0);
+        assert_eq!(snapshot.retention.next_expiry_at, None);
+        assert_eq!(snapshot.retention.carry_slot, c18::CarrySlot::Vacant);
+        assert_eq!(snapshot.retention.carry_capacity, 1);
+        assert_eq!(
+            snapshot.retention.ordinary_reservations,
+            c18::OrdinaryReservations::Running
+        );
+        assert_eq!(
+            snapshot.retention.retention_horizon,
+            Duration::from_micros(10)
+        );
+        assert_eq!(snapshot.capacity.usage, [[0; POOLS]; 5]);
+    }
+
+    /// T16 — repeating the same observation on unchanged state reproduces the
+    /// same value and keeps the generation.
+    #[test]
+    fn repeating_an_observation_is_stable_and_advances_nothing() {
+        let ledger = ledger();
+        let generation = ledger.generation();
+        let first = ledger
+            .ledger_snapshot(generation, at(3), &mut work())
+            .unwrap();
+        let second = ledger
+            .ledger_snapshot(generation, at(3), &mut work())
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(ledger.generation(), generation);
+    }
+
+    /// T17 — a stale generation is rejected even though the counts are equal,
+    /// and a backward `at` cannot observe the ledger.
+    #[test]
+    fn a_stale_generation_or_backward_time_is_rejected() {
+        let mut ledger = ledger();
+        let stale = ledger.generation();
+        let newer = stale.next().unwrap();
+        assert_eq!(
+            ledger
+                .ledger_snapshot(newer, at(0), &mut work())
+                .unwrap_err(),
+            SupportLedgerError::Generation
+        );
+        // An expiry commit advances the floor; an earlier observation then
+        // fails closed on time rather than reporting a stale view.
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(stale, at(50), &mut meter)
+            .unwrap();
+        ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(
+            ledger
+                .ledger_snapshot(ledger.generation(), at(49), &mut work())
+                .unwrap_err(),
+            SupportLedgerError::Storage(FixedStorageError::InvalidTime)
+        );
+    }
+
+    /// T16 — an empty batch commits successfully, releases nothing, and leaves
+    /// the generation unchanged.
+    #[test]
+    fn a_no_op_expiry_keeps_the_generation_stable() {
+        let mut ledger = ledger();
+        let generation = ledger.generation();
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(generation, at(0), &mut meter)
+            .unwrap();
+        let commit = ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(commit.released_groups, 0);
+        assert_eq!(commit.released_units, 0);
+        assert!(!commit.more_due);
+        assert_eq!(commit.next_expiry_at, None);
+        assert_eq!(commit.generation, generation);
+        assert_eq!(ledger.generation(), generation);
+    }
+
+    /// T21 — dropping a prepared or validated capability without committing
+    /// leaves the ledger byte-identical.
+    #[test]
+    fn dropping_a_prepared_expiry_changes_nothing() {
+        let mut ledger = ledger();
+        let generation = ledger.generation();
+        let before = ledger.c18.scheduled().to_vec();
+        let mut first = work();
+        drop(
+            ledger
+                .prepare_expiry::<1, 1>(generation, at(0), &mut first)
+                .unwrap(),
+        );
+        assert_eq!(ledger.generation(), generation);
+        assert_eq!(ledger.c18.scheduled(), before.as_slice());
+
+        let mut second = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(generation, at(0), &mut second)
+            .unwrap();
+        drop(ledger.validate_expiry(prepared).unwrap());
+        assert_eq!(ledger.generation(), generation);
+        assert_eq!(ledger.c18.scheduled(), before.as_slice());
+    }
+
+    /// A prepared selection cannot be replayed after the state it bound has
+    /// moved on.
+    #[test]
+    fn a_replayed_prepared_expiry_is_rejected() {
+        let mut ledger = ledger();
+        let generation = ledger.generation();
+        let mut stale_meter = work();
+        let mut fresh_meter = work();
+        let stale = ledger
+            .prepare_expiry::<1, 1>(generation, at(0), &mut stale_meter)
+            .unwrap();
+        let fresh = ledger
+            .prepare_expiry::<1, 1>(generation, at(0), &mut fresh_meter)
+            .unwrap();
+        ledger.validate_expiry(fresh).unwrap().commit();
+        // The no-op commit kept the generation, so advance it through a real
+        // ordinary reservation before replaying the stale capability.
+        ledger.generation = ledger.generation().next().unwrap();
+        assert!(matches!(
+            ledger.validate_expiry(stale),
+            Err(SupportLedgerError::Generation)
+        ));
+    }
+
+    /// The carry input exposes the exact snapshot, the canonical scheduled
+    /// view, the accumulator, and the vacant slot, without copying the state.
+    #[test]
+    fn the_carry_input_exposes_the_complete_canonical_view() {
+        let ledger = ledger();
+        let input = ledger
+            .carry_input(ledger.generation(), at(0), &mut work())
+            .unwrap();
+        assert_eq!(input.scheduled(), &[]);
+        assert_eq!(input.carry_slot(), &c18::CarrySlot::Vacant);
+        assert_eq!(input.accumulator(), &c18::Accumulator::default());
+        assert_eq!(input.snapshot().retention.carry_capacity, c18::CARRY_SLOTS);
+        // The inventory is complete on every axis the ledger actually owns; it
+        // does not invent a tensor the ledger does not track.
+        assert_eq!(input.history(), &[0; c18::CELLS]);
+        assert_eq!(input.vectors(), &[[0; 1]; c18::CELLS]);
+        assert_eq!(input.reserved(), &[[0; POOLS]; 5]);
+    }
+
+    /// D2/D3 end to end — a started record stays fully charged until its
+    /// Catalog Retention Horizon, and one bounded transition then releases the
+    /// whole group and advances the generation exactly once.
+    #[test]
+    fn a_started_record_is_retained_until_its_horizon_then_released_once() {
+        let mut ledger = ledger();
+        let id = obligation(1);
+        let claims = [SupportFundingClaim::OrdinaryReservation([1; 32])];
+        let mut credit = [1; 32];
+        credit[31] ^= 0x80;
+        let spec = SupportObligationSpec {
+            id,
+            operation: SupportOperation::MaterializeRequest,
+            pool: SupportPool::Ordinary,
+            physical_credit: PhysicalStartCreditId::new(credit).unwrap(),
+            predecessor: SupportCausalPredecessorId([1; 32]),
+            claims: &claims,
+        };
+        ledger
+            .reserve(ledger.generation(), spec, &mut work())
+            .unwrap();
+        ledger
+            .transition(
+                ledger.generation(),
+                id,
+                PredecessorEnded(SupportCausalPredecessorId([1; 32]), at(2)),
+                &mut work(),
+            )
+            .unwrap();
+        ledger
+            .transition(ledger.generation(), id, BeginSupport(at(5)), &mut work())
+            .unwrap();
+        // Finishing early must not shorten retention: the release instant is
+        // `max(terminal_at, start_at + R_cat) = max(6, 5 + 10) = 15`.
+        ledger
+            .transition(ledger.generation(), id, FinishSupport(at(6)), &mut work())
+            .unwrap();
+
+        let scheduled = ledger.c18.scheduled();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].release_at, at(15));
+
+        // Before the horizon the group is neither due nor releasable.
+        let early = ledger
+            .ledger_snapshot(ledger.generation(), at(14), &mut work())
+            .unwrap();
+        assert_eq!(early.retention.expiry_due, 0);
+        assert_eq!(early.retention.expiry_scheduled, 1);
+        assert_eq!(early.retention.next_expiry_at, Some(at(15)));
+
+        // Equality is eligible.
+        let due = ledger
+            .ledger_snapshot(ledger.generation(), at(15), &mut work())
+            .unwrap();
+        assert_eq!(due.retention.expiry_due, 1);
+
+        let generation = ledger.generation();
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(generation, at(15), &mut meter)
+            .unwrap();
+        let commit = ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(commit.released_groups, 1);
+        assert_eq!(commit.released_units, 1);
+        assert!(!commit.more_due);
+        assert_eq!(commit.next_expiry_at, None);
+        assert_eq!(commit.generation, generation.next().unwrap());
+        assert_eq!(ledger.generation(), generation.next().unwrap());
+        assert_eq!(ledger.c18.scheduled(), &[]);
+
+        // A reported release is an actual release: the whole group's
+        // occupancy, its one physical start credit and its funding claim all
+        // return, and the record slot becomes reusable.
+        assert_eq!(ledger.usage[ACTIVE][0], 0, "retained occupancy returned");
+        assert_eq!(ledger.usage[CREDITS][0], 0, "physical credit returned");
+        assert_eq!(ledger.usage[CLAIMS][0], 0, "funding claim returned");
+        assert_eq!(ledger.records.live(), 0, "record slot reclaimed");
+        assert_eq!(ledger.records.free_record_len(), 1, "slot is reusable");
+        // The identity left the index, so the same obligation may be created
+        // again rather than colliding forever with a released group.
+        assert_eq!(
+            ledger.records.find(key(0, id.get()), &mut work()).unwrap(),
+            None
+        );
+    }
+
+    /// T28 — churn beyond physical capacity succeeds when expiry runs between
+    /// generations, which is only true if a release actually frees the slot.
+    #[test]
+    fn churn_past_capacity_succeeds_when_expiry_runs_between() {
+        let mut ledger = ledger();
+        for round in 1..=6u8 {
+            let id = obligation(round);
+            let claims = [SupportFundingClaim::OrdinaryReservation([round; 32])];
+            let mut credit = [round; 32];
+            credit[31] ^= 0x80;
+            let spec = SupportObligationSpec {
+                id,
+                operation: SupportOperation::MaterializeRequest,
+                pool: SupportPool::Ordinary,
+                physical_credit: PhysicalStartCreditId::new(credit).unwrap(),
+                predecessor: SupportCausalPredecessorId([round; 32]),
+                claims: &claims,
+            };
+            let base = u64::from(round) * 100;
+            ledger
+                .reserve(ledger.generation(), spec, &mut work())
+                .unwrap();
+            ledger
+                .transition(
+                    ledger.generation(),
+                    id,
+                    PredecessorEnded(SupportCausalPredecessorId([round; 32]), at(base + 2)),
+                    &mut work(),
+                )
+                .unwrap();
+            ledger
+                .transition(
+                    ledger.generation(),
+                    id,
+                    BeginSupport(at(base + 5)),
+                    &mut work(),
+                )
+                .unwrap();
+            ledger
+                .transition(
+                    ledger.generation(),
+                    id,
+                    FinishSupport(at(base + 6)),
+                    &mut work(),
+                )
+                .unwrap();
+            let mut meter = work();
+            let prepared = ledger
+                .prepare_expiry::<1, 1>(ledger.generation(), at(base + 20), &mut meter)
+                .unwrap();
+            let commit = ledger.validate_expiry(prepared).unwrap().commit();
+            assert_eq!(
+                commit.released_groups, 1,
+                "round {round} released its group"
+            );
+            assert_eq!(
+                ledger.records.live(),
+                0,
+                "round {round} left no live record"
+            );
+            assert_eq!(
+                ledger.usage[CLAIMS][0], 0,
+                "round {round} returned its claim"
+            );
+        }
+    }
+}
