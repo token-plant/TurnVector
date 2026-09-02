@@ -620,6 +620,29 @@ pub(crate) struct ExpiryCommit {
     pub(crate) next_expiry_at: Option<MonotonicTime>,
 }
 
+/// The stride that separates one bundle's initial ordinals inside the
+/// `InitialBundle` slot space. Three ordinals are addressable; the fourth is
+/// deliberately unused so the encoding stays a shift and no two bundles can
+/// ever collide.
+const INITIAL_STRIDE: u32 = 4;
+
+/// Encodes one bundle record index and initial ordinal into the single
+/// `slot_index` an `InitialBundle` ticket carries. Paired with
+/// [`initial_slot`]; never build this index by hand, because the legacy record
+/// arena uses the same `u32` slot space for a different store.
+pub(crate) fn initial_ticket_slot(record_index: u32, ordinal: u8) -> u32 {
+    record_index * INITIAL_STRIDE + u32::from(ordinal)
+}
+
+/// Decodes an `InitialBundle` ticket's `slot_index` back into its bundle record
+/// index and initial ordinal.
+pub(crate) fn initial_slot(slot_index: u32) -> (u32, usize) {
+    (
+        slot_index / INITIAL_STRIDE,
+        (slot_index % INITIAL_STRIDE) as usize,
+    )
+}
+
 /// The retention boundary of a started record: its credit and every linked
 /// claim release together at `max(terminal_at, start_at + R_cat)`.
 pub(crate) fn started_release_at(

@@ -55,7 +55,7 @@ values! {
         EntitlementVector([u8; 32]), LifecycleReserve([u8; 32]),
     }
     SupportObligationState {
-        Conditional, Pending, Active, Retained, ClosedConditional, ClosedPending,
+        Conditional, Pending, Active, Retained, ClosedConditional, ClosedPending, Vacant,
     }
 }
 use SupportObligationState::*;
@@ -916,6 +916,38 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 .expect("validated retained bundle owners");
             self.c17.commit_c16_withdrawal(c17);
             self.bundles.withdraw_bundle_unmetered(ticket.slot_index);
+            return;
+        }
+        if ticket.family == c18::OwnerFamily::InitialBundle {
+            // Design 5.1: an operation record goes
+            // `Retained | ClosedConditional | ClosedPending --expiry--> Vacant`.
+            // An initial obligation is such a record, but its storage belongs to
+            // the bundle, so the release is a state transition on the ordinal
+            // rather than an arena removal. Routing it into the legacy path
+            // instead would look its composite index up in the record arena and
+            // either release nothing or release an unrelated record.
+            let (record_index, ordinal) = c18::initial_slot(ticket.slot_index);
+            let RecordSlot::Occupied(bundle) = &mut self.bundles.records[record_index as usize]
+            else {
+                unreachable!("validated retained initial bundle")
+            };
+            let item = &mut bundle.initial[ordinal];
+            let occupied = state_class(item.state);
+            item.state = Vacant;
+            // Invariant 5.2(2) counts credits and claims over non-vacant
+            // records, and the released ordinal is now vacant, so its slot,
+            // credit and claim return here. Its three identity leaves stay
+            // registered: `tagged_keys` publishes one fixed 11-key set derived
+            // from the whole bundle, so a leaf cannot be withdrawn per ordinal
+            // and the ID stays unreusable until the bundle itself withdraws.
+            // Nothing can transition through it meanwhile - every prepare
+            // requires a live state and `Vacant` matches none.
+            let mandatory = MandatoryCompletion as usize;
+            for class in [occupied, CREDITS, CLAIMS] {
+                self.usage[class][mandatory] = self.usage[class][mandatory]
+                    .checked_sub(1)
+                    .expect("validated retained initial occupancy");
+            }
             return;
         }
         let index = ticket.slot_index as usize;
@@ -3513,7 +3545,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     .schedule(c18::ExpiryTicket {
                         release_at,
                         family: c18::OwnerFamily::InitialBundle,
-                        slot_index: index * 4 + u32::from(ordinal),
+                        slot_index: c18::initial_ticket_slot(index, ordinal),
                         units: 1,
                         identity: [0; 32],
                     })
@@ -4275,6 +4307,18 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }))?;
         let mandatory = MandatoryCompletion as usize;
         for item in record.initial {
+            // A released ordinal charges no class at all. `bundle_logical_delta`
+            // seeds three conditional slots, three credits and three claims for
+            // the three initial obligations, so releasing one returns its slot,
+            // its one physical credit and its one claim, and adds nothing back.
+            if item.state == Vacant {
+                delta.usage[CONDITIONAL][mandatory] -= 1;
+                delta.usage[CREDITS][mandatory] -= 1;
+                delta.usage[CLAIMS][mandatory] -= 1;
+                delta.reserved[PENDING][mandatory] -= 1;
+                delta.reserved[ACTIVE][mandatory] -= 1;
+                continue;
+            }
             let current = state_class(item.state);
             if current != CONDITIONAL {
                 delta.usage[CONDITIONAL][mandatory] -= 1;
@@ -4287,6 +4331,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     delta.reserved[PENDING][mandatory] -= 1;
                     delta.reserved[ACTIVE][mandatory] -= 1;
                 }
+                Vacant => unreachable!("handled above"),
             }
         }
         Ok(delta)
@@ -5093,7 +5138,18 @@ fn apply_signed_u32(value: u32, delta: i32) -> Result<u32, SupportLedgerError> {
 fn total(values: impl IntoIterator<Item = u32>) -> u64 {
     values.into_iter().map(u64::from).sum()
 }
-const STATE_CLASSES: [usize; 6] = [CONDITIONAL, PENDING, ACTIVE, ACTIVE, CONDITIONAL, PENDING];
+/// `Vacant` is released storage and charges no capacity class. Its entry is a
+/// placeholder that keeps the table total over the enum: every walk that could
+/// reach it special-cases `Vacant` before indexing, so the value is never read.
+const STATE_CLASSES: [usize; 7] = [
+    CONDITIONAL,
+    PENDING,
+    ACTIVE,
+    ACTIVE,
+    CONDITIONAL,
+    PENDING,
+    CONDITIONAL,
+];
 /// The explicit instant a transition carries, when it carries one.
 fn transition_instant(transition: SupportTransition) -> Option<MonotonicTime> {
     match transition {
@@ -6717,7 +6773,7 @@ fn initial_semantic_envelope_is_valid(
     let zero_time = item.state_time == MonotonicTime::from_micros(0);
     let state_time_is_valid = match item.state {
         Conditional | ClosedConditional => zero_time,
-        Pending | Active | Retained | ClosedPending => true,
+        Pending | Active | Retained | ClosedPending | Vacant => true,
     };
     let bundle_state_is_valid = match bundle_state {
         BundleState::LivePristine => item.state == Conditional && zero_time,
@@ -13917,6 +13973,159 @@ mod tests {
             "the physical record returned"
         );
         assert_eq!(ledger.c18.scheduled(), &[], "the ticket is consumed");
+    }
+
+    /// F1a regression (#61) — an `InitialBundle` group must actually release.
+    /// The defect reported `released_groups: 1` while usage, reserves and the
+    /// bundle were byte-identical, which is the signature of the P0 this row
+    /// was already stopped for once.
+    #[test]
+    fn a_released_initial_obligation_returns_its_slot_credit_and_claim() {
+        let mut ledger = bundle_ledger(4, 8);
+        let cells = configured_cells(3, 1);
+        let input = bundle_input(1, &cells);
+        let initial = input.initial.values();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        ledger
+            .transition(
+                ledger.generation(),
+                obligation,
+                PredecessorEnded(initial[0].predecessor, MonotonicTime::from_micros(5)),
+                &mut work(),
+            )
+            .unwrap();
+        ledger
+            .transition(
+                ledger.generation(),
+                obligation,
+                Begin(MonotonicTime::from_micros(6)),
+                &mut work(),
+            )
+            .unwrap();
+        let mut meter = work();
+        let change = ledger
+            .prepare(
+                ledger.generation(),
+                SupportChangeInput::FinishActive(obligation, MonotonicTime::from_micros(1_000)),
+                &mut meter,
+            )
+            .unwrap();
+        ledger.validate(&change).unwrap();
+        ledger.commit(change, &mut meter).unwrap();
+
+        let scheduled = ledger.c18.scheduled().to_vec();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].family, c18::OwnerFamily::InitialBundle);
+        let (record_index, ordinal) = c18::initial_slot(scheduled[0].slot_index);
+        assert_eq!(
+            (record_index, ordinal),
+            (0, 0),
+            "composite slot round-trips"
+        );
+
+        let usage_before = ledger.usage;
+        let mandatory = MandatoryCompletion as usize;
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(ledger.generation(), scheduled[0].release_at, &mut meter)
+            .unwrap();
+        let commit = ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(commit.released_groups, 1);
+
+        // The reported release is an actual release: the ordinal's occupied
+        // class, its one physical credit and its one claim all return.
+        assert_eq!(
+            ledger.usage[ACTIVE][mandatory],
+            usage_before[ACTIVE][mandatory] - 1,
+            "the started ordinal returned its class"
+        );
+        assert_eq!(
+            ledger.usage[CREDITS][mandatory],
+            usage_before[CREDITS][mandatory] - 1,
+            "the physical start credit returned"
+        );
+        assert_eq!(
+            ledger.usage[CLAIMS][mandatory],
+            usage_before[CLAIMS][mandatory] - 1,
+            "the funding claim returned"
+        );
+        assert_eq!(
+            ledger.bundles.get_record(0).unwrap().initial[0].state,
+            Vacant,
+            "design 5.1: Retained --bounded expiry--> Vacant"
+        );
+        assert_eq!(ledger.c18.scheduled(), &[], "the ticket is consumed");
+        // The bundle's stored aggregates must still reconcile against the
+        // ledger totals after a per-ordinal release.
+        let record = *ledger.bundles.get_record(0).unwrap();
+        ledger
+            .validate_stored_bundle_aggregates_precharged(0, &record)
+            .expect("aggregates reconcile after an ordinal release");
+    }
+
+    /// F1b regression (#61) — an occupied legacy record at the colliding
+    /// composite index must not be reachable from an `InitialBundle` ticket.
+    /// The defect panicked inside a commit documented "consuming and infallible
+    /// after validation".
+    #[test]
+    fn an_initial_release_never_reaches_a_colliding_legacy_record() {
+        let at = MonotonicTime::from_micros;
+        let mut ledger = bundle_ledger(4, 8);
+        let spec = ordinary((1, 21, 41, Reserved([1; 32])));
+        let mut meter = work();
+        let change = ledger
+            .prepare(
+                ledger.generation(),
+                SupportChangeInput::BeginOrdinary(spec, at(5)),
+                &mut meter,
+            )
+            .unwrap();
+        ledger.validate(&change).unwrap();
+        ledger.commit(change, &mut meter).unwrap();
+        let legacy_before = *ledger.records.get(0).expect("legacy record 0 occupied");
+
+        let cells = configured_cells(3, 1);
+        let input = bundle_input(1, &cells);
+        let initial = input.initial.values();
+        let obligation = reserve_bundle(&mut ledger, 1, 3);
+        ledger
+            .transition(
+                ledger.generation(),
+                obligation,
+                PredecessorEnded(initial[0].predecessor, at(5)),
+                &mut work(),
+            )
+            .unwrap();
+        ledger
+            .transition(ledger.generation(), obligation, Begin(at(6)), &mut work())
+            .unwrap();
+        let mut meter = work();
+        let change = ledger
+            .prepare(
+                ledger.generation(),
+                SupportChangeInput::FinishActive(obligation, at(1_000)),
+                &mut meter,
+            )
+            .unwrap();
+        ledger.validate(&change).unwrap();
+        ledger.commit(change, &mut meter).unwrap();
+
+        let scheduled = ledger.c18.scheduled().to_vec();
+        assert_eq!(scheduled[0].family, c18::OwnerFamily::InitialBundle);
+        assert_eq!(scheduled[0].slot_index, 0, "collides with legacy record 0");
+
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(ledger.generation(), scheduled[0].release_at, &mut meter)
+            .unwrap();
+        // Previously this panicked with `validated retained group raw owners`.
+        let commit = ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(commit.released_groups, 1);
+        assert_eq!(
+            *ledger.records.get(0).expect("legacy record survives"),
+            legacy_before,
+            "the unrelated legacy record is untouched"
+        );
     }
 
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
