@@ -972,6 +972,52 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 .checked_sub(released)
                 .expect("validated retained group occupancy");
         }
+        self.release_owner_links(index, ticket.release_at);
+    }
+
+    /// Design 5.1: "a linked operation-group expiry decrements exactly one
+    /// owner link; the last link activates the tombstone's already reserved
+    /// ticket". Invariant 5.2(3) names which groups are linked: only a record
+    /// funded from an entitlement vector holds a reciprocal owner link, while
+    /// an ordinary record holds a reservation claim and no link at all, so this
+    /// walks the record's own claims rather than guessing from its pool.
+    ///
+    /// `released_at` is the releasing group's own boundary, which is the second
+    /// operand of 7.4's maximum. Because links release in heap order, the last
+    /// one to release carries the largest boundary, so the maximum is reached
+    /// without ever scanning the links.
+    fn release_owner_links(&mut self, index: usize, released_at: MonotonicTime) {
+        let claims = self.records.claims(index).map_or(0, <[_]>::len);
+        for position in 0..claims {
+            let Some(&SupportFundingClaim::EntitlementVector(entitlement)) = self
+                .records
+                .claims(index)
+                .and_then(|slice| slice.get(position))
+            else {
+                continue;
+            };
+            let Ok((_, Some(owner))) = self.bundles.route_precharged(TAG_ENTITLEMENT, &entitlement)
+            else {
+                continue;
+            };
+            let RecordSlot::Occupied(bundle) = &mut self.bundles.records[owner as usize] else {
+                continue;
+            };
+            let remaining = bundle
+                .linked_claims
+                .checked_sub(1)
+                .expect("validated owner link count");
+            bundle.linked_claims = remaining;
+            // Only the last link may unblock, and only for a bundle that is
+            // actually waiting on one. A live bundle owns no reserved
+            // tombstone, so `activate` finds nothing and costs one bounded
+            // pass.
+            if remaining == 0 && bundle.state == BundleState::RetainedTombstone {
+                self.c18
+                    .activate(c18::OwnerFamily::Tombstone, owner, released_at)
+                    .expect("validated tombstone activation");
+            }
+        }
     }
 
     pub(crate) fn commit_c17_assignment_direct(
@@ -3520,6 +3566,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     .schedule(c18::ExpiryTicket {
                         release_at,
                         family: c18::OwnerFamily::LegacyRecord,
+                        state: c18::TicketState::Active,
                         slot_index: u32::try_from(index).expect("validated record index"),
                         units: 1,
                         identity: id.get(),
@@ -3545,6 +3592,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     .schedule(c18::ExpiryTicket {
                         release_at,
                         family: c18::OwnerFamily::InitialBundle,
+                        state: c18::TicketState::Active,
                         slot_index: c18::initial_ticket_slot(index, ordinal),
                         units: 1,
                         identity: [0; 32],
@@ -3861,6 +3909,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     self.c18.schedule(c18::ExpiryTicket {
                         release_at,
                         family: c18::OwnerFamily::LegacyRecord,
+                        state: c18::TicketState::Active,
                         slot_index: u32::try_from(index).map_err(|_| {
                             SupportLedgerError::Storage(FixedStorageError::Capacity)
                         })?,
@@ -4686,9 +4735,19 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let height = u64::from(self.records.maximum_identity_height()?);
         let heap_depth =
             u64::from(u32::BITS - self.c18.scheduled_capacity().max(1).leading_zeros());
+        // Releasing a group may also settle its owner links: one identity
+        // route per entitlement-funded claim, and for the last link one pass
+        // over the ticket array to activate the tombstone it unblocks. Both
+        // are real work on the release path and are charged here rather than
+        // left to run unmetered under the commit, which ADR 0039 forbids.
+        let links = u64::from(self.records.maximum_claims_per_record()?);
+        let link_settlement = links
+            .checked_mul(u64::from(IDENTITY_BITS) + u64::from(self.c18.scheduled_capacity()))
+            .ok_or(SupportLedgerError::InvalidInput)?;
         let per_group = (2 * (3 * height + 1))
             .checked_add(2 * u64::from(IDENTITY_BITS))
             .and_then(|value| value.checked_add(heap_depth))
+            .and_then(|value| value.checked_add(link_settlement))
             .ok_or(SupportLedgerError::InvalidInput)?;
         let release = per_group
             .checked_mul(count as u64)
@@ -4977,19 +5036,29 @@ impl<'ledger, 'work, const R: usize, const F: usize, const H: usize>
             c17,
         } = self;
         ledger.bundles.retain_bundle_unmetered(change.record_index);
-        // The retained bundle now owns a scheduled release: without this the
+        // The retained bundle now owns a reserved release: without this the
         // record, its identities, cells, claims and vector stay occupied for
-        // the life of the process.
+        // the life of the process. Decision D2 makes a tombstone unschedulable
+        // while any owner link remains, so it is reserved `Dormant` and the
+        // last link's release activates it. Scheduling it `Active` here would
+        // let the bundle release inside a retained claim's own horizon, which
+        // is exactly what the second maximum in 7.4 exists to prevent.
+        let state = if change.record.linked_claims == 0 {
+            c18::TicketState::Active
+        } else {
+            c18::TicketState::Dormant
+        };
         ledger
             .c18
             .schedule(c18::ExpiryTicket {
                 release_at: change.release_at,
                 family: c18::OwnerFamily::Tombstone,
+                state,
                 slot_index: change.record_index,
                 units: 1,
                 identity: change.record.entitlement.get(),
             })
-            .expect("dormant tombstone ticket reserved at creation");
+            .expect("ticket reserved at creation");
         ledger.c17.commit_c16_tombstone(c17, &change.record);
         let next = change
             .snapshot
@@ -11992,6 +12061,77 @@ mod tests {
         assert_eq!(
             support.c17.owner_currents_for_test(5).unwrap(),
             (0, [0; 4], false)
+        );
+    }
+
+    /// D2 (#62) — a tombstone with outstanding owner links is reserved dormant,
+    /// so an expiry at its own catalog horizon releases nothing and the bundle
+    /// survives inside its links' retention. Before this, `prepare_tombstone`
+    /// passed `None` for `latest_link_release_at` and scheduled the ticket
+    /// immediately, so the bundle could release inside a retained claim.
+    #[test]
+    fn a_tombstone_with_links_is_reserved_dormant_and_does_not_release() {
+        let mut ledger = plan_ledger();
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        let mut meter = work();
+        let change = ledger
+            .prepare_c17_plan_create(
+                ledger.generation(),
+                &plan,
+                MonotonicTime::from_micros(2),
+                &mut meter,
+            )
+            .unwrap();
+        ledger.validate_c17_plan_create(&change).unwrap();
+        ledger.commit_c17_plan_create(change);
+        assert_eq!(
+            ledger.bundles.get_record(0).unwrap().linked_claims,
+            3,
+            "the plan left three owner links"
+        );
+
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
+                &mut meter,
+            )
+            .unwrap();
+        ledger
+            .validate_tombstone(change)
+            .unwrap()
+            .commit_tombstone();
+        let scheduled = ledger.c18.scheduled().to_vec();
+        let tombstone = scheduled
+            .iter()
+            .find(|ticket| ticket.family == c18::OwnerFamily::Tombstone)
+            .expect("the tombstone reserved a ticket");
+        assert_eq!(
+            tombstone.state,
+            c18::TicketState::Dormant,
+            "D2: unschedulable while any link remains"
+        );
+
+        let occupied_before = ledger.bundles.occupied_records;
+        let usage_before = ledger.usage;
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(ledger.generation(), tombstone.release_at, &mut meter)
+            .unwrap();
+        let commit = ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(
+            commit.released_groups, 0,
+            "its own horizon is not enough while a link is outstanding"
+        );
+        assert_eq!(ledger.usage, usage_before, "nothing was returned");
+        assert_eq!(
+            ledger.bundles.occupied_records, occupied_before,
+            "the bundle survives its links"
         );
     }
 

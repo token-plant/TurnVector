@@ -289,13 +289,31 @@ impl OwnerFamily {
     }
 }
 
-/// One dormant or scheduled whole-group release ticket. Ordering is exactly
-/// `(release_at, owner family, slot_index)`, which is total because a slot
-/// index is unique within its family.
+/// Whether a scheduled ticket may be selected yet. Invariant 5.2(5):
+/// `vacant + dormant + active = N_ticket`, and terminalization changes ticket
+/// state, never ticket capacity. A tombstone is `Dormant` while any owner link
+/// remains and the last link's release activates it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub(crate) enum TicketState {
+    /// Selectable once `release_at` is reached.
+    Active = 0,
+    /// Reserved and holding its horizon, but blocked from selection.
+    Dormant = 1,
+}
+
+/// One reserved whole-group release ticket. Ordering is exactly
+/// `(state, release_at, owner family, slot_index)`. Putting state first is what
+/// makes dormancy free: every `Active` ticket sorts before every `Dormant` one,
+/// so the min-heap's due prefix can never reach a blocked ticket and the
+/// selection walk needs no filter. A slot index is unique within its family, so
+/// the key is total.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExpiryTicket {
     pub(crate) release_at: MonotonicTime,
     pub(crate) family: OwnerFamily,
+    /// Blocked or selectable. Sorts ahead of `release_at`.
+    pub(crate) state: TicketState,
     pub(crate) slot_index: u32,
     /// The whole-group unit count charged when this ticket is released. A
     /// group is released in full or not at all.
@@ -307,22 +325,31 @@ pub(crate) struct ExpiryTicket {
 }
 
 /// The vacant entry of a fixed selection array. It is never due, never
-/// selected, and never released: `count` bounds every read.
-pub(crate) const DORMANT_TICKET: ExpiryTicket = ExpiryTicket {
+/// selected, and never released: `count` bounds every read. This is array
+/// padding, not a `Dormant` ticket - a dormant ticket is a real reserved
+/// release that is merely blocked.
+pub(crate) const VACANT_TICKET: ExpiryTicket = ExpiryTicket {
     release_at: MonotonicTime::from_micros(u64::MAX),
     family: OwnerFamily::LegacyRecord,
+    state: TicketState::Dormant,
     slot_index: u32::MAX,
     units: 0,
     identity: [0; 32],
 };
 
 impl ExpiryTicket {
-    fn key(&self) -> (u64, u8, u32) {
+    fn key(&self) -> (u8, u64, u8, u32) {
         (
+            self.state as u8,
             self.release_at.as_micros(),
             self.family.tag(),
             self.slot_index,
         )
+    }
+
+    /// True once the ticket is selectable and its horizon has arrived.
+    fn is_due(&self, at: MonotonicTime) -> bool {
+        self.state == TicketState::Active && self.release_at <= at
     }
 }
 
@@ -372,8 +399,14 @@ impl ExpiryHeap {
         (self.len() < self.capacity)
             .then_some(())
             .ok_or_else(capacity)?;
-        let mut child = self.tickets.len();
+        let child = self.tickets.len();
         self.tickets.push(ticket);
+        self.sift_up(child)
+    }
+
+    /// Restores the heap after one node's key was inserted or lowered.
+    fn sift_up(&mut self, from: usize) -> Result<(), SupportLedgerError> {
+        let mut child = from;
         while child > 0 {
             let parent = (child - 1) / 2;
             if self.tickets[parent] <= self.tickets[child] {
@@ -385,9 +418,45 @@ impl ExpiryHeap {
         Ok(())
     }
 
-    /// The earliest scheduled release time, or `None` when no ticket is active.
+    /// The earliest selectable release time, or `None` when every reserved
+    /// ticket is blocked. `Active` sorts before `Dormant`, so the root is the
+    /// answer whenever it is active at all.
     pub(crate) fn next_release(&self) -> Option<MonotonicTime> {
-        self.tickets.first().map(|ticket| ticket.release_at)
+        self.tickets
+            .first()
+            .filter(|ticket| ticket.state == TicketState::Active)
+            .map(|ticket| ticket.release_at)
+    }
+
+    /// Activates the dormant ticket for one owner and raises its horizon to
+    /// `not_before`, which is the releasing link's own boundary. Design 7.4
+    /// gives a tombstone
+    /// `max(tombstone_at + R_cat, max_{linked r} release_at(r))`; the ticket
+    /// already holds the first operand, and the last link to release supplies
+    /// the second, so the maximum needs no scan over the links.
+    ///
+    /// Returns the number of tickets examined so the caller can charge it.
+    /// Lowering the sort key can only move the ticket toward the root, so one
+    /// sift-up restores the heap.
+    pub(crate) fn activate(
+        &mut self,
+        family: OwnerFamily,
+        slot_index: u32,
+        not_before: MonotonicTime,
+    ) -> Result<u64, SupportLedgerError> {
+        let found = self.tickets.iter().position(|ticket| {
+            ticket.state == TicketState::Dormant
+                && ticket.family == family
+                && ticket.slot_index == slot_index
+        });
+        let visited = self.tickets.len() as u64;
+        let Some(index) = found else {
+            return Ok(visited);
+        };
+        self.tickets[index].state = TicketState::Active;
+        self.tickets[index].release_at = self.tickets[index].release_at.max(not_before);
+        self.sift_up(index)?;
+        Ok(visited)
     }
 
     /// The due prefix in exact key order, bounded componentwise by the sealed
@@ -406,7 +475,7 @@ impl ExpiryHeap {
     where
         ExpiryTicket: Copy,
     {
-        let mut selected = [DORMANT_TICKET; G];
+        let mut selected = [VACANT_TICKET; G];
         // Each step removes one frontier entry and adds up to two children, so
         // the frontier needs one slot more than the group quota. Sizing it at
         // `G` silently drops a due sibling and reports `more_due = false`.
@@ -439,7 +508,9 @@ impl ExpiryHeap {
             let node = frontier[best] as usize;
             let ticket = self.tickets[node];
             visited += 1;
-            if ticket.release_at > at {
+            // State sorts ahead of time, so the first non-due node ends the
+            // walk: everything after it is either later or blocked.
+            if !ticket.is_due(at) {
                 break;
             }
             if units
@@ -465,7 +536,7 @@ impl ExpiryHeap {
         }
         if !more_due {
             more_due = (0..frontier_len)
-                .any(|position| self.tickets[frontier[position] as usize].release_at <= at);
+                .any(|position| self.tickets[frontier[position] as usize].is_due(at));
         }
         (selected, count, more_due, visited)
     }
@@ -734,6 +805,18 @@ impl<const H: usize> SupportC18<H> {
     /// The dormant ticket was reserved at creation, so this never allocates.
     pub(crate) fn schedule(&mut self, ticket: ExpiryTicket) -> Result<(), SupportLedgerError> {
         self.expiry.schedule(ticket)
+    }
+
+    /// Activates one owner's dormant ticket, raising its horizon to the
+    /// releasing link's boundary. Returns the tickets examined so the caller
+    /// can charge the pass.
+    pub(crate) fn activate(
+        &mut self,
+        family: OwnerFamily,
+        slot_index: u32,
+        not_before: MonotonicTime,
+    ) -> Result<u64, SupportLedgerError> {
+        self.expiry.activate(family, slot_index, not_before)
     }
 
     /// A time-bearing mutation may not move the ledger backwards.
@@ -1046,6 +1129,7 @@ mod tests {
                 OwnerFamily::InitialBundle,
                 OwnerFamily::Tombstone,
             ][family as usize],
+            state: TicketState::Active,
             slot_index,
             units,
             identity: [slot_index as u8 + 1; 32],
@@ -1227,6 +1311,59 @@ mod tests {
             tombstone_release_at(MICRO(u64::MAX), None, retention).unwrap_err(),
             SupportLedgerError::InvalidInput
         );
+    }
+
+    /// D2 (#62) — a dormant ticket is never selected however overdue it is,
+    /// and activation raises its horizon to the releasing link's boundary,
+    /// which is 7.4's second maximum.
+    #[test]
+    fn a_dormant_ticket_is_unschedulable_until_its_last_link_activates_it() {
+        let mut heap = ExpiryHeap::try_new(4).unwrap();
+        let mut blocked = ticket(10, 2, 0, 1);
+        blocked.state = TicketState::Dormant;
+        heap.schedule(blocked).unwrap();
+        heap.schedule(ticket(20, 0, 1, 1)).unwrap();
+
+        // Long past its horizon, the blocked ticket is still not due, and it
+        // does not hide the later active one.
+        assert_eq!(heap.next_release(), Some(MICRO(20)), "dormant is skipped");
+        let (_, count, more, _) = heap.due_prefix::<2>(MICRO(15), 8);
+        assert_eq!((count, more), (0, false), "nothing due at 15us");
+
+        // The last link releases at 40us, later than the tombstone's own 10us
+        // horizon, so the maximum is the link.
+        heap.activate(OwnerFamily::Tombstone, 0, MICRO(40)).unwrap();
+        assert_eq!(
+            heap.next_release(),
+            Some(MICRO(20)),
+            "the active peer is first"
+        );
+        let (selected, count, _, _) = heap.due_prefix::<2>(MICRO(40), 8);
+        assert_eq!(count, 2);
+        assert_eq!(selected[1].family, OwnerFamily::Tombstone);
+        assert_eq!(
+            selected[1].release_at,
+            MICRO(40),
+            "7.4: max(tombstone_at + R_cat, latest link)"
+        );
+    }
+
+    /// Activation never shortens a horizon: a link that releases before the
+    /// tombstone's own boundary leaves the first maximum standing.
+    #[test]
+    fn an_early_link_cannot_shorten_the_tombstone_horizon() {
+        let mut heap = ExpiryHeap::try_new(2).unwrap();
+        let mut blocked = ticket(100, 2, 0, 1);
+        blocked.state = TicketState::Dormant;
+        heap.schedule(blocked).unwrap();
+        heap.activate(OwnerFamily::Tombstone, 0, MICRO(5)).unwrap();
+        assert_eq!(
+            heap.next_release(),
+            Some(MICRO(100)),
+            "the catalog horizon still dominates"
+        );
+        let (_, count, _, _) = heap.due_prefix::<1>(MICRO(99), 8);
+        assert_eq!(count, 0, "not due before its own horizon");
     }
 
     /// T14 — a typed-impossible close consumed no start, so its whole group is
