@@ -1084,6 +1084,48 @@ mod tests {
             SupportLedgerError::InvalidInput
         );
 
+        // A zeroed tensor is an absent Catalog output, not a small one.
+        let mut zero_operations = limits::<3>();
+        zero_operations.operation_capacity[0][0] = 0;
+        assert_eq!(
+            zero_operations.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        let mut zero_vector = limits::<3>();
+        zero_vector.vector_capacity[0][0] = 0;
+        assert_eq!(
+            zero_vector.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        let mut zero_lifecycle = limits::<3>();
+        zero_lifecycle.lifecycle_capacity[0][0][0] = 0;
+        assert_eq!(
+            zero_lifecycle.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        let mut zero_entitlements = limits::<3>();
+        zero_entitlements.entitlement_capacity = 0;
+        assert_eq!(
+            zero_entitlements.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        // Neither suballocation may be zero: one class could otherwise borrow
+        // the other's headroom.
+        let mut zero_safety = limits::<3>();
+        zero_safety.safety_pair_capacity.0[0].safety = 0;
+        assert_eq!(
+            zero_safety.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+        // A group quota beyond the fixed frontier would drop a due sibling.
+        let mut wide_quota = limits::<3>();
+        wide_quota.expiry_groups_per_transition =
+            NonZeroU32::new(EXPIRY_FRONTIER_MAX as u32).unwrap();
+        assert_eq!(
+            wide_quota.validate().unwrap_err(),
+            SupportLedgerError::InvalidInput
+        );
+
         let mut reset = limits::<3>();
         reset.mandatory_pair_capacity.0[0].history_reset = true;
         assert_eq!(

@@ -1672,3 +1672,65 @@ mod avl_removal_probe {
         audit(&index, &live);
     }
 }
+
+#[cfg(test)]
+mod reclamation_boundary_probe {
+    use super::*;
+    use crate::HotPathWorkBudget;
+
+    /// Start history is sized by the catalog-wide retained capacity, not by the
+    /// active Budget's admission bound. Sizing it by the active bound would
+    /// discard the predecessor starts a shorter Budget must still hand to a
+    /// longer successor.
+    #[test]
+    fn start_history_is_sized_by_catalog_capacity_not_the_active_bound() {
+        let bounds = [[
+            FixedStartCountBound(Duration::from_micros(10), 1),
+            FixedStartCountBound(Duration::from_micros(20), 2),
+        ]];
+        let counter = FixedWindowCounter::<1, 2>::try_new(bounds, [9]).unwrap();
+        assert_eq!(
+            counter.backing_capacities(),
+            [9],
+            "physical history follows the catalog capacity"
+        );
+        // The active bound still gates admission at 2, independently of the 9
+        // slots the catalog retains.
+        let mut counter = counter;
+        let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        // One start per 10us window, two per 20us window.
+        for micros in [1, 12] {
+            counter
+                .try_start(0, MonotonicTime::from_micros(micros), &mut work)
+                .unwrap();
+        }
+        assert_eq!(
+            counter.try_start(0, MonotonicTime::from_micros(13), &mut work),
+            Err(FixedStorageError::WindowExceeded),
+            "the active bound still gates at 1 per 10us"
+        );
+        // A capacity below the active bound is not constructible.
+        assert_eq!(
+            FixedWindowCounter::<1, 2>::try_new(bounds, [1]).unwrap_err(),
+            FixedStorageError::Capacity
+        );
+    }
+
+    /// A claim run longer than the entire claim arena must fail closed, not
+    /// index past the bucket table.
+    #[test]
+    fn an_oversized_claim_run_fails_closed_instead_of_panicking() {
+        let arena: FixedRecordArena<u8, u16, 1> = FixedRecordArena::try_new(4, 8).unwrap();
+        assert_eq!(arena.validate_capacity(8), Ok(()));
+        assert_eq!(
+            arena.validate_capacity(9),
+            Err(FixedStorageError::Capacity),
+            "one past the claim arena"
+        );
+        assert_eq!(
+            arena.validate_capacity(1_024),
+            Err(FixedStorageError::Capacity),
+            "far past the claim arena"
+        );
+    }
+}

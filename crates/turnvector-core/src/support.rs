@@ -13874,6 +13874,51 @@ mod tests {
         );
     }
 
+    /// A retained tombstone must return everything the bundle held, not only
+    /// its storage: releasing it while its logical occupancy, reserves, vector
+    /// cells or unified owner rows stay charged leaks capacity permanently.
+    #[test]
+    fn a_released_tombstone_returns_capacity_vectors_and_owners() {
+        let mut ledger = bundle_ledger(4, 8);
+        let empty = (ledger.usage, ledger.reserved, ledger.vector_usage);
+        let occupied_before = ledger.bundles.occupied_records;
+
+        reserve_bundle(&mut ledger, 1, 3);
+        assert_ne!(
+            (ledger.usage, ledger.reserved, ledger.vector_usage),
+            empty,
+            "the bundle charges capacity"
+        );
+        tombstone_bundle(&mut ledger, 1);
+        assert_ne!(
+            (ledger.usage, ledger.reserved, ledger.vector_usage),
+            empty,
+            "a retained tombstone still charges capacity"
+        );
+
+        let scheduled = ledger.c18.scheduled().to_vec();
+        assert_eq!(scheduled.len(), 1, "the tombstone scheduled its release");
+        assert_eq!(scheduled[0].family, c18::OwnerFamily::Tombstone);
+
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(ledger.generation(), scheduled[0].release_at, &mut meter)
+            .unwrap();
+        let commit = ledger.validate_expiry(prepared).unwrap().commit();
+        assert_eq!(commit.released_groups, 1);
+
+        assert_eq!(
+            (ledger.usage, ledger.reserved, ledger.vector_usage),
+            empty,
+            "every charged unit returned"
+        );
+        assert_eq!(
+            ledger.bundles.occupied_records, occupied_before,
+            "the physical record returned"
+        );
+        assert_eq!(ledger.c18.scheduled(), &[], "the ticket is consumed");
+    }
+
     fn tombstone_bundle(ledger: &mut Ledger, n: u8) -> SupportLedgerGeneration {
         let mut meter = work();
         let change = ledger
@@ -16017,6 +16062,168 @@ mod c18_ledger_tests {
             ledger.records.find(key(0, id.get()), &mut work()).unwrap(),
             None
         );
+    }
+
+    /// One preflight covers the whole envelope: after prepare returns, neither
+    /// validation nor commit may charge anything more, and the charge must
+    /// cover the release itself rather than only the selection walk.
+    #[test]
+    fn the_expiry_preflight_covers_validation_and_release() {
+        let mut ledger = ledger();
+        let id = obligation(1);
+        let claims = [SupportFundingClaim::OrdinaryReservation([1; 32])];
+        let mut credit = [1; 32];
+        credit[31] ^= 0x80;
+        let spec = SupportObligationSpec {
+            id,
+            operation: SupportOperation::MaterializeRequest,
+            pool: SupportPool::Ordinary,
+            physical_credit: PhysicalStartCreditId::new(credit).unwrap(),
+            predecessor: SupportCausalPredecessorId([1; 32]),
+            claims: &claims,
+        };
+        ledger
+            .reserve(ledger.generation(), spec, &mut work())
+            .unwrap();
+        ledger
+            .transition(
+                ledger.generation(),
+                id,
+                PredecessorEnded(SupportCausalPredecessorId([1; 32]), at(2)),
+                &mut work(),
+            )
+            .unwrap();
+        ledger
+            .transition(ledger.generation(), id, BeginSupport(at(5)), &mut work())
+            .unwrap();
+        ledger
+            .transition(ledger.generation(), id, FinishSupport(at(6)), &mut work())
+            .unwrap();
+
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(ledger.generation(), at(15), &mut meter)
+            .unwrap();
+        let preflight = prepared.work.witness();
+        // A one-group batch must be charged strictly more than the walk that
+        // found it: the release deletes two identities, removes the raw owner
+        // and extracts from the heap.
+        assert!(
+            preflight.value(WorkDimension::VisitedEntities) > 4,
+            "the preflight covers the release, saw {preflight:?}"
+        );
+        assert_eq!(preflight.value(WorkDimension::Allocations), 0);
+        assert_eq!(preflight.value(WorkDimension::CandidateWork), 0);
+
+        let validated = ledger.validate_expiry(prepared).unwrap();
+        let commit = validated.commit();
+        assert_eq!(commit.released_groups, 1);
+        // The meter is the same one the prepare charged; nothing after the
+        // preflight may add to it.
+        assert_eq!(
+            meter.witness(),
+            preflight,
+            "validation and commit charged nothing further"
+        );
+    }
+
+    /// A committed expiry advances the ledger's time floor, and no later
+    /// time-bearing transition may move the ledger back behind it.
+    #[test]
+    fn a_transition_cannot_move_the_ledger_behind_its_floor() {
+        let mut ledger = ledger();
+        let generation = ledger.generation();
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(generation, at(50), &mut meter)
+            .unwrap();
+        ledger.validate_expiry(prepared).unwrap().commit();
+
+        let id = obligation(1);
+        let claims = [SupportFundingClaim::OrdinaryReservation([1; 32])];
+        let mut credit = [1; 32];
+        credit[31] ^= 0x80;
+        let spec = SupportObligationSpec {
+            id,
+            operation: SupportOperation::MaterializeRequest,
+            pool: SupportPool::Ordinary,
+            physical_credit: PhysicalStartCreditId::new(credit).unwrap(),
+            predecessor: SupportCausalPredecessorId([1; 32]),
+            claims: &claims,
+        };
+        ledger
+            .reserve(ledger.generation(), spec, &mut work())
+            .unwrap();
+        let before = ledger.generation();
+        assert_eq!(
+            ledger.transition(
+                before,
+                id,
+                PredecessorEnded(SupportCausalPredecessorId([1; 32]), at(2)),
+                &mut work()
+            ),
+            Err(SupportLedgerError::Storage(FixedStorageError::InvalidTime)),
+            "a transition behind the floor"
+        );
+        assert_eq!(ledger.generation(), before, "state unchanged");
+    }
+
+    /// The ordinary prepare/commit finish path is the production route, and it
+    /// must enter expiry exactly like the transition route does.
+    #[test]
+    fn the_ordinary_finish_path_schedules_its_release() {
+        let mut ledger = ledger();
+        let id = obligation(1);
+        let claims = [SupportFundingClaim::OrdinaryReservation([1; 32])];
+        let mut credit = [1; 32];
+        credit[31] ^= 0x80;
+        let spec = SupportObligationSpec {
+            id,
+            operation: SupportOperation::MaterializeRequest,
+            pool: SupportPool::Ordinary,
+            physical_credit: PhysicalStartCreditId::new(credit).unwrap(),
+            predecessor: SupportCausalPredecessorId([1; 32]),
+            claims: &claims,
+        };
+        ledger
+            .reserve(ledger.generation(), spec, &mut work())
+            .unwrap();
+        ledger
+            .transition(
+                ledger.generation(),
+                id,
+                PredecessorEnded(SupportCausalPredecessorId([1; 32]), at(2)),
+                &mut work(),
+            )
+            .unwrap();
+        ledger
+            .transition(ledger.generation(), id, BeginSupport(at(5)), &mut work())
+            .unwrap();
+        assert_eq!(ledger.c18.scheduled(), &[], "nothing retained yet");
+
+        // Finish through prepare/commit, not through transition.
+        let mut meter = work();
+        let change = ledger
+            .prepare(
+                ledger.generation(),
+                SupportChangeInput::FinishActive(id, at(6)),
+                &mut meter,
+            )
+            .unwrap();
+        ledger.commit(change, &mut meter).unwrap();
+
+        let scheduled = ledger.c18.scheduled();
+        assert_eq!(
+            scheduled.len(),
+            1,
+            "the ordinary finish scheduled a release"
+        );
+        assert_eq!(
+            scheduled[0].release_at,
+            at(15),
+            "max(terminal, start + R_cat)"
+        );
+        assert_eq!(scheduled[0].identity, id.get());
     }
 
     /// T28 — churn beyond physical capacity succeeds when expiry runs between
