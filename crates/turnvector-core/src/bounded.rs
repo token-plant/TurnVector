@@ -902,8 +902,11 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         // length that only ever grows.
         // Constant time: either the exact-length bucket holds a released span
         // or the bump pointer still has room. No scan on a preflight path.
+        // A run longer than the whole claim arena can never be placed; index
+        // the bucket only after proving the length is addressable, or an
+        // oversized request panics instead of failing closed.
         let span_available = claims == 0
-            || self.free_span_head[claims] != NO_NODE
+            || (claims <= self.claim_capacity && self.free_span_head[claims] != NO_NODE)
             || self
                 .claim_high_water
                 .checked_add(claims)
@@ -959,7 +962,7 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
     /// span always returns to the bucket it came from and reuse cannot degrade
     /// into a search.
     fn claim_start(&mut self, len: usize) -> usize {
-        if len == 0 {
+        if len == 0 || len > self.claim_capacity {
             return self.claim_high_water;
         }
         let head = self.free_span_head[len];
