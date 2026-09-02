@@ -109,11 +109,11 @@ impl OwnedRawModelDescriptor {
 )]
 enum CoreAction<const I: usize, const S: usize, const T: usize> {
     Register(RegistrationIntent, OrdinarySupportSpec, MonotonicTime),
-    RegistrationResult(GenerationVector, OwnedRawModelDescriptor),
+    RegistrationResult(GenerationVector, OwnedRawModelDescriptor, MonotonicTime),
     Warm(RequestId),
     Describe(OperationId, RequestId, OrdinarySupportSpec, MonotonicTime),
-    DescriptionResult(OperationId, RawRequestDescription<I, S, T>),
-    PostLoadDescriptorResult(OperationId, OwnedRawModelDescriptor),
+    DescriptionResult(OperationId, RawRequestDescription<I, S, T>, MonotonicTime),
+    PostLoadDescriptorResult(OperationId, OwnedRawModelDescriptor, MonotonicTime),
     Refresh(DescriptionRefresh),
     DriveDescription(OperationId, MonotonicTime),
     C17PlanCreate(TurnPlan<4>, MonotonicTime),
@@ -186,7 +186,7 @@ impl<const I: usize, const S: usize, const T: usize> CoreEvent<I, S, T> {
     pub(crate) const fn describe_model(sequence: EventSequence, operation: OperationId, intent: RegistrationIntent, support: OrdinarySupportSpec, at: MonotonicTime) -> Self { Self { sequence, operation: Some(operation), follow_up: None, action: Some(CoreAction::Register(intent, support, at)), request: None } }
     #[allow(dead_code, reason = "the runtime adapter constructs registration events after C10e")]
     #[rustfmt::skip]
-    pub(crate) fn model_descriptor_result(sequence: EventSequence, operation: OperationId, generations: GenerationVector, result: RawModelDescriptor<'_>) -> Self { Self { sequence, operation: Some(operation), follow_up: None, action: Some(CoreAction::RegistrationResult(generations, OwnedRawModelDescriptor::new(result))), request: None } }
+    pub(crate) fn model_descriptor_result(sequence: EventSequence, operation: OperationId, generations: GenerationVector, result: RawModelDescriptor<'_>, at: MonotonicTime) -> Self { Self { sequence, operation: Some(operation), follow_up: None, action: Some(CoreAction::RegistrationResult(generations, OwnedRawModelDescriptor::new(result), at)), request: None } }
     #[allow(dead_code, reason = "the runtime adapter constructs request events after C11c")]
     #[rustfmt::skip]
     pub(crate) const fn accept_request(sequence: EventSequence, input: AcceptanceInput<I, S, T>) -> Self { Self { sequence, operation: None, follow_up: None, action: None, request: Some(input) } }
@@ -195,9 +195,9 @@ impl<const I: usize, const S: usize, const T: usize> CoreEvent<I, S, T> {
     #[rustfmt::skip]
     pub(crate) const fn describe_request(sequence: EventSequence, operation: OperationId, request: RequestId, support: OrdinarySupportSpec, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::Describe(operation, request, support, at)), request: None } }
     #[rustfmt::skip]
-    pub(crate) const fn request_description_result(sequence: EventSequence, operation: OperationId, result: RawRequestDescription<I, S, T>) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::DescriptionResult(operation, result)), request: None } }
+    pub(crate) const fn request_description_result(sequence: EventSequence, operation: OperationId, result: RawRequestDescription<I, S, T>, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::DescriptionResult(operation, result, at)), request: None } }
     #[rustfmt::skip]
-    pub(crate) fn post_load_model_descriptor_result(sequence: EventSequence, operation: OperationId, result: RawModelDescriptor<'_>) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::PostLoadDescriptorResult(operation, OwnedRawModelDescriptor::new(result))), request: None } }
+    pub(crate) fn post_load_model_descriptor_result(sequence: EventSequence, operation: OperationId, result: RawModelDescriptor<'_>, at: MonotonicTime) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::PostLoadDescriptorResult(operation, OwnedRawModelDescriptor::new(result), at)), request: None } }
     #[rustfmt::skip]
     pub(crate) const fn refresh_request_descriptions(sequence: EventSequence, predecessor: SupportCausalPredecessorId, at: MonotonicTime, obligations: DescriptionObligations, result: LifecycleTriggerResult, next_backend: Option<BackendGeneration>, loaded_revision: Option<ModelRevisionId>) -> Self { Self { sequence, operation: None, follow_up: None, action: Some(CoreAction::Refresh(DescriptionRefresh { predecessor, at, obligations, result, next_backend, loaded_revision })), request: None } }
     #[rustfmt::skip]
@@ -649,11 +649,12 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
                     work,
                 )
                 .map(none),
-            CoreAction::RegistrationResult(generations, result) => self
+            CoreAction::RegistrationResult(generations, result, at) => self
                 .finish_registration(
                     operation.expect("registration event"),
                     *generations,
                     result,
+                    *at,
                     work,
                 )
                 .map(none),
@@ -661,11 +662,11 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             CoreAction::Describe(operation, request, support, at) => self
                 .start_request_description(*operation, *request, *support, *at, work)
                 .map(none),
-            CoreAction::DescriptionResult(operation, result) => self
-                .finish_request_description(*operation, result, work)
+            CoreAction::DescriptionResult(operation, result, at) => self
+                .finish_request_description(*operation, result, *at, work)
                 .map(none),
-            CoreAction::PostLoadDescriptorResult(operation, result) => self
-                .finish_post_load_model_description(*operation, result, work)
+            CoreAction::PostLoadDescriptorResult(operation, result, at) => self
+                .finish_post_load_model_description(*operation, result, *at, work)
                 .map(none),
             CoreAction::Refresh(refresh) => {
                 self.resolve_description_refresh(refresh, work).map(none)
@@ -1616,6 +1617,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         &mut self,
         operation: OperationId,
         result: &RawRequestDescription<I, S, T>,
+        at: MonotonicTime,
         work: &mut WorkMeter,
     ) -> Result<Effects, StageFailure> {
         let pending = self.pending_description.as_ref().ok_or_else(|| {
@@ -1652,7 +1654,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             .support
             .prepare(
                 registration.support.generation(),
-                SupportChangeInput::FinishActive(obligation),
+                SupportChangeInput::FinishActive(obligation, at),
                 work,
             )
             .map_err(request_support_failure)?;
@@ -1686,6 +1688,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         &mut self,
         operation: OperationId,
         result: &OwnedRawModelDescriptor,
+        at: MonotonicTime,
         work: &mut WorkMeter,
     ) -> Result<Effects, StageFailure> {
         let pending = self.pending_description.as_ref().ok_or_else(|| {
@@ -1730,7 +1733,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             .support
             .prepare(
                 registration.support.generation(),
-                SupportChangeInput::FinishActive(obligation),
+                SupportChangeInput::FinishActive(obligation, at),
                 work,
             )
             .map_err(request_support_failure)?;
@@ -1763,6 +1766,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
         operation: OperationId,
         generations: GenerationVector,
         result: &OwnedRawModelDescriptor,
+        at: MonotonicTime,
         work: &mut WorkMeter,
     ) -> Result<Effects, StageFailure> {
         let state = self
@@ -1789,7 +1793,7 @@ impl<const OPERATIONS: usize, const I: usize, const S: usize, const T: usize>
             .support
             .prepare(
                 state.support.generation(),
-                SupportChangeInput::FinishActive(pending.obligation),
+                SupportChangeInput::FinishActive(pending.obligation, at),
                 work,
             )
             .map_err(support_failure)?;
@@ -2000,7 +2004,7 @@ mod tests {
     #[rustfmt::skip]
     fn start<const O: usize, const I: usize, const S: usize, const T: usize>(core: &mut Core<O, I, S, T>, sequence: u64, operation: u128, intent: RegistrationIntent, support: u8) -> CoreTransition { core.handle(CoreEvent::describe_model(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), intent, ordinary(support), MonotonicTime::from_micros(sequence))) }
     #[rustfmt::skip]
-    fn result<const O: usize, const I: usize, const S: usize, const T: usize>(core: &mut Core<O, I, S, T>, sequence: u64, operation: u128, descriptor: RawModelDescriptor<'_>) -> CoreTransition { core.handle(CoreEvent::model_descriptor_result(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), generations(), descriptor)) }
+    fn result<const O: usize, const I: usize, const S: usize, const T: usize>(core: &mut Core<O, I, S, T>, sequence: u64, operation: u128, descriptor: RawModelDescriptor<'_>) -> CoreTransition { core.handle(CoreEvent::model_descriptor_result(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), generations(), descriptor, MonotonicTime::from_micros(1_000))) }
     fn registration_core(capacity: u32) -> Core<4> {
         let mut capacities = [[0; 3]; 5];
         for class in [2, 3, 4] {
@@ -2578,6 +2582,7 @@ mod tests {
             OperationId::new(1).unwrap(),
             generations(),
             raw(&FRAME, ID, HASH, 7),
+            MonotonicTime::from_micros(1_000),
         ));
         assert_eq!(
             (result.outcome(), result.effects().is_empty()),
@@ -2682,6 +2687,7 @@ mod tests {
             EventSequence::new(5).unwrap(),
             OperationId::new(2).unwrap(),
             wrong,
+            MonotonicTime::from_micros(1_000),
         ));
         assert_eq!(
             (rejected.outcome(), core.pending_description.is_some()),
@@ -2696,6 +2702,7 @@ mod tests {
             EventSequence::new(6).unwrap(),
             OperationId::new(2).unwrap(),
             incomplete,
+            MonotonicTime::from_micros(1_000),
         ));
         assert_eq!(
             (rejected.outcome(), core.pending_description.is_some()),
@@ -2736,6 +2743,7 @@ mod tests {
             EventSequence::new(8).unwrap(),
             OperationId::new(2).unwrap(),
             result,
+            MonotonicTime::from_micros(1_000),
         ));
         assert_eq!(
             (
@@ -2765,6 +2773,7 @@ mod tests {
             EventSequence::new(9).unwrap(),
             OperationId::new(2).unwrap(),
             result,
+            MonotonicTime::from_micros(1_000),
         ));
         assert_eq!(
             (
@@ -2807,6 +2816,7 @@ mod tests {
             EventSequence::new(11).unwrap(),
             OperationId::new(3).unwrap(),
             result,
+            MonotonicTime::from_micros(1_000),
         ));
         assert_eq!(
             (
@@ -2825,13 +2835,13 @@ mod tests {
     }
     #[rustfmt::skip] #[test]
     fn post_load_refresh_is_stable_and_defers_unrelated_warming() {
-        std::thread::Builder::new().stack_size(8 << 20).spawn(|| { let first = ModelRevisionId::new([2; 32]).unwrap(); let second = ModelRevisionId::new([4; 32]).unwrap(); let mut core = registered_request_core_with::<8>(2); let intent = RegistrationIntent { model: ModelId::new(2).unwrap(), revision: second, manifest: ModelManifestId::new([5; 32]).unwrap(), expected_descriptor_hash: ModelDescriptorHash::from_manifest(1, HASH).unwrap(), context_limit: TokenCount::new(8) }; install_revision(&mut core, intent); let resident = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(first), 3, &[1], 1, 0, 1, 5))).request_acceptance().unwrap().id(); let warming = core.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), request_input(RequestSelector::Direct(first), 2, &[1], 1, 0, 2, 5))).request_acceptance().unwrap().id(); let unrelated = core.handle(CoreEvent::accept_request(EventSequence::new(5).unwrap(), request_input(RequestSelector::Direct(second), 4, &[1], 1, 0, 3, 5))).request_acceptance().unwrap().id(); assert_eq!(core.handle(CoreEvent::warm_request(EventSequence::new(6).unwrap(), warming)).outcome(), &CoreOutcome::Accepted); assert_eq!(core.handle(CoreEvent::warm_request(EventSequence::new(7).unwrap(), unrelated)).outcome(), &CoreOutcome::Accepted); assert_eq!(core.handle(CoreEvent::describe_request(EventSequence::new(8).unwrap(), OperationId::new(2).unwrap(), resident, ordinary_request(6), MonotonicTime::from_micros(4))).outcome(), &CoreOutcome::Accepted); let initial = core.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(core.handle(CoreEvent::request_description_result(EventSequence::new(9).unwrap(), OperationId::new(2).unwrap(), initial)).outcome(), &CoreOutcome::Accepted); let kinds = [LifecycleReserveKind::PostLoadModelDescription, LifecycleReserveKind::PostLoadRequestDescription, LifecycleReserveKind::PostLoadRequestDescription]; let (predecessor, ids) = reserve_descriptions::<8, 3>(&mut core, 20, kinds); let refreshed = core.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(10).unwrap(), predecessor, MonotonicTime::from_micros(6), ids, LifecycleTriggerResult::LoadSucceeded, Some(BackendGeneration::new(2).unwrap()), Some(first))); assert_eq!((refreshed.outcome(), core.state.generations.backend), (&CoreOutcome::Accepted, BackendGeneration::new(2).unwrap()));
-        let model = core.handle(CoreEvent::drive_request_description(EventSequence::new(11).unwrap(), OperationId::new(3).unwrap(), MonotonicTime::from_micros(7))); assert_eq!((model.effects().get(0).unwrap().registration(), model.effects().get(0).unwrap().request_description()), (Some(registration(HASH)), None)); let drift = core.handle(CoreEvent::post_load_model_descriptor_result(EventSequence::new(12).unwrap(), OperationId::new(3).unwrap(), raw(&FRAME, ID, HASH, 8))); assert_eq!((drift.outcome(), core.pending_description.is_some()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionDescriptor), true)); let checked = core.handle(CoreEvent::post_load_model_descriptor_result(EventSequence::new(13).unwrap(), OperationId::new(3).unwrap(), raw(&FRAME, ID, HASH, 7))); assert_eq!(checked.outcome(), &CoreOutcome::Accepted); for (sequence, operation, expected) in [(14, 4, warming), (16, 5, resident)] { let driven = core.handle(CoreEvent::drive_request_description(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), MonotonicTime::from_micros(7))); assert_eq!(driven.effects().get(0).unwrap().request_description(), Some(expected)); let result = core.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(core.handle(CoreEvent::request_description_result(EventSequence::new(sequence + 1).unwrap(), OperationId::new(operation).unwrap(), result)).outcome(), &CoreOutcome::Accepted); } assert_eq!((accepted(&core, warming).lifecycle(), accepted(&core, resident).description(), core.requests.as_ref().unwrap().description_facts(resident, &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap(), accepted(&core, unrelated).lifecycle(), accepted(&core, unrelated).description(), accepted(&core, unrelated).deadline().as_micros()), (RequestLifecycle::Preparing, DescriptionState::Ready(BackendGeneration::new(2).unwrap()), Some(&description_facts()), RequestLifecycle::Warming, DescriptionState::Missing, 8)); let unreserved = core.handle(CoreEvent::drive_request_description(EventSequence::new(18).unwrap(), OperationId::new(6).unwrap(), MonotonicTime::from_micros(8))); assert_eq!((unreserved.outcome(), unreserved.effects().len()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionRefreshSet), 0)); }).unwrap().join().unwrap();
+        std::thread::Builder::new().stack_size(8 << 20).spawn(|| { let first = ModelRevisionId::new([2; 32]).unwrap(); let second = ModelRevisionId::new([4; 32]).unwrap(); let mut core = registered_request_core_with::<8>(2); let intent = RegistrationIntent { model: ModelId::new(2).unwrap(), revision: second, manifest: ModelManifestId::new([5; 32]).unwrap(), expected_descriptor_hash: ModelDescriptorHash::from_manifest(1, HASH).unwrap(), context_limit: TokenCount::new(8) }; install_revision(&mut core, intent); let resident = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(first), 3, &[1], 1, 0, 1, 5))).request_acceptance().unwrap().id(); let warming = core.handle(CoreEvent::accept_request(EventSequence::new(4).unwrap(), request_input(RequestSelector::Direct(first), 2, &[1], 1, 0, 2, 5))).request_acceptance().unwrap().id(); let unrelated = core.handle(CoreEvent::accept_request(EventSequence::new(5).unwrap(), request_input(RequestSelector::Direct(second), 4, &[1], 1, 0, 3, 5))).request_acceptance().unwrap().id(); assert_eq!(core.handle(CoreEvent::warm_request(EventSequence::new(6).unwrap(), warming)).outcome(), &CoreOutcome::Accepted); assert_eq!(core.handle(CoreEvent::warm_request(EventSequence::new(7).unwrap(), unrelated)).outcome(), &CoreOutcome::Accepted); assert_eq!(core.handle(CoreEvent::describe_request(EventSequence::new(8).unwrap(), OperationId::new(2).unwrap(), resident, ordinary_request(6), MonotonicTime::from_micros(4))).outcome(), &CoreOutcome::Accepted); let initial = core.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(core.handle(CoreEvent::request_description_result(EventSequence::new(9).unwrap(), OperationId::new(2).unwrap(), initial, MonotonicTime::from_micros(1_000))).outcome(), &CoreOutcome::Accepted); let kinds = [LifecycleReserveKind::PostLoadModelDescription, LifecycleReserveKind::PostLoadRequestDescription, LifecycleReserveKind::PostLoadRequestDescription]; let (predecessor, ids) = reserve_descriptions::<8, 3>(&mut core, 20, kinds); let refreshed = core.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(10).unwrap(), predecessor, MonotonicTime::from_micros(6), ids, LifecycleTriggerResult::LoadSucceeded, Some(BackendGeneration::new(2).unwrap()), Some(first))); assert_eq!((refreshed.outcome(), core.state.generations.backend), (&CoreOutcome::Accepted, BackendGeneration::new(2).unwrap()));
+        let model = core.handle(CoreEvent::drive_request_description(EventSequence::new(11).unwrap(), OperationId::new(3).unwrap(), MonotonicTime::from_micros(7))); assert_eq!((model.effects().get(0).unwrap().registration(), model.effects().get(0).unwrap().request_description()), (Some(registration(HASH)), None)); let drift = core.handle(CoreEvent::post_load_model_descriptor_result(EventSequence::new(12).unwrap(), OperationId::new(3).unwrap(), raw(&FRAME, ID, HASH, 8), MonotonicTime::from_micros(1_000))); assert_eq!((drift.outcome(), core.pending_description.is_some()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionDescriptor), true)); let checked = core.handle(CoreEvent::post_load_model_descriptor_result(EventSequence::new(13).unwrap(), OperationId::new(3).unwrap(), raw(&FRAME, ID, HASH, 7), MonotonicTime::from_micros(1_000))); assert_eq!(checked.outcome(), &CoreOutcome::Accepted); for (sequence, operation, expected) in [(14, 4, warming), (16, 5, resident)] { let driven = core.handle(CoreEvent::drive_request_description(EventSequence::new(sequence).unwrap(), OperationId::new(operation).unwrap(), MonotonicTime::from_micros(7))); assert_eq!(driven.effects().get(0).unwrap().request_description(), Some(expected)); let result = core.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(core.handle(CoreEvent::request_description_result(EventSequence::new(sequence + 1).unwrap(), OperationId::new(operation).unwrap(), result, MonotonicTime::from_micros(1_000))).outcome(), &CoreOutcome::Accepted); } assert_eq!((accepted(&core, warming).lifecycle(), accepted(&core, resident).description(), core.requests.as_ref().unwrap().description_facts(resident, &mut WorkMeter::new(HotPathWorkBudget::binary_maximum())).unwrap(), accepted(&core, unrelated).lifecycle(), accepted(&core, unrelated).description(), accepted(&core, unrelated).deadline().as_micros()), (RequestLifecycle::Preparing, DescriptionState::Ready(BackendGeneration::new(2).unwrap()), Some(&description_facts()), RequestLifecycle::Warming, DescriptionState::Missing, 8)); let unreserved = core.handle(CoreEvent::drive_request_description(EventSequence::new(18).unwrap(), OperationId::new(6).unwrap(), MonotonicTime::from_micros(8))); assert_eq!((unreserved.outcome(), unreserved.effects().len()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionRefreshSet), 0)); }).unwrap().join().unwrap();
     }
     #[rustfmt::skip] #[test]
     fn description_rejections_and_impossible_triggers_emit_nothing() {
         let revision = ModelRevisionId::new([2; 32]).unwrap(); let mut exhausted = registered_request_core_with::<4>(1); let id = exhausted.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap().id(); let support = exhausted.registration.as_ref().unwrap().support.generation(); let rejected = exhausted.handle(CoreEvent::describe_request(EventSequence::new(4).unwrap(), OperationId::new(2).unwrap(), id, ordinary_request(6), MonotonicTime::from_micros(4))); assert_eq!((rejected.outcome(), rejected.effects().len(), rejected.work(), exhausted.pending_description.is_none(), accepted(&exhausted, id).description(), exhausted.registration.as_ref().unwrap().support.generation()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionSupport), 0, HotPathWorkWitness::new([5, 381, 0, 1, 16]), true, DescriptionState::Missing, support)); for result in [LifecycleTriggerResult::LoadFailed, LifecycleTriggerResult::LoadCancelled, LifecycleTriggerResult::ObservationUnchanged, LifecycleTriggerResult::ObservationFailed, LifecycleTriggerResult::ObservationCancelled] { let load = matches!(result, LifecycleTriggerResult::LoadFailed | LifecycleTriggerResult::LoadCancelled); let mut core = registered_request_core(); let id = core.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap().id(); if load { assert_eq!(core.handle(CoreEvent::warm_request(EventSequence::new(4).unwrap(), id)).outcome(), &CoreOutcome::Accepted); let blocked = core.handle(CoreEvent::describe_request(EventSequence::new(5).unwrap(), OperationId::new(2).unwrap(), id, ordinary_request(6), MonotonicTime::from_micros(5))); assert_eq!((blocked.outcome(), blocked.effects().len()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionState), 0)); } let kinds = if load { [LifecycleReserveKind::PostLoadModelDescription, LifecycleReserveKind::PostLoadRequestDescription] } else { [LifecycleReserveKind::PostObservationRequestDescription; 2] }; let (predecessor, ids) = reserve_descriptions::<4, 2>(&mut core, 20, kinds); let sequence = 4 + 2 * u64::from(load); let closed = core.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(sequence).unwrap(), predecessor, MonotonicTime::from_micros(6), ids, result, None, if load { Some(revision) } else { None })); assert_eq!((closed.outcome(), closed.effects().len(), core.state.generations.backend, core.description_refresh.is_none()), (&CoreOutcome::Accepted, 0, BackendGeneration::new(1).unwrap(), true)); }
-        let mut empty = registered_request_core(); let before = empty.registration.as_ref().unwrap().support.generation(); let transition = empty.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(3).unwrap(), SupportCausalPredecessorId([30; 32]), MonotonicTime::from_micros(6), BoundedVec::new(), LifecycleTriggerResult::ObservationDescriptionsRequired, Some(BackendGeneration::new(2).unwrap()), None)); assert_eq!((transition.outcome(), transition.effects().len(), empty.state.generations.backend, empty.registration.as_ref().unwrap().support.generation()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionSupport), 0, BackendGeneration::new(1).unwrap(), before)); let mut expired = registered_request_core(); let id = expired.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap().id(); let transition = expired.handle(CoreEvent::describe_request(EventSequence::new(4).unwrap(), OperationId::new(2).unwrap(), id, ordinary_request(6), MonotonicTime::from_micros(8))); assert_eq!((transition.outcome(), accepted(&expired, id).description()), (&CoreOutcome::Rejected(DomainRejection::RequestPreparationTimeout), DescriptionState::Missing)); std::thread::Builder::new().stack_size(8 << 20).spawn(move || { let mut refresh = registered_request_core_with::<4>(3); let expired = refresh.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap().id(); assert_eq!(refresh.handle(CoreEvent::describe_request(EventSequence::new(4).unwrap(), OperationId::new(2).unwrap(), expired, ordinary_request(6), MonotonicTime::from_micros(4))).outcome(), &CoreOutcome::Accepted); let result = refresh.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(refresh.handle(CoreEvent::request_description_result(EventSequence::new(5).unwrap(), OperationId::new(2).unwrap(), result)).outcome(), &CoreOutcome::Accepted); let fresh = refresh.handle(CoreEvent::accept_request(EventSequence::new(6).unwrap(), request_input(RequestSelector::Direct(revision), 3, &[1], 1, 0, 10, 100))).request_acceptance().unwrap().id(); assert_eq!(refresh.handle(CoreEvent::describe_request(EventSequence::new(7).unwrap(), OperationId::new(3).unwrap(), fresh, ordinary_request(10), MonotonicTime::from_micros(4))).outcome(), &CoreOutcome::Accepted); let result = refresh.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(refresh.handle(CoreEvent::request_description_result(EventSequence::new(8).unwrap(), OperationId::new(3).unwrap(), result)).outcome(), &CoreOutcome::Accepted); let (predecessor, ids) = reserve_descriptions::<4, 2>(&mut refresh, 50, [LifecycleReserveKind::PostObservationRequestDescription; 2]); assert_eq!(refresh.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(9).unwrap(), predecessor, MonotonicTime::from_micros(8), ids, LifecycleTriggerResult::ObservationDescriptionsRequired, Some(BackendGeneration::new(2).unwrap()), None)).outcome(), &CoreOutcome::Accepted); let closed = refresh.handle(CoreEvent::drive_request_description(EventSequence::new(10).unwrap(), OperationId::new(4).unwrap(), MonotonicTime::from_micros(8))); assert_eq!((closed.outcome(), closed.effects().len(), refresh.description_refresh.as_ref().unwrap().next), (&CoreOutcome::Accepted, 0, 1)); let driven = refresh.handle(CoreEvent::drive_request_description(EventSequence::new(11).unwrap(), OperationId::new(5).unwrap(), MonotonicTime::from_micros(8))); assert_eq!((driven.outcome(), driven.effects().get(0).unwrap().request_description()), (&CoreOutcome::Accepted, Some(fresh))); }).unwrap().join().unwrap();
+        let mut empty = registered_request_core(); let before = empty.registration.as_ref().unwrap().support.generation(); let transition = empty.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(3).unwrap(), SupportCausalPredecessorId([30; 32]), MonotonicTime::from_micros(6), BoundedVec::new(), LifecycleTriggerResult::ObservationDescriptionsRequired, Some(BackendGeneration::new(2).unwrap()), None)); assert_eq!((transition.outcome(), transition.effects().len(), empty.state.generations.backend, empty.registration.as_ref().unwrap().support.generation()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionSupport), 0, BackendGeneration::new(1).unwrap(), before)); let mut expired = registered_request_core(); let id = expired.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap().id(); let transition = expired.handle(CoreEvent::describe_request(EventSequence::new(4).unwrap(), OperationId::new(2).unwrap(), id, ordinary_request(6), MonotonicTime::from_micros(8))); assert_eq!((transition.outcome(), accepted(&expired, id).description()), (&CoreOutcome::Rejected(DomainRejection::RequestPreparationTimeout), DescriptionState::Missing)); std::thread::Builder::new().stack_size(8 << 20).spawn(move || { let mut refresh = registered_request_core_with::<4>(3); let expired = refresh.handle(CoreEvent::accept_request(EventSequence::new(3).unwrap(), request_input(RequestSelector::Direct(revision), 2, &[1], 1, 0, 9, 5))).request_acceptance().unwrap().id(); assert_eq!(refresh.handle(CoreEvent::describe_request(EventSequence::new(4).unwrap(), OperationId::new(2).unwrap(), expired, ordinary_request(6), MonotonicTime::from_micros(4))).outcome(), &CoreOutcome::Accepted); let result = refresh.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(refresh.handle(CoreEvent::request_description_result(EventSequence::new(5).unwrap(), OperationId::new(2).unwrap(), result, MonotonicTime::from_micros(1_000))).outcome(), &CoreOutcome::Accepted); let fresh = refresh.handle(CoreEvent::accept_request(EventSequence::new(6).unwrap(), request_input(RequestSelector::Direct(revision), 3, &[1], 1, 0, 10, 100))).request_acceptance().unwrap().id(); assert_eq!(refresh.handle(CoreEvent::describe_request(EventSequence::new(7).unwrap(), OperationId::new(3).unwrap(), fresh, ordinary_request(10), MonotonicTime::from_micros(4))).outcome(), &CoreOutcome::Accepted); let result = refresh.request_description_input().unwrap().bound_result(description_facts()); assert_eq!(refresh.handle(CoreEvent::request_description_result(EventSequence::new(8).unwrap(), OperationId::new(3).unwrap(), result, MonotonicTime::from_micros(1_000))).outcome(), &CoreOutcome::Accepted); let (predecessor, ids) = reserve_descriptions::<4, 2>(&mut refresh, 50, [LifecycleReserveKind::PostObservationRequestDescription; 2]); assert_eq!(refresh.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(9).unwrap(), predecessor, MonotonicTime::from_micros(8), ids, LifecycleTriggerResult::ObservationDescriptionsRequired, Some(BackendGeneration::new(2).unwrap()), None)).outcome(), &CoreOutcome::Accepted); let closed = refresh.handle(CoreEvent::drive_request_description(EventSequence::new(10).unwrap(), OperationId::new(4).unwrap(), MonotonicTime::from_micros(8))); assert_eq!((closed.outcome(), closed.effects().len(), refresh.description_refresh.as_ref().unwrap().next), (&CoreOutcome::Accepted, 0, 1)); let driven = refresh.handle(CoreEvent::drive_request_description(EventSequence::new(11).unwrap(), OperationId::new(5).unwrap(), MonotonicTime::from_micros(8))); assert_eq!((driven.outcome(), driven.effects().get(0).unwrap().request_description()), (&CoreOutcome::Accepted, Some(fresh))); }).unwrap().join().unwrap();
     }
     #[rustfmt::skip] #[test]
     fn refresh_rejects_the_wrong_lifecycle_kind_before_mutation() { let mut core = registered_request_core(); let (predecessor, ids) = reserve_descriptions::<4, 1>(&mut core, 40, [LifecycleReserveKind::PostLoadRequestDescription]); let before = core.registration.as_ref().unwrap().support.generation(); let transition = core.handle(CoreEvent::refresh_request_descriptions(EventSequence::new(3).unwrap(), predecessor, MonotonicTime::from_micros(6), ids, LifecycleTriggerResult::ObservationDescriptionsRequired, Some(BackendGeneration::new(2).unwrap()), None)); assert_eq!((transition.outcome(), core.state.generations.backend, core.registration.as_ref().unwrap().support.generation()), (&CoreOutcome::Rejected(DomainRejection::RequestDescriptionRefreshSet), BackendGeneration::new(1).unwrap(), before)); }

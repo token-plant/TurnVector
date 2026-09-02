@@ -1062,10 +1062,42 @@ impl SupportC17 {
         self.advance_generation();
     }
 
+    /// Releases a retained tombstone's unified owner rows. A tombstoned bundle
+    /// is in `OWNER_STATE_TOMBSTONE`, which the live withdrawal path rejects,
+    /// so without this entry a released tombstone leaves its owner rows charged
+    /// for the life of the process.
+    pub(super) fn prepare_c16_tombstone_release(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
+        self.prepare_c16_owner_removal(
+            record_slot,
+            record,
+            OWNER_STATE_TOMBSTONE,
+            RawOwnerState::Tombstone,
+        )
+    }
+
     pub(super) fn prepare_c16_withdrawal(
         &self,
         record_slot: u32,
         record: &BundleRecord,
+    ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
+        self.prepare_c16_owner_removal(
+            record_slot,
+            record,
+            OWNER_STATE_LIVE,
+            RawOwnerState::Committed,
+        )
+    }
+
+    fn prepare_c16_owner_removal(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+        owner_state: u8,
+        raw_state: RawOwnerState,
     ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
         let references = [
             self.owner_headers.reference_at(record_slot, &[1])?,
@@ -1079,8 +1111,8 @@ impl SupportC17 {
             self.owner_indices.image(references[2], &[1])?.as_slice(),
             self.owners.image(references[3], &[1])?.as_slice(),
         ];
-        validate_c16_owner_set(images, references, record_slot, record, OWNER_STATE_LIVE)?;
-        validate_withdrawable_owner_row(images[1])?;
+        validate_c16_owner_set(images, references, record_slot, record, owner_state)?;
+        validate_withdrawable_owner_row(images[1], owner_state)?;
         let mut raw_keys = [[0; 32]; C16_RAW_OWNERS];
         for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
             let value = self
@@ -1089,7 +1121,7 @@ impl SupportC17 {
                 .ok_or_else(noncanonical_error)?;
             let (kind, state, stored_ordinal, owner) = decode_raw_owner_at(value)?;
             if kind != c16_raw_kind(ordinal)?
-                || state != RawOwnerState::Committed
+                || state != raw_state
                 || usize::from(stored_ordinal) != ordinal
                 || owner != references[0]
             {
@@ -4885,9 +4917,17 @@ fn validate_c16_owner_set(
         .ok_or_else(noncanonical_error)
 }
 
-fn validate_withdrawable_owner_row(image: &[u8]) -> Result<(), SupportLedgerError> {
+/// The release preconditions for one unified owner row. Beyond the owner state
+/// itself these are exactly the conservation conditions: no linked claim may
+/// remain, nothing may still be charged, and no active link may be held. A
+/// retained tombstone therefore cannot be released while any link survives,
+/// which is the rule its retention boundary states.
+fn validate_withdrawable_owner_row(
+    image: &[u8],
+    owner_state: u8,
+) -> Result<(), SupportLedgerError> {
     let canonical = image.len() == OWNER_ROW_BYTES
-        && image[8] == OWNER_STATE_LIVE
+        && image[8] == owner_state
         && read_u16(image, OWNER_ROW_VECTOR_LEN) > 0
         && read_u32(image, OWNER_ROW_LINKED_CLAIMS) == 0
         && read_u64(image, OWNER_ROW_CURRENT) == 0

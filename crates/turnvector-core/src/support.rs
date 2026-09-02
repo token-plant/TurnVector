@@ -127,7 +127,7 @@ pub(crate) struct OrdinarySupportSpec {
     pub(crate) claim: SupportFundingClaim,
 }
 #[rustfmt::skip]
-pub(crate) enum SupportChangeInput { BeginOrdinary(OrdinarySupportSpec, MonotonicTime), BeginPending(SupportOperationObligationId, LifecycleReserveKind, MonotonicTime), FinishActive(SupportOperationObligationId) }
+pub(crate) enum SupportChangeInput { BeginOrdinary(OrdinarySupportSpec, MonotonicTime), BeginPending(SupportOperationObligationId, LifecycleReserveKind, MonotonicTime), FinishActive(SupportOperationObligationId, MonotonicTime) }
 enum SupportDelta {
     BeginOrdinary(OrdinarySupportSpec, MonotonicTime, FixedWindowStart),
     BeginPending(
@@ -137,8 +137,14 @@ enum SupportDelta {
         MonotonicTime,
         FixedWindowStart,
     ),
-    FinishActive(usize, Record, SupportOperationObligationId),
-    FinishInitial(u32, u8, InitialRequirementRecord, BundleState),
+    FinishActive(usize, Record, SupportOperationObligationId, MonotonicTime),
+    FinishInitial(
+        u32,
+        u8,
+        InitialRequirementRecord,
+        BundleState,
+        MonotonicTime,
+    ),
 }
 enum LegacyC17Change {
     Insert(c17::PreparedLegacyInsert),
@@ -738,9 +744,13 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         valid
             .then_some(())
             .ok_or(SupportLedgerError::InvalidInput)?;
-        let history_slots = starts.iter().try_fold(0u64, |total, row| {
-            total.checked_add(u64::from(row[H - 1].1))
-        });
+        let retained = limits.start_history_capacity;
+        let history_slots = limits
+            .start_history_capacity
+            .iter()
+            .try_fold(0u64, |total, capacity| {
+                total.checked_add(u64::from(*capacity))
+            });
         let storage = support_storage_bytes(
             H,
             records,
@@ -807,7 +817,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 claims + 1,
                 claims,
             ],
-            history: starts.each_ref().map(|row| row[H - 1].1 as usize),
+            history: retained.map(|capacity| capacity as usize),
             bundles: [
                 bundle_records,
                 bundle_records,
@@ -824,7 +834,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             std::array::from_fn(|horizon| u64::from(starts[cell][horizon].1))
         });
         let c18 = c18::SupportC18::try_new(limits, &starts)?;
-        let starts = FixedWindowCounter::try_new(starts)?;
+        let starts = FixedWindowCounter::try_new(starts, retained)?;
         let bundles = RequestBundleStore::try_new(bundle_records, bundle_cells)?;
         let c17 = c17::SupportC17::try_new(c17_capacities)?;
         let actual_backing = SupportBackingCapacities {
@@ -871,8 +881,40 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     /// fails stop rather than saturating.
     fn release_group(&mut self, ticket: &c18::ExpiryTicket) {
         if ticket.family == c18::OwnerFamily::Tombstone {
-            // The bundle is the release group: its record, identity leaves,
-            // owned cells, claims and vector all return together.
+            // The bundle is the release group. Everything it holds returns in
+            // one step: the logical occupancy and vector cells it still charges,
+            // its unified raw owner rows, and only then its physical record,
+            // identity leaves and owned cells. Freeing storage alone would leave
+            // the capacity and the owner directory charged forever.
+            let record = *self
+                .bundles
+                .get_record(ticket.slot_index)
+                .expect("scheduled tombstone record");
+            let delta = self
+                .stored_bundle_logical_delta_precharged(ticket.slot_index, &record)
+                .expect("validated retained bundle aggregates");
+            for class in 0..5 {
+                for pool in 0..POOLS {
+                    self.usage[class][pool] = self.usage[class][pool]
+                        .checked_sub(delta.usage[class][pool])
+                        .expect("validated retained bundle occupancy");
+                    self.reserved[class][pool] = self.reserved[class][pool]
+                        .checked_sub(delta.reserved[class][pool])
+                        .expect("validated retained bundle reserves");
+                }
+            }
+            for axis in 0..21 {
+                for horizon in 0..H {
+                    self.vector_usage[axis][horizon] = self.vector_usage[axis][horizon]
+                        .checked_sub(delta.vector[axis][horizon])
+                        .expect("validated retained bundle vector");
+                }
+            }
+            let c17 = self
+                .c17
+                .prepare_c16_tombstone_release(ticket.slot_index, &record)
+                .expect("validated retained bundle owners");
+            self.c17.commit_c16_withdrawal(c17);
             self.bundles.withdraw_bundle_unmetered(ticket.slot_index);
             return;
         }
@@ -3230,7 +3272,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             SupportChangeInput::BeginPending(id, kind, at) => {
                 self.prepare_pending(expected, id, kind, at, &mut census)
             }
-            SupportChangeInput::FinishActive(id) => self.prepare_finish(expected, id, &mut census),
+            SupportChangeInput::FinishActive(id, terminal_at) => {
+                self.prepare_finish(expected, id, terminal_at, &mut census)
+            }
         };
         let mut change = match prepared {
             Ok(change) => change,
@@ -3255,7 +3299,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     false,
                 )?))
             }
-            SupportDelta::FinishActive(index, record, id) => {
+            SupportDelta::FinishActive(index, record, id, _) => {
                 Some(LegacyC17Change::Update(self.c17.prepare_legacy_update(
                     *index,
                     id.get(),
@@ -3326,9 +3370,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         &self,
         expected: SupportLedgerGeneration,
         id: SupportOperationObligationId,
+        terminal_at: MonotonicTime,
         work: &mut W,
     ) -> Result<SupportChange, SupportLedgerError> {
         self.next(expected, work)?;
+        self.c18.check_floor(terminal_at)?;
         let delta = match self.find_obligation(id, work)? {
             ObligationOwner::Legacy { index, record } => {
                 check!(
@@ -3336,7 +3382,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     record.3 == Active,
                     SupportLedgerError::InvalidTransition
                 )?;
-                SupportDelta::FinishActive(index, record, id)
+                SupportDelta::FinishActive(index, record, id, terminal_at)
             }
             ObligationOwner::InitialBundle { record, ordinal } => {
                 let bundle = *self
@@ -3350,7 +3396,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 if item.state != Active {
                     return Err(SupportLedgerError::InvalidTransition);
                 }
-                SupportDelta::FinishInitial(record, ordinal, item, bundle.state)
+                SupportDelta::FinishInitial(record, ordinal, item, bundle.state, terminal_at)
             }
         };
         Ok(SupportChange {
@@ -3369,10 +3415,10 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             SupportDelta::BeginPending(index, record, ..) => {
                 self.records.get(*index) == Some(record)
             }
-            SupportDelta::FinishActive(index, record, _) => {
+            SupportDelta::FinishActive(index, record, _, _) => {
                 self.records.get(*index) == Some(record)
             }
-            SupportDelta::FinishInitial(index, ordinal, item, state) => {
+            SupportDelta::FinishInitial(index, ordinal, item, state, _) => {
                 self.bundles.get_record(*index).is_some_and(|bundle| {
                     bundle.initial.get(usize::from(*ordinal)) == Some(item)
                         && bundle.state == *state
@@ -3431,13 +3477,47 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                     self.usage[class][SupportPool::Ordinary as usize] += 1;
                 }
             }
-            SupportDelta::FinishActive(index, _, _) => {
+            SupportDelta::FinishActive(index, record, id, terminal_at) => {
+                // The record keeps its start instant; the retention boundary
+                // lives in the release ticket. Without this the ordinary finish
+                // path retains forever.
+                let release_at =
+                    c18::started_release_at(record.4, terminal_at, self.c18.limits().retention())
+                        .expect("validated terminal instant");
+                self.c18
+                    .schedule(c18::ExpiryTicket {
+                        release_at,
+                        family: c18::OwnerFamily::LegacyRecord,
+                        slot_index: u32::try_from(index).expect("validated record index"),
+                        units: 1,
+                        identity: id.get(),
+                    })
+                    .expect("dormant ticket reserved at creation");
                 self.records
                     .get_mut(index)
                     .expect("validated support record")
                     .3 = Retained;
             }
-            SupportDelta::FinishInitial(index, ordinal, _, _) => {
+            SupportDelta::FinishInitial(index, ordinal, item, _, terminal_at) => {
+                // An initial obligation is retained with its own horizon. Its
+                // storage is owned by the bundle, so the ticket records the
+                // retention boundary and the bundle's own tombstone releases
+                // the group.
+                let release_at = c18::started_release_at(
+                    item.state_time,
+                    terminal_at,
+                    self.c18.limits().retention(),
+                )
+                .expect("validated terminal instant");
+                self.c18
+                    .schedule(c18::ExpiryTicket {
+                        release_at,
+                        family: c18::OwnerFamily::InitialBundle,
+                        slot_index: index * 4 + u32::from(ordinal),
+                        units: 1,
+                        identity: [0; 32],
+                    })
+                    .expect("dormant ticket reserved at creation");
                 let RecordSlot::Occupied(bundle) = &mut self.bundles.records[index as usize] else {
                     unreachable!("validated initial bundle")
                 };
@@ -3654,6 +3734,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     ) -> Result<SupportLedgerGeneration, SupportLedgerError> {
         let mut census = ExactWorkCensus::new();
         let next = self.next(expected, &mut census)?;
+        // A committed expiry advances the ledger's time floor. A time-bearing
+        // transition may not move the ledger back behind it.
+        if let Some(at) = transition_instant(transition) {
+            self.c18.check_floor(at)?;
+        }
         match self.find_obligation(id, &mut census)? {
             ObligationOwner::Legacy { index, record } => {
                 census.record(WorkDimension::InvariantChecks, 1)?;
@@ -4548,15 +4633,27 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         let (selected, count, more_due, visited) =
             self.c18.select_expiry::<E_GROUPS, E_UNITS>(at)?;
-        // Charge exactly what the bounded walk touched. The walk allocates
-        // nothing and never scans the owner set, so Allocations and Candidate
-        // Work stay zero by construction rather than by assertion.
+        // One preflight covers the complete envelope, because nothing after it
+        // may fail: the selection walk, the identical revalidation walk, and
+        // the release of every selected group. Charging only the selection
+        // would leave the revalidation, the two identity deletions per group,
+        // the raw owner removal and the heap extraction unmetered.
+        let height = u64::from(self.records.maximum_identity_height()?);
+        let heap_depth =
+            u64::from(u32::BITS - self.c18.scheduled_capacity().max(1).leading_zeros());
+        let per_group = (2 * (3 * height + 1))
+            .checked_add(2 * u64::from(IDENTITY_BITS))
+            .and_then(|value| value.checked_add(heap_depth))
+            .ok_or(SupportLedgerError::InvalidInput)?;
+        let release = per_group
+            .checked_mul(count as u64)
+            .ok_or(SupportLedgerError::InvalidInput)?;
         work.charge(HotPathWorkWitness::new([
-            visited,
+            2 * visited + release,
             (std::mem::size_of::<c18::ExpiryTicket>() * count) as u64,
             0,
             0,
-            2,
+            2 + count as u64,
         ]))?;
         Ok(c18::PreparedSupportExpiry {
             work,
@@ -4584,8 +4681,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         }
         self.c18.check_floor(prepared.at)?;
         // A nonempty batch must be able to publish its next generation before
-        // it mutates: exhaustion rejects here, never inside the commit.
-        if !prepared.selected.is_empty() {
+        // it mutates: exhaustion rejects here, never inside the commit. The
+        // selection is a fixed array, so emptiness is its count, not its length.
+        if prepared.count > 0 {
             self.generation
                 .next()
                 .map_err(|_| SupportLedgerError::Generation)?;
@@ -4996,6 +5094,15 @@ fn total(values: impl IntoIterator<Item = u32>) -> u64 {
     values.into_iter().map(u64::from).sum()
 }
 const STATE_CLASSES: [usize; 6] = [CONDITIONAL, PENDING, ACTIVE, ACTIVE, CONDITIONAL, PENDING];
+/// The explicit instant a transition carries, when it carries one.
+fn transition_instant(transition: SupportTransition) -> Option<MonotonicTime> {
+    match transition {
+        PredecessorEnded(_, at)
+        | BeginSupport(at)
+        | FinishSupport(at)
+        | CloseCausalCallImpossible(at) => Some(at),
+    }
+}
 fn state_class(state: SupportObligationState) -> usize {
     STATE_CLASSES[state as usize]
 }
@@ -7519,7 +7626,10 @@ mod tests {
                 let change = ledger
                     .prepare(
                         ledger.generation(),
-                        SupportChangeInput::FinishActive(obligation),
+                        SupportChangeInput::FinishActive(
+                            obligation,
+                            MonotonicTime::from_micros(1_000),
+                        ),
                         &mut meter,
                     )
                     .unwrap();
@@ -7732,7 +7842,7 @@ mod tests {
         let change = ledger
             .prepare(
                 next,
-                SupportChangeInput::FinishActive(valid.id),
+                SupportChangeInput::FinishActive(valid.id, MonotonicTime::from_micros(1_000)),
                 &mut finished,
             )
             .unwrap();
@@ -13619,7 +13729,7 @@ mod tests {
         let change = ledger
             .prepare(
                 ledger.generation(),
-                SupportChangeInput::FinishActive(obligation),
+                SupportChangeInput::FinishActive(obligation, MonotonicTime::from_micros(1_000)),
                 &mut meter,
             )
             .unwrap();

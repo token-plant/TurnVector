@@ -1122,7 +1122,15 @@ pub struct FixedWindowCounter<const CELLS: usize, const H: usize> {
 pub(crate) struct FixedWindowStart(usize, MonotonicTime);
 
 impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
-    pub fn try_new(bounds: [[FixedStartCountBound; H]; CELLS]) -> Result<Self, FixedStorageError> {
+    /// `bounds` are the active Budget's admission limits; `retained` is the
+    /// catalog-wide physical capacity, which is the maximum any production
+    /// Budget can retain at the Catalog Retention Horizon. Sizing storage by
+    /// the active bound instead would lose the predecessor starts a shorter
+    /// Budget must still hand to a longer successor.
+    pub fn try_new(
+        bounds: [[FixedStartCountBound; H]; CELLS],
+        retained: [u32; CELLS],
+    ) -> Result<Self, FixedStorageError> {
         if CELLS == 0 || H == 0 || H > 8 {
             return Err(FixedStorageError::Capacity);
         }
@@ -1137,9 +1145,16 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         if !valid {
             return Err(FixedStorageError::NonCanonical);
         }
+        if bounds
+            .iter()
+            .zip(&retained)
+            .any(|(cell, capacity)| cell[H - 1].1 > *capacity)
+        {
+            return Err(FixedStorageError::Capacity);
+        }
         let mut history = std::array::from_fn(|_| VecDeque::new());
-        for (queue, cell) in history.iter_mut().zip(&bounds) {
-            let capacity = cell[H - 1].1 as usize;
+        for (queue, cell) in history.iter_mut().zip(&retained) {
+            let capacity = *cell as usize;
             queue
                 .try_reserve_exact(capacity)
                 .map_err(|_| FixedStorageError::Allocation)?;
@@ -1490,7 +1505,7 @@ mod fixed_index_tests {
             FixedStartCountBound(Duration::from_micros(10), 1),
             FixedStartCountBound(Duration::from_micros(20), 2),
         ]];
-        let mut counter = FixedWindowCounter::try_new(bounds).unwrap();
+        let mut counter = FixedWindowCounter::try_new(bounds, [2]).unwrap();
         let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
         assert_eq!(
             counter.try_start(1, MonotonicTime::from_micros(5), &mut work),

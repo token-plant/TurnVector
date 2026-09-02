@@ -31,6 +31,11 @@ pub(crate) const CARRY_SLOTS: u32 = 1;
 /// How many due groups an observation counts before saturating. An observation
 /// must not scan the owner set, so the count is deliberately bounded.
 pub(crate) const EXPIRY_OBSERVATION_GROUPS: usize = 8;
+/// The bounded best-first walk keeps one frontier entry per pending candidate.
+/// Each step removes one and adds up to two children, so the frontier needs one
+/// slot beyond the group quota. This fixed bound keeps it a stack array; the
+/// sealed quota is validated against it at construction.
+pub(crate) const EXPIRY_FRONTIER_MAX: usize = 64;
 
 fn invalid() -> SupportLedgerError {
     SupportLedgerError::InvalidInput
@@ -198,13 +203,40 @@ impl<const H: usize> SupportHistoryLimits<H> {
                 && row[H - 1].1 <= self.start_history_capacity[cell]
         });
         let limits = self.interference_limit_us.iter().all(|limit| *limit > 0);
+        // Every sealed tensor must be a real Catalog output. A zeroed capacity
+        // is not a small capacity: it is an absent one, and accepting it would
+        // let a ledger construct against a tensor B04 never produced.
+        let tensors = self
+            .operation_capacity
+            .iter()
+            .flatten()
+            .chain(self.physical_credit_capacity.iter())
+            .chain(self.funding_claim_capacity.iter().flatten())
+            .chain(self.ordinary_claim_capacity.iter())
+            .all(|capacity| *capacity > 0)
+            && self.lifecycle_capacity.iter().flatten().flatten().all(|capacity| *capacity > 0)
+            && self.vector_capacity.iter().flatten().all(|capacity| *capacity > 0)
+            && self.owner_capacity > 0
+            && self.link_capacity > 0
+            && self.entitlement_capacity > 0
+            && self.start_history_capacity.iter().all(|capacity| *capacity > 0)
+            // The pair proof's suballocations are nonfungible: neither class
+            // may be zero, or one could silently borrow the other's headroom.
+            && self
+                .mandatory_pair_capacity
+                .0
+                .iter()
+                .chain(self.safety_pair_capacity.0.iter())
+                .all(|cell| cell.mandatory > 0 && cell.safety > 0);
         let pairs = self.mandatory_pair_capacity.valid() && self.safety_pair_capacity.valid();
         // A dormant expiry ticket is constructible for every releasable root,
         // so terminalizing a record never needs new capacity.
         let roots = self.releasable_roots().ok_or_else(invalid)?;
         let tickets = self.expiry_ticket_capacity == roots;
-        let quotas = self.expiry_units_per_transition >= self.largest_atomic_release_group_units;
-        (identities && horizons && bounds && limits && pairs && tickets && quotas)
+        let quotas = self.expiry_units_per_transition >= self.largest_atomic_release_group_units
+            && (self.expiry_groups_per_transition.get() as usize) < EXPIRY_FRONTIER_MAX
+            && EXPIRY_OBSERVATION_GROUPS < EXPIRY_FRONTIER_MAX;
+        (identities && horizons && bounds && limits && tensors && pairs && tickets && quotas)
             .then_some(())
             .ok_or_else(invalid)
     }
@@ -224,6 +256,11 @@ impl<const H: usize> SupportHistoryLimits<H> {
             self.expiry_groups_per_transition.get(),
             self.expiry_units_per_transition.get(),
         )
+    }
+
+    /// The catalog-wide retained start capacity per `(operation, pool)` cell.
+    pub(crate) fn start_history_capacity(&self) -> &[u32; CELLS] {
+        &self.start_history_capacity
     }
 
     pub(crate) fn retention(&self) -> Duration {
@@ -370,7 +407,16 @@ impl ExpiryHeap {
         ExpiryTicket: Copy,
     {
         let mut selected = [DORMANT_TICKET; G];
-        let mut frontier = [u32::MAX; G];
+        // Each step removes one frontier entry and adds up to two children, so
+        // the frontier needs one slot more than the group quota. Sizing it at
+        // `G` silently drops a due sibling and reports `more_due = false`.
+        let mut frontier = [u32::MAX; EXPIRY_FRONTIER_MAX];
+        // Enforced at construction; a quota that cannot keep its own frontier
+        // would silently drop a due sibling.
+        assert!(
+            G < EXPIRY_FRONTIER_MAX,
+            "expiry group quota exceeds the frontier"
+        );
         let mut frontier_len = 0usize;
         let mut visited = 0u64;
         if !self.tickets.is_empty() && G > 0 {
@@ -411,7 +457,7 @@ impl ExpiryHeap {
             frontier[best] = frontier[frontier_len - 1];
             frontier_len -= 1;
             for child in [2 * node + 1, 2 * node + 2] {
-                if child < self.tickets.len() && frontier_len < G {
+                if child < self.tickets.len() && frontier_len < frontier.len() {
                     frontier[frontier_len] = child as u32;
                     frontier_len += 1;
                 }
@@ -462,29 +508,6 @@ impl ExpiryHeap {
     /// The complete canonical scheduled view in heap storage order.
     pub(crate) fn scheduled(&self) -> &[ExpiryTicket] {
         &self.tickets
-    }
-
-    pub(crate) fn release(&mut self, selected: &[ExpiryTicket]) {
-        self.tickets.retain(|ticket| !selected.contains(ticket));
-        let len = self.tickets.len();
-        for start in (0..len / 2).rev() {
-            let mut parent = start;
-            loop {
-                let (left, right) = (2 * parent + 1, 2 * parent + 2);
-                let mut smallest = parent;
-                if left < len && self.tickets[left] < self.tickets[smallest] {
-                    smallest = left;
-                }
-                if right < len && self.tickets[right] < self.tickets[smallest] {
-                    smallest = right;
-                }
-                if smallest == parent {
-                    break;
-                }
-                self.tickets.swap(parent, smallest);
-                parent = smallest;
-            }
-        }
     }
 }
 
@@ -774,6 +797,11 @@ impl<const H: usize> SupportC18<H> {
             u32::try_from(count).expect("constructor-bounded group count"),
             units,
         )
+    }
+
+    /// The sealed ticket capacity, for bounding the heap's extraction depth.
+    pub(crate) fn scheduled_capacity(&self) -> u32 {
+        self.limits().expiry_ticket_capacity
     }
 
     pub(crate) fn next_release(&self) -> Option<MonotonicTime> {
