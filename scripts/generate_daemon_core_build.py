@@ -1,5 +1,5 @@
 #!/usr/bin/env -S python3 -I -S -B
-import argparse, contextlib, hashlib, json, os, shlex, shutil, stat, struct, subprocess, sys, tempfile
+import argparse, concurrent.futures, contextlib, hashlib, json, os, shlex, shutil, stat, struct, subprocess, sys, tempfile
 from pathlib import Path
 if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode): raise SystemExit("daemon core build error: generator requires Python -I -S -B\n")
 _EXECUTED_SOURCE, _EXECUTED_LAUNCHER_SOURCE = (globals().get(name) for name in ("_EXECUTED_SOURCE", "_EXECUTED_LAUNCHER_SOURCE"))
@@ -364,9 +364,11 @@ def build_descriptor(root: Path) -> tuple:
         registry, cargo = generation_registry(snapshot, env), str(paths["cargo"]); common = ["--offline", "--locked", "--manifest-path", str(snapshot / "Cargo.toml")]
         if tree_identity(snapshot) != before: raise ValueError("source snapshot changed during Generation Semantics verification")
         metadata = read_json(run([cargo, "metadata", *common, "--format-version", "1", "--filter-platform", selected["rustc"]["host"]], Path("/"), env).encode()); graph, package_roots = dependency_graph(snapshot, metadata)
-        for profile in ([], ["--release"]):
-            run([cargo, "check", *common, "--package", "turnvector-daemon", "--bin", "turnvector-daemon", *profile], Path("/"), env); frozen(snapshot, before, "during daemon check")
-        trace = run([cargo, "build", *common, "--release", "--package", "turnvector-daemon", "--bin", "turnvector-daemon"], Path("/"), env, True)
+        check_env = {**env, "CARGO_TARGET_DIR": str(temporary / "check-target")}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            check = pool.submit(run, [cargo, "check", *common, "--package", "turnvector-daemon", "--bin", "turnvector-daemon"], Path("/"), check_env)
+            trace = run([cargo, "build", *common, "--release", "--package", "turnvector-daemon", "--bin", "turnvector-daemon"], Path("/"), env, True); check.result()
+        frozen(snapshot, before, "during daemon check")
         if tree_identity(snapshot) != before: raise ValueError("source snapshot changed during daemon build")
         linked, current_tools = sdk_link_inputs(trace, paths["sdk"]), toolchain(paths, root)
         if current_tools != selected: raise ValueError("toolchain changed after discovery")
@@ -375,7 +377,7 @@ def build_descriptor(root: Path) -> tuple:
         if sdk_link_inputs(final_trace, frozen_sdk) != frozen_linked or sdk_link_inputs(final_trace, paths["sdk"], False): raise ValueError("linker input set changed after discovery")
         frozen(snapshot, before, "during final daemon build"); current_tools = toolchain(final_paths, root); current_tools["native_link"]["link_inputs"] = tree_artifact(frozen_sdk, "sdk-link-inputs", frozen_linked)
         if current_tools != selected: raise ValueError("toolchain or linker input changed during final daemon build")
-        dev_traced, dev_environment = traced_inputs(snapshot, temporary / "discovery-target", package_roots); release_traced, release_environment = traced_inputs(snapshot, temporary / "target", package_roots); traced, environment = sorted({*dev_traced, *release_traced}), sorted({*dev_environment, *release_environment}); names = source_names(snapshot, graph, traced); executable, records = macho_text(temporary / "target/release/turnvector-daemon", selected["rustc"]["host"]), source_records(before, names)
+        dev_traced, dev_environment = traced_inputs(snapshot, temporary / "check-target", package_roots); discovery_traced, discovery_environment = traced_inputs(snapshot, temporary / "discovery-target", package_roots); release_traced, release_environment = traced_inputs(snapshot, temporary / "target", package_roots); traced, environment = sorted({*dev_traced, *discovery_traced, *release_traced}), sorted({*dev_environment, *discovery_environment, *release_environment}); names = source_names(snapshot, graph, traced); executable, records = macho_text(temporary / "target/release/turnvector-daemon", selected["rustc"]["host"]), source_records(before, names)
         if tree_identity(snapshot) != before: raise ValueError("source snapshot changed before descriptor publication")
         descriptor = {"descriptor_schema_version": 1, "source_closure": {"algorithm": "isolated_snapshot_plus_dev_and_release_daemon_dep_info_v1", "dependency_policy": "reachable_normal_repository_path_dependencies_with_single_turnvector_core_build_rs_v1", "runtime_inputs": traced, "environment_inputs": environment, "files": records}, "toolchain": selected, "dependency_graph": graph, "registries": {"protocol": [], "domain": [registry]}, "section_identities": {"executable_text": executable, "native_text": {"artifacts": [], "byte_length": 0, "present": False, "sha256": EMPTY_SHA}, "catalog_payload": CATALOG_SECTION}, **CONTRACT}
     return descriptor, (before, paths, selected, linked)
