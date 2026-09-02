@@ -305,6 +305,10 @@ pub(crate) struct PreparedC17RootBatch {
     reserved_after: [[u32; POOLS]; 5],
     attached_after: [[u32; POOLS]; 4],
     vector_after: [[u64; 3]; 21],
+    /// The batch's own instant. When the batch retires a tombstoned owner's
+    /// last link, this is the link boundary that design 7.4 takes the maximum
+    /// with, so the commit can activate the owner's reserved ticket at it.
+    occurred_at: MonotonicTime,
     c17: c17::PreparedRootBatch,
 }
 
@@ -971,52 +975,6 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             self.usage[class][pool] = self.usage[class][pool]
                 .checked_sub(released)
                 .expect("validated retained group occupancy");
-        }
-        self.release_owner_links(index, ticket.release_at);
-    }
-
-    /// Design 5.1: "a linked operation-group expiry decrements exactly one
-    /// owner link; the last link activates the tombstone's already reserved
-    /// ticket". Invariant 5.2(3) names which groups are linked: only a record
-    /// funded from an entitlement vector holds a reciprocal owner link, while
-    /// an ordinary record holds a reservation claim and no link at all, so this
-    /// walks the record's own claims rather than guessing from its pool.
-    ///
-    /// `released_at` is the releasing group's own boundary, which is the second
-    /// operand of 7.4's maximum. Because links release in heap order, the last
-    /// one to release carries the largest boundary, so the maximum is reached
-    /// without ever scanning the links.
-    fn release_owner_links(&mut self, index: usize, released_at: MonotonicTime) {
-        let claims = self.records.claims(index).map_or(0, <[_]>::len);
-        for position in 0..claims {
-            let Some(&SupportFundingClaim::EntitlementVector(entitlement)) = self
-                .records
-                .claims(index)
-                .and_then(|slice| slice.get(position))
-            else {
-                continue;
-            };
-            let Ok((_, Some(owner))) = self.bundles.route_precharged(TAG_ENTITLEMENT, &entitlement)
-            else {
-                continue;
-            };
-            let RecordSlot::Occupied(bundle) = &mut self.bundles.records[owner as usize] else {
-                continue;
-            };
-            let remaining = bundle
-                .linked_claims
-                .checked_sub(1)
-                .expect("validated owner link count");
-            bundle.linked_claims = remaining;
-            // Only the last link may unblock, and only for a bundle that is
-            // actually waiting on one. A live bundle owns no reserved
-            // tombstone, so `activate` finds nothing and costs one bounded
-            // pass.
-            if remaining == 0 && bundle.state == BundleState::RetainedTombstone {
-                self.c18
-                    .activate(c18::OwnerFamily::Tombstone, owner, released_at)
-                    .expect("validated tombstone activation");
-            }
         }
     }
 
@@ -2093,7 +2051,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             disposition,
             occurred_at.as_micros(),
         )?;
-        self.prepare_c17_root_preview(expected, preview, work)
+        self.prepare_c17_root_preview(expected, preview, occurred_at, work)
     }
 
     pub(crate) fn prepare_c17_observation_resolution(
@@ -2113,7 +2071,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             resolution,
             occurred_at.as_micros(),
         )?;
-        self.prepare_c17_root_preview(expected, preview, work)
+        self.prepare_c17_root_preview(expected, preview, occurred_at, work)
     }
 
     pub(crate) fn prepare_c17_plan_root_action(
@@ -2135,7 +2093,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let preview = self
             .c17
             .inspect_root_action(anchor, action, occurred_at.as_micros())?;
-        self.prepare_c17_root_preview(expected, preview, work)
+        self.prepare_c17_root_preview(expected, preview, occurred_at, work)
     }
 
     pub(crate) fn prepare_c17_typed_close(
@@ -2148,7 +2106,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             return Err(SupportLedgerError::Generation);
         }
         let preview = self.c17.inspect_typed_close(input)?;
-        self.prepare_c17_root_preview(expected, preview, work)
+        self.prepare_c17_root_preview(expected, preview, input.occurred_at, work)
     }
 
     pub(crate) fn prepare_c17_membership_root_action(
@@ -2165,7 +2123,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let preview =
             self.c17
                 .inspect_membership_root_action(anchor, action, occurred_at.as_micros())?;
-        self.prepare_c17_root_preview(expected, preview, work)
+        self.prepare_c17_root_preview(expected, preview, occurred_at, work)
     }
 
     pub(crate) fn prepare_c17_root_action(
@@ -2182,13 +2140,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let preview = self
             .c17
             .inspect_root_action(anchor, action, occurred_at.as_micros())?;
-        self.prepare_c17_root_preview(expected, preview, work)
+        self.prepare_c17_root_preview(expected, preview, occurred_at, work)
     }
 
     fn prepare_c17_root_preview(
         &self,
         expected: SupportLedgerGeneration,
         preview: c17::RootBatchPreview,
+        occurred_at: MonotonicTime,
         work: &mut impl WorkRecorder,
     ) -> Result<PreparedC17RootBatch, SupportLedgerError> {
         let generation_after = expected
@@ -2234,6 +2193,17 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let expected_c17 = self.c17.generation();
         let c17 = self.c17.prepare_root_batch(preview, owner_records, work)?;
         let owner_records_after = c17.owner_records_after();
+        // Retiring a tombstoned owner's last link activates its reserved
+        // ticket, which is one pass over the ticket array. That is release
+        // work on this path, so it is charged here and never under the commit.
+        for index in 0..owner_count {
+            if retires_last_tombstone_link(owner_records[index], owner_records_after[index]) {
+                work.record(
+                    WorkDimension::VisitedEntities,
+                    u64::from(self.c18.scheduled_capacity()),
+                )?;
+            }
+        }
         Ok(PreparedC17RootBatch {
             expected,
             expected_c17,
@@ -2248,6 +2218,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             reserved_after,
             attached_after,
             vector_after,
+            occurred_at,
             c17,
         })
     }
@@ -2345,7 +2316,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             generation_after,
             owner_count,
             owner_slots,
-            owner_records_before: _,
+            owner_records_before,
             owner_records_after,
             cell_outcomes,
             cell_count,
@@ -2353,6 +2324,7 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
             reserved_after,
             attached_after,
             vector_after,
+            occurred_at,
             c17,
         } = change;
         self.c17
@@ -2364,6 +2336,16 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
                 unreachable!("sealed semantic owner destination")
             };
             *record = owner_records_after[index].expect("sealed semantic owner after-image");
+            // Design 5.1: "the last link activates the tombstone's already
+            // reserved ticket". A link retires at this batch's instant, so
+            // that instant is the link boundary in 7.4's maximum; activation
+            // never lowers the ticket below its own catalog horizon.
+            if retires_last_tombstone_link(owner_records_before[index], owner_records_after[index])
+            {
+                self.c18
+                    .activate(c18::OwnerFamily::Tombstone, owner_slots[index], occurred_at)
+                    .expect("validated tombstone activation");
+            }
         }
         self.commit_c17_direct_cell_outcomes(&cell_outcomes[..cell_count]);
         self.usage = usage_after;
@@ -2687,16 +2669,14 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
     ) -> Result<(), SupportLedgerError> {
         for (index, publication) in retractions.iter().copied().enumerate() {
             let owner_slot = publication.owner_slot();
+            // A retraction only lowers the owner's link count, so a tombstoned
+            // owner is a legal target: design 5.1 needs its last link to
+            // retire so its reserved ticket can activate. Publications, which
+            // add links, keep their own live-owner check.
             let record = self
                 .bundles
                 .get_record(owner_slot)
                 .ok_or(SupportLedgerError::InvalidTransition)?;
-            if !matches!(
-                record.state,
-                BundleState::LivePristine | BundleState::LiveConsumed
-            ) {
-                return Err(SupportLedgerError::InvalidTransition);
-            }
             self.c17
                 .validate_lifecycle_publication_record(publication, record)?;
             let owner_delta = u32::try_from(
@@ -4735,19 +4715,9 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         let height = u64::from(self.records.maximum_identity_height()?);
         let heap_depth =
             u64::from(u32::BITS - self.c18.scheduled_capacity().max(1).leading_zeros());
-        // Releasing a group may also settle its owner links: one identity
-        // route per entitlement-funded claim, and for the last link one pass
-        // over the ticket array to activate the tombstone it unblocks. Both
-        // are real work on the release path and are charged here rather than
-        // left to run unmetered under the commit, which ADR 0039 forbids.
-        let links = u64::from(self.records.maximum_claims_per_record()?);
-        let link_settlement = links
-            .checked_mul(u64::from(IDENTITY_BITS) + u64::from(self.c18.scheduled_capacity()))
-            .ok_or(SupportLedgerError::InvalidInput)?;
         let per_group = (2 * (3 * height + 1))
             .checked_add(2 * u64::from(IDENTITY_BITS))
             .and_then(|value| value.checked_add(heap_depth))
-            .and_then(|value| value.checked_add(link_settlement))
             .ok_or(SupportLedgerError::InvalidInput)?;
         let release = per_group
             .checked_mul(count as u64)
@@ -4916,8 +4886,11 @@ impl<const R: usize, const F: usize, const H: usize> SupportChargeLedger<R, F, H
         {
             return Err(invalid);
         }
-        // The retained tombstone releases at its own Catalog horizon or with
-        // its last linked claim, whichever is later.
+        // The ticket carries the tombstone's own Catalog horizon. Design 7.4's
+        // second operand, the latest linked release, is not known here: a
+        // linked bundle reserves the ticket dormant and the batch that retires
+        // its last link raises the horizon to that batch's instant on
+        // activation, so the maximum is reached without scanning the links.
         let release_at =
             c18::tombstone_release_at(terminal_at, None, self.c18.limits().retention())?;
         Ok(PreparedTombstone {
@@ -5192,6 +5165,19 @@ fn support_storage_bytes(
         .checked_add(legacy)
         .and_then(|value| value.checked_add(bundles))
         .ok_or(invalid)
+}
+/// True when a C17 root batch takes a tombstoned owner from at least one
+/// link to none. Design 5.1 makes that the moment the tombstone's reserved
+/// ticket activates; a live owner reaching zero links has nothing reserved.
+fn retires_last_tombstone_link(before: Option<BundleRecord>, after: Option<BundleRecord>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            before.linked_claims > 0
+                && after.linked_claims == 0
+                && after.state == BundleState::RetainedTombstone
+        }
+        _ => false,
+    }
 }
 fn apply_signed_u32(value: u32, delta: i32) -> Result<u32, SupportLedgerError> {
     if delta >= 0 {
@@ -12132,6 +12118,177 @@ mod tests {
         assert_eq!(
             ledger.bundles.occupied_records, occupied_before,
             "the bundle survives its links"
+        );
+    }
+
+    fn scheduled_tombstone(ledger: &PlanLedger) -> c18::ExpiryTicket {
+        ledger
+            .c18
+            .scheduled()
+            .iter()
+            .find(|ticket| ticket.family == c18::OwnerFamily::Tombstone)
+            .copied()
+            .expect("the tombstone reserved a ticket")
+    }
+
+    #[inline(never)]
+    fn tombstone_first_funder_for_link_test(ledger: &mut PlanLedger) {
+        let mut meter = work();
+        let change = ledger
+            .prepare_tombstone(
+                request_owner(1),
+                bundle_entitlement(1),
+                MonotonicTime::from_micros(1_000),
+                &mut meter,
+            )
+            .unwrap();
+        ledger
+            .validate_tombstone(change)
+            .unwrap()
+            .commit_tombstone();
+    }
+
+    /// Two of the three links retire with the plan's rejection. The owner is
+    /// tombstoned, which used to reject the batch as noncanonical.
+    #[inline(never)]
+    fn retire_two_links_by_rejection_for_link_test(ledger: &mut PlanLedger, plan: &TurnPlan<4>) {
+        let rejection = ledger
+            .prepare_c17_plan_disposition(
+                ledger.generation(),
+                plan.identity(),
+                c17::PlanDisposition::Rejection,
+                MonotonicTime::from_micros(1_001),
+                &mut work(),
+            )
+            .unwrap();
+        ledger.validate_c17_root_batch(&rejection).unwrap();
+        ledger.commit_c17_root_batch(rejection);
+    }
+
+    /// The typed close retires the last link at `2_000us`, later than the
+    /// tombstone's own horizon. Returns the measured prepare Work.
+    #[inline(never)]
+    fn retire_last_link_by_typed_close_for_link_test(
+        ledger: &mut PlanLedger,
+        plan: &TurnPlan<4>,
+    ) -> HotPathWorkWitness {
+        let authority_key = plan_authority_key(plan.identity().id.get());
+        let identity = encode_plan_identity(plan.identity());
+        let anchor = ledger
+            .c17
+            .plan_root_anchor(authority_key, identity, 2)
+            .unwrap();
+        let input = crate::TypedCloseInput {
+            group: anchor.group.slot,
+            branch: crate::PlanBranch::Rejection,
+            root: crate::RootRef::new(anchor.root.slot, anchor.root.generation, anchor.version)
+                .unwrap(),
+            occurred_at: MonotonicTime::from_micros(2_000),
+            reason: crate::TypedImpossible::new(9).unwrap(),
+            authority: crate::CloseAuthority::Plan {
+                identity: plan.identity(),
+                event: crate::PlanCausalEventId::new(1).unwrap(),
+            },
+        };
+        let mut measured = work();
+        let close = ledger
+            .prepare_c17_typed_close(ledger.generation(), input, &mut measured)
+            .unwrap();
+        ledger.validate_c17_root_batch(&close).unwrap();
+        ledger.commit_c17_root_batch(close);
+        measured.witness()
+    }
+
+    #[inline(never)]
+    fn expire_for_link_test(ledger: &mut PlanLedger, at: MonotonicTime) -> u32 {
+        let mut meter = work();
+        let prepared = ledger
+            .prepare_expiry::<1, 1>(ledger.generation(), at, &mut meter)
+            .unwrap();
+        ledger
+            .validate_expiry(prepared)
+            .unwrap()
+            .commit()
+            .released_groups
+    }
+
+    /// D2 / 5.1 / 7.4 (#62), end to end: a tombstone reserved dormant behind
+    /// three plan links activates when the last link retires, at the later of
+    /// its own catalog horizon and the retiring batch's instant, and only then
+    /// does its group release. Links retire through C17 root batches, which
+    /// previously rejected a tombstoned owner outright, so the ticket could
+    /// never activate and the bundle stayed occupied for the life of the
+    /// process.
+    #[test]
+    fn the_last_retired_link_activates_a_dormant_tombstone_at_the_later_boundary() {
+        let at = MonotonicTime::from_micros;
+        let mut ledger = Box::new(plan_ledger());
+        let funders = std::array::from_fn(|index| {
+            reserve_plan_bundle(&mut ledger, u8::try_from(index + 1).unwrap())
+        });
+        let plan = turn_plan(&funders, 1, 1);
+        commit_plan_create_for_root_test(&mut ledger, &plan);
+        assert_eq!(ledger.bundles.get_record(0).unwrap().linked_claims, 3);
+
+        tombstone_first_funder_for_link_test(&mut ledger);
+        let horizon = at(1_000)
+            .checked_add(ledger.c18.limits().retention())
+            .unwrap();
+        let ticket = scheduled_tombstone(&ledger);
+        assert_eq!(
+            (ticket.state, ticket.release_at),
+            (c18::TicketState::Dormant, horizon)
+        );
+
+        retire_two_links_by_rejection_for_link_test(&mut ledger, &plan);
+        assert_eq!(ledger.bundles.get_record(0).unwrap().linked_claims, 1);
+        assert_eq!(
+            scheduled_tombstone(&ledger).state,
+            c18::TicketState::Dormant,
+            "one link still blocks the ticket"
+        );
+
+        let measured = retire_last_link_by_typed_close_for_link_test(&mut ledger, &plan);
+        // The activation pass over the ticket array is charged on the
+        // retiring batch, once for the one owner it unblocks.
+        let mut expected_work = crate::c17_layout::WORK_CLOSE;
+        expected_work[WorkDimension::VisitedEntities as usize] +=
+            u64::from(ledger.c18.scheduled_capacity());
+        assert_eq!(measured, HotPathWorkWitness::new(expected_work));
+        for slot in 0..4 {
+            assert_eq!(ledger.bundles.get_record(slot).unwrap().linked_claims, 0);
+        }
+        let ticket = scheduled_tombstone(&ledger);
+        assert_eq!(
+            (ticket.state, ticket.release_at),
+            (c18::TicketState::Active, at(2_000)),
+            "7.4: the late link dominates the catalog horizon"
+        );
+
+        let occupied_before = ledger.bundles.occupied_records;
+        assert_eq!(
+            expire_for_link_test(&mut ledger, at(1_999)),
+            0,
+            "not due before the link boundary"
+        );
+        assert_eq!(ledger.bundles.occupied_records, occupied_before);
+        assert_eq!(
+            expire_for_link_test(&mut ledger, at(2_000)),
+            1,
+            "due at the link boundary"
+        );
+        assert!(
+            ledger.bundles.get_record(0).is_none(),
+            "the bundle released"
+        );
+        assert_eq!(ledger.bundles.occupied_records, occupied_before - 1);
+        assert!(
+            ledger
+                .c18
+                .scheduled()
+                .iter()
+                .all(|ticket| ticket.family != c18::OwnerFamily::Tombstone),
+            "the ticket is consumed"
         );
     }
 

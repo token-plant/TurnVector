@@ -1057,13 +1057,6 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         AvlIndex::height_bound(self.identities.capacity)
     }
 
-    /// The sealed upper bound on how many claims one record can hold. A caller
-    /// charging work for a per-claim walk uses this rather than a live length,
-    /// so the charge is a constructor-fixed bound and not workload-dependent.
-    pub(crate) fn maximum_claims_per_record(&self) -> Result<u32, FixedStorageError> {
-        u32::try_from(self.claim_capacity).map_err(|_| FixedStorageError::Capacity)
-    }
-
     pub fn get(&self, index: usize) -> Option<&V> {
         self.records.get(index)
     }

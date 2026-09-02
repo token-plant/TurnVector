@@ -1460,10 +1460,7 @@ impl SupportC17 {
             BundleState::LivePristine | BundleState::LiveConsumed => RawOwnerState::Committed,
             BundleState::RetainedTombstone => RawOwnerState::Tombstone,
         };
-        let expected_owner_state = match record.state {
-            BundleState::LivePristine | BundleState::LiveConsumed => OWNER_STATE_LIVE,
-            BundleState::RetainedTombstone => OWNER_STATE_TOMBSTONE,
-        };
+        let expected_owner_state = owner_state_byte(record.state);
         if state != expected_state
             || owner.slot != record_slot
             || owner != self.owner_headers.reference_at(record_slot, &[1])?
@@ -3380,7 +3377,11 @@ impl SupportC17 {
             references,
             slot,
             record,
-            OWNER_STATE_LIVE,
+            // A retraction may target a tombstoned owner: it only ever lowers
+            // the link count, and design 5.1 needs the last link to retire so
+            // the tombstone's reserved ticket can activate. New publications
+            // are rejected by their own live-owner check before reaching here.
+            owner_state_byte(record.state),
         )
     }
 
@@ -4823,6 +4824,16 @@ fn encode_c16_owner_set(
         index,
         owner,
     })
+}
+
+/// The owner-set state byte a record in `state` must carry. A tombstoned
+/// record keeps its owner set until its group expires, so validation must
+/// expect the tombstone byte rather than reject the record as noncanonical.
+pub(super) fn owner_state_byte(state: BundleState) -> u8 {
+    match state {
+        BundleState::LivePristine | BundleState::LiveConsumed => OWNER_STATE_LIVE,
+        BundleState::RetainedTombstone => OWNER_STATE_TOMBSTONE,
+    }
 }
 
 fn tombstone_owner_images(mut images: C16OwnerSetImages) -> C16OwnerSetImages {
