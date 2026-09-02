@@ -1,4 +1,5 @@
 import hashlib, json, os, shutil, struct, subprocess, sys, tempfile, unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]; GENERATOR, LAUNCHER, SCHEMAS = ROOT / "scripts/generate_daemon_core_build.py", "scripts/run_daemon_core_build.py", ROOT / "schemas"; DESCRIPTOR, LOCK = "daemon-core-build-v1.json", "daemon-core-build-v1.lock.json"; BOOTSTRAP = json.loads((SCHEMAS / DESCRIPTOR).read_bytes())["build_variants"]["generator_execution"]["bootstrap_source"]
 INPUTS = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "crates/turnvector-core/Cargo.toml", "crates/turnvector-core/build.rs", "crates/turnvector-core/src/lib.rs", "crates/turnvector-core/src/bounded.rs", "crates/turnvector-core/src/core.rs", "crates/turnvector-core/src/scheduling.rs", "crates/turnvector-core/src/support.rs", "crates/turnvector-core/src/turns.rs", "crates/turnvector-core/src/work.rs", "crates/turnvector-daemon/Cargo.toml", "crates/turnvector-daemon/src/main.rs", "schemas/generation-semantics-v1.json", "schemas/generation-semantics-v1.lock.json", "scripts/generate_generation_semantics.py", "scripts/generate_daemon_core_build.py", LAUNCHER)
@@ -6,9 +7,13 @@ INPUTS += ("crates/turnvector-core/src/model_registry.rs",)
 INPUTS += ("crates/turnvector-core/src/model_descriptor.rs", "crates/turnvector-core/src/model_descriptor/sha256.rs")
 INPUTS += ("crates/turnvector-core/src/request_book.rs",)
 INPUTS += ("crates/turnvector-core/src/c17_generated.rs", "crates/turnvector-core/src/c17_layout.rs", "crates/turnvector-core/src/reusable.rs", "crates/turnvector-core/src/request_book/c17.rs", "crates/turnvector-core/src/support/c17.rs", "crates/turnvector-core/src/support/c17/membership.rs", "crates/turnvector-core/src/support/c17/semantic.rs", "crates/turnvector-core/src/support/c17/topology.rs")
+INPUTS += ("crates/turnvector-core/src/support/c18.rs",)
 INPUTS += ("crates/turnvector-core/src/certification.rs",)
 INPUTS += ("crates/turnvector-core/src/admission.rs", "crates/turnvector-core/src/closure_control.rs", "crates/turnvector-core/src/resource_ledger.rs", "crates/turnvector-core/src/scheduler.rs", "crates/turnvector-core/src/transition_coordinator.rs", "crates/turnvector-core/src/turn_plans.rs", "crates/turnvector-daemon/src/audit_journal.rs", "crates/turnvector-daemon/src/backend_contract.rs", "crates/turnvector-daemon/src/certification_tooling.rs", "crates/turnvector-daemon/src/control_plane.rs", "crates/turnvector-daemon/src/control_store.rs", "crates/turnvector-daemon/src/daemon_custody.rs", "crates/turnvector-daemon/src/data_plane.rs", "crates/turnvector-daemon/src/device_executor.rs", "crates/turnvector-daemon/src/event_loop.rs", "crates/turnvector-daemon/src/fake_backend.rs", "crates/turnvector-daemon/src/native_build.rs", "crates/turnvector-daemon/src/native_runtime.rs", "crates/turnvector-daemon/src/native_turns.rs", "crates/turnvector-daemon/src/protocol_authority.rs", "crates/turnvector-daemon/src/residency_coordinator.rs", "crates/turnvector-daemon/src/resource_evidence.rs", "crates/turnvector-daemon/src/resource_governor.rs", "crates/turnvector-daemon/src/runtime_carry.rs", "crates/turnvector-daemon/src/runtime_measurement.rs", "crates/turnvector-daemon/src/runtime_qualification.rs", "crates/turnvector-daemon/src/volume_qualification.rs")
 FIXTURE_ONLY_INPUTS = ("crates/turnvector-protocol/Cargo.toml", "crates/turnvector-protocol/src/lib.rs", "crates/turnvector-daemon/src/release_identity.rs")
+# Independent generations run concurrently. Each uses roughly 1.3 cores, so
+# this stays below the machine while keeping the slowest test bounded.
+GENERATOR_WORKERS = min(12, max(2, (os.cpu_count() or 4) // 2))
 def canonical(value): return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 def evidence(payload, domain="turnvector:evidence:daemon-core-build", version=1): return hashlib.sha256(domain.encode() + b"\0" + version.to_bytes(4, "big") + payload).hexdigest()
 def macho_fixture(catalog_sections=1, data_command_padding=0, rebase=b"", bind=b"", weak=b"", lazy=b"", export=b"", chained=False, reordered_loader=False):
@@ -67,8 +72,18 @@ class DaemonCoreBuildTests(unittest.TestCase):
             sections, tools = values[0]["section_identities"], values[0]["toolchain"]; execution = values[0]["build_variants"]["generator_execution"]; support, records = values[0]["support"], values[0]["support"]["records"]; self.assertEqual(execution["bootstrap_source"], BOOTSTRAP); self.assertEqual(execution["bootstrap_sha256"], hashlib.sha256(BOOTSTRAP.encode()).hexdigest()); self.assertTrue(sections["executable_text"]["present"] and sections["executable_text"]["byte_length"] > 0); self.assertTrue({"__text", "__stubs", "__stub_helper"} <= {item["section"] for item in sections["executable_text"]["sections"]}); self.assertEqual((support["funding_claim"]["max_claims_per_obligation"], records["entitlement_tombstones"], records["funding_claims"], records["lifecycle_reserves"], records["total_operation_obligations"], support["start_count"]["max_physical_credits"]), (1024, 2048, 4194304, 4096, 32768, 32768))
             self.assertEqual(sections["native_text"], {"artifacts": [], "byte_length": 0, "present": False, "sha256": hashlib.sha256(b"").hexdigest()}); self.assertTrue(tools["python"]["runtime_files"]["file_count"] > 0); self.assertEqual(tools["python"]["flags"], {"dont_write_bytecode": True, "isolated": True, "no_site": True}); self.assertTrue(tools["rustc"]["driver_and_target_files"]); baseline = json.loads((SCHEMAS / LOCK).read_bytes())["digest"]
             for name in ("sdk", "link_inputs", "clang_resources", "linker_libraries", "xcode", "system_build"): self.assertIn(name, tools["native_link"])
+            # One generation per consumed input, each in its own fixture and
+            # output directory, so they are independent and run concurrently.
+            # Serially this is the slowest test in the repository by an order of
+            # magnitude; a single generation uses about 1.3 cores, so the run is
+            # bounded by generator count rather than by this machine.
+            drifts = []
             for index, relative in enumerate(item for item in INPUTS if not item.startswith("schemas/")):
-                root = self.fixture(str(Path(directory) / str(index))); path = root / relative; path.write_bytes(path.read_bytes() + (b"\n// drift\n" if relative.endswith(".rs") else b"\n# drift\n")); output = Path(directory) / f"drift-{index}"; self.assertEqual(self.run_generator(root, "--output", str(output)).returncode, 0, relative); self.assertNotEqual(json.loads((output / LOCK).read_bytes())["digest"], baseline)
+                root = self.fixture(str(Path(directory) / str(index))); path = root / relative; path.write_bytes(path.read_bytes() + (b"\n// drift\n" if relative.endswith(".rs") else b"\n# drift\n")); drifts.append((relative, root, Path(directory) / f"drift-{index}"))
+            with ThreadPoolExecutor(max_workers=GENERATOR_WORKERS) as pool:
+                results = list(pool.map(lambda case: self.run_generator(case[1], "--output", str(case[2])), drifts))
+            for (relative, _, output), result in zip(drifts, results):
+                self.assertEqual(result.returncode, 0, f"{relative}: {result.stderr}"); self.assertNotEqual(json.loads((output / LOCK).read_bytes())["digest"], baseline, relative)
         self.assertEqual(self.run_generator(ROOT, "--check", str(SCHEMAS)).returncode, 0)
     def test_payload_invariance_code_identity_and_b02_authority(self):
         with tempfile.TemporaryDirectory() as directory:

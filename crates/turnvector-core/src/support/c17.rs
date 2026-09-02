@@ -564,6 +564,60 @@ impl SupportC17 {
         self.advance_generation();
     }
 
+    /// Read-only preparation of one terminal group's release: both raw owner
+    /// keys leave the directory so the record slot and its identities can be
+    /// reused. Preparing mutates nothing.
+    pub(super) fn prepare_legacy_release(
+        &self,
+        obligation: [u8; 32],
+        credit: [u8; 32],
+    ) -> Result<PreparedLegacyRelease, SupportLedgerError> {
+        if obligation == [0; 32] || credit == [0; 32] || obligation == credit {
+            return Err(SupportLedgerError::InvalidInput);
+        }
+        let mut keys = [[0; 32]; LEGACY_RAW_EDIT_MAX];
+        let (low, high) = if obligation < credit {
+            (obligation, credit)
+        } else {
+            (credit, obligation)
+        };
+        keys[0] = low;
+        keys[1] = high;
+        self.raw.validate_remove_batch(&keys[..2])?;
+        Ok(PreparedLegacyRelease {
+            expected_c17: self.generation(),
+            expected_raw: self.raw.generation(),
+            keys,
+            key_count: 2,
+        })
+    }
+
+    pub(super) fn validate_legacy_release(
+        &self,
+        change: &PreparedLegacyRelease,
+    ) -> Result<(), SupportLedgerError> {
+        if self.generation() != change.expected_c17
+            || self.raw.generation() != change.expected_raw
+            || change.key_count != 2
+            || change.keys[change.key_count..]
+                .iter()
+                .any(|key| *key != [0; 32])
+        {
+            return Err(SupportLedgerError::Generation);
+        }
+        self.raw
+            .validate_remove_batch(&change.keys[..change.key_count])?;
+        Ok(())
+    }
+
+    pub(super) fn commit_legacy_release(&mut self, change: PreparedLegacyRelease) {
+        self.validate_legacy_release(&change)
+            .expect("validated legacy Raw release");
+        self.raw
+            .remove_batch_prevalidated(&change.keys[..change.key_count]);
+        self.advance_generation();
+    }
+
     pub(super) fn prepare_legacy_update(
         &self,
         record_slot: usize,
@@ -1008,10 +1062,42 @@ impl SupportC17 {
         self.advance_generation();
     }
 
+    /// Releases a retained tombstone's unified owner rows. A tombstoned bundle
+    /// is in `OWNER_STATE_TOMBSTONE`, which the live withdrawal path rejects,
+    /// so without this entry a released tombstone leaves its owner rows charged
+    /// for the life of the process.
+    pub(super) fn prepare_c16_tombstone_release(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+    ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
+        self.prepare_c16_owner_removal(
+            record_slot,
+            record,
+            OWNER_STATE_TOMBSTONE,
+            RawOwnerState::Tombstone,
+        )
+    }
+
     pub(super) fn prepare_c16_withdrawal(
         &self,
         record_slot: u32,
         record: &BundleRecord,
+    ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
+        self.prepare_c16_owner_removal(
+            record_slot,
+            record,
+            OWNER_STATE_LIVE,
+            RawOwnerState::Committed,
+        )
+    }
+
+    fn prepare_c16_owner_removal(
+        &self,
+        record_slot: u32,
+        record: &BundleRecord,
+        owner_state: u8,
+        raw_state: RawOwnerState,
     ) -> Result<PreparedC16Withdrawal, SupportLedgerError> {
         let references = [
             self.owner_headers.reference_at(record_slot, &[1])?,
@@ -1025,8 +1111,8 @@ impl SupportC17 {
             self.owner_indices.image(references[2], &[1])?.as_slice(),
             self.owners.image(references[3], &[1])?.as_slice(),
         ];
-        validate_c16_owner_set(images, references, record_slot, record, OWNER_STATE_LIVE)?;
-        validate_withdrawable_owner_row(images[1])?;
+        validate_c16_owner_set(images, references, record_slot, record, owner_state)?;
+        validate_withdrawable_owner_row(images[1], owner_state)?;
         let mut raw_keys = [[0; 32]; C16_RAW_OWNERS];
         for (ordinal, key) in record.tagged_keys().into_iter().enumerate() {
             let value = self
@@ -1035,7 +1121,7 @@ impl SupportC17 {
                 .ok_or_else(noncanonical_error)?;
             let (kind, state, stored_ordinal, owner) = decode_raw_owner_at(value)?;
             if kind != c16_raw_kind(ordinal)?
-                || state != RawOwnerState::Committed
+                || state != raw_state
                 || usize::from(stored_ordinal) != ordinal
                 || owner != references[0]
             {
@@ -3856,6 +3942,13 @@ pub(super) struct PreparedLegacyInsert {
 }
 
 #[derive(Debug)]
+pub(super) struct PreparedLegacyRelease {
+    expected_c17: u64,
+    expected_raw: u64,
+    keys: [[u8; 32]; LEGACY_RAW_EDIT_MAX],
+    key_count: usize,
+}
+
 pub(super) struct PreparedLegacyUpdate {
     expected_c17: u64,
     expected_raw: u64,
@@ -4824,9 +4917,17 @@ fn validate_c16_owner_set(
         .ok_or_else(noncanonical_error)
 }
 
-fn validate_withdrawable_owner_row(image: &[u8]) -> Result<(), SupportLedgerError> {
+/// The release preconditions for one unified owner row. Beyond the owner state
+/// itself these are exactly the conservation conditions: no linked claim may
+/// remain, nothing may still be charged, and no active link may be held. A
+/// retained tombstone therefore cannot be released while any link survives,
+/// which is the rule its retention boundary states.
+fn validate_withdrawable_owner_row(
+    image: &[u8],
+    owner_state: u8,
+) -> Result<(), SupportLedgerError> {
     let canonical = image.len() == OWNER_ROW_BYTES
-        && image[8] == OWNER_STATE_LIVE
+        && image[8] == owner_state
         && read_u16(image, OWNER_ROW_VECTOR_LEN) > 0
         && read_u32(image, OWNER_ROW_LINKED_CLAIMS) == 0
         && read_u64(image, OWNER_ROW_CURRENT) == 0
@@ -5152,8 +5253,8 @@ mod tests {
 
     #[test]
     fn production_physical_equation_and_every_first_one_over_are_exact() {
-        assert_eq!(super::super::C17_LANDED_PREFIX_BYTES, 3_248);
-        assert_eq!(SUPPORT_LEDGER_CEILING_BYTES, 63_942_176);
+        assert_eq!(super::super::C17_LANDED_PREFIX_BYTES, 3_328);
+        assert_eq!(SUPPORT_LEDGER_CEILING_BYTES, 63_942_256);
         assert_eq!(
             SupportC17::physical_bytes(SupportC17Capacities::production()),
             Some(C17_PHYSICAL_BYTES)

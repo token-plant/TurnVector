@@ -397,6 +397,14 @@ fn reserved_index<T>(capacity: usize) -> Result<Vec<T>, FixedIndexError> {
     Ok(values)
 }
 
+/// A fixed index preallocated once and filled with a sentinel, for bucket
+/// heads and intrusive links that must be addressable from construction.
+fn vec_filled(capacity: usize, value: u32) -> Result<Vec<u32>, FixedIndexError> {
+    let mut values = reserved_index(capacity)?;
+    values.resize(capacity, value);
+    Ok(values)
+}
+
 fn is_branch(node: u32) -> bool {
     node & BRANCH_TAG != 0
 }
@@ -437,6 +445,12 @@ pub(crate) struct AvlNode {
 pub(crate) struct AvlIndex {
     nodes: Vec<AvlNode>,
     root: u32,
+    /// Head of the intrusive free list threaded through vacated slots' `left`
+    /// links. Nodes address one another by index, so a removed slot is retained
+    /// and reused rather than shifted out; the list costs no extra storage
+    /// because it reuses the padding beside `root`.
+    free_head: u32,
+    free_len: u32,
     capacity: usize,
 }
 
@@ -448,6 +462,8 @@ impl AvlIndex {
         Ok(Self {
             nodes: reserved_index(capacity)?,
             root: NO_NODE,
+            free_head: NO_NODE,
+            free_len: 0,
             capacity,
         })
     }
@@ -505,8 +521,41 @@ impl AvlIndex {
         Ok(None)
     }
 
+    /// The number of live keys. Removed slots stay in `nodes` for index
+    /// stability, so the physical length is not the live count.
+    pub(crate) fn live(&self) -> usize {
+        self.nodes.len() - self.free_len as usize
+    }
+
+    fn claim_slot(&mut self, node: AvlNode) -> u32 {
+        if self.free_head == NO_NODE {
+            let slot = u32::try_from(self.nodes.len()).expect("constructor-bounded AVL index");
+            self.nodes.push(node);
+            return slot;
+        }
+        let slot = self.free_head;
+        self.free_head = self.nodes[slot as usize].left;
+        self.free_len -= 1;
+        self.nodes[slot as usize] = node;
+        slot
+    }
+
+    /// Returns one vacated slot to the intrusive free list. The slot keeps its
+    /// position so every other node's stored index stays valid.
+    fn release_slot(&mut self, slot: u32) {
+        self.nodes[slot as usize] = AvlNode {
+            key: [0; 33],
+            record: 0,
+            left: self.free_head,
+            right: NO_NODE,
+            parent: NO_NODE,
+            height: 0,
+        };
+        self.free_head = slot;
+        self.free_len += 1;
+    }
+
     fn insert_prevalidated(&mut self, key: [u8; 33], record: u32) {
-        let index = u32::try_from(self.nodes.len()).expect("constructor-bounded AVL index");
         let mut parent = NO_NODE;
         let mut node = self.root;
         while node != NO_NODE {
@@ -518,7 +567,7 @@ impl AvlIndex {
                 current.right
             };
         }
-        self.nodes.push(AvlNode {
+        let index = self.claim_slot(AvlNode {
             key,
             record,
             left: NO_NODE,
@@ -536,6 +585,93 @@ impl AvlIndex {
             self.nodes[parent as usize].right = index;
         }
         self.rebalance_after_insert(parent);
+    }
+
+    /// Removes one key and returns the record it addressed. Deletion splices the
+    /// in-order successor when the target has two children, rebalances the whole
+    /// parent chain, and returns the vacated slot to the free list. Every other
+    /// node keeps its index, so record indices held elsewhere stay valid.
+    fn remove(&mut self, key: [u8; 33]) -> Option<u32> {
+        let mut node = self.root;
+        while node != NO_NODE {
+            let current = &self.nodes[node as usize];
+            if key == current.key {
+                break;
+            }
+            node = if key < current.key {
+                current.left
+            } else {
+                current.right
+            };
+        }
+        if node == NO_NODE {
+            return None;
+        }
+        let record = self.nodes[node as usize].record;
+        // With two children the successor's key and record move into this node
+        // and the successor itself becomes the physically removed slot; it has
+        // no left child by construction.
+        let target = if self.nodes[node as usize].left != NO_NODE
+            && self.nodes[node as usize].right != NO_NODE
+        {
+            let mut successor = self.nodes[node as usize].right;
+            while self.nodes[successor as usize].left != NO_NODE {
+                successor = self.nodes[successor as usize].left;
+            }
+            self.nodes[node as usize].key = self.nodes[successor as usize].key;
+            self.nodes[node as usize].record = self.nodes[successor as usize].record;
+            successor
+        } else {
+            node
+        };
+        let value = self.nodes[target as usize];
+        let child = if value.left != NO_NODE {
+            value.left
+        } else {
+            value.right
+        };
+        if child != NO_NODE {
+            self.nodes[child as usize].parent = value.parent;
+        }
+        if value.parent == NO_NODE {
+            self.root = child;
+        } else if self.nodes[value.parent as usize].left == target {
+            self.nodes[value.parent as usize].left = child;
+        } else {
+            self.nodes[value.parent as usize].right = child;
+        }
+        self.release_slot(target);
+        self.rebalance_after_delete(value.parent);
+        Some(record)
+    }
+
+    /// Unlike an insertion, a deletion can shorten a subtree, so rebalancing
+    /// continues above a rotation instead of stopping at the first one.
+    fn rebalance_after_delete(&mut self, mut node: u32) {
+        while node != NO_NODE {
+            let old_height = self.nodes[node as usize].height;
+            self.refresh(node);
+            let balance = self.balance(node);
+            let settled = if balance == 2 {
+                let left = self.nodes[node as usize].left;
+                if self.balance(left) < 0 {
+                    self.rotate_left(left);
+                }
+                self.rotate_right(node)
+            } else if balance == -2 {
+                let right = self.nodes[node as usize].right;
+                if self.balance(right) > 0 {
+                    self.rotate_right(right);
+                }
+                self.rotate_left(node)
+            } else {
+                if self.nodes[node as usize].height == old_height {
+                    return;
+                }
+                node
+            };
+            node = self.nodes[settled as usize].parent;
+        }
     }
 
     fn height(&self, node: u32) -> u8 {
@@ -659,10 +795,36 @@ impl From<FixedIndexError> for FixedStorageError {
 pub struct FixedRecordArena<V, C, const KEYS: usize> {
     records: Vec<V>,
     claims: Vec<C>,
-    claim_ends: Vec<u32>,
+    /// One packed `(start, len)` claim span per record slot. A prefix sum
+    /// cannot express a hole, and reclaiming a terminal group leaves holes, so
+    /// each slot addresses its claims explicitly. A vacated slot stores the
+    /// next free slot index instead and is marked by `VACANT_SLOT`.
+    claim_spans: Vec<u64>,
     identities: AvlIndex,
+    /// Head of the intrusive vacated-slot list threaded through `claim_spans`.
+    free_record_head: u32,
+    free_records: u32,
+    /// Released claim spans, bucketed by exact length. `free_span_head[len]`
+    /// is the first free span of that length and `free_span_next[start]` links
+    /// to the next, so reuse is a constant-time pop rather than a scan. A
+    /// linear search here would be unbounded hot-path work under ADR 0039.
+    free_span_head: Vec<u32>,
+    free_span_next: Vec<u32>,
+    free_spans: u32,
+    claim_high_water: usize,
     record_capacity: usize,
     claim_capacity: usize,
+}
+
+/// Marks a `claim_spans` entry as a vacated-slot link rather than a span.
+const VACANT_SLOT: u64 = 1 << 63;
+
+const fn span(start: usize, len: usize) -> u64 {
+    ((start as u64) << 32) | len as u64
+}
+
+const fn span_parts(value: u64) -> (usize, usize) {
+    ((value >> 32) as usize, (value & 0xFFFF_FFFF) as usize)
 }
 
 impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
@@ -676,7 +838,13 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         Ok(Self {
             records: reserved_index(record_capacity)?,
             claims: reserved_index(claim_capacity)?,
-            claim_ends: reserved_index(record_capacity)?,
+            claim_spans: reserved_index(record_capacity)?,
+            free_record_head: NO_NODE,
+            free_records: 0,
+            free_span_head: vec_filled(claim_capacity + 1, NO_NODE)?,
+            free_span_next: vec_filled(claim_capacity, NO_NODE)?,
+            free_spans: 0,
+            claim_high_water: 0,
             identities: AvlIndex::try_new(
                 record_capacity
                     .checked_mul(KEYS)
@@ -729,16 +897,25 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
     }
 
     pub(crate) fn validate_capacity(&self, claims: usize) -> Result<(), FixedStorageError> {
-        if self.records.len() == self.record_capacity
+        // Reclaimed slots, spans and identity nodes are all reusable, so each
+        // bound is checked against live occupancy rather than a physical
+        // length that only ever grows.
+        // Constant time: either the exact-length bucket holds a released span
+        // or the bump pointer still has room. No scan on a preflight path.
+        // A run longer than the whole claim arena can never be placed; index
+        // the bucket only after proving the length is addressable, or an
+        // oversized request panics instead of failing closed.
+        let span_available = claims == 0
+            || (claims <= self.claim_capacity && self.free_span_head[claims] != NO_NODE)
             || self
-                .claims
-                .len()
+                .claim_high_water
                 .checked_add(claims)
-                .is_none_or(|end| end > self.claim_capacity)
+                .is_some_and(|end| end <= self.claim_capacity);
+        if self.live() == self.record_capacity
+            || !span_available
             || self
                 .identities
-                .nodes
-                .len()
+                .live()
                 .checked_add(KEYS)
                 .is_none_or(|end| end > self.identities.capacity)
         {
@@ -753,14 +930,101 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
         record: V,
         claims: &[C],
     ) -> usize {
-        let index = self.records.len();
-        self.records.push(record);
-        self.claims.extend_from_slice(claims);
-        self.claim_ends.push(self.claims.len() as u32);
+        let start = self.claim_start(claims.len());
+        for (offset, claim) in claims.iter().enumerate() {
+            if start + offset < self.claims.len() {
+                self.claims[start + offset] = *claim;
+            } else {
+                self.claims.push(*claim);
+            }
+        }
+        let index = if self.free_record_head == NO_NODE {
+            let index = self.records.len();
+            self.records.push(record);
+            self.claim_spans.push(span(start, claims.len()));
+            index
+        } else {
+            let index = self.free_record_head as usize;
+            self.free_record_head = (self.claim_spans[index] & 0xFFFF_FFFF) as u32;
+            self.free_records -= 1;
+            self.records[index] = record;
+            self.claim_spans[index] = span(start, claims.len());
+            index
+        };
         for key in keys {
             self.identities.insert_prevalidated(key, index as u32);
         }
         index
+    }
+
+    /// Places one claim run in constant time: an exact released span of the
+    /// same length, or the bump pointer. Spans are never split, so a released
+    /// span always returns to the bucket it came from and reuse cannot degrade
+    /// into a search.
+    fn claim_start(&mut self, len: usize) -> usize {
+        if len == 0 || len > self.claim_capacity {
+            return self.claim_high_water;
+        }
+        let head = self.free_span_head[len];
+        if head != NO_NODE {
+            self.free_span_head[len] = self.free_span_next[head as usize];
+            self.free_span_next[head as usize] = NO_NODE;
+            self.free_spans -= 1;
+            return head as usize;
+        }
+        let start = self.claim_high_water;
+        self.claim_high_water += len;
+        start
+    }
+
+    /// Returns one released span to its exact-length bucket in constant time.
+    fn release_span(&mut self, start: usize, len: usize) {
+        self.free_span_next[start] = self.free_span_head[len];
+        self.free_span_head[len] = u32::try_from(start).expect("constructor-bounded claim start");
+        self.free_spans += 1;
+    }
+
+    /// Releases one record slot: its identity keys leave the index, its claim
+    /// span returns to the free list, and the slot itself joins the vacated
+    /// list. Every other record keeps its index, so indices held elsewhere stay
+    /// valid, and the slot may later be reused by a new identity.
+    pub(crate) fn remove(&mut self, index: usize, keys: [[u8; 33]; KEYS]) -> bool {
+        if index >= self.records.len() || self.claim_spans[index] & VACANT_SLOT != 0 {
+            return false;
+        }
+        for key in keys {
+            self.identities.remove(key);
+        }
+        let (start, len) = span_parts(self.claim_spans[index]);
+        if len > 0 {
+            self.release_span(start, len);
+        }
+        self.claim_spans[index] = VACANT_SLOT | u64::from(self.free_record_head);
+        self.free_record_head = u32::try_from(index).expect("constructor-bounded record index");
+        self.free_records += 1;
+        true
+    }
+
+    /// The slot the next push will occupy. Vacated slots are reused, so a
+    /// caller that must predict the slot cannot use the physical length.
+    pub(crate) fn next_slot(&self) -> usize {
+        if self.free_record_head == NO_NODE {
+            self.records.len()
+        } else {
+            self.free_record_head as usize
+        }
+    }
+
+    /// The number of live records. Vacated slots keep their position, so the
+    /// physical length is not the live count.
+    pub(crate) fn live(&self) -> usize {
+        self.records.len() - self.free_records as usize
+    }
+
+    /// Vacated record slots available for immediate reuse.
+    #[allow(dead_code, reason = "C18 retention tests assert slot reuse")]
+    pub(crate) fn free_record_len(&self) -> usize {
+        self.free_records as usize
     }
 
     pub fn find(
@@ -802,19 +1066,22 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
     }
 
     pub fn claims(&self, index: usize) -> Option<&[C]> {
-        let end = *self.claim_ends.get(index)? as usize;
-        let start = index
-            .checked_sub(1)
-            .map_or(0, |prior| self.claim_ends[prior] as usize);
-        Some(&self.claims[start..end])
+        let value = *self.claim_spans.get(index)?;
+        if value & VACANT_SLOT != 0 {
+            return None;
+        }
+        let (start, len) = span_parts(value);
+        Some(&self.claims[start..start + len])
     }
 
-    pub(crate) fn backing_capacities(&self) -> [usize; 4] {
+    pub(crate) fn backing_capacities(&self) -> [usize; 6] {
         [
             self.records.capacity(),
             self.claims.capacity(),
-            self.claim_ends.capacity(),
+            self.claim_spans.capacity(),
             self.identities.nodes.capacity(),
+            self.free_span_head.capacity(),
+            self.free_span_next.capacity(),
         ]
     }
 
@@ -824,8 +1091,8 @@ impl<V, C: Copy, const KEYS: usize> FixedRecordArena<V, C, KEYS> {
             (self.records.as_ptr() as usize, self.records.capacity()),
             (self.claims.as_ptr() as usize, self.claims.capacity()),
             (
-                self.claim_ends.as_ptr() as usize,
-                self.claim_ends.capacity(),
+                self.claim_spans.as_ptr() as usize,
+                self.claim_spans.capacity(),
             ),
             (
                 self.identities.nodes.as_ptr() as usize,
@@ -855,7 +1122,15 @@ pub struct FixedWindowCounter<const CELLS: usize, const H: usize> {
 pub(crate) struct FixedWindowStart(usize, MonotonicTime);
 
 impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
-    pub fn try_new(bounds: [[FixedStartCountBound; H]; CELLS]) -> Result<Self, FixedStorageError> {
+    /// `bounds` are the active Budget's admission limits; `retained` is the
+    /// catalog-wide physical capacity, which is the maximum any production
+    /// Budget can retain at the Catalog Retention Horizon. Sizing storage by
+    /// the active bound instead would lose the predecessor starts a shorter
+    /// Budget must still hand to a longer successor.
+    pub fn try_new(
+        bounds: [[FixedStartCountBound; H]; CELLS],
+        retained: [u32; CELLS],
+    ) -> Result<Self, FixedStorageError> {
         if CELLS == 0 || H == 0 || H > 8 {
             return Err(FixedStorageError::Capacity);
         }
@@ -870,9 +1145,16 @@ impl<const CELLS: usize, const H: usize> FixedWindowCounter<CELLS, H> {
         if !valid {
             return Err(FixedStorageError::NonCanonical);
         }
+        if bounds
+            .iter()
+            .zip(&retained)
+            .any(|(cell, capacity)| cell[H - 1].1 > *capacity)
+        {
+            return Err(FixedStorageError::Capacity);
+        }
         let mut history = std::array::from_fn(|_| VecDeque::new());
-        for (queue, cell) in history.iter_mut().zip(&bounds) {
-            let capacity = cell[H - 1].1 as usize;
+        for (queue, cell) in history.iter_mut().zip(&retained) {
+            let capacity = *cell as usize;
             queue
                 .try_reserve_exact(capacity)
                 .map_err(|_| FixedStorageError::Allocation)?;
@@ -1223,7 +1505,7 @@ mod fixed_index_tests {
             FixedStartCountBound(Duration::from_micros(10), 1),
             FixedStartCountBound(Duration::from_micros(20), 2),
         ]];
-        let mut counter = FixedWindowCounter::try_new(bounds).unwrap();
+        let mut counter = FixedWindowCounter::try_new(bounds, [2]).unwrap();
         let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
         assert_eq!(
             counter.try_start(1, MonotonicTime::from_micros(5), &mut work),
@@ -1277,5 +1559,178 @@ mod fixed_index_tests {
             )))
         ));
         assert_eq!(counter.len(0), before);
+    }
+}
+
+#[cfg(test)]
+mod avl_removal_probe {
+    use super::*;
+
+    fn key(n: u8) -> [u8; 33] {
+        let mut value = [0; 33];
+        value[0] = n;
+        value
+    }
+
+    /// Every live key remains findable, every removed key is gone, and the
+    /// tree stays height-balanced with intact parent links after each removal.
+    fn audit(index: &AvlIndex, live: &[u8]) {
+        for n in 0..=32u8 {
+            let found = index.find_precharged(key(n)).unwrap();
+            assert_eq!(
+                found.is_some(),
+                live.contains(&n),
+                "key {n} presence after removals"
+            );
+        }
+        fn check(index: &AvlIndex, node: u32, parent: u32) -> u8 {
+            if node == NO_NODE {
+                return 0;
+            }
+            let value = index.nodes[node as usize];
+            assert_eq!(value.parent, parent, "parent link");
+            let left = check(index, value.left, node);
+            let right = check(index, value.right, node);
+            assert_eq!(value.height, 1 + left.max(right), "stored height");
+            assert!(
+                (i16::from(left) - i16::from(right)).abs() <= 1,
+                "AVL balance"
+            );
+            value.height
+        }
+        check(index, index.root, NO_NODE);
+        assert_eq!(index.live(), live.len(), "live count");
+    }
+
+    /// Claim-span reuse must be constant time: a released span returns to its
+    /// exact-length bucket and is popped from the head, never searched for.
+    /// A linear search here would be unbounded unmetered hot-path work.
+    #[test]
+    fn claim_span_reuse_is_exact_fit_and_scan_free() {
+        let mut arena: FixedRecordArena<u8, u16, 1> = FixedRecordArena::try_new(4, 8).unwrap();
+        let key = |n: u8| {
+            let mut value = [0; 33];
+            value[0] = n;
+            value
+        };
+        // Two records with different claim lengths, then a third that must
+        // start fresh because no bucket holds its length.
+        let one = arena.push_prevalidated([key(1)], 1, &[10, 11]);
+        let two = arena.push_prevalidated([key(2)], 2, &[20]);
+        assert_eq!(arena.claim_high_water, 3);
+
+        arena.remove(one, [key(1)]);
+        assert_eq!(arena.free_spans, 1, "the two-slot span is banked");
+        assert_eq!(arena.free_span_head[2], 0, "banked under its exact length");
+        assert_eq!(arena.free_span_head[1], NO_NODE, "not under another length");
+
+        // A same-length request reuses the banked span exactly and does not
+        // advance the bump pointer.
+        let three = arena.push_prevalidated([key(3)], 3, &[30, 31]);
+        assert_eq!(arena.claims(three), Some(&[30, 31][..]));
+        assert_eq!(arena.claim_high_water, 3, "reused, not appended");
+        assert_eq!(arena.free_spans, 0, "the bucket is drained");
+
+        // A different-length request cannot use a banked span of another
+        // length and takes fresh storage instead of splitting.
+        arena.remove(three, [key(3)]);
+        let four = arena.push_prevalidated([key(4)], 4, &[40]);
+        assert_eq!(arena.claims(four), Some(&[40][..]));
+        assert_eq!(arena.claim_high_water, 4, "no split, fresh storage");
+        assert_eq!(arena.free_spans, 1, "the two-slot span stays banked");
+        assert_eq!(
+            arena.claims(two),
+            Some(&[20][..]),
+            "untouched record intact"
+        );
+    }
+
+    #[test]
+    fn removal_preserves_search_order_balance_and_parent_links() {
+        let mut index = AvlIndex::try_new(64).unwrap();
+        let mut live: Vec<u8> = Vec::new();
+        for n in 1..=24u8 {
+            index.insert_prevalidated(key(n), u32::from(n));
+            live.push(n);
+        }
+        audit(&index, &live);
+        // Remove in an order that exercises leaf, one-child and two-child
+        // deletions and forces rebalancing above a rotation.
+        for n in [12u8, 1, 24, 13, 2, 23, 7, 18, 3] {
+            assert_eq!(index.remove(key(n)), Some(u32::from(n)), "removing {n}");
+            live.retain(|value| *value != n);
+            audit(&index, &live);
+        }
+        assert_eq!(index.remove(key(12)), None, "second removal is absent");
+        // Vacated slots are reused rather than growing the arena.
+        let physical = index.nodes.len();
+        for n in [12u8, 1, 24] {
+            index.insert_prevalidated(key(n), u32::from(n));
+            live.push(n);
+        }
+        assert_eq!(index.nodes.len(), physical, "vacated slots reused");
+        audit(&index, &live);
+    }
+}
+
+#[cfg(test)]
+mod reclamation_boundary_probe {
+    use super::*;
+    use crate::HotPathWorkBudget;
+
+    /// Start history is sized by the catalog-wide retained capacity, not by the
+    /// active Budget's admission bound. Sizing it by the active bound would
+    /// discard the predecessor starts a shorter Budget must still hand to a
+    /// longer successor.
+    #[test]
+    fn start_history_is_sized_by_catalog_capacity_not_the_active_bound() {
+        let bounds = [[
+            FixedStartCountBound(Duration::from_micros(10), 1),
+            FixedStartCountBound(Duration::from_micros(20), 2),
+        ]];
+        let counter = FixedWindowCounter::<1, 2>::try_new(bounds, [9]).unwrap();
+        assert_eq!(
+            counter.backing_capacities(),
+            [9],
+            "physical history follows the catalog capacity"
+        );
+        // The active bound still gates admission at 2, independently of the 9
+        // slots the catalog retains.
+        let mut counter = counter;
+        let mut work = WorkMeter::new(HotPathWorkBudget::binary_maximum());
+        // One start per 10us window, two per 20us window.
+        for micros in [1, 12] {
+            counter
+                .try_start(0, MonotonicTime::from_micros(micros), &mut work)
+                .unwrap();
+        }
+        assert_eq!(
+            counter.try_start(0, MonotonicTime::from_micros(13), &mut work),
+            Err(FixedStorageError::WindowExceeded),
+            "the active bound still gates at 1 per 10us"
+        );
+        // A capacity below the active bound is not constructible.
+        assert_eq!(
+            FixedWindowCounter::<1, 2>::try_new(bounds, [1]).unwrap_err(),
+            FixedStorageError::Capacity
+        );
+    }
+
+    /// A claim run longer than the entire claim arena must fail closed, not
+    /// index past the bucket table.
+    #[test]
+    fn an_oversized_claim_run_fails_closed_instead_of_panicking() {
+        let arena: FixedRecordArena<u8, u16, 1> = FixedRecordArena::try_new(4, 8).unwrap();
+        assert_eq!(arena.validate_capacity(8), Ok(()));
+        assert_eq!(
+            arena.validate_capacity(9),
+            Err(FixedStorageError::Capacity),
+            "one past the claim arena"
+        );
+        assert_eq!(
+            arena.validate_capacity(1_024),
+            Err(FixedStorageError::Capacity),
+            "far past the claim arena"
+        );
     }
 }
