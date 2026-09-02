@@ -50,7 +50,7 @@ FROZEN_TOPOLOGY_SHA256 = {
     "crates/turnvector-core/src/lib.rs": "35c1ab53c9afae00ec07f545e423ed4a0b08ce58b99a3a88ec5b2d0b4170a06a",
     "crates/turnvector-daemon/Cargo.toml": "1dec90d7c04004eaa25ab4bf3aacea7989a898a24df29629be6c93ad6d203f0a",
     "crates/turnvector-daemon/src/main.rs": "f9e7bb4b97fbe08292028ab4ada11199df3a3629a18899cfb57a46683230622e",
-    "tests/test_daemon_core_build.py": "90ab766ac80f11504511f09648af1ab2a195a6b3e3cc1dce1e746ffa80394a09",
+    "tests/test_daemon_core_build.py": "62debaff8f6f878ad3253c7be64a328347845a2b033c649ffde1474aa4eebe9d",
 }
 PROTOCOL_CARGO = b'''[package]\nname = "turnvector-protocol"\nversion.workspace = true\nedition.workspace = true\nrust-version.workspace = true\nlicense.workspace = true\npublish = false\n\n[lints]\nworkspace = true\n'''
 
