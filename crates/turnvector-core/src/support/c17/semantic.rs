@@ -1310,8 +1310,13 @@ impl SupportC17 {
                 owner_references[ordinal],
                 delta.slot,
                 &before_record,
-                OWNER_STATE_LIVE,
+                owner_state_byte(before_record.state),
             )?;
+            // A tombstone forbids new funding (design 5.1): a root batch may
+            // retire a tombstoned owner's links, never add to them.
+            if before_record.state == BundleState::RetainedTombstone && delta.linked > 0 {
+                return Err(SupportLedgerError::InvalidTransition);
+            }
             let mut record_after = before_record;
             record_after.linked_claims = apply_i32_u32(record_after.linked_claims, delta.linked)?;
             let mut row = *self.owner_rows.image(owner_references[ordinal][1], &[1])?;
@@ -1841,6 +1846,7 @@ impl SupportC17 {
         }
         for index in 0..change.preview.owner_count {
             let references = change.owner_references[index];
+            let record = owner_records[index].ok_or(SupportLedgerError::Generation)?;
             validate_c16_owner_set(
                 [
                     self.owner_headers.image(references[0], &[1])?.as_slice(),
@@ -1850,8 +1856,8 @@ impl SupportC17 {
                 ],
                 references,
                 change.preview.owners[index].slot,
-                &owner_records[index].ok_or(SupportLedgerError::Generation)?,
-                OWNER_STATE_LIVE,
+                &record,
+                owner_state_byte(record.state),
             )?;
             if !matches!(change.preview.resolver, ResolverChange::Keep) {
                 let reference = change.retired_links[index];
