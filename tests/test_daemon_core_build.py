@@ -11,9 +11,13 @@ INPUTS += ("crates/turnvector-core/src/support/c18.rs",)
 INPUTS += ("crates/turnvector-core/src/certification.rs",)
 INPUTS += ("crates/turnvector-core/src/admission.rs", "crates/turnvector-core/src/closure_control.rs", "crates/turnvector-core/src/resource_ledger.rs", "crates/turnvector-core/src/scheduler.rs", "crates/turnvector-core/src/transition_coordinator.rs", "crates/turnvector-core/src/turn_plans.rs", "crates/turnvector-daemon/src/audit_journal.rs", "crates/turnvector-daemon/src/backend_contract.rs", "crates/turnvector-daemon/src/certification_tooling.rs", "crates/turnvector-daemon/src/control_plane.rs", "crates/turnvector-daemon/src/control_store.rs", "crates/turnvector-daemon/src/daemon_custody.rs", "crates/turnvector-daemon/src/data_plane.rs", "crates/turnvector-daemon/src/device_executor.rs", "crates/turnvector-daemon/src/event_loop.rs", "crates/turnvector-daemon/src/fake_backend.rs", "crates/turnvector-daemon/src/native_build.rs", "crates/turnvector-daemon/src/native_runtime.rs", "crates/turnvector-daemon/src/native_turns.rs", "crates/turnvector-daemon/src/protocol_authority.rs", "crates/turnvector-daemon/src/residency_coordinator.rs", "crates/turnvector-daemon/src/resource_evidence.rs", "crates/turnvector-daemon/src/resource_governor.rs", "crates/turnvector-daemon/src/runtime_carry.rs", "crates/turnvector-daemon/src/runtime_measurement.rs", "crates/turnvector-daemon/src/runtime_qualification.rs", "crates/turnvector-daemon/src/volume_qualification.rs")
 FIXTURE_ONLY_INPUTS = ("crates/turnvector-protocol/Cargo.toml", "crates/turnvector-protocol/src/lib.rs", "crates/turnvector-daemon/src/release_identity.rs")
-# Independent generations run concurrently. Each uses roughly 1.3 cores, so
-# this stays below the machine while keeping the slowest test bounded.
-GENERATOR_WORKERS = min(12, max(2, (os.cpu_count() or 4) // 2))
+# Independent generations run concurrently. A generation is mostly two cargo
+# processes and averages well under one core of its own, so three quarters of
+# the machine is the measured optimum: on 28 logical cores the drift matrix
+# takes 242s at 8 workers, 199s at 12, 191s at 14, 155s at 21 and 165s at 28.
+# The cap keeps a very large machine from starting more builds than its memory
+# can hold.
+GENERATOR_WORKERS = min(24, max(2, ((os.cpu_count() or 4) * 3) // 4))
 def canonical(value): return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 def evidence(payload, domain="turnvector:evidence:daemon-core-build", version=1): return hashlib.sha256(domain.encode() + b"\0" + version.to_bytes(4, "big") + payload).hexdigest()
 def macho_fixture(catalog_sections=1, data_command_padding=0, rebase=b"", bind=b"", weak=b"", lazy=b"", export=b"", chained=False, reordered_loader=False):
@@ -96,22 +100,35 @@ class DaemonCoreBuildTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, f"{relative}: {result.stderr}"); self.assertNotEqual(json.loads((output / LOCK).read_bytes())["digest"], baseline, relative)
     def test_payload_invariance_code_identity_and_b02_authority(self):
         with tempfile.TemporaryDirectory() as directory:
-            # Three chains over three fixtures. Within a chain each step
-            # mutates the fixture the previous step generated from, so a chain
-            # stays ordered; the chains never touch one another and run
-            # concurrently.
-            root = self.fixture(directory)
-            def payload_chain(root=root):
-                baseline = self.generate(root, Path(directory) / "base"); (root / "notes.txt").write_text("unrelated\n")
-                integration = root / "crates/turnvector-core/tests/unrelated.rs"; integration.parent.mkdir(); integration.write_text("#[test]\nfn unrelated() {}\n"); self.assertEqual(self.generate(root, Path(directory) / "integration"), baseline); payload = root / "schemas/runtime-overhead-catalog-v1.json"
-                for index in range(2): payload.write_text(f"payload {index}\n"); self.assertEqual(self.generate(root, Path(directory) / f"payload-{index}"), baseline)
-                extra = root / "crates/turnvector-core/src/extra.rs"; extra.write_text("pub fn value() -> u32 { 1 }\n"); core = root / "crates/turnvector-core/src/lib.rs"; core.write_text(core.read_text() + "\nmod extra;\n"); expanded = self.generate(root, Path(directory) / "expanded"); self.assertIn("crates/turnvector-core/src/extra.rs", [item["path"] for item in expanded["source_closure"]["files"]])
-                (root / "crates/turnvector-daemon/src/main.rs").write_text('fn main() { println!("code drift"); }\n'); changed = self.generate(root, Path(directory) / "code"); self.assertNotEqual(changed["section_identities"]["executable_text"]["sha256"], expanded["section_identities"]["executable_text"]["sha256"])
-            debug_root = self.fixture(str(Path(directory) / "debug")); debug = debug_root / "crates/turnvector-daemon/src/debug_only.rs"; debug.write_text("pub fn value() -> u32 { 1 }\n"); (debug_root / "crates/turnvector-daemon/src/main.rs").write_text("#[cfg(debug_assertions)] mod debug_only;\nfn main() {}\n")
-            def debug_chain(debug_root=debug_root, debug=debug):
-                first = self.generate(debug_root, Path(directory) / "debug-one"); self.assertIn("crates/turnvector-daemon/src/debug_only.rs", [item["path"] for item in first["source_closure"]["files"]]); debug.write_text("pub fn value() -> u32 { 2 }\n"); second = self.generate(debug_root, Path(directory) / "debug-two"); self.assertNotEqual(first, second)
-            root = self.fixture(str(Path(directory) / "b02")); path = root / "schemas/generation-semantics-v1.json"; value = json.loads(path.read_bytes()); value["sampling_rng"]["splits_per_sampled_token"] = 99; blob = canonical(value); path.write_bytes(blob); lock_path = root / "schemas/generation-semantics-v1.lock.json"; lock = json.loads(lock_path.read_bytes()); lock["digest"] = evidence(blob, lock["domain"], lock["hash_schema_version"]); lock_path.write_bytes(canonical(lock))
-            self.concurrently([payload_chain, debug_chain, lambda root=root: self.rejects(root, Path(directory) / "b02-out", "current Generation Semantics")])
+            # A descriptor is a pure function of its source tree, so a
+            # sequence of in-place mutations is the same thing as one fixture
+            # per cumulative state. Materialising the states makes every
+            # generation independent, and the states stay cumulative exactly as
+            # they were when applied in place.
+            def notes(root): (root / "notes.txt").write_text("unrelated\n"); integration = root / "crates/turnvector-core/tests/unrelated.rs"; integration.parent.mkdir(); integration.write_text("#[test]\nfn unrelated() {}\n")
+            def payload(index): return lambda root: (root / "schemas/runtime-overhead-catalog-v1.json").write_text(f"payload {index}\n")
+            def extra(root): (root / "crates/turnvector-core/src/extra.rs").write_text("pub fn value() -> u32 { 1 }\n"); core = root / "crates/turnvector-core/src/lib.rs"; core.write_text(core.read_text() + "\nmod extra;\n")
+            def drift(root): (root / "crates/turnvector-daemon/src/main.rs").write_text('fn main() { println!("code drift"); }\n')
+            def debug_only(value): return lambda root: ((root / "crates/turnvector-daemon/src/debug_only.rs").write_text(f"pub fn value() -> u32 {{ {value} }}\n"), (root / "crates/turnvector-daemon/src/main.rs").write_text("#[cfg(debug_assertions)] mod debug_only;\nfn main() {}\n"))
+            def b02(root):
+                path = root / "schemas/generation-semantics-v1.json"; value = json.loads(path.read_bytes()); value["sampling_rng"]["splits_per_sampled_token"] = 99; blob = canonical(value); path.write_bytes(blob)
+                lock_path = root / "schemas/generation-semantics-v1.lock.json"; lock = json.loads(lock_path.read_bytes()); lock["digest"] = evidence(blob, lock["domain"], lock["hash_schema_version"]); lock_path.write_bytes(canonical(lock))
+            def state(name, *steps):
+                root = self.fixture(str(Path(directory) / name))
+                for step in steps: step(root)
+                return root
+            states = {name: state(name, *steps) for name, steps in (
+                ("base", ()), ("integration", (notes,)), ("payload-0", (notes, payload(0))), ("payload-1", (notes, payload(0), payload(1))),
+                ("expanded", (notes, payload(0), payload(1), extra)), ("code", (notes, payload(0), payload(1), extra, drift)),
+                ("debug-one", (debug_only(1),)), ("debug-two", (debug_only(2),)), ("b02", (b02,)))}
+            values = self.concurrently([lambda name=name: self.generate(states[name], Path(directory) / f"{name}-out") for name in states if name != "b02"]
+                                       + [lambda: self.rejects(states["b02"], Path(directory) / "b02-out", "current Generation Semantics")])
+            baseline, integration, payload_zero, payload_one, expanded, changed, first, second = values[:8]
+            for name, value in (("integration", integration), ("payload-0", payload_zero), ("payload-1", payload_one)):
+                self.assertEqual(value, baseline, name)
+            self.assertIn("crates/turnvector-core/src/extra.rs", [item["path"] for item in expanded["source_closure"]["files"]])
+            self.assertNotEqual(changed["section_identities"]["executable_text"]["sha256"], expanded["section_identities"]["executable_text"]["sha256"])
+            self.assertIn("crates/turnvector-daemon/src/debug_only.rs", [item["path"] for item in first["source_closure"]["files"]]); self.assertNotEqual(first, second)
     def test_catalog_section_is_a_unique_file_backed_readonly_nonexecuting_region(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory); payload, offsets = macho_fixture(); valid = directory / "valid"; valid.write_bytes(payload); self.assertEqual(self.inspect_macho(valid).returncode, 0)
@@ -208,12 +225,21 @@ class DaemonCoreBuildTests(unittest.TestCase):
             parent = Path(directory) / "ambient"; root = self.fixture(str(parent)); (parent / ".cargo").mkdir(); (parent / ".cargo/config.toml").write_text('[build]\nrustflags=["--invalid-ambient-flag"]\n'); env = os.environ.copy(); env["TMPDIR"] = str(parent); pending.append(lambda root=root, env=env: self.succeeds(root, Path(directory) / "ambient-out", env))
             root = self.fixture(str(Path(directory) / "vendor")); vendor = root / "vendor/third-party"; (vendor / "src").mkdir(parents=True); (vendor / "Cargo.toml").write_text('[package]\nname="third-party"\nversion="1.0.0"\nedition="2024"\n'); source = vendor / "src/lib.rs"; source.write_text("pub fn value() -> u32 { 1 }\n"); manifest = root / "crates/turnvector-daemon/Cargo.toml"; manifest.write_text(manifest.read_text() + '\nthird-party = { path = "../../vendor/third-party" }\n')
             (root / "crates/turnvector-daemon/src/main.rs").write_text('fn main() { println!("{}", third_party::value()); }\n'); subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, capture_output=True)
-            # Each step mutates the one vendored fixture, so these four
-            # generations stay ordered inside a single case.
-            def vendor_chain(root=root, vendor=vendor, source=source):
-                first = self.generate(root, Path(directory) / "vendor-one"); self.assertIn("vendor/third-party/src/lib.rs", [item["path"] for item in first["source_closure"]["files"]]); source.write_text("pub fn value() -> u32 { 2 }\n"); second = self.generate(root, Path(directory) / "vendor-two"); self.assertNotEqual(first["section_identities"]["executable_text"]["sha256"], second["section_identities"]["executable_text"]["sha256"])
-                (vendor / "unused.txt").write_text("not reachable\n"); self.assertEqual(self.generate(root, Path(directory) / "vendor-unused"), second); (vendor / "Cargo.toml").write_text((vendor / "Cargo.toml").read_text() + "\n[lib]\nproc-macro = true\n"); self.rejects(root, Path(directory) / "proc-macro", "proc-macro")
-            pending.append(vendor_chain); root = self.fixture(str(Path(directory) / "build-script")); manifest = root / "crates/turnvector-daemon/Cargo.toml"; manifest.write_text(manifest.read_text().replace("[package]\n", '[package]\nbuild = "build.rs"\n')); (manifest.parent / "build.rs").write_text("fn main() {}\n"); pending.append(lambda root=root: self.rejects(root, Path(directory) / "build-script-out", "build scripts")); root = self.fixture(str(Path(directory) / "build-dependency")); manifest = root / "crates/turnvector-daemon/Cargo.toml"; manifest.write_text(manifest.read_text() + '\n[build-dependencies]\nturnvector-core = { path = "../turnvector-core" }\n'); pending.append(lambda root=root: self.rejects(root, Path(directory) / "build-dependency-out", "build dependencies"))
+            # The vendored chain's four states are cumulative mutations of one
+            # tree, and a descriptor is a pure function of its tree, so each
+            # state gets its own copy of the prepared fixture and the four
+            # generations join the batch instead of waiting on each other.
+            def bump(variant): (variant / "vendor/third-party/src/lib.rs").write_text("pub fn value() -> u32 { 2 }\n")
+            def unused(variant): (variant / "vendor/third-party/unused.txt").write_text("not reachable\n")
+            def proc_macro(variant): path = variant / "vendor/third-party/Cargo.toml"; path.write_text(path.read_text() + "\n[lib]\nproc-macro = true\n")
+            def vendor_state(name, *steps):
+                variant = Path(directory) / name; shutil.copytree(root, variant)
+                for step in steps: step(variant)
+                return variant
+            vendored = [vendor_state("vendor-one"), vendor_state("vendor-two", bump), vendor_state("vendor-unused", bump, unused), vendor_state("vendor-proc-macro", bump, unused, proc_macro)]
+            vendor_results = slice(len(pending), len(pending) + 3)
+            pending.extend(lambda variant=variant, name=name: self.generate(variant, Path(directory) / f"{name}-out") for variant, name in zip(vendored[:3], ("vendor-one", "vendor-two", "vendor-unused")))
+            pending.append(lambda variant=vendored[3]: self.rejects(variant, Path(directory) / "proc-macro-out", "proc-macro")); root = self.fixture(str(Path(directory) / "build-script")); manifest = root / "crates/turnvector-daemon/Cargo.toml"; manifest.write_text(manifest.read_text().replace("[package]\n", '[package]\nbuild = "build.rs"\n')); (manifest.parent / "build.rs").write_text("fn main() {}\n"); pending.append(lambda root=root: self.rejects(root, Path(directory) / "build-script-out", "build scripts")); root = self.fixture(str(Path(directory) / "build-dependency")); manifest = root / "crates/turnvector-daemon/Cargo.toml"; manifest.write_text(manifest.read_text() + '\n[build-dependencies]\nturnvector-core = { path = "../turnvector-core" }\n'); pending.append(lambda root=root: self.rejects(root, Path(directory) / "build-dependency-out", "build dependencies"))
             root, wrapper = self.fixture(str(Path(directory) / "race")), Path(directory) / "bin/cargo"; wrapper.parent.mkdir(); marker = Path(directory) / "marker"; real = shutil.which("cargo"); wrapper.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ] && [ ! -e "{marker}" ]; then echo "// raced" >> "{root / "crates/turnvector-daemon/src/main.rs"}"; touch "{marker}"; fi\nexec "{real}" "$@"\n'); wrapper.chmod(0o755); env = {**os.environ, "PATH": f'{wrapper.parent}:{os.environ["PATH"]}'}
             pending.append(lambda root=root, env=env: self.rejects(root, Path(directory) / "race-out", "changed", env))
             root, wrapper = self.fixture(str(Path(directory) / "snapshot-race")), Path(directory) / "snapshot-bin/cargo"; wrapper.parent.mkdir(); marker = Path(directory) / "snapshot-marker"; wrapper.write_text(f'#!/bin/sh\n"{real}" "$@" || exit $?\ncase " $* " in *" build "*" --release "*) if [ ! -e "{marker}" ]; then while [ "$1" != "--manifest-path" ]; do shift; done; echo "// raced" >> "$(dirname "$2")/crates/turnvector-daemon/src/main.rs"; touch "{marker}"; fi;; esac\n'); wrapper.chmod(0o755); env = {**os.environ, "PATH": f'{wrapper.parent}:{os.environ["PATH"]}'}
@@ -232,16 +258,31 @@ class DaemonCoreBuildTests(unittest.TestCase):
             root, wrapper, output = self.fixture(str(Path(directory) / "directory-race")), Path(directory) / "directory-bin/cargo", Path(directory) / "directory-output"; wrapper.parent.mkdir(); output.mkdir(); marker, moved = Path(directory) / "directory-marker", Path(directory) / "directory-moved"; wrapper.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ] && [ -d "{output}" ] && [ ! -e "{marker}" ]; then mv "{output}" "{moved}"; mkdir "{output}"; touch "{marker}"; fi\nexec "{real}" "$@"\n'); wrapper.chmod(0o755); env = {**os.environ, "PATH": f'{wrapper.parent}:{os.environ["PATH"]}'}
             def directory_race(root=root, output=output, env=env, moved=moved): result = self.run_generator(root, "--output", str(output), env=env); self.assertNotEqual(result.returncode, 0); self.assertIn("output directory changed", result.stderr); self.assertFalse((output / DESCRIPTOR).exists() or (moved / DESCRIPTOR).exists())
             pending.append(directory_race)
-            self.concurrently(pending)
+            first, second, without_unused = self.concurrently(pending)[vendor_results]
+            self.assertIn("vendor/third-party/src/lib.rs", [item["path"] for item in first["source_closure"]["files"]])
+            self.assertNotEqual(first["section_identities"]["executable_text"]["sha256"], second["section_identities"]["executable_text"]["sha256"])
+            self.assertEqual(without_unused, second, "an unreachable vendored file is not an input")
     def test_structural_and_self_hash_drift_are_rejected(self):
         descriptor, lock = json.loads((SCHEMAS / DESCRIPTOR).read_bytes()), json.loads((SCHEMAS / LOCK).read_bytes()); paths = (("catalog", "schema_version"), ("catalog", "capacity", "max_entries"), ("catalog", "frame", "section_bytes"), ("support", "start_count", "max_horizons"), ("support", "start_count", "max_physical_credits"), ("support", "funding_claim", "max_claims_per_obligation"), ("support", "funding_claim", "variants", 0), ("support", "outstanding_credit_vector", "max_dimensions"), ("support", "records", "ordinary_claims"), ("support", "records", "conditional_obligations"), ("support", "records", "pending_obligations"), ("support", "records", "entitlement_tombstones"), ("support", "records", "funding_claims"), ("support", "records", "lifecycle_reserves"), ("support", "records", "total_operation_obligations"), ("cardinality_inputs", "ingress", "global_warming"), ("prepared_carry", "slots"), ("prepared_carry", "mandatory_suballocation_max"), ("prepared_carry", "safety_suballocation_max"), ("event_registry", "max_entries"), ("build_variants", "profiles", 0), ("native_inputs", "interface_revision"), ("section_identities", "executable_text", "cpu_type"), ("section_identities", "executable_text", "cpu_subtype"), ("section_identities", "executable_text", "sections", 0, "sha256"), ("section_identities", "native_text", "sha256"), ("section_identities", "catalog_payload", "byte_length"), ("toolchain", "python", "runtime_files", "sha256"), ("toolchain", "native_link", "sdk", "sha256"), ("toolchain", "native_link", "link_inputs", "sha256"), ("toolchain", "native_link", "linker_libraries", "sha256"))
+        def drifted(output, candidate):
+            output.mkdir(); blob = canonical(candidate); (output / DESCRIPTOR).write_bytes(blob); (output / LOCK).write_bytes(canonical({**lock, "digest": evidence(blob)})); return output
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory)
-            for path in paths:
+            # A structurally valid candidate is only rejected after the
+            # generator rebuilds the descriptor to compare against, so most of
+            # these are full generations. Each candidate gets its own output
+            # directory, which is what lets them share one batch.
+            pending = []
+            for index, path in enumerate(paths):
                 candidate = json.loads(json.dumps(descriptor)); target = candidate
                 for key in path[:-1]: target = target[key]
-                value = target[path[-1]]; target[path[-1]] = value + 1 if isinstance(value, int) else value + "_drift"; blob = canonical(candidate); (output / DESCRIPTOR).write_bytes(blob); (output / LOCK).write_bytes(canonical({**lock, "digest": evidence(blob)})); self.assertNotEqual(self.run_generator(ROOT, "--check", str(output)).returncode, 0)
-            descriptor["final_binary_sha256"] = "00" * 32; blob = canonical(descriptor); (output / DESCRIPTOR).write_bytes(blob); (output / LOCK).write_bytes(canonical({**lock, "digest": evidence(blob)})); result = self.run_generator(ROOT, "--check", str(output)); self.assertNotEqual(result.returncode, 0); self.assertIn("final binary self hash", result.stderr)
-            foreign = self.fixture(str(Path(directory) / "foreign")); result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", BOOTSTRAP, str(ROOT / LAUNCHER), "--root", str(foreign), "--output", str(Path(directory) / "foreign-out")], cwd=ROOT, check=False, capture_output=True, text=True); self.assertNotEqual(result.returncode, 0); self.assertIn("executing generator", result.stderr); root = self.fixture(str(Path(directory) / "source-race")); path, replacement = root / "scripts/generate_daemon_core_build.py", root / ".work/replacement.py"; replacement.parent.mkdir(); source = path.read_text(); replacement.write_text(source.replace('"interface_revision":1', '"interface_revision":2', 1)); path.write_text(source.replace('if __name__ == "__main__": main()', f'if __name__ == "__main__": os.replace({str(replacement)!r}, __file__); main()')); self.rejects(root, Path(directory) / "source-race-out", "executing generator or launcher bytes"); root = self.fixture(str(Path(directory) / "launcher-race")); path, replacement = root / LAUNCHER, root / ".work/replacement-launcher.py"; replacement.parent.mkdir(); source = path.read_text(); replacement.write_text(source + "# replacement\n"); replacement.chmod(0o755); path.write_text(source.replace("import os, stat, sys; from pathlib import Path", f"import os, stat, sys; from pathlib import Path\nos.replace({str(replacement)!r}, __file__)")); self.rejects(root, Path(directory) / "launcher-race-out", "launcher bytes")
+                value = target[path[-1]]; target[path[-1]] = value + 1 if isinstance(value, int) else value + "_drift"; output = drifted(Path(directory) / f"drift-{index}", candidate)
+                pending.append(lambda output=output, path=path: self.assertNotEqual(self.run_generator(ROOT, "--check", str(output)).returncode, 0, path))
+            descriptor["final_binary_sha256"] = "00" * 32; output = drifted(Path(directory) / "self-hash", descriptor)
+            def self_hash(output=output): result = self.run_generator(ROOT, "--check", str(output)); self.assertNotEqual(result.returncode, 0); self.assertIn("final binary self hash", result.stderr)
+            pending.append(self_hash)
+            foreign = self.fixture(str(Path(directory) / "foreign"))
+            def foreign_launcher(foreign=foreign): result = subprocess.run([sys.executable, "-I", "-S", "-B", "-c", BOOTSTRAP, str(ROOT / LAUNCHER), "--root", str(foreign), "--output", str(Path(directory) / "foreign-out")], cwd=ROOT, check=False, capture_output=True, text=True); self.assertNotEqual(result.returncode, 0); self.assertIn("executing generator", result.stderr)
+            pending.append(foreign_launcher); root = self.fixture(str(Path(directory) / "source-race")); path, replacement = root / "scripts/generate_daemon_core_build.py", root / ".work/replacement.py"; replacement.parent.mkdir(); source = path.read_text(); replacement.write_text(source.replace('"interface_revision":1', '"interface_revision":2', 1)); path.write_text(source.replace('if __name__ == "__main__": main()', f'if __name__ == "__main__": os.replace({str(replacement)!r}, __file__); main()')); pending.append(lambda root=root: self.rejects(root, Path(directory) / "source-race-out", "executing generator or launcher bytes")); root = self.fixture(str(Path(directory) / "launcher-race")); path, replacement = root / LAUNCHER, root / ".work/replacement-launcher.py"; replacement.parent.mkdir(); source = path.read_text(); replacement.write_text(source + "# replacement\n"); replacement.chmod(0o755); path.write_text(source.replace("import os, stat, sys; from pathlib import Path", f"import os, stat, sys; from pathlib import Path\nos.replace({str(replacement)!r}, __file__)")); pending.append(lambda root=root: self.rejects(root, Path(directory) / "launcher-race-out", "launcher bytes"))
+            self.concurrently(pending)
             result = subprocess.run([sys.executable, "-I", "-B", str(GENERATOR), "--root", str(ROOT), "--check", str(SCHEMAS)], cwd=ROOT, check=False, capture_output=True, text=True); self.assertNotEqual(result.returncode, 0); self.assertIn("-I -S -B", result.stderr); result = subprocess.run([sys.executable, "-I", "-S", "-B", str(GENERATOR), "--root", str(ROOT), "--check", str(SCHEMAS)], cwd=ROOT, check=False, capture_output=True, text=True); self.assertNotEqual(result.returncode, 0); self.assertIn("captured-source launcher", result.stderr)
 if __name__ == "__main__": unittest.main()
